@@ -241,7 +241,7 @@ impl<'a> Lexer<'a> {
 
             // ===== 标识符与关键字 =====
             '_' => {
-                self.advance();
+                // `next_token` 已经 advance 过 `_`，这里不再 advance
                 return Token::new(TokenKind::Underscore, Span::new(start, self.pos, line, col));
             }
             'a'..='z' | 'A'..='Z' | '_' => return self.read_ident(start, line, col),
@@ -741,7 +741,7 @@ mod tests {
 
     #[test]
     fn lex_error_invalid_char() {
-        let t = Lexer::new("@").tokenize();
+        let t = Lexer::new("$").tokenize();
         assert!(matches!(t[0].kind, TokenKind::LexError(_)));
     }
 

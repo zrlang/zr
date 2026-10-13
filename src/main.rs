@@ -160,6 +160,10 @@ impl Cli {
             }
             i += 1;
         }
+        // 无输入文件时默认显示帮助
+        if cli.input.is_none() {
+            cli.help = true;
+        }
         Ok(cli)
     }
 }

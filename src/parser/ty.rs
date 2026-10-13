@@ -125,6 +125,25 @@ impl Parser {
             return Ok(Type::Tuple(types));
         }
 
+        // 数组 / 切片：`[T; N]` / `[T]`
+        if self.match_kind(&TokenKind::LBracket) {
+            if self.match_kind(&TokenKind::RBracket) {
+                // `[]T` —— 这里简化为错误，标准写法是 `[T]`
+                return Err(crate::error::CompileError::type_error(
+                    "expected element type after '['",
+                ));
+            }
+            let elem = self.parse_type()?;
+            let len = if self.match_kind(&TokenKind::Semicolon) {
+                let len_expr = self.parse_expression()?;
+                ArrayLen::Const(Box::new(len_expr))
+            } else {
+                ArrayLen::Dynamic
+            };
+            self.consume(&TokenKind::RBracket, "expected ']' to close array type")?;
+            return Ok(Type::Array(Box::new(elem), len));
+        }
+
         // 基础类型
         let kind = self.peek().kind.clone();
         match &kind {
@@ -137,7 +156,19 @@ impl Parser {
             TokenKind::TyNever => { self.advance(); Ok(Type::Never) }
             TokenKind::KwVoid => { self.advance(); Ok(Type::Void) }
             TokenKind::KwAnytype => { self.advance(); Ok(Type::Anytype) }
-            TokenKind::KwUpperSelf => { self.advance(); Ok(Type::Named { path: vec!["Self".into()], generics: vec![] }) }
+            TokenKind::KwUpperSelf => {
+                self.advance();
+                let mut path = vec!["Self".to_string()];
+                while self.match_kind(&TokenKind::ColonColon) {
+                    path.push(self.consume_ident("expected path segment")?);
+                }
+                let generics = if self.match_kind(&TokenKind::Lt) {
+                    self.parse_generic_args()?
+                } else {
+                    vec![]
+                };
+                Ok(Type::Named { path, generics })
+            }
             TokenKind::KwFn => self.parse_function_type(),
             TokenKind::Ident(_) => {
                 let first = self.consume_ident("expected type name")?;

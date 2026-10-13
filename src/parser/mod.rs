@@ -95,8 +95,13 @@ impl Parser {
         if self.match_kind(&TokenKind::KwExtern) {
             return self.parse_extern(attrs).map(ModuleItem::Extern);
         }
+        if self.check(&TokenKind::KwAsync) && self.peek_n(1).map(|t| t.kind == TokenKind::KwFn).unwrap_or(false) {
+            self.advance(); // async
+            self.advance(); // fn
+            return self.parse_function(vis, attrs, true).map(ModuleItem::Function);
+        }
         if self.match_kind(&TokenKind::KwFn) {
-            return self.parse_function(vis, attrs).map(ModuleItem::Function);
+            return self.parse_function(vis, attrs, false).map(ModuleItem::Function);
         }
         if self.match_kind(&TokenKind::KwConst) {
             return self.parse_const(vis, attrs).map(ModuleItem::Const);
@@ -133,8 +138,11 @@ impl Parser {
     /// 解析内部属性（出现在 `mod`/`fn` 之后的 `#![...]`）。
     fn parse_inner_attrs(&mut self) -> Result<Vec<Attribute>> {
         let mut attrs = Vec::new();
-        while self.match_kind(&TokenKind::Hash) {
-            self.consume(&TokenKind::Bang, "expected '!' after '#' for inner attribute")?;
+        while self.check(&TokenKind::Hash)
+            && self.peek_n(1).map(|t| t.kind == TokenKind::Bang).unwrap_or(false)
+        {
+            self.advance(); // #
+            self.advance(); // !
             attrs.push(self.parse_attribute_body(true)?);
         }
         Ok(attrs)
@@ -143,11 +151,6 @@ impl Parser {
     /// 解析外部属性（出现在条目之前的 `#[...]`）。
     fn parse_outer_attrs(&mut self) -> Result<Vec<Attribute>> {
         let mut attrs = Vec::new();
-        while self.check(&TokenKind::Hash) && self.peek_n(1).map(|t| t.kind == TokenKind::Bang).unwrap_or(false) {
-            self.advance(); // #
-            self.advance(); // !
-            attrs.push(self.parse_attribute_body(true)?);
-        }
         while self.match_kind(&TokenKind::Hash) {
             attrs.push(self.parse_attribute_body(false)?);
         }
@@ -283,8 +286,15 @@ impl Parser {
         let mut stmts = Vec::new();
         let mut tail: Option<Box<Expression>> = None;
         while !self.check(&TokenKind::RBrace) && !self.check(&TokenKind::Eof) {
-            // 如果是「表达式 + 可能的 ;」，且后面还有更多语句，当作表达式语句
-            // 如果是「表达式 + 无 ;」，当作块尾
+            // `let` / `var` / `const` 语句
+            if matches!(
+                self.peek().kind,
+                TokenKind::KwLet | TokenKind::KwVar | TokenKind::KwConst
+            ) {
+                stmts.push(self.parse_statement()?);
+                continue;
+            }
+            // 表达式语句 / 块尾表达式
             let expr = self.parse_expression()?;
             if self.match_kind(&TokenKind::Semicolon) {
                 stmts.push(Statement::Expr(expr, Span::unknown()));
@@ -292,8 +302,7 @@ impl Parser {
                 tail = Some(Box::new(expr));
                 break;
             } else {
-                // 解析到一半发现不是表达式语句尾部（如 `let` 后缺少分号已在上层处理）
-                // 这里属于「裸表达式」当作尾表达式
+                // 裸表达式当作尾表达式
                 tail = Some(Box::new(expr));
                 break;
             }

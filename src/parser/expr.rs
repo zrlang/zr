@@ -122,6 +122,19 @@ impl Parser {
                     continue;
                 }
 
+                // 范围运算符 `..` / `..=`
+                if matches!(op_kind, TokenKind::DotDot | TokenKind::DotDotEq) {
+                    self.advance();
+                    let op = if op_kind == TokenKind::DotDotEq {
+                        BinaryOp::RangeInclusive
+                    } else {
+                        BinaryOp::Range
+                    };
+                    let right = self.parse_expr_bp(right_bp)?;
+                    left = Expression::Binary(Box::new(left), op, Box::new(right), op_span);
+                    continue;
+                }
+
                 self.advance();
                 let op = self.binary_op(&op_kind)
                     .ok_or_else(|| CompileError::internal(format!(
@@ -260,6 +273,19 @@ impl Parser {
         }
 
         // ===== 一元运算符 =====
+        if kind == TokenKind::Amp {
+            // `&x` / `&mut x` / `&const x`
+            self.advance();
+            let mutability = if self.match_kind(&TokenKind::KwMut) {
+                Mutability::Mutable
+            } else if self.match_kind(&TokenKind::KwConst) {
+                Mutability::Immutable
+            } else {
+                Mutability::Immutable
+            };
+            let operand = self.parse_expr_bp(Prec::UNARY)?;
+            return Ok(Expression::AddrOf(Box::new(operand), mutability, span));
+        }
         if let Some(op) = self.unary_op(&kind) {
             self.advance();
             let operand = self.parse_expr_bp(Prec::UNARY)?;
@@ -270,9 +296,9 @@ impl Parser {
         if self.match_kind(&TokenKind::Pipe) {
             let mut params = Vec::new();
             if !self.check(&TokenKind::Pipe) {
-                params.push(self.parse_pattern()?);
+                params.push(self.parse_pattern_single()?);
                 while self.match_kind(&TokenKind::Comma) {
-                    params.push(self.parse_pattern()?);
+                    params.push(self.parse_pattern_single()?);
                 }
             }
             self.consume(&TokenKind::Pipe, "expected '|' after lambda parameters")?;
@@ -281,7 +307,16 @@ impl Parser {
             } else {
                 None
             };
-            let body = self.parse_block()?;
+            let body = if self.check(&TokenKind::LBrace) {
+                self.parse_block()?
+            } else {
+                let expr = self.parse_expression()?;
+                Block {
+                    stmts: Vec::new(),
+                    tail: Some(Box::new(expr)),
+                    span,
+                }
+            };
             return Ok(Expression::Lambda(params, ret, body, span));
         }
 
@@ -361,7 +396,7 @@ impl Parser {
 
     // ===== 字面量 =====
 
-    fn parse_literal(&mut self) -> Result<Option<Literal>, CompileError> {
+    pub(crate) fn parse_literal(&mut self) -> Result<Option<Literal>, CompileError> {
         let tk = self.peek().kind.clone();
         Ok(Some(match tk {
             TokenKind::IntLiteral(v) => {
@@ -583,6 +618,9 @@ impl Parser {
             TokenKind::PipePipe => (Prec::OR, Prec(Prec::OR.0 + 1)),
             TokenKind::AmpAmp => (Prec::AND, Prec(Prec::AND.0 + 1)),
 
+            // 范围运算符 `..` / `..=`（优先级低于逻辑或）
+            TokenKind::DotDot | TokenKind::DotDotEq => (Prec::OR, Prec(Prec::OR.0 + 1)),
+
             TokenKind::Pipe => (Prec::BIT_OR, Prec(Prec::BIT_OR.0 + 1)),
             TokenKind::Caret => (Prec::XOR, Prec(Prec::XOR.0 + 1)),
             TokenKind::Amp => (Prec::BIT_AND, Prec(Prec::BIT_AND.0 + 1)),
@@ -618,6 +656,8 @@ impl Parser {
             TokenKind::Amp => BinaryOp::BitAnd,
             TokenKind::Pipe => BinaryOp::BitOr,
             TokenKind::Caret => BinaryOp::BitXor,
+            TokenKind::AmpAmp => BinaryOp::And,
+            TokenKind::PipePipe => BinaryOp::Or,
             TokenKind::Shl => BinaryOp::Shl,
             TokenKind::Shr => BinaryOp::Shr,
             TokenKind::EqEq => BinaryOp::Eq,

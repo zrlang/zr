@@ -143,7 +143,7 @@ impl Parser {
         let mut items = Vec::new();
         while !self.check(&TokenKind::RBrace) && !self.is_at_end() {
             if self.match_kind(&TokenKind::KwFn) {
-                items.push(ExternItem::Function(self.parse_function(Visibility::Private, vec![])?));
+                items.push(ExternItem::Function(self.parse_function(Visibility::Private, vec![], false)?));
             } else if self.match_kind(&TokenKind::KwType) {
                 let name = self.consume_ident("expected type name")?;
                 self.consume(&TokenKind::Semicolon, "expected ';'")?;
@@ -164,9 +164,9 @@ impl Parser {
         &mut self,
         visibility: Visibility,
         attrs: Vec<Attribute>,
+        is_async: bool,
     ) -> Result<Function, CompileError> {
         let span = self.previous().span;
-        let is_async = self.match_kind(&TokenKind::KwAsync);
         let is_const = self.match_kind(&TokenKind::KwComptime);
         let name = self.consume_ident("expected function name")?;
 
@@ -196,6 +196,14 @@ impl Parser {
                 params.push(self.parse_param()?);
                 while self.match_kind(&TokenKind::Comma) {
                     if self.check(&TokenKind::RParen) {
+                        break;
+                    }
+                    // 可变参数 `...`
+                    if self.check(&TokenKind::DotDot)
+                        && self.peek_n(1).map(|t| t.kind == TokenKind::Dot).unwrap_or(false)
+                    {
+                        self.advance(); // ..
+                        self.advance(); // .
                         break;
                     }
                     params.push(self.parse_param()?);
@@ -586,7 +594,9 @@ impl Parser {
             if self.match_kind(&TokenKind::KwType) {
                 assoc_types.push(self.parse_assoc_type()?);
             } else {
-                methods.push(self.parse_function(Visibility::Private, vec![])?);
+                let is_async = self.match_kind(&TokenKind::KwAsync);
+                self.consume(&TokenKind::KwFn, "expected 'fn'")?;
+                methods.push(self.parse_function(Visibility::Private, vec![], is_async)?);
             }
         }
         self.consume(&TokenKind::RBrace, "expected '}'")?;
@@ -649,7 +659,9 @@ impl Parser {
             if self.match_kind(&TokenKind::KwType) {
                 assoc_types.push(self.parse_assoc_type()?);
             } else {
-                items.push(self.parse_function(Visibility::Private, vec![])?);
+                let is_async = self.match_kind(&TokenKind::KwAsync);
+                self.consume(&TokenKind::KwFn, "expected 'fn'")?;
+                items.push(self.parse_function(Visibility::Private, vec![], is_async)?);
             }
         }
         self.consume(&TokenKind::RBrace, "expected '}'")?;

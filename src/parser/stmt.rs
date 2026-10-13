@@ -37,15 +37,45 @@ impl Parser {
     fn parse_pattern_or(&mut self) -> Result<Pattern, CompileError> {
         let mut pat = self.parse_pattern_single()?;
         // 目前或模式暂不展开为独立节点，第一个分支作为主模式
-        while self.match_kind(&TokenKind::Pipe) {
+        while self.check(&TokenKind::Pipe) && self.next_can_start_pattern() {
+            self.advance(); // |
             self.parse_pattern_single()?;
         }
         Ok(pat)
     }
 
+    /// 判断下一个 token 是否可以作为模式的起始。
+    fn next_can_start_pattern(&self) -> bool {
+        self.peek_n(1).map(|t| {
+            matches!(
+                t.kind,
+                TokenKind::Ident(_)
+                    | TokenKind::Underscore
+                    | TokenKind::IntLiteral(_)
+                    | TokenKind::FloatLiteral(_)
+                    | TokenKind::CharLiteral(_)
+                    | TokenKind::StringLiteral(_)
+                    | TokenKind::KwTrue
+                    | TokenKind::KwFalse
+                    | TokenKind::KwRef
+                    | TokenKind::KwMut
+                    | TokenKind::Tilde
+                    | TokenKind::Minus
+                    | TokenKind::LParen
+                    | TokenKind::LBracket
+            )
+        }).unwrap_or(false)
+    }
+
     /// 解析单个模式。
-    fn parse_pattern_single(&mut self) -> Result<Pattern, CompileError> {
+    pub(crate) fn parse_pattern_single(&mut self) -> Result<Pattern, CompileError> {
         let span = self.peek().span;
+
+        // `mut name`（可变绑定）
+        if self.match_kind(&TokenKind::KwMut) {
+            let name = self.consume_ident("expected name after 'mut'")?;
+            return Ok(Pattern::Binding(name, crate::parser::ast::Mutability::Mutable, None, span));
+        }
 
         // `ref mut? p`
         if self.match_kind(&TokenKind::KwRef) {
@@ -64,41 +94,29 @@ impl Parser {
             return Ok(inner);
         }
 
-        // 字面量模式
-        if let TokenKind::IntLiteral(v) = &self.peek().kind {
-            let v = *v;
-            self.advance();
-            return Ok(Pattern::Literal(Literal::Int(v, None)));
-        }
-        if let TokenKind::StringLiteral(s) = &self.peek().kind {
-            let s = s.clone();
-            self.advance();
-            return Ok(Pattern::Literal(Literal::String(s)));
-        }
-        if let TokenKind::CharLiteral(c) = &self.peek().kind {
-            let c = *c;
-            self.advance();
-            return Ok(Pattern::Literal(Literal::Char(c)));
-        }
-        if matches!(self.peek().kind, TokenKind::KwTrue | TokenKind::KwFalse) {
-            let b = self.match_kind(&TokenKind::KwTrue);
-            return Ok(Pattern::Literal(Literal::Bool(b)));
-        }
-
-        // 范围模式 `1..=5`（仅作为独立模式，不出现在其他模式内）
+        // 范围模式 `1..=5` / 字面量模式（必须在字面量单独处理之前，
+        // 否则 `1` 会被当作普通字面量而无法识别范围）
         if self.peek().kind.is_lit_or_minus() {
-            let start = self.parse_expression()?;
+            // 只解析字面量前缀（不消费 `..` / `..=`，因为它们现在是表达式二元运算符）
+            let start = self.parse_pattern_literal_expr()?;
             if self.match_kind(&TokenKind::DotDot) || self.match_kind(&TokenKind::DotDotEq) {
                 let inclusive = self.previous().kind == TokenKind::DotDotEq;
-                let end = self.parse_expression()?;
+                let end = self.parse_pattern_literal_expr()?;
                 return Ok(Pattern::Range(Box::new(start), Box::new(end), inclusive, span));
             }
-            // 不是范围模式，回退——但此时已消费了字面量，构造一个 Literal 模式
+            // 不是范围模式，回退为字面量模式
             return if let Expression::Literal(lit, _) = start {
                 Ok(Pattern::Literal(lit))
             } else {
                 Err(CompileError::internal("expected pattern"))
             };
+        }
+
+        // 字符串字面量模式（不在 is_lit_or_minus 中）
+        if let TokenKind::StringLiteral(s) = &self.peek().kind {
+            let s = s.clone();
+            self.advance();
+            return Ok(Pattern::Literal(Literal::String(s)));
         }
 
         // 元组模式 `(p1, p2)`
@@ -171,24 +189,15 @@ impl Parser {
                 return Ok(Pattern::Binding(ident, crate::parser::ast::Mutability::Immutable, Some(Box::new(sub)), span));
             }
 
-            // 普通绑定，可选类型注解 `: T`
-            let ty = if self.match_kind(&TokenKind::Colon) {
-                Some(self.parse_type()?)
-            } else {
-                None
-            };
-            let mutability = crate::parser::ast::Mutability::Immutable;
-            // 类型注解绑定：`mut name: T`
+            // 类型注解 `: T` 由调用方（parse_param / parse_let_stmt）处理，
+            // 这里不消费 `:`，避免与参数/绑定的类型注解冲突。
+
+            // `mut name`（可变绑定）
             if ident == "mut" {
                 let real = self.consume_ident("expected name after 'mut'")?;
-                let ty = if self.match_kind(&TokenKind::Colon) {
-                    Some(self.parse_type()?)
-                } else {
-                    None
-                };
                 return Ok(Pattern::Binding(real, crate::parser::ast::Mutability::Mutable, None, span));
             }
-            let _ = ty;
+            let mutability = crate::parser::ast::Mutability::Immutable;
             return Ok(Pattern::Binding(ident, mutability, None, span));
         }
 
@@ -232,6 +241,21 @@ impl Parser {
         }
         self.consume(&TokenKind::RBrace, "expected '}'")?;
         Ok(Pattern::Struct { path, fields, rest, span })
+    }
+
+    /// 解析模式中的字面量表达式（仅前缀，不消费 `..` / `..=` 等二元运算符）。
+    fn parse_pattern_literal_expr(&mut self) -> Result<Expression, CompileError> {
+        let span = self.peek().span;
+        let neg = self.match_kind(&TokenKind::Minus);
+        let lit = self.parse_literal()?.ok_or_else(|| {
+            CompileError::internal("expected literal in pattern range")
+        })?;
+        let expr = Expression::Literal(lit, span);
+        Ok(if neg {
+            Expression::Unary(UnaryOp::Neg, Box::new(expr), span)
+        } else {
+            expr
+        })
     }
 }
 
