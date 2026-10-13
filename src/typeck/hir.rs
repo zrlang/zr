@@ -77,6 +77,15 @@ pub enum Ty {
     Alias(Box<Ty>),
     /// 不透明类型（前向声明）。
     Opaque(DefId),
+    /// `Pin<T>`：固定指针，阻止 pointee 被移动。
+    Pin(Box<Ty>),
+    /// 关联类型投影 `<T as Trait>::Assoc`。
+    Projection {
+        /// 限定路径：`(self_type, trait_def_id, assoc_name)`。
+        self_ty: Box<Ty>,
+        trait_id: DefId,
+        assoc_name: String,
+    },
 }
 
 impl Default for Ty {
@@ -142,6 +151,42 @@ pub struct LocalId(pub u32);
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 pub struct BasicBlockId(pub u32);
 
+/// 生命周期变量 ID。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct RegionVarId(pub u32);
+
+/// 生命周期。
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum Region {
+    /// 静态生命周期 `'static`。
+    Static,
+    /// 命名生命周期 `'a`。
+    Named(String),
+    /// 生命周期变量（推断用）。
+    Var(RegionVarId),
+    /// 匿名生命周期（省略的）。
+    Anonymous,
+}
+
+/// 全称量化绑定器 `for<'a> T`。
+/// 表示 T 中的生命周期变量被全称量化，对所有生命周期都成立。
+#[derive(Debug, Clone)]
+pub struct Binder<T> {
+    /// 绑定的生命周期变量列表。
+    pub bound_regions: Vec<Region>,
+    /// 被量化的内部值。
+    pub value: T,
+}
+
+impl<T> Binder<T> {
+    pub fn new(value: T) -> Self {
+        Self {
+            bound_regions: Vec::new(),
+            value,
+        }
+    }
+}
+
 /// 类型方案（带量化）。
 #[derive(Debug, Clone)]
 pub struct TypeScheme {
@@ -155,6 +200,11 @@ pub struct TypeScheme {
 pub struct WherePred {
     pub lhs: Ty,
     pub trait_id: DefId,
+    /// 高阶 trait 边界：`for<'a> T: Trait`。
+    /// 存储绑定的生命周期变量列表（空 = 普通边界）。
+    pub hrtb: Vec<Region>,
+    /// 是否为负边界：`T: !Trait`。
+    pub negated: bool,
     pub span: Span,
 }
 
@@ -526,6 +576,8 @@ pub struct HirFunction {
     pub is_async: bool,
     pub is_noreturn: bool,
     pub is_const: bool,
+    /// 是否为 `default fn`（可被特化覆盖）。
+    pub is_default: bool,
     pub abi: Abi,
     pub generics: Vec<GenericParam>,
     pub params: Vec<HirParam>,
@@ -692,6 +744,11 @@ pub struct HirTrait {
     pub super_traits: Vec<DefId>,
     pub assoc_types: Vec<HirAssocType>,
     pub methods: Vec<HirFunction>,
+    /// 是否为 marker trait（`#[marker]`），如 `Send`、`Sync`、`Unpin`。
+    /// marker trait 没有方法，且可以有多个 impl（只要不重叠）。
+    pub is_marker: bool,
+    /// auto trait（自动为所有类型实现，除非有显式 `!Trait` impl）。
+    pub is_auto: bool,
     pub span: Span,
 }
 

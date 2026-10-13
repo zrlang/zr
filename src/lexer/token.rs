@@ -79,6 +79,8 @@ pub enum TokenKind {
     KwSpawn,
     /// `comptime`
     KwComptime,
+    /// `default`（特化中的默认方法）
+    KwDefault,
     /// `goto`（受限跳转，仅函数内）
     KwGoto,
 

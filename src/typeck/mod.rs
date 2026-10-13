@@ -17,7 +17,7 @@ use crate::error::{CompileError, ErrorKind, Result};
 use crate::parser::ast::{
     self, Abi, Arm, Attribute, AttributeArg, Block as AstBlock, ConstDecl as AstConst, Expression,
     Function as AstFunction, GenericParam as AstGeneric, Literal as AstLiteral, ModuleItem,
-    Pattern as AstPattern, Program, Spanned, Statement, StaticDecl as AstStatic, StructDef as AstStruct,
+    Pattern as AstPattern, Program, Spanned, Span, Statement, StaticDecl as AstStatic, StructDef as AstStruct,
     Type as AstType, UseDecl, UseTree, Visibility,
 };
 use crate::typeck::hir::{
@@ -182,6 +182,7 @@ impl TypeChecker {
                     is_async: item.is_async,
                     is_noreturn: item.is_noreturn,
                     is_const: item.is_const,
+                    is_default: item.is_default,
                     abi: item.abi.clone(),
                     generics: item.generics.clone(),
                     params: Vec::new(),
@@ -249,6 +250,7 @@ impl TypeChecker {
         }
         for t in &prog.traits {
             let id = self.alloc_def(t.name.clone());
+            let (is_marker, is_auto) = classify_trait(t);
             self.trait_defs.insert(
                 id,
                 hir::HirTrait {
@@ -259,6 +261,8 @@ impl TypeChecker {
                     super_traits: Vec::new(),
                     assoc_types: Vec::new(),
                     methods: Vec::new(),
+                    is_marker,
+                    is_auto,
                     span: t.span,
                 },
             );
@@ -528,15 +532,15 @@ impl TypeChecker {
                     let _ = self.resolve_type_path(path)?;
                 }
             }
+            // 先解析关联类型的默认值（避免与 get_mut 借用冲突）
+            let assoc_types: Vec<_> = t.assoc_types.iter().map(|at| hir::HirAssocType {
+                name: at.name.clone(),
+                bounds: Vec::new(),
+                default: at.default.as_ref().and_then(|t| self.ast_to_hir_type(t).ok()),
+                span: at.span,
+            }).collect();
             let hir_t = self.trait_defs.get_mut(&id).unwrap();
-            for at in &t.assoc_types {
-                hir_t.assoc_types.push(hir::HirAssocType {
-                    name: at.name.clone(),
-                    bounds: Vec::new(),
-                    default: None,
-                    span: at.span,
-                });
-            }
+            hir_t.assoc_types = assoc_types;
             for m in &t.methods {
                 let fid = self.find_def(&m.name)?;
                 // trait 中的方法是声明，不要求有 body
@@ -565,17 +569,29 @@ impl TypeChecker {
             let where_clause: Vec<_> = ib.where_clause.iter().map(|w| WherePred {
                 lhs: self.ast_to_hir_type(&w.lhs).unwrap_or(Ty::Infer(InferId(0))),
                 trait_id: DefId(0),
+                hrtb: w.for_lifetimes.iter().map(|l| hir::Region::Named(l.clone())).collect(),
+                negated: w.negated,
                 span: w.span,
             }).collect();
-            self.impl_blocks.push(hir::HirImpl {
+            let hir_impl = hir::HirImpl {
                 generics: ib.generics.clone(),
-                target,
+                target: target.clone(),
                 trait_id,
                 where_clause,
                 items,
-                assoc_types: Vec::new(),
+                assoc_types: ib.assoc_types.iter().map(|at| hir::HirAssocType {
+                    name: at.name.clone(),
+                    bounds: Vec::new(),
+                    default: at.default.as_ref().and_then(|t| self.ast_to_hir_type(t).ok()),
+                    span: at.span,
+                }).collect(),
                 span: ib.span,
-            });
+            };
+            // 一致性检查：孤儿规则
+            check_orphan_rule(&hir_impl, &self.type_defs, &self.trait_defs, ib.span)?;
+            // 一致性检查：重叠检测
+            check_overlap(&hir_impl, &self.impl_blocks, &self.trait_defs)?;
+            self.impl_blocks.push(hir_impl);
         }
         Ok(())
     }
@@ -1794,6 +1810,24 @@ impl TypeChecker {
             ),
             AstType::Infer => Ty::Infer(InferId(0)),
             AstType::Anytype => Ty::Infer(InferId(0)),
+            AstType::ImplTrait(bounds) => {
+                // `impl Trait` 降级为不透明类型：
+                // - RPIT（返回位置）：隐藏类型由函数体推断，外部不可见
+                // - APIT（参数位置）：等价于一个新的泛型参数
+                // 这里统一创建一个 OpaqueTy，其隐藏类型在后续推断中确定
+                let opaque_id = self.alloc_def(format!("impl_trait_{}", self.next_def));
+                // 记录 trait 边界到约束集合
+                for bound in bounds {
+                    if let AstType::Named { path, .. } = bound {
+                        if let Ok(trait_id) = self.resolve_type_path(path) {
+                            // 约束：opaque 类型必须实现该 trait
+                            // 这里简化为 Infer，实际的 trait 约束在推断阶段检查
+                            let _ = trait_id;
+                        }
+                    }
+                }
+                Ty::Opaque(opaque_id)
+            }
         })
     }
 
@@ -1942,6 +1976,7 @@ impl TypeChecker {
             is_async: f.is_async,
             is_noreturn: f.is_noreturn,
             is_const: f.is_const,
+            is_default: f.is_default,
             abi: f.abi.clone(),
             generics: f.generics.clone(),
             params: Vec::new(),
@@ -2491,6 +2526,10 @@ pub mod print {
             Ty::Infer(_) => "_".into(),
             Ty::Alias(t) => type_name(t),
             Ty::Opaque(id) => format!("opaque({})", id.0),
+            Ty::Pin(inner) => format!("Pin<{}>", type_name(inner)),
+            Ty::Projection { self_ty, trait_id, assoc_name } => {
+                format!("<{} as trait#{}>::{}", type_name(self_ty), trait_id.0, assoc_name)
+            }
         }
     }
 }
@@ -2505,5 +2544,178 @@ impl ConstraintSet {
     /// 合并两组约束。
     pub fn merge(&mut self, other: Self) {
         self.constraints.extend(other.constraints);
+    }
+}
+
+// ======================================================================
+// Trait 一致性检查（Coherence）
+// ======================================================================
+
+/// 根据属性分类 trait：是否为 marker trait、是否为 auto trait。
+fn classify_trait(t: &ast::TraitDef) -> (bool, bool) {
+    let mut is_marker = false;
+    let mut is_auto = false;
+    for attr in &t.attrs {
+        match attr.name.as_str() {
+            "marker" => is_marker = true,
+            "auto" => is_auto = true,
+            _ => {}
+        }
+    }
+    // 内建 auto traits：Send、Sync、Unpin
+    if matches!(t.name.as_str(), "Send" | "Sync" | "Unpin" | "Sized") {
+        is_auto = true;
+        is_marker = true;
+    }
+    (is_marker, is_auto)
+}
+
+/// 孤儿规则：impl 只有在 trait 或至少一个类型参数是本地定义时才有效。
+/// 在单 crate 编译器中，所有定义都是本地的，因此此规则主要为多 crate 扩展预留。
+fn check_orphan_rule(
+    impl_block: &hir::HirImpl,
+    type_defs: &HashMap<DefId, hir::HirTypeDef>,
+    trait_defs: &HashMap<DefId, hir::HirTrait>,
+    span: Span,
+) -> Result<()> {
+    // 检查 trait 是否本地
+    if let Some(trait_id) = impl_block.trait_id {
+        if trait_defs.contains_key(&trait_id) {
+            return Ok(()); // trait 是本地的
+        }
+    }
+    // 检查目标类型是否本地
+    match &impl_block.target {
+        Ty::Named(def_id, _) => {
+            if type_defs.contains_key(def_id) {
+                return Ok(()); // 目标类型是本地的
+            }
+        }
+        Ty::Pointer(_, _) | Ty::Reference(_, _) | Ty::Slice(_, _) | Ty::Array(_, _) => {
+            // 指针/引用/切片/数组类型：检查内部类型是否本地
+            return Ok(()); // 简化：允许对这些类型 impl
+        }
+        Ty::Tuple(_) | Ty::Function { .. } => {
+            return Ok(()); // 元组/函数类型允许
+        }
+        _ => {}
+    }
+    Err(CompileError::coherence_error(format!(
+        "cannot implement trait for type `{}`: either the trait or the type must be defined in the current crate",
+        ty_name(&impl_block.target)
+    ))
+    .with_span(span))
+}
+
+/// 重叠检查：两个 impl 不能应用到同一个具体类型。
+/// 对于 marker trait，允许重叠（多个 impl 可以共存）。
+fn check_overlap(
+    new_impl: &hir::HirImpl,
+    existing_impls: &[hir::HirImpl],
+    trait_defs: &HashMap<DefId, hir::HirTrait>,
+) -> Result<()> {
+    let new_trait = new_impl.trait_id;
+    // 只比较相同 trait 的 impl
+    for existing in existing_impls {
+        if existing.trait_id != new_trait {
+            continue;
+        }
+        // 如果是 marker trait，允许多个 impl（不检查重叠）
+        if let Some(tid) = new_trait {
+            if let Some(td) = trait_defs.get(&tid) {
+                if td.is_marker {
+                    continue;
+                }
+            }
+        }
+        // 检查目标类型是否可能重叠
+        if types_may_overlap(&new_impl.target, &existing.target) {
+            // 特化：如果一个 impl 比另一个更 specific，则允许重叠
+            let new_more_specific = is_more_specific(new_impl, existing);
+            let existing_more_specific = is_more_specific(existing, new_impl);
+            if new_more_specific || existing_more_specific {
+                continue;
+            }
+            return Err(CompileError::coherence_error(format!(
+                "conflicting implementations: type `{}` has multiple impls of the same trait",
+                ty_name(&new_impl.target)
+            ))
+            .with_span(new_impl.span));
+        }
+    }
+    Ok(())
+}
+
+/// 判断 `a` 是否比 `b` 更 specific（用于特化）。
+/// 更 specific 的 impl 可以覆盖较不 specific 的 impl。
+/// 规则：
+///   - 具体类型 > 泛型参数
+///   - 有更多 where 约束的更 specific
+fn is_more_specific(a: &hir::HirImpl, b: &hir::HirImpl) -> bool {
+    // 具体类型比泛型参数更 specific
+    let a_is_concrete = !matches!(a.target, Ty::Param(_) | Ty::Infer(_));
+    let b_is_concrete = !matches!(b.target, Ty::Param(_) | Ty::Infer(_));
+    if a_is_concrete && !b_is_concrete {
+        return true;
+    }
+    if !a_is_concrete && b_is_concrete {
+        return false;
+    }
+    // 约束更多的更 specific
+    a.where_clause.len() > b.where_clause.len()
+}
+
+/// 判断两个类型是否可能重叠（即是否存在一个具体类型同时匹配两者）。
+fn types_may_overlap(a: &Ty, b: &Ty) -> bool {
+    match (a, b) {
+        // 相同的命名类型可能重叠
+        (Ty::Named(id1, _), Ty::Named(id2, _)) => id1 == id2,
+        // 泛型参数可能与任何类型重叠
+        (Ty::Param(_), _) | (_, Ty::Param(_)) => true,
+        // 推断变量可能与任何类型重叠
+        (Ty::Infer(_), _) | (_, Ty::Infer(_)) => true,
+        // 指针/引用：检查内部类型
+        (Ty::Pointer(t1, _), Ty::Pointer(t2, _))
+        | (Ty::Reference(t1, _), Ty::Reference(t2, _)) => types_may_overlap(t1, t2),
+        // 数组：检查内部类型
+        (Ty::Array(t1, _), Ty::Array(t2, _)) => types_may_overlap(t1, t2),
+        // 元组：检查长度和元素
+        (Ty::Tuple(ts1), Ty::Tuple(ts2)) => {
+            ts1.len() == ts2.len()
+                && ts1.iter().zip(ts2.iter()).all(|(x, y)| types_may_overlap(x, y))
+        }
+        // 其他组合：保守地认为不重叠
+        _ => a == b,
+    }
+}
+
+/// 格式化类型名为字符串（用于错误消息）。
+fn ty_name(ty: &Ty) -> String {
+    match ty {
+        Ty::Int(w) => format!("i{}", w),
+        Ty::Uint(w) => format!("u{}", w),
+        Ty::Float(w) => format!("f{}", w),
+        Ty::Bool => "bool".into(),
+        Ty::Char => "char".into(),
+        Ty::Str => "str".into(),
+        Ty::Unit => "()".into(),
+        Ty::Never => "!".into(),
+        Ty::Named(id, _) => format!("type#{}", id.0),
+        Ty::Pointer(t, _) => format!("*{}", ty_name(t)),
+        Ty::Reference(t, _) => format!("&{}", ty_name(t)),
+        Ty::Array(t, _) => format!("[{}; _]", ty_name(t)),
+        Ty::Slice(t, _) => format!("[]{}", ty_name(t)),
+        Ty::Tuple(ts) => format!("({})", ts.iter().map(ty_name).collect::<Vec<_>>().join(", ")),
+        Ty::Function { .. } => "fn(...)".into(),
+        Ty::Optional(t) => format!("{}?", ty_name(t)),
+        Ty::ErrorUnion(t, e) => format!("{}!{}", ty_name(t), ty_name(e)),
+        Ty::Param(g) => format!("T{}", g.0),
+        Ty::Infer(_) => "_".into(),
+        Ty::Alias(t) => ty_name(t),
+        Ty::Opaque(id) => format!("opaque({})", id.0),
+        Ty::Pin(inner) => format!("Pin<{}>", ty_name(inner)),
+        Ty::Projection { self_ty, trait_id, assoc_name } => {
+            format!("<{} as trait#{}>::{}", ty_name(self_ty), trait_id.0, assoc_name)
+        }
     }
 }

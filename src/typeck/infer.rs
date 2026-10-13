@@ -276,6 +276,8 @@ impl<'a> InferCtxt<'a> {
             }
             Ty::Alias(inner) => self.size_of(inner),
             Ty::Opaque(_) => 0,
+            Ty::Pin(inner) => self.size_of(inner),
+            Ty::Projection { self_ty, .. } => self.size_of(self_ty),
             Ty::Param(_) | Ty::Infer(_) => 0,
         }
     }
@@ -312,6 +314,8 @@ impl<'a> InferCtxt<'a> {
             }
             Ty::Alias(inner) => self.align_of(inner),
             Ty::Opaque(_) => 1,
+            Ty::Pin(inner) => self.align_of(inner),
+            Ty::Projection { self_ty, .. } => self.align_of(self_ty),
             Ty::Param(_) | Ty::Infer(_) => 1,
         }
     }
@@ -361,6 +365,12 @@ impl<'a> InferCtxt<'a> {
                 *id,
                 args.iter().map(|a| self.resolve(a)).collect(),
             ),
+            Ty::Pin(inner) => Ty::Pin(Box::new(self.resolve(inner))),
+            Ty::Projection { self_ty, trait_id, assoc_name } => Ty::Projection {
+                self_ty: Box::new(self.resolve(self_ty)),
+                trait_id: *trait_id,
+                assoc_name: assoc_name.clone(),
+            },
             _ => ty.clone(),
         }
     }
@@ -427,6 +437,17 @@ impl<'a> InferCtxt<'a> {
                 Ok(())
             }
             (Ty::Param(_), _) => Err(self.type_mismatch(&a, &b, span)),
+            // 关联类型投影：尝试归一化后再统一
+            (Ty::Projection { .. }, _) => {
+                let norm_a = self.normalize_projection(&a);
+                self.unify(&norm_a, &b, span)
+            }
+            (_, Ty::Projection { .. }) => {
+                let norm_b = self.normalize_projection(&b);
+                self.unify(&a, &norm_b, span)
+            }
+            // 不透明类型（impl Trait）：可以与任何类型统一（隐藏类型推断）
+            (Ty::Opaque(_), _) | (_, Ty::Opaque(_)) => Ok(()),
             _ => Err(self.type_mismatch(&a, &b, span)),
         }
     }
@@ -445,6 +466,8 @@ impl<'a> InferCtxt<'a> {
             Ty::Optional(t) | Ty::ErrorUnion(t, _) => self.occurs_check(generic, t),
             Ty::Named(_, args) => args.iter().any(|a| self.occurs_check(generic, a)),
             Ty::Alias(t) => self.occurs_check(generic, t),
+            Ty::Pin(t) => self.occurs_check(generic, t),
+            Ty::Projection { self_ty, .. } => self.occurs_check(generic, self_ty),
             _ => false,
         }
     }
@@ -480,6 +503,8 @@ impl<'a> InferCtxt<'a> {
             Ty::Optional(t) | Ty::ErrorUnion(t, _) => self.occurs_in(id, t),
             Ty::Named(_, args) => args.iter().any(|a| self.occurs_in(id, a)),
             Ty::Alias(t) => self.occurs_in(id, t),
+            Ty::Pin(t) => self.occurs_in(id, t),
+            Ty::Projection { self_ty, .. } => self.occurs_in(id, self_ty),
             _ => false,
         }
     }
@@ -527,6 +552,21 @@ impl<'a> InferCtxt<'a> {
                 self.check_trait_impl(*sub_id, *sup_id, span)
             }
 
+            // 关联类型投影：归一化后再检查子类型
+            (Ty::Projection { .. }, _) => {
+                let norm = self.normalize_projection(&sub);
+                self.subtype(&norm, &sup, span)
+            }
+            (_, Ty::Projection { .. }) => {
+                let norm = self.normalize_projection(&sup);
+                self.subtype(&sub, &norm, span)
+            }
+
+            // 不透明类型（impl Trait）：可以是任何类型的子类型/超类型
+            (Ty::Opaque(_), _) | (_, Ty::Opaque(_)) => Ok(()),
+            // Pin<T>：与 Pin<U> 比较时比较内部类型
+            (Ty::Pin(a), Ty::Pin(b)) => self.subtype(a, b, span),
+
             _ => Err(self.type_mismatch(&sub, &sup, span)),
         }
     }
@@ -566,6 +606,69 @@ impl<'a> InferCtxt<'a> {
     fn impl_matches_type(&self, _impl_block: &hir::HirImpl, _ty: &Ty) -> bool {
         // 占位：实际实现需要类型参数匹配
         true
+    }
+
+    /// 归一化关联类型投影 `<T as Trait>::Assoc`。
+    /// 查找 T 实现 Trait 的 impl 块，返回其中定义的 Assoc 类型。
+    /// 如果找不到匹配的 impl，返回原投影类型（延迟求解）。
+    pub fn normalize_projection(&self, ty: &Ty) -> Ty {
+        let Ty::Projection { self_ty, trait_id, assoc_name } = ty else {
+            return ty.clone();
+        };
+        let self_ty = self.resolve(self_ty);
+        // 遍历所有 impl 块，寻找匹配 trait_id 且目标类型匹配的 impl
+        for impl_block in self.impl_blocks {
+            if impl_block.trait_id != Some(*trait_id) {
+                continue;
+            }
+            let target = self.resolve(&impl_block.target);
+            if !self.types_match(&self_ty, &target) {
+                continue;
+            }
+            // 在 impl 的关联类型中查找
+            for at in &impl_block.assoc_types {
+                if at.name == *assoc_name {
+                    if let Some(default) = &at.default {
+                        return self.resolve(default);
+                    }
+                }
+            }
+        }
+        // 检查 trait 定义中的默认关联类型
+        if let Some(td) = self.trait_defs.get(trait_id) {
+            for at in &td.assoc_types {
+                if at.name == *assoc_name {
+                    if let Some(default) = &at.default {
+                        return self.resolve(default);
+                    }
+                }
+            }
+        }
+        // 无法归一化，返回原投影
+        ty.clone()
+    }
+
+    /// 判断两个类型是否在结构上匹配（用于 impl 选择）。
+    fn types_match(&self, a: &Ty, b: &Ty) -> bool {
+        match (a, b) {
+            (Ty::Infer(_), _) | (_, Ty::Infer(_)) => true,
+            (Ty::Param(_), _) | (_, Ty::Param(_)) => true,
+            (Ty::Named(id1, args1), Ty::Named(id2, args2)) => {
+                id1 == id2 && args1.len() == args2.len()
+                    && args1.iter().zip(args2.iter()).all(|(x, y)| self.types_match(x, y))
+            }
+            (Ty::Pointer(t1, m1), Ty::Pointer(t2, m2))
+            | (Ty::Reference(t1, m1), Ty::Reference(t2, m2)) => {
+                m1 == m2 && self.types_match(t1, t2)
+            }
+            (Ty::Array(t1, _), Ty::Array(t2, _)) => self.types_match(t1, t2),
+            (Ty::Slice(t1, m1), Ty::Slice(t2, m2)) => m1 == m2 && self.types_match(t1, t2),
+            (Ty::Tuple(ts1), Ty::Tuple(ts2)) => {
+                ts1.len() == ts2.len()
+                    && ts1.iter().zip(ts2.iter()).all(|(x, y)| self.types_match(x, y))
+            }
+            _ => a == b,
+        }
     }
 
     // ===== 错误消息辅助 =====
@@ -671,6 +774,13 @@ impl<'a> InferCtxt<'a> {
             Ty::Infer(_) => "_".into(),
             Ty::Alias(t) => self.type_name(t),
             Ty::Opaque(id) => format!("opaque({})", self.type_id_name(*id)),
+            Ty::Pin(inner) => format!("Pin<{}>", self.type_name(inner)),
+            Ty::Projection { self_ty, trait_id, assoc_name } => format!(
+                "<{} as {}>::{}",
+                self.type_name(self_ty),
+                self.type_id_name(*trait_id),
+                assoc_name
+            ),
         }
     }
 
@@ -847,6 +957,10 @@ impl fmt::Display for Ty {
             Ty::Infer(_) => "_".to_string(),
             Ty::Alias(t) => format!("alias({})", t),
             Ty::Opaque(_) => "opaque".to_string(),
+            Ty::Pin(inner) => format!("Pin<{}>", inner),
+            Ty::Projection { self_ty, trait_id, assoc_name } => {
+                format!("<{} as trait#{}>::{}", self_ty, trait_id.0, assoc_name)
+            }
         };
         f.write_str(&name)
     }

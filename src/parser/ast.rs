@@ -36,6 +36,8 @@ pub struct Program {
     pub traits: Vec<TraitDef>,
     /// impl 块。
     pub impls: Vec<ImplBlock>,
+    /// 声明式宏定义。
+    pub macros: Vec<MacroDef>,
 }
 
 // ======================================================================
@@ -193,6 +195,8 @@ pub enum Type {
     Infer,
     /// 编译期类型：`anytype`
     Anytype,
+    /// `impl Trait`：存在性类型（返回位置 RPIT / 参数位置 APIT）。
+    ImplTrait(Vec<Type>),
 }
 
 /// 数组长度（可以是编译期常量表达式）。
@@ -518,6 +522,24 @@ pub enum ModuleItem {
     Module(ModuleDecl),
     Extern(ExternBlock),
     Attribute(Attribute),
+    /// `macro_rules! name { ... }` 声明式宏定义。
+    Macro(MacroDef),
+}
+
+/// 声明式宏定义。
+#[derive(Debug, Clone)]
+pub struct MacroDef {
+    pub name: String,
+    pub arms: Vec<MacroArm>,
+    pub span: Span,
+}
+
+/// 宏分支：匹配模式 token 树 → 展开 token 树。
+#[derive(Debug, Clone)]
+pub struct MacroArm {
+    pub lhs: Vec<crate::lexer::Token>,
+    pub rhs: Vec<crate::lexer::Token>,
+    pub span: Span,
 }
 
 /// 块 = 一系列语句，最后一个表达式可选。
@@ -551,6 +573,8 @@ pub struct Function {
     /// 是否不返回（如 `fn abort() -> never`）。
     pub is_noreturn: bool,
     pub is_const: bool, // 编译期可执行
+    /// 是否为 `default fn`（可被特化覆盖）。
+    pub is_default: bool,
     pub abi: Abi,
     pub generics: Vec<GenericParam>,
     pub where_clause: Vec<WherePred>,
@@ -575,6 +599,10 @@ pub enum GenericParam {
 pub struct WherePred {
     pub lhs: Type,
     pub trait_type: Type,
+    /// `for<'a, 'b>` 绑定的生命周期（HRTB）。
+    pub for_lifetimes: Vec<String>,
+    /// 是否为负边界：`T: !Trait`。
+    pub negated: bool,
     pub span: Span,
 }
 
@@ -717,6 +745,7 @@ pub struct TraitDef {
     pub super_traits: Vec<Type>,
     pub assoc_types: Vec<AssocType>,
     pub methods: Vec<Function>,
+    pub attrs: Vec<Attribute>,
     pub span: Span,
 }
 

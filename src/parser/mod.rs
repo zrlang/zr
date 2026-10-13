@@ -75,6 +75,7 @@ impl Parser {
                 ModuleItem::Module(m) => program.modules.push(m),
                 ModuleItem::Extern(e) => program.externs.push(e),
                 ModuleItem::Attribute(a) => program.attrs.push(a),
+                ModuleItem::Macro(m) => program.macros.push(m),
             }
         }
         Ok(program)
@@ -86,6 +87,14 @@ impl Parser {
         let vis = self.parse_visibility();
 
         // 分流
+        // `macro_rules! name { ... }`
+        if self.check(&TokenKind::Ident("macro_rules".into()))
+            && self.peek_n(1).map(|t| t.kind == TokenKind::Bang).unwrap_or(false)
+        {
+            self.advance(); // macro_rules
+            self.advance(); // !
+            return self.parse_macro_rules(attrs).map(ModuleItem::Macro);
+        }
         if self.match_kind(&TokenKind::KwUse) {
             return Ok(ModuleItem::Use(self.parse_use(attrs)?));
         }
@@ -98,10 +107,16 @@ impl Parser {
         if self.check(&TokenKind::KwAsync) && self.peek_n(1).map(|t| t.kind == TokenKind::KwFn).unwrap_or(false) {
             self.advance(); // async
             self.advance(); // fn
-            return self.parse_function(vis, attrs, true).map(ModuleItem::Function);
+            return self.parse_function(vis, attrs, true, false).map(ModuleItem::Function);
+        }
+        // `default fn`（特化中的默认方法）
+        if self.check(&TokenKind::KwDefault) && self.peek_n(1).map(|t| t.kind == TokenKind::KwFn).unwrap_or(false) {
+            self.advance(); // default
+            self.advance(); // fn
+            return self.parse_function(vis, attrs, false, true).map(ModuleItem::Function);
         }
         if self.match_kind(&TokenKind::KwFn) {
-            return self.parse_function(vis, attrs, false).map(ModuleItem::Function);
+            return self.parse_function(vis, attrs, false, false).map(ModuleItem::Function);
         }
         if self.match_kind(&TokenKind::KwConst) {
             return self.parse_const(vis, attrs).map(ModuleItem::Const);

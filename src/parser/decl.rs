@@ -76,6 +76,40 @@ impl Parser {
     }
 
     // ==================================================================
+    // macro_rules!
+    // ==================================================================
+
+    pub fn parse_macro_rules(&mut self, _attrs: Vec<Attribute>) -> Result<MacroDef, CompileError> {
+        let span = self.previous().span;
+        let name = self.consume_ident("expected macro name")?;
+        self.consume(&TokenKind::LBrace, "expected '{' after macro name")?;
+
+        let mut arms = Vec::new();
+        while !self.check(&TokenKind::RBrace) && !self.is_at_end() {
+            let arm_span = self.peek().span;
+            // 解析 lhs（匹配模式），直到 `=>`
+            let mut lhs = Vec::new();
+            while !self.check(&TokenKind::Rocket) && !self.is_at_end() {
+                lhs.push(self.peek().clone());
+                self.advance();
+            }
+            self.consume(&TokenKind::Rocket, "expected '=>' in macro arm")?;
+            // 解析 rhs（展开），直到 `;` 或 `}`
+            let mut rhs = Vec::new();
+            while !self.check(&TokenKind::Semicolon) && !self.check(&TokenKind::RBrace) && !self.is_at_end() {
+                rhs.push(self.peek().clone());
+                self.advance();
+            }
+            // 可选的分号
+            self.match_kind(&TokenKind::Semicolon);
+            arms.push(MacroArm { lhs, rhs, span: arm_span });
+        }
+        self.consume(&TokenKind::RBrace, "expected '}' to close macro")?;
+
+        Ok(MacroDef { name, arms, span })
+    }
+
+    // ==================================================================
     // mod
     // ==================================================================
 
@@ -104,6 +138,7 @@ impl Parser {
                     ModuleItem::Module(m) => inner.modules.push(m),
                     ModuleItem::Extern(e) => inner.externs.push(e),
                     ModuleItem::Attribute(a) => inner.attrs.push(a),
+                    ModuleItem::Macro(m) => inner.macros.push(m),
                 }
             }
             self.consume(&TokenKind::RBrace, "expected '}' to close module")?;
@@ -143,7 +178,7 @@ impl Parser {
         let mut items = Vec::new();
         while !self.check(&TokenKind::RBrace) && !self.is_at_end() {
             if self.match_kind(&TokenKind::KwFn) {
-                items.push(ExternItem::Function(self.parse_function(Visibility::Private, vec![], false)?));
+                items.push(ExternItem::Function(self.parse_function(Visibility::Private, vec![], false, false)?));
             } else if self.match_kind(&TokenKind::KwType) {
                 let name = self.consume_ident("expected type name")?;
                 self.consume(&TokenKind::Semicolon, "expected ';'")?;
@@ -165,6 +200,7 @@ impl Parser {
         visibility: Visibility,
         attrs: Vec<Attribute>,
         is_async: bool,
+        is_default: bool,
     ) -> Result<Function, CompileError> {
         let span = self.previous().span;
         let is_const = self.match_kind(&TokenKind::KwComptime);
@@ -243,6 +279,7 @@ impl Parser {
             is_async,
             is_noreturn,
             is_const,
+            is_default,
             abi: Abi::Zr,
             generics,
             where_clause,
@@ -291,10 +328,29 @@ impl Parser {
 
     fn parse_where_pred(&mut self) -> Result<WherePred, CompileError> {
         let span = self.peek().span;
+        // 支持 `for<'a> T: Trait` 高阶 trait 边界
+        let for_lifetimes = if self.match_kind(&TokenKind::KwFor) {
+            self.consume(&TokenKind::Lt, "expected '<' after 'for'")?;
+            let mut lts = Vec::new();
+            if !self.check(&TokenKind::Gt) {
+                lts.push(self.consume_ident("expected lifetime name")?);
+                while self.match_kind(&TokenKind::Comma) {
+                    if self.check(&TokenKind::Gt) {
+                        break;
+                    }
+                    lts.push(self.consume_ident("expected lifetime name")?);
+                }
+            }
+            self.consume(&TokenKind::Gt, "expected '>' to close lifetime parameters")?;
+            lts
+        } else {
+            Vec::new()
+        };
         let lhs = self.parse_type()?;
         self.consume(&TokenKind::Colon, "expected ':' in where predicate")?;
+        let negated = self.match_kind(&TokenKind::Bang);
         let trait_type = self.parse_type()?;
-        Ok(WherePred { lhs, trait_type, span })
+        Ok(WherePred { lhs, trait_type, for_lifetimes, negated, span })
     }
 
     // ==================================================================
@@ -569,7 +625,7 @@ impl Parser {
     pub fn parse_trait_def(
         &mut self,
         visibility: Visibility,
-        _attrs: Vec<Attribute>,
+        attrs: Vec<Attribute>,
     ) -> Result<TraitDef, CompileError> {
         let span = self.previous().span;
         let name = self.consume_ident("expected trait name")?;
@@ -596,11 +652,11 @@ impl Parser {
             } else {
                 let is_async = self.match_kind(&TokenKind::KwAsync);
                 self.consume(&TokenKind::KwFn, "expected 'fn'")?;
-                methods.push(self.parse_function(Visibility::Private, vec![], is_async)?);
+                methods.push(self.parse_function(Visibility::Private, vec![], is_async, false)?);
             }
         }
         self.consume(&TokenKind::RBrace, "expected '}'")?;
-        Ok(TraitDef { name, visibility, generics, super_traits, assoc_types, methods, span })
+        Ok(TraitDef { name, visibility, generics, super_traits, assoc_types, methods, attrs, span })
     }
 
     fn parse_assoc_type(&mut self) -> Result<AssocType, CompileError> {
@@ -661,7 +717,7 @@ impl Parser {
             } else {
                 let is_async = self.match_kind(&TokenKind::KwAsync);
                 self.consume(&TokenKind::KwFn, "expected 'fn'")?;
-                items.push(self.parse_function(Visibility::Private, vec![], is_async)?);
+                items.push(self.parse_function(Visibility::Private, vec![], is_async, false)?);
             }
         }
         self.consume(&TokenKind::RBrace, "expected '}'")?;

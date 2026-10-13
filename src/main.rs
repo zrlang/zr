@@ -20,6 +20,7 @@
 mod codegen;
 mod error;
 mod lexer;
+mod macro_system;
 mod mir;
 mod opt;
 mod parser;

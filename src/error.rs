@@ -37,6 +37,8 @@ pub enum ErrorKind {
     Pattern,
     /// 泛型 / trait 错误。
     Generic,
+    /// trait 一致性错误（孤儿规则、重叠 impl）。
+    Coherence,
     /// 编译期求值错误（CTFE）。
     ConstEval,
     /// 代码生成错误。
@@ -75,6 +77,11 @@ impl CompileError {
     /// 构造一条类型错误。
     pub fn type_error<S: Into<String>>(msg: S) -> Self {
         Self::new(msg).with_kind(ErrorKind::Type)
+    }
+
+    /// 构造一条 trait 一致性错误。
+    pub fn coherence_error<S: Into<String>>(msg: S) -> Self {
+        Self::new(msg).with_kind(ErrorKind::Coherence)
     }
 
     /// 构造一条名称解析错误。

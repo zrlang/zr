@@ -622,6 +622,7 @@ fn keyword(text: &str) -> Option<TokenKind> {
         "yield" => TokenKind::KwYield,
         "spawn" => TokenKind::KwSpawn,
         "comptime" => TokenKind::KwComptime,
+        "default" => TokenKind::KwDefault,
         "goto" => TokenKind::KwGoto,
 
         // 类型系统

@@ -81,6 +81,15 @@ impl Parser {
 
     /// 解析类型前缀（基础类型 + 一元类型）。
     fn parse_type_prefix(&mut self) -> Result<Type, crate::error::CompileError> {
+        // `impl Trait` / `impl Trait1 + Trait2`
+        if self.match_kind(&TokenKind::KwImpl) {
+            let mut bounds = vec![self.parse_type_bp(10)?];
+            while self.match_kind(&TokenKind::Plus) {
+                bounds.push(self.parse_type_bp(10)?);
+            }
+            return Ok(Type::ImplTrait(bounds));
+        }
+
         // 指针：`*T` / `*const T` / `*mut T`
         if self.match_kind(&TokenKind::Star) {
             let mutability = if self.match_kind(&TokenKind::KwMut) {
