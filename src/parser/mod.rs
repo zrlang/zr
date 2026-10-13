@@ -71,7 +71,6 @@ impl Parser {
                 ModuleItem::Use(u) => program.imports.push(u),
                 ModuleItem::Module(m) => program.modules.push(m),
                 ModuleItem::Extern(e) => program.externs.push(e),
-                ModuleItem::Attribute(a) => program.attrs.push(a),
                 ModuleItem::Macro(m) => program.macros.push(m),
             }
         }
@@ -185,10 +184,9 @@ impl Parser {
                         break;
                     }
                     if self.peek_n(1).map(|t| t.kind == TokenKind::Eq).unwrap_or(false) {
-                        let n = self.consume_ident("expected argument name")?;
+                        let _n = self.consume_ident("expected argument name")?;
                         self.advance(); // =
-                        let v = self.parse_expression()?;
-                        args.push(AttributeArg::Named(n, v));
+                        let _v = self.parse_expression()?;
                     } else {
                         args.push(AttributeArg::Pos(self.parse_expression()?));
                     }
@@ -196,7 +194,8 @@ impl Parser {
             }
         }
         self.consume(&TokenKind::RBracket, "expected ']' to close attribute")?;
-        Ok(Attribute { name, args, inner, span: Span::unknown() })
+        let _ = inner;
+        Ok(Attribute { name, args })
     }
 
     // ===== 可见性 =====

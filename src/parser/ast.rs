@@ -49,8 +49,6 @@ pub struct Program {
 pub struct Attribute {
     pub name: String,
     pub args: Vec<AttributeArg>,
-    pub inner: bool,
-    pub span: Span,
 }
 
 /// 属性参数：`name = value` 或位置参数。
@@ -58,8 +56,6 @@ pub struct Attribute {
 pub enum AttributeArg {
     /// 位置参数：`#[foo(bar)]`。
     Pos(Expression),
-    /// 命名参数：`#[foo(name = bar)]`。
-    Named(String, Expression),
 }
 
 // ======================================================================
@@ -70,18 +66,9 @@ pub enum AttributeArg {
 #[derive(Debug, Clone)]
 pub enum ModuleDecl {
     /// `mod foo;` —— 从 `foo.zr` 加载。
-    Load {
-        name: String,
-        visibility: Visibility,
-        span: Span,
-    },
+    Load,
     /// `mod foo { ... }` —— 内联模块。
-    Inline {
-        name: String,
-        visibility: Visibility,
-        body: Program,
-        span: Span,
-    },
+    Inline,
 }
 
 /// 可见性修饰符。
@@ -121,28 +108,11 @@ pub enum UseTree {
 
 /// 外部块（`extern "C" { fn ...; }`）。
 #[derive(Debug, Clone)]
-pub struct ExternBlock {
-    pub abi: Abi,
-    pub items: Vec<ExternItem>,
-    pub span: Span,
-}
+pub struct ExternBlock;
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum Abi {
-    C,
-    Cdecl,
-    Stdcall,
-    Fastcall,
     Zr,
-    System,
-    Other(String),
-}
-
-#[derive(Debug, Clone)]
-pub enum ExternItem {
-    Function(Function),
-    /// 不透明类型声明：`extern "C" { type FILE; }`
-    Type(String, Span),
 }
 
 // ======================================================================
@@ -191,14 +161,10 @@ pub enum Type {
     Optional(Box<Type>),
     /// 错误联合：`T!E`（语法糖：`Result<T, E>`）
     ErrorUnion(Box<Type>, Box<Type>),
-    /// 推断类型（留给类型推导）：`_`
-    Infer,
     /// 编译期类型：`anytype`
     Anytype,
     /// `impl Trait`：存在性类型（返回位置 RPIT / 参数位置 APIT）。
     ImplTrait(Vec<Type>),
-    /// `Pin<T>`：固定指针类型。
-    Pin(Box<Type>),
 }
 
 /// 数组长度（可以是编译期常量表达式）。
@@ -264,8 +230,6 @@ pub enum Pattern {
     Range(Box<Expression>, Box<Expression>, bool, Span),
     /// `ref mut p`（显式引用绑定）。
     Ref(Box<Pattern>, Mutability, Span),
-    /// 带守卫的 pattern：`p if cond`。
-    Guard(Box<Pattern>, Box<Expression>, Span),
 }
 
 /// 结构体模式中的字段。
@@ -328,22 +292,14 @@ pub enum Expression {
     Assign(Box<Expression>, AssignOp, Box<Expression>, Span),
     /// 调用。
     Call(Box<Expression>, Vec<Argument>, Span),
-    /// 方法调用：`obj.method(args)`。
-    MethodCall(Box<Expression>, String, Vec<Argument>, Span),
     /// 索引：`a[i]`。
     Index(Box<Expression>, Box<Expression>, Span),
     /// 字段访问：`a.b`。
     Field(Box<Expression>, String, Span),
-    /// 解引用：`*p`。
-    Deref(Box<Expression>, Span),
     /// 取地址：`&x` / `&mut x`。
     AddrOf(Box<Expression>, Mutability, Span),
     /// 类型转换：`value as Type`。
     Cast(Box<Expression>, Type, Span),
-    /// `value is Type`（类型测试）。
-    Is(Box<Expression>, Type, Span),
-    /// `value in range`（范围测试）。
-    In(Box<Expression>, Box<Expression>, Span),
     /// 块 `{ ... }`，最后一个表达式作为块的值。
     Block(Block, Span),
     /// `if` 表达式（带可选 `else`）。
@@ -392,19 +348,6 @@ pub enum Expression {
     Goto(String, Span),
     /// `sizeof(T)` / `typeof(e)` / `alignof(T)`
     Intrinsic(IntrinsicKind, Vec<Type>, Span),
-    /// 编译错误内置：`@compileError("msg")`
-    CompileError(String, Span),
-    /// 函数指针取址：`&func`
-    FuncRef(String, Span),
-    /// 字符串插值：`f"hello {name}"`
-    Interpolated(Vec<InterpPart>, Span),
-}
-
-/// 插值字符串片段。
-#[derive(Debug, Clone)]
-pub enum InterpPart {
-    Text(String),
-    Expr(Expression),
 }
 
 /// 内置编译器内置函数。
@@ -418,18 +361,8 @@ pub enum IntrinsicKind {
     TypeOf,
     /// `offsetof(T, field)`
     OffsetOf,
-    /// `@compileLog(args...)`
-    CompileLog,
-    /// `@bitCast(T, value)`
-    BitCast,
     /// `@intCast(T, value)`
     IntCast,
-    /// `@errorReturnTrace()`
-    ErrorReturnTrace,
-    /// `@frame()`
-    Frame,
-    /// `@call(.always_inline, f, args)`
-    Call,
     /// `intrinsic!(yield)` —— 挂起当前协程
     Yield,
     /// `intrinsic!(now_ms)` —— 当前时间戳（毫秒）
@@ -470,8 +403,6 @@ pub enum BinaryOp {
     And, Or,
     // 范围
     Range, RangeInclusive,
-    // 字符串/切片连接
-    Concat,
 }
 
 /// 一元运算符。
@@ -531,8 +462,6 @@ pub enum Statement {
     Const(String, Type, Expression, Span),
     /// 表达式语句（结果被丢弃，除非是 `;` 结尾的块）。
     Expr(Expression, Span),
-    /// 宏调用语句（以 `;` 结尾的 `expr!()` 等）。
-    Item(ModuleItem),
 }
 
 /// 一个模块级条目（函数 / 类型 / trait / impl / const / static / use / mod）。
@@ -547,26 +476,13 @@ pub enum ModuleItem {
     Use(UseDecl),
     Module(ModuleDecl),
     Extern(ExternBlock),
-    Attribute(Attribute),
     /// `macro_rules! name { ... }` 声明式宏定义。
     Macro(MacroDef),
 }
 
 /// 声明式宏定义。
 #[derive(Debug, Clone)]
-pub struct MacroDef {
-    pub name: String,
-    pub arms: Vec<MacroArm>,
-    pub span: Span,
-}
-
-/// 宏分支：匹配模式 token 树 → 展开 token 树。
-#[derive(Debug, Clone)]
-pub struct MacroArm {
-    pub lhs: Vec<crate::lexer::Token>,
-    pub rhs: Vec<crate::lexer::Token>,
-    pub span: Span,
-}
+pub struct MacroDef;
 
 /// 块 = 一系列语句，最后一个表达式可选。
 #[derive(Debug, Clone, Default)]
@@ -582,7 +498,6 @@ pub struct Arm {
     pub pattern: Pattern,
     pub guard: Option<Box<Expression>>,
     pub body: Box<Expression>,
-    pub span: Span,
 }
 
 // ======================================================================
@@ -603,7 +518,6 @@ pub struct Function {
     pub is_default: bool,
     pub abi: Abi,
     pub generics: Vec<GenericParam>,
-    pub where_clause: Vec<WherePred>,
     pub params: Vec<Param>,
     pub receiver: Option<Receiver>, // `self` / `&self` / `&mut self`
     pub return_type: Type,
@@ -615,16 +529,15 @@ pub struct Function {
 #[derive(Debug, Clone)]
 pub enum GenericParam {
     /// 类型参数：`<T>` / `<T: Trait>`。
-    Type { name: String, bounds: Vec<Type>, default: Option<Type> },
+    Type,
     /// 常量参数：`<const N: usize>`。
-    Const { name: String, ty: Type, default: Option<Expression> },
+    Const,
 }
 
 /// `where` 子句谓词。
 #[derive(Debug, Clone)]
 pub struct WherePred {
     pub lhs: Type,
-    pub trait_type: Type,
     /// `for<'a, 'b>` 绑定的生命周期（HRTB）。
     pub for_lifetimes: Vec<String>,
     /// 是否为负边界：`T: !Trait`。
@@ -644,8 +557,6 @@ pub struct Param {
 #[derive(Debug, Clone)]
 pub struct Receiver {
     pub mutability: Mutability,
-    pub ty: Option<Type>, // `self: Box<Self>` 等显式形式
-    pub span: Span,
 }
 
 // ======================================================================
@@ -664,7 +575,6 @@ pub enum TypeDef {
     /// `type` 别名。
     Alias {
         name: String,
-        generics: Vec<GenericParam>,
         target: Type,
         visibility: Visibility,
         span: Span,
@@ -677,7 +587,6 @@ pub struct Field {
     pub name: String,
     pub ty: Type,
     pub visibility: Visibility,
-    pub default: Option<Expression>,
     pub span: Span,
 }
 
@@ -689,8 +598,6 @@ pub struct StructDef {
     pub attrs: Vec<Attribute>,
     pub generics: Vec<GenericParam>,
     pub fields: Vec<Field>,
-    /// 是否元组结构体：`struct Point(u32, u32)`。
-    pub tuple_like: bool,
     pub span: Span,
 }
 
@@ -779,7 +686,6 @@ pub struct TraitDef {
 #[derive(Debug, Clone)]
 pub struct AssocType {
     pub name: String,
-    pub bounds: Vec<Type>,
     pub default: Option<Type>,
     pub span: Span,
 }
@@ -815,14 +721,10 @@ impl Spanned for Expression {
             Expression::Unary(_, _, s) => *s,
             Expression::Assign(_, _, _, s) => *s,
             Expression::Call(_, _, s) => *s,
-            Expression::MethodCall(_, _, _, s) => *s,
             Expression::Index(_, _, s) => *s,
             Expression::Field(_, _, s) => *s,
-            Expression::Deref(_, s) => *s,
             Expression::AddrOf(_, _, s) => *s,
             Expression::Cast(_, _, s) => *s,
-            Expression::Is(_, _, s) => *s,
-            Expression::In(_, _, s) => *s,
             Expression::Block(_b, s) => *s,
             Expression::If(_, _, _, s) => *s,
             Expression::Match(_, _, s) => *s,
@@ -847,9 +749,6 @@ impl Spanned for Expression {
             Expression::Labeled(_, _, s) => *s,
             Expression::Goto(_, s) => *s,
             Expression::Intrinsic(_, _, s) => *s,
-            Expression::CompileError(_, s) => *s,
-            Expression::FuncRef(_, s) => *s,
-            Expression::Interpolated(_, s) => *s,
         }
     }
 }
@@ -867,7 +766,6 @@ impl Spanned for Pattern {
             Pattern::Slice(_, s) => *s,
             Pattern::Range(_, _, _, s) => *s,
             Pattern::Ref(_, _, s) => *s,
-            Pattern::Guard(_, _, s) => *s,
         }
     }
 }

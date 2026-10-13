@@ -475,7 +475,7 @@ impl Parser {
                 }
                 Box::new(e)
             };
-            arms.push(Arm { pattern: pat, guard, body, span: Span::unknown() });
+            arms.push(Arm { pattern: pat, guard, body });
             // 允许省略最后一个逗号
             if self.match_kind(&TokenKind::Comma) {
                 if self.check(&TokenKind::RBrace) {

@@ -799,7 +799,6 @@ impl TypeChecker {
                 Ok(HirStmt::Item)
             }
             Statement::Expr(e, span) => Ok(HirStmt::Expr(Box::new(self.check_expr(e, &Ty::Unit)?), *span)),
-            Statement::Item(_) => Ok(HirStmt::Item),
         }
     }
 
@@ -880,9 +879,6 @@ impl TypeChecker {
             Expression::Call(callee, args, _) => {
                 return self.check_call(callee, args, expected, span);
             }
-            Expression::MethodCall(receiver, name, args, _) => {
-                return self.check_method_call(receiver, name, args, expected, span);
-            }
             Expression::Index(receiver, index, _) => {
                 let recv = self.check_expr(receiver, &Ty::Infer(InferId(0)))?;
                 let idx = self.check_expr(index, &Ty::Int(64))?;
@@ -908,16 +904,6 @@ impl TypeChecker {
                 let (ty, idx) = self.check_field_access(&recv.ty, name, span)?;
                 return Ok(HirExpr { kind: ExprKind::Field(Box::new(recv), idx), ty, span });
             }
-            Expression::Deref(e, _) => {
-                let inner = self.check_expr(e, &Ty::Infer(InferId(0)))?;
-                let elem = self.infer.fresh_infer(span);
-                self.infer.unify(
-                    &inner.ty,
-                    &Ty::Reference(Box::new(elem.clone()), hir::Mutability::Immutable),
-                    span,
-                ).ok();
-                return Ok(HirExpr { kind: ExprKind::Deref(Box::new(inner)), ty: elem, span });
-            }
             Expression::AddrOf(e, m, _) => {
                 let inner = self.check_expr(e, &Ty::Infer(InferId(0)))?;
                 let ty = Ty::Reference(Box::new(inner.ty.clone()), *m);
@@ -928,16 +914,6 @@ impl TypeChecker {
                 let inner = self.check_expr(e, &Ty::Infer(InferId(0)))?;
                 self.validate_cast(&inner.ty, &target_ty, span)?;
                 return Ok(HirExpr { kind: ExprKind::Cast(Box::new(inner), target_ty.clone()), ty: target_ty, span });
-            }
-            Expression::Is(e, target, _) => {
-                let _inner = self.check_expr(e, &Ty::Infer(InferId(0)))?;
-                let _target = self.ast_to_hir_type(target)?;
-                return Ok(HirExpr { kind: ExprKind::Is(Box::new(_inner), _target.clone()), ty: Ty::Bool, span });
-            }
-            Expression::In(e, target, _) => {
-                let inner = self.check_expr(e, &Ty::Infer(InferId(0)))?;
-                let _target = self.check_expr(target, &Ty::Infer(InferId(0)))?;
-                return Ok(HirExpr { kind: ExprKind::Is(Box::new(inner), Ty::Bool), ty: Ty::Bool, span });
             }
             Expression::Block(b, _) => {
                 let inner = self.check_block(b, expected)?;
@@ -1167,24 +1143,6 @@ impl TypeChecker {
                     span,
                 });
             }
-            Expression::CompileError(msg, _) => {
-                return Err(CompileError::internal(format!(
-                    "@compileError({:?})",
-                    msg
-                ))
-                .with_span(span));
-            }
-            Expression::FuncRef(name, _) => {
-                let id = self.resolve_name(name, span)?;
-                return Ok(HirExpr { kind: ExprKind::Def(id), ty: Ty::Infer(InferId(0)), span });
-            }
-            Expression::Interpolated(parts, _) => {
-                let hir_parts: Result<Vec<_>> = parts.iter().map(|p| match p {
-                    ast::InterpPart::Text(s) => Ok(hir::InterpPart::Text(s.clone())),
-                    ast::InterpPart::Expr(e) => Ok(hir::InterpPart::Expr(self.check_expr(e, &Ty::Infer(InferId(0)))?)),
-                }).collect();
-                return Ok(HirExpr { kind: ExprKind::Interpolated(hir_parts?), ty: Ty::Str, span });
-            }
         };
         let ty = self.infer.fresh_infer(span);
         Ok(HirExpr { kind, ty, span })
@@ -1219,7 +1177,6 @@ impl TypeChecker {
             ast::BinaryOp::Range | ast::BinaryOp::RangeInclusive => {
                 Ty::Reference(Box::new(l.ty.clone()), hir::Mutability::Immutable)
             }
-            ast::BinaryOp::Concat => Ty::Str,
         };
         Ok(HirExpr { kind: ExprKind::Binary(bin_op, Box::new(l), Box::new(r)), ty, span })
     }
@@ -1263,45 +1220,6 @@ impl TypeChecker {
             hir_args.push(self.check_expr(a, &param_ty)?);
         }
         Ok(HirExpr { kind: ExprKind::Call(Box::new(callee_hir), hir_args), ty: ret_ty, span })
-    }
-
-    fn check_method_call(
-        &mut self,
-        receiver: &Expression,
-        name: &str,
-        args: &[ast::Argument],
-        _expected: &Ty,
-        span: ast::Span,
-    ) -> Result<HirExpr> {
-        let recv_ty = self.infer_expr_ty(receiver)?;
-        let recv = self.check_expr(receiver, &recv_ty)?;
-        // 查找方法：先在 receiver 的 impl 中找，再在 trait 中找
-        let method_id = self.lookup_method(&recv.ty, name, span)?;
-        let mut hir_args = Vec::new();
-        for arg in args {
-            let e = match arg {
-                ast::Argument::Pos(e) => e,
-                ast::Argument::Named(_, e) => e,
-            };
-            hir_args.push(self.check_expr(e, &Ty::Infer(InferId(0)))?);
-        }
-        Ok(HirExpr {
-            kind: ExprKind::MethodCall(Box::new(recv), method_id, hir_args),
-            ty: Ty::Infer(InferId(0)),
-            span,
-        })
-    }
-
-    fn lookup_method(&self, _recv_ty: &Ty, name: &str, span: ast::Span) -> Result<DefId> {
-        // 遍历所有 impl 块，查找匹配的方法
-        for impl_block in &self.impl_blocks {
-            for item in &impl_block.items {
-                if item.name == name {
-                    return Ok(item.id);
-                }
-            }
-        }
-        Err(CompileError::name_error(format!("no method named `{}` found", name)).with_span(span))
     }
 
     // ==================================================================
@@ -1587,7 +1505,6 @@ impl TypeChecker {
             AstPattern::Ref(inner, mutability, _) => {
                 hir::HirPattern::Ref(Box::new(self.lower_pattern(inner, ty)?), *mutability)
             }
-            AstPattern::Guard(pat, _guard, _) => self.lower_pattern(pat, ty)?,
         })
     }
 
@@ -1833,7 +1750,6 @@ impl TypeChecker {
                 Box::new(self.ast_to_hir_type(t)?),
                 Box::new(self.ast_to_hir_type(e)?),
             ),
-            AstType::Infer => Ty::Infer(InferId(0)),
             AstType::Anytype => Ty::Infer(InferId(0)),
             AstType::ImplTrait(bounds) => {
                 // `impl Trait` 降级为不透明类型：
@@ -1853,7 +1769,6 @@ impl TypeChecker {
                 }
                 Ty::Opaque(opaque_id)
             }
-            AstType::Pin(inner) => Ty::Pin(Box::new(self.ast_to_hir_type(inner)?)),
         })
     }
 
@@ -2155,7 +2070,6 @@ impl TypeChecker {
             ast::BinaryOp::Or => hir::BinaryOp::Or,
             ast::BinaryOp::Range => hir::BinaryOp::Range,
             ast::BinaryOp::RangeInclusive => hir::BinaryOp::RangeInclusive,
-            ast::BinaryOp::Concat => hir::BinaryOp::Concat,
         }
     }
 
@@ -2181,12 +2095,7 @@ impl TypeChecker {
             ast::IntrinsicKind::AlignOf => hir::Intrinsic::AlignOf,
             ast::IntrinsicKind::TypeOf => hir::Intrinsic::TypeOf,
             ast::IntrinsicKind::OffsetOf => hir::Intrinsic::OffsetOf,
-            ast::IntrinsicKind::CompileLog => hir::Intrinsic::TypeOf, // 降级为 no-op
-            ast::IntrinsicKind::BitCast => hir::Intrinsic::BitCast,
             ast::IntrinsicKind::IntCast => hir::Intrinsic::IntCast,
-            ast::IntrinsicKind::ErrorReturnTrace => hir::Intrinsic::FrameAddress,
-            ast::IntrinsicKind::Frame => hir::Intrinsic::FrameAddress,
-            ast::IntrinsicKind::Call => hir::Intrinsic::Call,
             // 运行时内建：编译器处理为对应的 HIR 内建操作。
             ast::IntrinsicKind::Yield => hir::Intrinsic::Yield,
             ast::IntrinsicKind::NowMs => hir::Intrinsic::NowMs,
