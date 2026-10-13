@@ -56,7 +56,7 @@ fn lower_block(b: &mut Builder, block: &HirBlock) -> Option<MirValue> {
 /// 降级一条语句。
 fn lower_stmt(b: &mut Builder, stmt: &HirStmt) {
     match stmt {
-        HirStmt::Let { local, init, .. } | HirStmt::Var { local, init, .. } => {
+        HirStmt::Let { local, init } | HirStmt::Var { local, init } => {
             let name = format!("v{}", local.0);
             if let Some(init) = init {
                 let v = lower_expr(b, init);
@@ -65,10 +65,7 @@ fn lower_stmt(b: &mut Builder, stmt: &HirStmt) {
                     .push(MirInstr::Assign(name, v));
             }
         }
-        HirStmt::Const { .. } => {
-            // 顶层常量在 `lower` 中收集，函数内 `const` 降级为 let
-        }
-        HirStmt::Expr(expr, _) => {
+        HirStmt::Expr(expr) => {
             let _ = lower_expr(b, expr);
         }
         HirStmt::Item => {}
@@ -144,7 +141,7 @@ fn lower_expr(b: &mut Builder, expr: &HirExpr) -> MirValue {
             b.current = join;
             MirValue::Unit
         }
-        While(cond, body, _) => {
+        While(cond, body) => {
             let header = b.new_block();
             let body_bb = b.new_block();
             let exit = b.new_block();
@@ -230,7 +227,7 @@ fn convert_binary(op: hir::BinaryOp) -> MirBinaryOp {
         Ge => MirBinaryOp::Ge,
         And => MirBinaryOp::And,
         Or => MirBinaryOp::Or,
-        Range | RangeInclusive | Concat => MirBinaryOp::Add,
+        Range | RangeInclusive => MirBinaryOp::Add,
     }
 }
 

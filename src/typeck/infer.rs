@@ -20,7 +20,7 @@ use crate::parser::ast::Span;
 
 use super::hir::{
     self, Cfg, DefId, GenericId, InferId, LocalId,
-    Ty, TypeScheme,
+    Ty,
 };
 
 /// 类型推断上下文。
@@ -246,9 +246,9 @@ impl<'a> InferCtxt<'a> {
                     }
                     Some(hir::HirTypeDef::Enum(e)) => {
                         let tag = match e.repr {
-                            hir::IntegerRepr::I8 | hir::IntegerRepr::U8 => 1,
-                            hir::IntegerRepr::I16 | hir::IntegerRepr::U16 => 2,
-                            hir::IntegerRepr::I32 | hir::IntegerRepr::U32 => 4,
+                            hir::IntegerRepr::I8 => 1,
+                            hir::IntegerRepr::I16 => 2,
+                            hir::IntegerRepr::I32 => 4,
                             _ => 8,
                         };
                         let mut max_payload = 0usize;
@@ -273,11 +273,9 @@ impl<'a> InferCtxt<'a> {
                     None => 0,
                 }
             }
-            Ty::Alias(inner) => self.size_of(inner),
             Ty::Opaque(_) => 0,
             Ty::Pin(inner) => self.size_of(inner),
-            Ty::Projection { self_ty, .. } => self.size_of(self_ty),
-            Ty::Param(_) | Ty::Infer(_) => 0,
+            Ty::Infer(_) => 0,
         }
     }
 
@@ -311,19 +309,10 @@ impl<'a> InferCtxt<'a> {
                     None => 1,
                 }
             }
-            Ty::Alias(inner) => self.align_of(inner),
             Ty::Opaque(_) => 1,
             Ty::Pin(inner) => self.align_of(inner),
-            Ty::Projection { self_ty, .. } => self.align_of(self_ty),
-            Ty::Param(_) | Ty::Infer(_) => 1,
+            Ty::Infer(_) => 1,
         }
-    }
-
-    /// 创建一个新的类型参数。
-    pub fn fresh_generic(&mut self, _name: &str) -> Ty {
-        let id = GenericId(self.next_infer);
-        self.next_infer += 1;
-        Ty::Param(id)
     }
 
     /// 求一个类型的完整形式（展开别名、替换参数）。
@@ -333,12 +322,6 @@ impl<'a> InferCtxt<'a> {
                 Some(t) if !matches!(t, Ty::Infer(_)) => self.resolve(t),
                 _ => ty.clone(),
             },
-            Ty::Alias(inner) => self.resolve(inner),
-            Ty::Param(id) => self
-                .substitution
-                .get(id)
-                .map(|t| self.resolve(t))
-                .unwrap_or_else(|| ty.clone()),
             Ty::Pointer(t, m) => Ty::Pointer(Box::new(self.resolve(t)), *m),
             Ty::Reference(t, m) => Ty::Reference(Box::new(self.resolve(t)), *m),
             Ty::Array(t, len) => Ty::Array(
@@ -365,11 +348,6 @@ impl<'a> InferCtxt<'a> {
                 args.iter().map(|a| self.resolve(a)).collect(),
             ),
             Ty::Pin(inner) => Ty::Pin(Box::new(self.resolve(inner))),
-            Ty::Projection { self_ty, trait_id, assoc_name } => Ty::Projection {
-                self_ty: Box::new(self.resolve(self_ty)),
-                trait_id: *trait_id,
-                assoc_name: assoc_name.clone(),
-            },
             _ => ty.clone(),
         }
     }
@@ -431,20 +409,6 @@ impl<'a> InferCtxt<'a> {
                 }
                 Ok(())
             }
-            (Ty::Param(g1), occurs) if !self.occurs_check(*g1, occurs) => {
-                self.substitution.insert(*g1, occurs.clone());
-                Ok(())
-            }
-            (Ty::Param(_), _) => Err(self.type_mismatch(&a, &b, span)),
-            // 关联类型投影：尝试归一化后再统一
-            (Ty::Projection { .. }, _) => {
-                let norm_a = self.normalize_projection(&a);
-                self.unify(&norm_a, &b, span)
-            }
-            (_, Ty::Projection { .. }) => {
-                let norm_b = self.normalize_projection(&b);
-                self.unify(&a, &norm_b, span)
-            }
             // 不透明类型（impl Trait）：可以与任何类型统一（隐藏类型推断）
             (Ty::Opaque(_), _) | (_, Ty::Opaque(_)) => Ok(()),
             _ => Err(self.type_mismatch(&a, &b, span)),
@@ -453,8 +417,8 @@ impl<'a> InferCtxt<'a> {
 
     /// 发生性检查（Occurs Check），防止无限类型。
     fn occurs_check(&self, generic: GenericId, ty: &Ty) -> bool {
+        let _ = generic;
         match ty {
-            Ty::Param(g) => g == &generic,
             Ty::Infer(_) => false,
             Ty::Pointer(t, _) | Ty::Reference(t, _) | Ty::Array(t, _) | Ty::Slice(t, _) => {
                 self.occurs_check(generic, t)
@@ -464,9 +428,7 @@ impl<'a> InferCtxt<'a> {
             }
             Ty::Optional(t) | Ty::ErrorUnion(t, _) => self.occurs_check(generic, t),
             Ty::Named(_, args) => args.iter().any(|a| self.occurs_check(generic, a)),
-            Ty::Alias(t) => self.occurs_check(generic, t),
             Ty::Pin(t) => self.occurs_check(generic, t),
-            Ty::Projection { self_ty, .. } => self.occurs_check(generic, self_ty),
             _ => false,
         }
     }
@@ -501,9 +463,7 @@ impl<'a> InferCtxt<'a> {
             }
             Ty::Optional(t) | Ty::ErrorUnion(t, _) => self.occurs_in(id, t),
             Ty::Named(_, args) => args.iter().any(|a| self.occurs_in(id, a)),
-            Ty::Alias(t) => self.occurs_in(id, t),
             Ty::Pin(t) => self.occurs_in(id, t),
-            Ty::Projection { self_ty, .. } => self.occurs_in(id, self_ty),
             _ => false,
         }
     }
@@ -549,16 +509,6 @@ impl<'a> InferCtxt<'a> {
             (Ty::Named(sub_id, _), Ty::Named(sup_id, _)) => {
                 // 检查 sub 是否 impl sup_trait
                 self.check_trait_impl(*sub_id, *sup_id, span)
-            }
-
-            // 关联类型投影：归一化后再检查子类型
-            (Ty::Projection { .. }, _) => {
-                let norm = self.normalize_projection(&sub);
-                self.subtype(&norm, &sup, span)
-            }
-            (_, Ty::Projection { .. }) => {
-                let norm = self.normalize_projection(&sup);
-                self.subtype(&sub, &norm, span)
             }
 
             // 不透明类型（impl Trait）：可以是任何类型的子类型/超类型
@@ -607,51 +557,10 @@ impl<'a> InferCtxt<'a> {
         true
     }
 
-    /// 归一化关联类型投影 `<T as Trait>::Assoc`。
-    /// 查找 T 实现 Trait 的 impl 块，返回其中定义的 Assoc 类型。
-    /// 如果找不到匹配的 impl，返回原投影类型（延迟求解）。
-    pub fn normalize_projection(&self, ty: &Ty) -> Ty {
-        let Ty::Projection { self_ty, trait_id, assoc_name } = ty else {
-            return ty.clone();
-        };
-        let self_ty = self.resolve(self_ty);
-        // 遍历所有 impl 块，寻找匹配 trait_id 且目标类型匹配的 impl
-        for impl_block in self.impl_blocks {
-            if impl_block.trait_id != Some(*trait_id) {
-                continue;
-            }
-            let target = self.resolve(&impl_block.target);
-            if !self.types_match(&self_ty, &target) {
-                continue;
-            }
-            // 在 impl 的关联类型中查找
-            for at in &impl_block.assoc_types {
-                if at.name == *assoc_name {
-                    if let Some(default) = &at.default {
-                        return self.resolve(default);
-                    }
-                }
-            }
-        }
-        // 检查 trait 定义中的默认关联类型
-        if let Some(td) = self.trait_defs.get(trait_id) {
-            for at in &td.assoc_types {
-                if at.name == *assoc_name {
-                    if let Some(default) = &at.default {
-                        return self.resolve(default);
-                    }
-                }
-            }
-        }
-        // 无法归一化，返回原投影
-        ty.clone()
-    }
-
     /// 判断两个类型是否在结构上匹配（用于 impl 选择）。
     fn types_match(&self, a: &Ty, b: &Ty) -> bool {
         match (a, b) {
             (Ty::Infer(_), _) | (_, Ty::Infer(_)) => true,
-            (Ty::Param(_), _) | (_, Ty::Param(_)) => true,
             (Ty::Named(id1, args1), Ty::Named(id2, args2)) => {
                 id1 == id2 && args1.len() == args2.len()
                     && args1.iter().zip(args2.iter()).all(|(x, y)| self.types_match(x, y))
@@ -769,17 +678,9 @@ impl<'a> InferCtxt<'a> {
             Ty::ErrorUnion(t, e) => {
                 format!("{}!{}", self.type_name(t), self.type_name(e))
             }
-            Ty::Param(g) => format!("T{}", g.0),
             Ty::Infer(_) => "_".into(),
-            Ty::Alias(t) => self.type_name(t),
             Ty::Opaque(id) => format!("opaque({})", self.type_id_name(*id)),
             Ty::Pin(inner) => format!("Pin<{}>", self.type_name(inner)),
-            Ty::Projection { self_ty, trait_id, assoc_name } => format!(
-                "<{} as {}>::{}",
-                self.type_name(self_ty),
-                self.type_id_name(*trait_id),
-                assoc_name
-            ),
         }
     }
 
@@ -903,16 +804,6 @@ impl<'a> InferCtxt<'a> {
     }
 }
 
-/// 类型方案（带全称量化的类型）。
-impl TypeScheme {
-    /// 实例化一个类型方案，生成新的推断变量。
-    pub fn instantiate(&self, _cx: &mut InferCtxt<'_>, _span: Span) -> Ty {
-        // 为每个泛型参数创建新的推断变量，并替换到 ty 中
-        // 此处为框架实现
-        self.ty.clone()
-    }
-}
-
 /// 区域推断（NLL）。
 #[derive(Debug, Default)]
 pub struct RegionInferer {
@@ -952,14 +843,9 @@ impl fmt::Display for Ty {
             Ty::Function { .. } => "fn".to_string(),
             Ty::Optional(t) => format!("{}?", t),
             Ty::ErrorUnion(t, _) => format!("{}!", t),
-            Ty::Param(_) => "param".to_string(),
             Ty::Infer(_) => "_".to_string(),
-            Ty::Alias(t) => format!("alias({})", t),
             Ty::Opaque(_) => "opaque".to_string(),
             Ty::Pin(inner) => format!("Pin<{}>", inner),
-            Ty::Projection { self_ty, trait_id, assoc_name } => {
-                format!("<{} as trait#{}>::{}", self_ty, trait_id.0, assoc_name)
-            }
         };
         f.write_str(&name)
     }

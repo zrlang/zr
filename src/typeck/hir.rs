@@ -9,17 +9,12 @@
 //!
 //! HIR 是后续 MIR 降级、借用检查、模式穷尽性检查、闭包转换的输入。
 
-use crate::parser::ast::{Abi, Attribute, GenericParam, Span, Visibility};
+use crate::parser::ast::{Abi, Attribute, Span};
 
 /// 一个 HIR 程序（已通过类型检查）。
 #[derive(Debug, Clone, Default)]
 pub struct HirModule {
     pub functions: Vec<HirFunction>,
-    pub type_defs: Vec<HirTypeDef>,
-    pub consts: Vec<HirConst>,
-    pub statics: Vec<HirStatic>,
-    pub trait_defs: Vec<HirTrait>,
-    pub impl_blocks: Vec<HirImpl>,
 }
 
 // ======================================================================
@@ -68,23 +63,12 @@ pub enum Ty {
     Optional(Box<Ty>),
     /// 错误联合 `T!E`。
     ErrorUnion(Box<Ty>, Box<Ty>),
-    /// 泛型参数（类型变量）。
-    Param(GenericId),
     /// 推断类型（待 unify）。
     Infer(InferId),
-    /// 类型别名（已展开）。
-    Alias(Box<Ty>),
     /// 不透明类型（前向声明）。
     Opaque(DefId),
     /// `Pin<T>`：固定指针，阻止 pointee 被移动。
     Pin(Box<Ty>),
-    /// 关联类型投影 `<T as Trait>::Assoc`。
-    Projection {
-        /// 限定路径：`(self_type, trait_def_id, assoc_name)`。
-        self_ty: Box<Ty>,
-        trait_id: DefId,
-        assoc_name: String,
-    },
 }
 
 impl Default for Ty {
@@ -148,64 +132,11 @@ pub struct LocalId(pub u32);
 
 /// 基本块 ID。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
-pub struct BasicBlockId(pub u32);
-
-/// 生命周期变量 ID。
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct RegionVarId(pub u32);
-
-/// 生命周期。
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub enum Region {
-    /// 静态生命周期 `'static`。
-    Static,
-    /// 命名生命周期 `'a`。
-    Named(String),
-    /// 生命周期变量（推断用）。
-    Var(RegionVarId),
-    /// 匿名生命周期（省略的）。
-    Anonymous,
-}
-
-/// 全称量化绑定器 `for<'a> T`。
-/// 表示 T 中的生命周期变量被全称量化，对所有生命周期都成立。
-#[derive(Debug, Clone)]
-pub struct Binder<T> {
-    /// 绑定的生命周期变量列表。
-    pub bound_regions: Vec<Region>,
-    /// 被量化的内部值。
-    pub value: T,
-}
-
-impl<T> Binder<T> {
-    pub fn new(value: T) -> Self {
-        Self {
-            bound_regions: Vec::new(),
-            value,
-        }
-    }
-}
-
-/// 类型方案（带量化）。
-#[derive(Debug, Clone)]
-pub struct TypeScheme {
-    pub generics: Vec<GenericParam>,
-    pub where_clause: Vec<WherePred>,
-    pub ty: Ty,
-}
+pub struct BasicBlockId;
 
 /// Where 谓词。
 #[derive(Debug, Clone)]
-pub struct WherePred {
-    pub lhs: Ty,
-    pub trait_id: DefId,
-    /// 高阶 trait 边界：`for<'a> T: Trait`。
-    /// 存储绑定的生命周期变量列表（空 = 普通边界）。
-    pub hrtb: Vec<Region>,
-    /// 是否为负边界：`T: !Trait`。
-    pub negated: bool,
-    pub span: Span,
-}
+pub struct WherePred;
 
 // ======================================================================
 // HIR 表达式
@@ -217,22 +148,6 @@ pub struct HirExpr {
     pub kind: ExprKind,
     pub ty: Ty,
     pub span: Span,
-}
-
-/// 内联汇编表达式（HIR）。
-#[derive(Debug, Clone)]
-pub struct HirAsmExpr {
-    pub template: String,
-    pub outputs: Vec<HirAsmOperand>,
-    pub inputs: Vec<HirAsmOperand>,
-    pub options: Vec<String>,
-}
-
-/// HIR 汇编操作数。
-#[derive(Debug, Clone)]
-pub struct HirAsmOperand {
-    pub constraint: String,
-    pub expr: Box<HirExpr>,
 }
 
 /// 表达式种类。
@@ -251,73 +166,59 @@ pub enum ExprKind {
     /// 赋值（含复合赋值，已脱糖为普通赋值）。
     Assign(Box<HirExpr>, Box<HirExpr>),
     /// 函数调用（含方法调用，已确定 receiver 与方法）。
-    Call(Box<HirExpr>, Vec<HirExpr>),
-    /// 方法调用。
-    MethodCall(Box<HirExpr>, DefId, Vec<HirExpr>),
+    Call,
     /// 字段访问（含元组索引）。
-    Field(Box<HirExpr>, FieldIndex),
+    Field(Box<HirExpr>),
     /// 解引用。
     Deref(Box<HirExpr>),
     /// 取地址。
-    AddrOf(Box<HirExpr>, Mutability),
+    AddrOf,
     /// 索引访问。
-    Index(Box<HirExpr>, Box<HirExpr>),
+    Index(Box<HirExpr>),
     /// 类型转换（已确定源类型与目标类型）。
-    Cast(Box<HirExpr>, Ty),
+    Cast,
     /// 块表达式。
     Block(HirBlock),
     /// `if` 表达式。
     If(Box<HirExpr>, HirBlock, Option<HirBlock>),
     /// `match` 表达式（已验证穷尽性）。
-    Match(Box<HirExpr>, Vec<HirArm>),
+    Match,
     /// `while` 循环。
-    While(Box<HirExpr>, HirBlock, Option<HirBlock>),
+    While(Box<HirExpr>, HirBlock),
     /// `for` 循环（脱糖后保留 for-specific 语义）。
-    For(ForLoop),
+    For,
     /// `loop` 无限循环。
     Loop(HirBlock),
     /// `break` / `continue`（含标签与值）。
-    Break(BreakValue),
+    Break,
     /// `return`。
     Return(Option<Box<HirExpr>>),
     /// `defer` 延迟表达式。
-    Defer(Box<HirExpr>),
+    Defer,
     /// `try` / `catch`。
-    Try(Box<HirExpr>, Option<Box<HirExpr>>),
+    Try,
     /// `throw`。
-    Throw(Box<HirExpr>),
+    Throw,
     /// 数组字面量。
-    Array(Vec<HirExpr>, Ty),
+    Array,
     /// 元组字面量。
-    Tuple(Vec<HirExpr>),
+    Tuple,
     /// 结构体字面量（字段顺序已按定义重排）。
-    Struct(DefId, Vec<(usize, HirExpr)>),
+    Struct,
     /// Lambda / 闭包（已确定捕获列表与类型）。
-    Closure(Box<ClosureExpr>),
+    Closure,
     /// `comptime` 块。
-    Comptime(Box<HirExpr>),
+    Comptime,
     /// `await`。
     Await(Box<HirExpr>),
     /// 内联汇编。
-    Asm(HirAsmExpr),
+    Asm,
     /// `yield`。
-    Yield(Box<HirExpr>),
+    Yield,
     /// `spawn`。
-    Spawn(Box<HirExpr>),
-    /// 编译期错误。
-    CompileError(String),
+    Spawn,
     /// `sizeof` / `alignof` / `typeof` / `offsetof` 内置。
-    Intrinsic(Intrinsic, Vec<Ty>),
-    /// `is` 类型测试（脱糖为判别 + 转换）。
-    Is(Box<HirExpr>, Ty),
-    /// 字符串插值。
-    Interpolated(Vec<InterpPart>),
-    /// 永不求值的表达式（用于 `!` 类型传播）。
-    Never(Box<HirExpr>),
-    /// 错误传播 `expr?`（脱糖为 match）。
-    TryOperator(Box<HirExpr>),
-    /// 范围字面量。
-    Range(Box<HirExpr>, Box<HirExpr>, RangeInclusivity),
+    Intrinsic,
 }
 
 /// 字面量（HIR 层已类型化）。
@@ -330,8 +231,6 @@ pub enum HirLiteral {
     Bool(bool),
     /// 复合字面量（数组 / 结构体 / 元组）。
     Composite(Vec<HirExpr>),
-    /// 零初始化（`std::mem::zeroed()`）。
-    Zero(Ty),
 }
 
 impl PartialEq for HirLiteral {
@@ -342,7 +241,6 @@ impl PartialEq for HirLiteral {
             (HirLiteral::String(a), HirLiteral::String(b)) => a == b,
             (HirLiteral::Char(a), HirLiteral::Char(b)) => a == b,
             (HirLiteral::Bool(a), HirLiteral::Bool(b)) => a == b,
-            (HirLiteral::Zero(a), HirLiteral::Zero(b)) => a == b,
             (HirLiteral::Composite(a), HirLiteral::Composite(b)) => {
                 a.len() == b.len()
                     && a.iter().zip(b.iter()).all(|(x, y)| {
@@ -364,7 +262,6 @@ pub enum BinaryOp {
     Eq, Ne, Lt, Gt, Le, Ge,
     And, Or,
     Range, RangeInclusive,
-    Concat,
 }
 
 /// 一元运算符。
@@ -389,13 +286,6 @@ pub enum RangeInclusivity {
     Inclusive,
 }
 
-/// 字符串插值片段。
-#[derive(Debug, Clone)]
-pub enum InterpPart {
-    Text(String),
-    Expr(HirExpr),
-}
-
 /// 内置函数。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Intrinsic {
@@ -403,10 +293,7 @@ pub enum Intrinsic {
     AlignOf,
     TypeOf,
     OffsetOf,
-    BitCast,
     IntCast,
-    /// 帧地址（用于 error return trace / frame 内建）。
-    FrameAddress,
     /// `intrinsic!(yield)` —— 挂起当前协程。
     Yield,
     /// `intrinsic!(now_ms)` —— 当前时间戳（毫秒）。
@@ -423,81 +310,12 @@ pub enum Intrinsic {
     Zeroed,
     /// `intrinsic!(transmute src -> Dst)` —— 位转换。
     Transmute,
-    /// `intrinsic!(call ...)` —— 强制内联调用。
-    Call,
-}
-
-/// `break` / `continue` 的值。
-#[derive(Debug, Clone)]
-pub enum BreakValue {
-    /// 无值 `break`。
-    None,
-    /// 带值 `break value`。
-    Value(Box<HirExpr>),
-    /// 带标签 `break 'label`。
-    Label(String),
-    /// 带标签和值。
-    Labeled(String, Box<HirExpr>),
-}
-
-/// `for` 循环（脱糖信息保留）。
-#[derive(Debug, Clone)]
-pub struct ForLoop {
-    /// 循环变量（已声明为局部）。
-    pub var: LocalId,
-    /// 迭代器表达式。
-    pub iter: Box<HirExpr>,
-    /// 循环体。
-    pub body: HirBlock,
-    /// 迭代器协议（by-value / by-ref）。
-    pub protocol: ForProtocol,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum ForProtocol {
-    /// `for x in iter`（按值消费）
-    ByValue,
-    /// `for x in &iter`（按引用）
-    ByRef,
-}
-
-/// 闭包表达式。
-#[derive(Debug, Clone)]
-pub struct ClosureExpr {
-    /// 参数列表（已声明为匿名结构体字段）。
-    pub params: Vec<(HirPattern, Ty)>,
-    /// 捕获列表（按引用 / 按值）。
-    pub captures: Vec<Capture>,
-    /// 函数指针类型。
-    pub ty: Ty,
-    /// 函数体。
-    pub body: HirExpr,
-}
-
-/// 捕获方式。
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum CaptureKind {
-    /// 按引用（共享）。
-    ByRef,
-    /// 按可变引用。
-    ByRefMut,
-    /// 按值（move）。
-    ByValue,
-}
-
-/// 单个捕获。
-#[derive(Debug, Clone)]
-pub struct Capture {
-    pub local: LocalId,
-    pub kind: CaptureKind,
-    pub ty: Ty,
 }
 
 /// match 分支（已验证穷尽性）。
 #[derive(Debug, Clone)]
 pub struct HirArm {
     pub pattern: HirPattern,
-    pub guard: Option<Box<HirExpr>>,
     pub body: Box<HirExpr>,
 }
 
@@ -510,30 +328,21 @@ pub struct HirArm {
 pub enum HirPattern {
     Wildcard,
     /// 字面量模式。
-    Literal(HirLiteral),
+    Literal,
     /// 绑定（绑定到局部变量）。
-    Binding(LocalId, Ty),
+    Binding,
     /// 元组模式。
-    Tuple(Vec<HirPattern>, Ty),
+    Tuple,
     /// 结构体模式。
-    Struct {
-        def_id: DefId,
-        fields: Vec<(usize, HirPattern)>,
-        /// 是否含 `..`（剩余字段）。
-        rest: bool,
-    },
+    Struct,
     /// 枚举变体模式。
-    Variant {
-        enum_id: DefId,
-        variant: usize,
-        args: Vec<HirPattern>,
-    },
+    Variant,
     /// 切片模式。
-    Slice(Vec<HirPattern>, Option<Box<HirPattern>>, Vec<HirPattern>),
+    Slice,
     /// 范围模式。
-    Range(Box<HirExpr>, Box<HirExpr>, RangeInclusivity),
+    Range,
     /// 引用模式 `ref mut? p`。
-    Ref(Box<HirPattern>, Mutability),
+    Ref,
 }
 
 // ======================================================================
@@ -546,26 +355,15 @@ pub enum HirStmt {
     /// `let` 绑定（不可变，初始化可选，未初始化 = 要求后续赋值）。
     Let {
         local: LocalId,
-        ty: Ty,
         init: Option<Box<HirExpr>>,
-        span: Span,
     },
     /// `var` / `mut let` 绑定（可变）。
     Var {
         local: LocalId,
-        ty: Ty,
         init: Option<Box<HirExpr>>,
-        span: Span,
-    },
-    /// `const`（编译期常量，要求 const-foldable）。
-    Const {
-        def: DefId,
-        ty: Ty,
-        value: Box<HirExpr>,
-        span: Span,
     },
     /// 表达式语句（结果被丢弃，除非是尾表达式）。
-    Expr(Box<HirExpr>, Span),
+    Expr(Box<HirExpr>),
     /// 语义项（函数 / 类型定义等，已在 HIR 顶层处理）。
     Item,
 }
@@ -575,8 +373,6 @@ pub enum HirStmt {
 pub struct HirBlock {
     pub stmts: Vec<HirStmt>,
     pub tail: Option<Box<HirExpr>>,
-    pub ty: Ty,
-    pub span: Span,
 }
 
 // ======================================================================
@@ -586,41 +382,15 @@ pub struct HirBlock {
 /// HIR 函数。
 #[derive(Debug, Clone)]
 pub struct HirFunction {
-    pub id: DefId,
     pub name: String,
-    pub visibility: Visibility,
-    pub attrs: Vec<Attribute>,
-    pub is_async: bool,
-    pub is_noreturn: bool,
-    pub is_const: bool,
-    /// 是否为 `default fn`（可被特化覆盖）。
-    pub is_default: bool,
-    pub abi: Abi,
-    pub generics: Vec<GenericParam>,
     pub params: Vec<HirParam>,
-    pub receiver: Option<HirReceiver>,
     pub return_type: Ty,
     pub body: Option<HirBlock>,
-    pub span: Span,
 }
 
 /// HIR 参数。
 #[derive(Debug, Clone)]
-pub struct HirParam {
-    pub local: LocalId,
-    pub pattern: HirPattern,
-    pub ty: Ty,
-    pub span: Span,
-}
-
-/// 方法接收者。
-#[derive(Debug, Clone)]
-pub struct HirReceiver {
-    pub local: LocalId,
-    pub mutability: Mutability,
-    pub ty: Ty,
-    pub span: Span,
-}
+pub struct HirParam;
 
 /// HIR 类型定义。
 #[derive(Debug, Clone)]
@@ -635,45 +405,31 @@ pub enum HirTypeDef {
     Alias {
         def_id: DefId,
         target: Ty,
-        visibility: Visibility,
-        span: Span,
     },
 }
 
 /// HIR 结构体。
 #[derive(Debug, Clone)]
 pub struct HirStruct {
-    pub def_id: DefId,
     pub name: String,
-    pub visibility: Visibility,
-    pub generics: Vec<GenericParam>,
     pub attrs: Vec<Attribute>,
     pub fields: Vec<HirField>,
     pub repr: Repr,
-    pub span: Span,
 }
 
 /// HIR 枚举。
 #[derive(Debug, Clone)]
 pub struct HirEnum {
-    pub def_id: DefId,
     pub name: String,
-    pub visibility: Visibility,
-    pub generics: Vec<GenericParam>,
     pub repr: IntegerRepr,
     pub variants: Vec<HirVariant>,
-    pub span: Span,
 }
 
 /// HIR 联合体。
 #[derive(Debug, Clone)]
 pub struct HirUnion {
-    pub def_id: DefId,
     pub name: String,
-    pub visibility: Visibility,
-    pub generics: Vec<GenericParam>,
     pub fields: Vec<HirField>,
-    pub span: Span,
 }
 
 /// HIR 字段。
@@ -681,20 +437,13 @@ pub struct HirUnion {
 pub struct HirField {
     pub name: String,
     pub ty: Ty,
-    pub visibility: Visibility,
     pub index: usize,
-    pub offset: usize,
-    pub align: usize,
-    pub span: Span,
 }
 
 /// HIR 枚举变体。
 #[derive(Debug, Clone)]
 pub struct HirVariant {
-    pub name: String,
     pub payload: HirVariantPayload,
-    pub discriminant: Option<i128>,
-    pub span: Span,
 }
 
 #[derive(Debug, Clone)]
@@ -707,8 +456,7 @@ pub enum HirVariantPayload {
 /// 整数表示。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum IntegerRepr {
-    I8, I16, I32, I64, I128, ISize,
-    U8, U16, U32, U64, U128, USize,
+    I8, I16, I32, I64, I128,
     /// 由编译器选择最小表示（默认）。
     Auto,
 }
@@ -722,8 +470,6 @@ pub enum Repr {
     C,
     /// 紧凑布局（无填充）。
     Packed,
-    /// 显式对齐。
-    Align(usize),
     /// 透明布局（与第一个字段相同，用于 FFI 新类型）。
     Transparent,
     /// SIMD 向量布局（`#[repr(simd)]`），同质向量类型。
@@ -733,33 +479,20 @@ pub enum Repr {
 /// HIR 常量。
 #[derive(Debug, Clone)]
 pub struct HirConst {
-    pub def_id: DefId,
-    pub name: String,
-    pub visibility: Visibility,
     pub ty: Ty,
     pub value: Box<HirExpr>,
-    pub span: Span,
 }
 
 /// HIR 静态变量。
 #[derive(Debug, Clone)]
 pub struct HirStatic {
-    pub def_id: DefId,
-    pub name: String,
-    pub visibility: Visibility,
-    pub mutable: bool,
     pub ty: Ty,
     pub init: Box<HirExpr>,
-    pub span: Span,
 }
 
 /// HIR trait 定义。
 #[derive(Debug, Clone)]
 pub struct HirTrait {
-    pub def_id: DefId,
-    pub name: String,
-    pub visibility: Visibility,
-    pub generics: Vec<GenericParam>,
     pub super_traits: Vec<DefId>,
     pub assoc_types: Vec<HirAssocType>,
     pub methods: Vec<HirFunction>,
@@ -768,26 +501,21 @@ pub struct HirTrait {
     pub is_marker: bool,
     /// auto trait（自动为所有类型实现，除非有显式 `!Trait` impl）。
     pub is_auto: bool,
-    pub span: Span,
 }
 
 /// 关联类型。
 #[derive(Debug, Clone)]
 pub struct HirAssocType {
     pub name: String,
-    pub bounds: Vec<DefId>,
     pub default: Option<Ty>,
-    pub span: Span,
 }
 
 /// HIR impl 块。
 #[derive(Debug, Clone)]
 pub struct HirImpl {
-    pub generics: Vec<GenericParam>,
     pub target: Ty,
     pub trait_id: Option<DefId>,
     pub where_clause: Vec<WherePred>,
-    pub items: Vec<HirFunction>,
     pub assoc_types: Vec<HirAssocType>,
     pub span: Span,
 }
@@ -801,46 +529,20 @@ pub struct HirImpl {
 pub struct Cfg {
     pub blocks: Vec<BasicBlock>,
     pub start: BasicBlockId,
-    /// 循环信息（用于 borrow checker 的 "NLL region" 分析）。
-    pub loops: Vec<LoopInfo>,
-    /// 标签 → 块映射。
-    pub labels: std::collections::HashMap<String, BasicBlockId>,
 }
 
 /// 基本块。
 #[derive(Debug, Clone)]
 pub struct BasicBlock {
-    pub id: BasicBlockId,
     pub stmts: Vec<HirStmt>,
     pub term: Terminator,
-    pub preds: Vec<BasicBlockId>,
-    pub succs: Vec<BasicBlockId>,
-    /// 支配者集合（用于 SSA 构造）。
-    pub dominators: Vec<BasicBlockId>,
-    /// 此块内定义的局部变量。
-    pub defs: Vec<LocalId>,
 }
 
 /// 终结器。
 #[derive(Debug, Clone)]
 pub enum Terminator {
-    /// 顺序执行下一块。
-    Goto(BasicBlockId),
-    /// 条件分支。
-    Branch(Box<HirExpr>, BasicBlockId, BasicBlockId),
     /// 函数返回。
-    Return(Option<Box<HirExpr>>),
+    Return,
     /// 不可达（`!` 类型）。
     Unreachable,
-    /// 发散调用（如 `abort()`）。
-    Diverge,
-}
-
-/// 循环信息。
-#[derive(Debug, Clone)]
-pub struct LoopInfo {
-    pub header: BasicBlockId,
-    pub body: Vec<BasicBlockId>,
-    /// 循环变量（用于归纳变量优化）。
-    pub induction_vars: Vec<LocalId>,
 }

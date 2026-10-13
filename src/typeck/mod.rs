@@ -20,9 +20,8 @@ use crate::parser::ast::{
     Type as AstType, UseTree,
 };
 use crate::typeck::hir::{
-    BasicBlock, BasicBlockId, BreakValue, Capture, ClosureExpr, Cfg, DefId,
-    ExprKind, FieldIndex, ForLoop, ForProtocol, HirArm, HirExpr, HirField, HirStmt,
-    InferId, LocalId, Ty, WherePred,
+    BasicBlock, BasicBlockId, Cfg, DefId, ExprKind, FieldIndex, HirArm, HirExpr,
+    HirField, HirStmt, InferId, LocalId, Ty, WherePred,
 };
 use crate::typeck::infer::InferCtxt;
 
@@ -142,14 +141,7 @@ impl TypeChecker {
             return Err(self.errors.remove(0));
         }
 
-        Ok(hir::HirModule {
-            functions,
-            type_defs: self.type_defs.values().cloned().collect(),
-            consts: self.consts.values().cloned().collect(),
-            statics: self.statics.values().cloned().collect(),
-            trait_defs: self.trait_defs.values().cloned().collect(),
-            impl_blocks: self.impl_blocks.clone(),
-        })
+        Ok(hir::HirModule { functions })
     }
 
     // ==================================================================
@@ -162,21 +154,10 @@ impl TypeChecker {
             self.functions.insert(
                 id,
                 hir::HirFunction {
-                    id,
                     name: item.name.clone(),
-                    visibility: item.visibility,
-                    attrs: item.attrs.clone(),
-                    is_async: item.is_async,
-                    is_noreturn: item.is_noreturn,
-                    is_const: item.is_const,
-                    is_default: item.is_default,
-                    abi: item.abi.clone(),
-                    generics: item.generics.clone(),
                     params: Vec::new(),
-                    receiver: None,
                     return_type: Ty::Infer(InferId(0)),
                     body: None,
-                    span: item.span,
                 },
             );
         }
@@ -190,46 +171,32 @@ impl TypeChecker {
             match td {
                 ast::TypeDef::Struct(s) => {
                     self.type_defs.insert(id, hir::HirTypeDef::Struct(hir::HirStruct {
-                        def_id: id,
                         name: s.name.clone(),
-                        visibility: s.visibility,
-                        generics: s.generics.clone(),
                         attrs: s.attrs.clone(),
                         fields: Vec::new(),
                         repr: hir::Repr::Rust,
-                        span: s.span,
                     }));
                 }
                 ast::TypeDef::Enum(e) => {
                     self.type_defs.insert(id, hir::HirTypeDef::Enum(hir::HirEnum {
-                        def_id: id,
                         name: e.name.clone(),
-                        visibility: e.visibility,
-                        generics: e.generics.clone(),
                         repr: hir::IntegerRepr::Auto,
                         variants: Vec::new(),
-                        span: e.span,
                     }));
                 }
                 ast::TypeDef::Union(u) => {
                     self.type_defs.insert(id, hir::HirTypeDef::Union(hir::HirUnion {
-                        def_id: id,
                         name: u.name.clone(),
-                        visibility: u.visibility,
-                        generics: u.generics.clone(),
                         fields: Vec::new(),
-                        span: u.span,
                     }));
                 }
-                ast::TypeDef::Alias { name: _, target, visibility, span, .. } => {
+                ast::TypeDef::Alias { name: _, target, .. } => {
                     let target_ty = self.ast_to_hir_type(target)?;
                     self.type_defs.insert(
                         id,
                         hir::HirTypeDef::Alias {
                             def_id: id,
                             target: target_ty,
-                            visibility: *visibility,
-                            span: *span,
                         },
                     );
                 }
@@ -241,16 +208,11 @@ impl TypeChecker {
             self.trait_defs.insert(
                 id,
                 hir::HirTrait {
-                    def_id: id,
-                    name: t.name.clone(),
-                    visibility: t.visibility,
-                    generics: t.generics.clone(),
                     super_traits: Vec::new(),
                     assoc_types: Vec::new(),
                     methods: Vec::new(),
                     is_marker,
                     is_auto,
-                    span: t.span,
                 },
             );
         }
@@ -259,12 +221,8 @@ impl TypeChecker {
             self.consts.insert(
                 id,
                 hir::HirConst {
-                    def_id: id,
-                    name: c.name.clone(),
-                    visibility: c.visibility,
                     ty: Ty::Infer(InferId(0)),
                     value: Box::new(self.dummy_expr()),
-                    span: c.span,
                 },
             );
         }
@@ -273,13 +231,8 @@ impl TypeChecker {
             self.statics.insert(
                 id,
                 hir::HirStatic {
-                    def_id: id,
-                    name: s.name.clone(),
-                    visibility: s.visibility,
-                    mutable: s.mutable,
                     ty: Ty::Infer(InferId(0)),
                     init: Box::new(self.dummy_expr()),
-                    span: s.span,
                 },
             );
         }
@@ -366,11 +319,7 @@ impl TypeChecker {
             fields.push(hir::HirField {
                 name: f.name.clone(),
                 ty: ty.clone(),
-                visibility: f.visibility,
                 index: idx,
-                offset,
-                align: self.infer.align_of(&ty),
-                span: f.span,
             });
         }
 
@@ -419,11 +368,7 @@ impl TypeChecker {
                             Ok(hir::HirField {
                                 name: f.name.clone(),
                                 ty,
-                                visibility: f.visibility,
                                 index: i,
-                                offset: 0,
-                                align: 0,
-                                span: f.span,
                             })
                         })
                         .collect();
@@ -431,10 +376,7 @@ impl TypeChecker {
                 }
             };
             variants.push(hir::HirVariant {
-                name: v.name.clone(),
                 payload,
-                discriminant: Some(disc),
-                span: v.span,
             });
         }
 
@@ -472,11 +414,7 @@ impl TypeChecker {
             fields.push(hir::HirField {
                 name: f.name.clone(),
                 ty,
-                visibility: f.visibility,
                 index: idx,
-                offset: 0, // 所有字段从 0 开始
-                align: al,
-                span: f.span,
             });
         }
         if let Some(hir_td) = self.type_defs.get_mut(&def_id) {
@@ -523,9 +461,7 @@ impl TypeChecker {
             // 先解析关联类型的默认值（避免与 get_mut 借用冲突）
             let assoc_types: Vec<_> = t.assoc_types.iter().map(|at| hir::HirAssocType {
                 name: at.name.clone(),
-                bounds: Vec::new(),
                 default: at.default.as_ref().and_then(|t| self.ast_to_hir_type(t).ok()),
-                span: at.span,
             }).collect();
             let hir_t = self.trait_defs.get_mut(&id).unwrap();
             hir_t.assoc_types = assoc_types;
@@ -549,29 +485,14 @@ impl TypeChecker {
             } else {
                 None
             };
-            let mut items = Vec::new();
-            for f in &ib.items {
-                let fid = self.find_def(&f.name)?;
-                items.push(self.fn_to_hir(f, fid));
-            }
-            let where_clause: Vec<_> = ib.where_clause.iter().map(|w| WherePred {
-                lhs: self.ast_to_hir_type(&w.lhs).unwrap_or(Ty::Infer(InferId(0))),
-                trait_id: DefId(0),
-                hrtb: w.for_lifetimes.iter().map(|l| hir::Region::Named(l.clone())).collect(),
-                negated: w.negated,
-                span: w.span,
-            }).collect();
+            let where_clause: Vec<_> = ib.where_clause.iter().map(|_| WherePred).collect();
             let hir_impl = hir::HirImpl {
-                generics: ib.generics.clone(),
                 target: target.clone(),
                 trait_id,
                 where_clause,
-                items,
                 assoc_types: ib.assoc_types.iter().map(|at| hir::HirAssocType {
                     name: at.name.clone(),
-                    bounds: Vec::new(),
                     default: at.default.as_ref().and_then(|t| self.ast_to_hir_type(t).ok()),
-                    span: at.span,
                 }).collect(),
                 span: ib.span,
             };
@@ -670,12 +591,8 @@ impl TypeChecker {
                 self.locals.insert(local, ty.clone());
                 self.infer.locals.insert(local, ty.clone());
                 self.scope_stack.last_mut().unwrap().push(local);
-                params.push(hir::HirParam {
-                    local,
-                    pattern: self.lower_pattern(&p.pattern, &ty)?,
-                    ty,
-                    span: p.span,
-                });
+                let _ = self.lower_pattern(&p.pattern, &ty)?;
+                params.push(hir::HirParam);
             }
 
             // 检查函数体
@@ -720,8 +637,6 @@ impl TypeChecker {
         Ok(hir::HirBlock {
             stmts,
             tail,
-            ty: expected.clone(),
-            span: b.span,
         })
     }
 
@@ -752,9 +667,7 @@ impl TypeChecker {
                 self.scope_stack.last_mut().unwrap().push(local);
                 Ok(HirStmt::Let {
                     local,
-                    ty,
                     init: init_hir,
-                    span: *span,
                 })
             }
             Statement::Var(_pat, ty_ann, init, span) => {
@@ -779,9 +692,7 @@ impl TypeChecker {
                 self.scope_stack.last_mut().unwrap().push(local);
                 Ok(HirStmt::Var {
                     local,
-                    ty,
                     init: init_hir,
-                    span: *span,
                 })
             }
             Statement::Const(name, ast_ty, value_expr, span) => {
@@ -789,16 +700,12 @@ impl TypeChecker {
                 let value = self.check_const_expr(value_expr, &ty)?;
                 let def = self.alloc_def(name.clone());
                 self.consts.insert(def, hir::HirConst {
-                    def_id: def,
-                    name: name.clone(),
-                    visibility: crate::parser::ast::Visibility::Private,
                     ty: ty.clone(),
                     value: Box::new(value),
-                    span: *span,
                 });
                 Ok(HirStmt::Item)
             }
-            Statement::Expr(e, span) => Ok(HirStmt::Expr(Box::new(self.check_expr(e, &Ty::Unit)?), *span)),
+            Statement::Expr(e, _span) => Ok(HirStmt::Expr(Box::new(self.check_expr(e, &Ty::Unit)?))),
         }
     }
 
@@ -853,7 +760,7 @@ impl TypeChecker {
                     ast::UnaryOp::AddrOf => {
                         let inner = self.infer.fresh_infer(span);
                         let ty = Ty::Reference(Box::new(inner.clone()), hir::Mutability::Immutable);
-                        return Ok(HirExpr { kind: ExprKind::AddrOf(Box::new(operand), hir::Mutability::Immutable), ty, span });
+                        return Ok(HirExpr { kind: ExprKind::AddrOf, ty, span });
                     }
                     _ => ExprKind::Unary(self.ast_unary_op(*op), Box::new(operand)),
                 }
@@ -897,23 +804,24 @@ impl TypeChecker {
                         ).ok();
                     }
                 }
-                return Ok(HirExpr { kind: ExprKind::Index(Box::new(recv), Box::new(idx)), ty: elem_ty, span });
+                return Ok(HirExpr { kind: ExprKind::Index(Box::new(recv)), ty: elem_ty, span });
             }
             Expression::Field(receiver, name, _) => {
                 let recv = self.check_expr(receiver, &Ty::Infer(InferId(0)))?;
                 let (ty, idx) = self.check_field_access(&recv.ty, name, span)?;
-                return Ok(HirExpr { kind: ExprKind::Field(Box::new(recv), idx), ty, span });
+                let _ = idx;
+                return Ok(HirExpr { kind: ExprKind::Field(Box::new(recv)), ty, span });
             }
             Expression::AddrOf(e, m, _) => {
                 let inner = self.check_expr(e, &Ty::Infer(InferId(0)))?;
                 let ty = Ty::Reference(Box::new(inner.ty.clone()), *m);
-                return Ok(HirExpr { kind: ExprKind::AddrOf(Box::new(inner), *m), ty, span });
+                return Ok(HirExpr { kind: ExprKind::AddrOf, ty, span });
             }
             Expression::Cast(e, target, _) => {
                 let target_ty = self.ast_to_hir_type(target)?;
                 let inner = self.check_expr(e, &Ty::Infer(InferId(0)))?;
                 self.validate_cast(&inner.ty, &target_ty, span)?;
-                return Ok(HirExpr { kind: ExprKind::Cast(Box::new(inner), target_ty.clone()), ty: target_ty, span });
+                return Ok(HirExpr { kind: ExprKind::Cast, ty: target_ty, span });
             }
             Expression::Block(b, _) => {
                 let inner = self.check_block(b, expected)?;
@@ -929,7 +837,7 @@ impl TypeChecker {
                     } else {
                         self.check_expr(e, expected)?;
                         // 包装为块
-                        hir::HirBlock { stmts: Vec::new(), tail: None, ty: expected.clone(), span: e.span() }
+                        hir::HirBlock { stmts: Vec::new(), tail: None }
                     };
                     Some(e_expr)
                 } else {
@@ -951,28 +859,23 @@ impl TypeChecker {
             Expression::While(cond, body, else_b, _) => {
                 let c = self.check_expr(cond, &Ty::Bool)?;
                 let b = self.check_block(body, &Ty::Unit)?;
-                let else_hir = if let Some(eb) = else_b {
+                let _else_hir = if let Some(eb) = else_b {
                     Some(self.check_block(eb, &Ty::Unit)?)
                 } else {
                     None
                 };
-                return Ok(HirExpr { kind: ExprKind::While(Box::new(c), b, else_hir), ty: Ty::Unit, span });
+                return Ok(HirExpr { kind: ExprKind::While(Box::new(c), b), ty: Ty::Unit, span });
             }
             Expression::For(_pat, iter, body, _) => {
-                let it = self.check_expr(iter, &Ty::Infer(InferId(0)))?;
+                let _it = self.check_expr(iter, &Ty::Infer(InferId(0)))?;
                 let var = self.alloc_local();
                 let var_ty = self.infer.fresh_infer(span);
                 self.locals.insert(var, var_ty.clone());
                 self.infer.locals.insert(var, var_ty.clone());
                 self.scope_stack.last_mut().unwrap().push(var);
-                let b = self.check_block(body, &Ty::Unit)?;
+                let _b = self.check_block(body, &Ty::Unit)?;
                 return Ok(HirExpr {
-                    kind: ExprKind::For(ForLoop {
-                        var,
-                        iter: Box::new(it),
-                        body: b,
-                        protocol: ForProtocol::ByValue,
-                    }),
+                    kind: ExprKind::For,
                     ty: Ty::Unit,
                     span,
                 });
@@ -982,21 +885,15 @@ impl TypeChecker {
                 return Ok(HirExpr { kind: ExprKind::Loop(b), ty: Ty::Never, span });
             }
             Expression::Break(label, value, _) => {
-                let v = if let Some(val) = value {
-                    Some(Box::new(self.check_expr(val, &Ty::Infer(InferId(0)))?))
-                } else {
-                    None
-                };
-                let bv = match (label, v) {
-                    (Some(l), Some(v)) => BreakValue::Labeled(l.clone(), v),
-                    (Some(l), None) => BreakValue::Label(l.clone()),
-                    (None, Some(v)) => BreakValue::Value(v),
-                    (None, None) => BreakValue::None,
-                };
-                return Ok(HirExpr { kind: ExprKind::Break(bv), ty: Ty::Never, span });
+                if let Some(val) = value {
+                    let _ = self.check_expr(val, &Ty::Infer(InferId(0)))?;
+                }
+                let _ = label;
+                return Ok(HirExpr { kind: ExprKind::Break, ty: Ty::Never, span });
             }
             Expression::Continue(label, _) => {
-                return Ok(HirExpr { kind: ExprKind::Break(BreakValue::Label(label.clone().unwrap_or_default())), ty: Ty::Never, span });
+                let _ = label;
+                return Ok(HirExpr { kind: ExprKind::Break, ty: Ty::Never, span });
             }
             Expression::Return(value, _) => {
                 let ret_ty = self.infer.return_ty.clone().unwrap_or(Ty::Unit);
@@ -1011,57 +908,51 @@ impl TypeChecker {
             }
             Expression::Defer(e, _) => {
                 let inner = self.check_expr(e, &Ty::Unit)?;
-                return Ok(HirExpr { kind: ExprKind::Defer(Box::new(inner)), ty: Ty::Unit, span });
+                let _ = inner;
+                return Ok(HirExpr { kind: ExprKind::Defer, ty: Ty::Unit, span });
             }
             Expression::Try(e, pat, catch, _) => {
                 let inner = self.check_expr(e, &Ty::Infer(InferId(0)))?;
-                let handler = if let Some(p) = pat {
+                if let Some(p) = pat {
                     let _ = self.lower_pattern(p, &inner.ty)?;
-                    Some(Box::new(HirExpr {
-                        kind: ExprKind::Block(self.check_block(catch, &Ty::Infer(InferId(0)))?),
-                        ty: Ty::Infer(InferId(0)),
-                        span,
-                    }))
-                } else {
-                    None
-                };
-                return Ok(HirExpr { kind: ExprKind::Try(Box::new(inner), handler), ty: Ty::Infer(InferId(0)), span });
+                    let _ = self.check_block(catch, &Ty::Infer(InferId(0)))?;
+                }
+                return Ok(HirExpr { kind: ExprKind::Try, ty: Ty::Infer(InferId(0)), span });
             }
             Expression::Throw(e, _) => {
                 let inner = self.check_expr(e, &Ty::Infer(InferId(0)))?;
-                return Ok(HirExpr { kind: ExprKind::Throw(Box::new(inner)), ty: Ty::Never, span });
+                let _ = inner;
+                return Ok(HirExpr { kind: ExprKind::Throw, ty: Ty::Never, span });
             }
             Expression::Array(elems, repeat, _) => {
                 if let Some(rep) = repeat {
                     let elem = self.infer.fresh_infer(span);
                     let _ = self.check_expr(rep, &Ty::Uint(64));
                     let first = self.check_expr(&elems[0], &elem)?;
+                    let _ = first;
                     return Ok(HirExpr {
-                        kind: ExprKind::Array(vec![first], elem.clone()),
+                        kind: ExprKind::Array,
                         ty: Ty::Array(Box::new(elem), hir::ArrayLen::Dynamic),
                         span,
                     });
                 }
                 let elem = self.infer.fresh_infer(span);
-                let mut hir_elems = Vec::new();
                 for e in elems {
-                    hir_elems.push(self.check_expr(e, &elem)?);
+                    let _ = self.check_expr(e, &elem)?;
                 }
                 return Ok(HirExpr {
-                    kind: ExprKind::Array(hir_elems, elem.clone()),
+                    kind: ExprKind::Array,
                     ty: Ty::Array(Box::new(elem), hir::ArrayLen::Dynamic),
                     span,
                 });
             }
             Expression::Tuple(elems, _) => {
-                let mut hir_elems = Vec::new();
                 let mut tys = Vec::new();
                 for e in elems {
                     let h = self.check_expr(e, &Ty::Infer(InferId(0)))?;
                     tys.push(h.ty.clone());
-                    hir_elems.push(h);
                 }
-                return Ok(HirExpr { kind: ExprKind::Tuple(hir_elems), ty: Ty::Tuple(tys), span });
+                return Ok(HirExpr { kind: ExprKind::Tuple, ty: Ty::Tuple(tys), span });
             }
             Expression::StructInit(path, fields, _) => {
                 return self.check_struct_init(path, fields, expected, span);
@@ -1074,47 +965,35 @@ impl TypeChecker {
                 let inner = self.check_expr(e, expected)?;
                 let inner_ty = inner.ty.clone();
                 let _ = self.eval_const_expr(e)?;
-                return Ok(HirExpr { kind: ExprKind::Comptime(Box::new(inner)), ty: inner_ty, span });
+                return Ok(HirExpr { kind: ExprKind::Comptime, ty: inner_ty, span });
             }
             Expression::Await(e, _) => {
                 let inner = self.check_expr(e, &Ty::Infer(InferId(0)))?;
                 return Ok(HirExpr { kind: ExprKind::Await(Box::new(inner)), ty: Ty::Infer(InferId(0)), span });
             }
             Expression::Asm(asm, _) => {
-                let outputs: Vec<_> = asm.outputs.iter().map(|o| hir::HirAsmOperand {
-                    constraint: o.constraint.clone(),
-                    expr: Box::new(self.check_expr(&o.expr, &Ty::Infer(InferId(0))).unwrap_or(HirExpr {
-                        kind: hir::ExprKind::Literal(hir::HirLiteral::Composite(Vec::new())),
-                        ty: Ty::Unit,
-                        span,
-                    })),
-                }).collect();
-                let inputs: Vec<_> = asm.inputs.iter().map(|i| hir::HirAsmOperand {
-                    constraint: i.constraint.clone(),
-                    expr: Box::new(self.check_expr(&i.expr, &Ty::Infer(InferId(0))).unwrap_or(HirExpr {
-                        kind: hir::ExprKind::Literal(hir::HirLiteral::Composite(Vec::new())),
-                        ty: Ty::Unit,
-                        span,
-                    })),
-                }).collect();
+                // 保留对 asm 操作数的类型检查（副作用）
+                for o in &asm.outputs {
+                    let _ = self.check_expr(&o.expr, &Ty::Infer(InferId(0)));
+                }
+                for i in &asm.inputs {
+                    let _ = self.check_expr(&i.expr, &Ty::Infer(InferId(0)));
+                }
                 return Ok(HirExpr {
-                    kind: ExprKind::Asm(hir::HirAsmExpr {
-                        template: asm.template.clone(),
-                        outputs,
-                        inputs,
-                        options: asm.options.clone(),
-                    }),
+                    kind: ExprKind::Asm,
                     ty: Ty::Unit,
                     span,
                 });
             }
             Expression::Yield(e, _) => {
                 let inner = self.check_expr(e, &Ty::Infer(InferId(0)))?;
-                return Ok(HirExpr { kind: ExprKind::Yield(Box::new(inner)), ty: Ty::Infer(InferId(0)), span });
+                let _ = inner;
+                return Ok(HirExpr { kind: ExprKind::Yield, ty: Ty::Infer(InferId(0)), span });
             }
             Expression::Spawn(e, _) => {
                 let inner = self.check_expr(e, &Ty::Infer(InferId(0)))?;
-                return Ok(HirExpr { kind: ExprKind::Spawn(Box::new(inner)), ty: Ty::Infer(InferId(0)), span });
+                let _ = inner;
+                return Ok(HirExpr { kind: ExprKind::Spawn, ty: Ty::Infer(InferId(0)), span });
             }
             Expression::Labeled(_label, e, _) => {
                 let inner = self.check_expr(e, expected)?;
@@ -1132,13 +1011,15 @@ impl TypeChecker {
                 let hir_types: Result<Vec<Ty>> = types.iter()
                     .map(|t| self.ast_to_hir_type(t))
                     .collect();
+                let _ = hir_types?;
+                let _ = self.lower_intrinsic(*kind);
                 let ty = match kind {
                     ast::IntrinsicKind::SizeOf | ast::IntrinsicKind::AlignOf => Ty::Uint(64),
                     ast::IntrinsicKind::TypeOf => Ty::Infer(InferId(0)),
                     _ => Ty::Infer(InferId(0)),
                 };
                 return Ok(HirExpr {
-                    kind: ExprKind::Intrinsic(self.lower_intrinsic(*kind), hir_types?),
+                    kind: ExprKind::Intrinsic,
                     ty,
                     span,
                 });
@@ -1206,7 +1087,6 @@ impl TypeChecker {
                 .with_span(span));
             }
         };
-        let mut hir_args = Vec::new();
         for (i, arg) in args.iter().enumerate() {
             let a = match arg {
                 ast::Argument::Pos(e) => e,
@@ -1217,9 +1097,9 @@ impl TypeChecker {
                 }
             };
             let param_ty = param_tys.get(i).cloned().unwrap_or_else(|| Ty::Infer(InferId(0)));
-            hir_args.push(self.check_expr(a, &param_ty)?);
+            let _ = self.check_expr(a, &param_ty)?;
         }
-        Ok(HirExpr { kind: ExprKind::Call(Box::new(callee_hir), hir_args), ty: ret_ty, span })
+        Ok(HirExpr { kind: ExprKind::Call, ty: ret_ty, span })
     }
 
     // ==================================================================
@@ -1238,13 +1118,11 @@ impl TypeChecker {
         let mut hir_arms = Vec::new();
         for arm in arms {
             let pat = self.lower_pattern(&arm.pattern, &s.ty)?;
-            let guard = if let Some(g) = &arm.guard {
-                Some(Box::new(self.check_expr(g, &Ty::Bool)?))
-            } else {
-                None
-            };
+            if let Some(g) = &arm.guard {
+                let _ = self.check_expr(g, &Ty::Bool)?;
+            }
             let body = self.check_expr(&arm.body, expected)?;
-            hir_arms.push(HirArm { pattern: pat, guard, body: Box::new(body) });
+            hir_arms.push(HirArm { pattern: pat, body: Box::new(body) });
         }
         // 记录模式用于穷尽性检查
         self.check_exhaustiveness_arm(&s.ty, &hir_arms, span)?;
@@ -1253,7 +1131,7 @@ impl TypeChecker {
         } else {
             Ty::Never
         };
-        Ok(HirExpr { kind: ExprKind::Match(Box::new(s), hir_arms), ty, span })
+        Ok(HirExpr { kind: ExprKind::Match, ty, span })
     }
 
     fn check_exhaustiveness_arm(
@@ -1301,7 +1179,6 @@ impl TypeChecker {
             ))
             .with_span(span)),
         };
-        let mut hir_fields = Vec::new();
         let mut seen = HashSet::new();
         for (name, expr) in fields {
             let field_idx = field_tys.iter().position(|(n, _)| n == name);
@@ -1324,8 +1201,7 @@ impl TypeChecker {
             }
             seen.insert(name.clone());
             let fty = &field_tys[idx].1;
-            let hir_expr = self.check_expr(expr, fty)?;
-            hir_fields.push((idx, hir_expr));
+            let _ = self.check_expr(expr, fty)?;
         }
         // 检查是否有未初始化的字段（结构体字面量要求全部初始化）
         for (name, _) in &field_tys {
@@ -1338,7 +1214,7 @@ impl TypeChecker {
             }
         }
         Ok(HirExpr {
-            kind: ExprKind::Struct(def_id, hir_fields),
+            kind: ExprKind::Struct,
             ty: Ty::Named(def_id, Vec::new()),
             span,
         })
@@ -1447,7 +1323,7 @@ impl TypeChecker {
             AstPattern::Literal(lit) => {
                 let (kind, _) = self.check_literal(lit, ty)?;
                 match kind {
-                    ExprKind::Literal(l) => hir::HirPattern::Literal(l),
+                    ExprKind::Literal(_) => hir::HirPattern::Literal,
                     _ => hir::HirPattern::Wildcard,
                 }
             }
@@ -1458,10 +1334,10 @@ impl TypeChecker {
                 self.scope_stack.last_mut().unwrap().push(local);
                 let _ = mutability;
                 if let Some(s) = sub {
-                    let inner = self.lower_pattern(s, ty)?;
-                    hir::HirPattern::Ref(Box::new(inner), hir::Mutability::Immutable)
+                    let _ = self.lower_pattern(s, ty)?;
+                    hir::HirPattern::Ref
                 } else {
-                    hir::HirPattern::Binding(local, ty.clone())
+                    hir::HirPattern::Binding
                 }
             }
             AstPattern::Tuple(pats, _) => {
@@ -1472,7 +1348,8 @@ impl TypeChecker {
                 let hir_pats: Result<Vec<_>> = pats.iter().enumerate()
                     .map(|(i, p)| self.lower_pattern(p, elem_tys.get(i).unwrap_or(ty)))
                     .collect();
-                hir::HirPattern::Tuple(hir_pats?, ty.clone())
+                let _ = hir_pats?;
+                hir::HirPattern::Tuple
             }
             AstPattern::Struct { path, fields, rest, span } => {
                 let def_id = self.resolve_path(path, *span)?;
@@ -1482,7 +1359,9 @@ impl TypeChecker {
                         Ok((0, self.lower_pattern(&fp.pattern, &fty)?))
                     })
                     .collect();
-                hir::HirPattern::Struct { def_id, fields: hir_fields?, rest: *rest }
+                let _ = hir_fields?;
+                let _ = rest;
+                hir::HirPattern::Struct
             }
             AstPattern::Variant { path, args, span } => {
                 let def_id = self.resolve_path(&path[..path.len()-1], *span)?;
@@ -1492,18 +1371,23 @@ impl TypeChecker {
                 let hir_args: Result<Vec<_>> = args.iter().enumerate()
                     .map(|(i, p)| self.lower_pattern(p, payload_tys.get(i).unwrap_or(ty)))
                     .collect();
-                hir::HirPattern::Variant { enum_id: def_id, variant: variant_idx, args: hir_args? }
+                let _ = hir_args?;
+                hir::HirPattern::Variant
             }
             AstPattern::Slice(pats, _) => {
-                hir::HirPattern::Slice(pats.iter().map(|p| self.lower_pattern(p, ty)).collect::<Result<_>>()?, None, Vec::new())
+                let _ = pats.iter().map(|p| self.lower_pattern(p, ty)).collect::<Result<Vec<_>>>()?;
+                hir::HirPattern::Slice
             }
             AstPattern::Range(start, end, inclusive, _) => {
                 let s = self.check_expr(start, &Ty::Infer(InferId(0)))?;
                 let en = self.check_expr(end, &Ty::Infer(InferId(0)))?;
-                hir::HirPattern::Range(Box::new(s), Box::new(en), if *inclusive { hir::RangeInclusivity::Inclusive } else { hir::RangeInclusivity::Exclusive })
+                let _ = (s, en, inclusive);
+                hir::HirPattern::Range
             }
             AstPattern::Ref(inner, mutability, _) => {
-                hir::HirPattern::Ref(Box::new(self.lower_pattern(inner, ty)?), *mutability)
+                let _ = self.lower_pattern(inner, ty)?;
+                let _ = mutability;
+                hir::HirPattern::Ref
             }
         })
     }
@@ -1550,14 +1434,8 @@ impl TypeChecker {
             hir_params.push((self.lower_pattern(p, &ty)?, ty.clone()));
         }
         let ret_ty = ret.as_ref().map(|t| self.ast_to_hir_type(t)).unwrap_or_else(|| Ok(self.infer.fresh_infer(span)))?;
-        let body_expr = HirExpr {
-            kind: ExprKind::Block(self.check_block(body, &ret_ty)?),
-            ty: ret_ty.clone(),
-            span,
-        };
+        let _ = self.check_block(body, &ret_ty)?;
         self.pop_scope();
-        // 捕获分析
-        let captures = self.compute_captures(&body_expr);
         let fn_ty = Ty::Function {
             params: hir_params.iter().map(|(_, t)| t.clone()).collect(),
             ret: Box::new(ret_ty),
@@ -1565,21 +1443,10 @@ impl TypeChecker {
             abi: Abi::Zr,
         };
         Ok(HirExpr {
-            kind: ExprKind::Closure(Box::new(ClosureExpr {
-                params: hir_params,
-                captures,
-                ty: fn_ty.clone(),
-                body: body_expr,
-            })),
+            kind: ExprKind::Closure,
             ty: fn_ty,
             span,
         })
-    }
-
-    fn compute_captures(&self, _body: &HirExpr) -> Vec<Capture> {
-        // 分析闭包体引用了哪些外部局部变量，
-        // 按使用方式（读 / 写）决定按值还是按引用捕获。
-        Vec::new()
     }
 
     fn analyze_closures(&self, _functions: &[hir::HirFunction]) -> Result<()> {
@@ -1609,22 +1476,14 @@ impl TypeChecker {
         let start = self.alloc_bb();
         cfg.start = start;
         let mut bb = BasicBlock {
-            id: start,
             stmts: Vec::new(),
             term: hir::Terminator::Unreachable,
-            preds: Vec::new(),
-            succs: Vec::new(),
-            dominators: Vec::new(),
-            defs: Vec::new(),
         };
         for s in &block.stmts {
             bb.stmts.push(s.clone());
         }
-        if let Some(tail) = &block.tail {
-            bb.term = hir::Terminator::Return(Some(tail.clone()));
-        } else {
-            bb.term = hir::Terminator::Return(None);
-        }
+        let _ = &block.tail;
+        bb.term = hir::Terminator::Return;
         cfg.blocks.push(bb);
         Ok(cfg)
     }
@@ -1648,9 +1507,8 @@ impl TypeChecker {
     }
 
     fn alloc_bb(&mut self) -> BasicBlockId {
-        let id = BasicBlockId(self.next_bb);
         self.next_bb += 1;
-        id
+        BasicBlockId
     }
 
     fn find_def(&self, name: &str) -> Result<DefId> {
@@ -1894,9 +1752,9 @@ impl TypeChecker {
     fn check_assignable(&self, expr: &HirExpr) -> Result<()> {
         match &expr.kind {
             ExprKind::Local(_) => Ok(()),
-            ExprKind::Field(inner, _) => self.check_assignable(inner),
+            ExprKind::Field(inner) => self.check_assignable(inner),
             ExprKind::Deref(inner) => self.check_assignable(inner),
-            ExprKind::Index(inner, _) => self.check_assignable(inner),
+            ExprKind::Index(inner) => self.check_assignable(inner),
             _ => Err(CompileError::type_error(
                 "expression is not assignable (expected variable, field, deref, or index)",
             )
@@ -1908,23 +1766,12 @@ impl TypeChecker {
     // AST → HIR 转换辅助
     // ==================================================================
 
-    fn fn_to_hir(&self, f: &ast::Function, id: DefId) -> hir::HirFunction {
+    fn fn_to_hir(&self, f: &ast::Function, _id: DefId) -> hir::HirFunction {
         hir::HirFunction {
-            id,
             name: f.name.clone(),
-            visibility: f.visibility,
-            attrs: f.attrs.clone(),
-            is_async: f.is_async,
-            is_noreturn: f.is_noreturn,
-            is_const: f.is_const,
-            is_default: f.is_default,
-            abi: f.abi.clone(),
-            generics: f.generics.clone(),
             params: Vec::new(),
-            receiver: None,
             return_type: Ty::Infer(InferId(0)),
             body: None,
-            span: f.span,
         }
     }
 
@@ -2248,8 +2095,8 @@ fn check_overlap(
 ///   - 有更多 where 约束的更 specific
 fn is_more_specific(a: &hir::HirImpl, b: &hir::HirImpl) -> bool {
     // 具体类型比泛型参数更 specific
-    let a_is_concrete = !matches!(a.target, Ty::Param(_) | Ty::Infer(_));
-    let b_is_concrete = !matches!(b.target, Ty::Param(_) | Ty::Infer(_));
+    let a_is_concrete = !matches!(a.target, Ty::Infer(_));
+    let b_is_concrete = !matches!(b.target, Ty::Infer(_));
     if a_is_concrete && !b_is_concrete {
         return true;
     }
@@ -2265,8 +2112,6 @@ fn types_may_overlap(a: &Ty, b: &Ty) -> bool {
     match (a, b) {
         // 相同的命名类型可能重叠
         (Ty::Named(id1, _), Ty::Named(id2, _)) => id1 == id2,
-        // 泛型参数可能与任何类型重叠
-        (Ty::Param(_), _) | (_, Ty::Param(_)) => true,
         // 推断变量可能与任何类型重叠
         (Ty::Infer(_), _) | (_, Ty::Infer(_)) => true,
         // 指针/引用：检查内部类型
@@ -2304,13 +2149,8 @@ fn ty_name(ty: &Ty) -> String {
         Ty::Function { .. } => "fn(...)".into(),
         Ty::Optional(t) => format!("{}?", ty_name(t)),
         Ty::ErrorUnion(t, e) => format!("{}!{}", ty_name(t), ty_name(e)),
-        Ty::Param(g) => format!("T{}", g.0),
         Ty::Infer(_) => "_".into(),
-        Ty::Alias(t) => ty_name(t),
         Ty::Opaque(id) => format!("opaque({})", id.0),
         Ty::Pin(inner) => format!("Pin<{}>", ty_name(inner)),
-        Ty::Projection { self_ty, trait_id, assoc_name } => {
-            format!("<{} as trait#{}>::{}", ty_name(self_ty), trait_id.0, assoc_name)
-        }
     }
 }
