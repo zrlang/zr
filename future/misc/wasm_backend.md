@@ -1,6 +1,6 @@
 # WebAssembly Backend
 
-## Status: 📐 Designed, not started
+## Status: ✅ Done
 
 ## Goal
 `zr compile --target wasm32-unknown-unknown` produces a valid `.wasm` module

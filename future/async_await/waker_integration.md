@@ -1,6 +1,6 @@
 # Waker / Context Integration
 
-## Status: ⬜ Not implemented
+## Status: ✅ Done
 
 ## Problem
 `.await` needs a way to register interest in readiness and be notified when an

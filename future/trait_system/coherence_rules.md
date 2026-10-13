@@ -1,6 +1,6 @@
 # Trait Coherence Rules
 
-## Status: 📐 Designed
+## Status: ✅ Done
 
 ## Problem
 Two independent crates must never be able to define overlapping impls that

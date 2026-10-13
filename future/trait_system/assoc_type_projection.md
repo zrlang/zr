@@ -1,6 +1,6 @@
 # Associated Type Projection
 
-## Status: 🔧 Partial
+## Status: ✅ Done
 
 ## Problem
 Given `<T as Iterator>::Item`, the compiler must normalize the projection to a

@@ -1,6 +1,6 @@
 # DWARF Debug Info
 
-## Status: ⬜ Not implemented
+## Status: ✅ Done
 
 ## Goal
 Emit standard DWARFv5 `.debug_*` sections so `zr` binaries can be debugged

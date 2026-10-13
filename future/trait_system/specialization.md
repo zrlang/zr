@@ -1,6 +1,6 @@
 # Specialization
 
-## Status: ⬜ Not implemented
+## Status: ✅ Done
 
 ## Problem
 Allow `impl<T> Trait for T` to be specialized by a more specific impl

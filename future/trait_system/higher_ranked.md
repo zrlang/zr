@@ -1,6 +1,6 @@
 # Higher-Ranked Trait Bounds (HRTB)
 
-## Status: ⬜ Not implemented
+## Status: ✅ Done
 
 ## Problem
 `for<'a> fn(&'a T)` requires the trait bound to hold for *all* lifetimes `'a`.

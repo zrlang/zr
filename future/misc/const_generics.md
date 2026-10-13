@@ -1,6 +1,6 @@
 # Const Generics
 
-## Status: ⬜ Not implemented
+## Status: ✅ Done
 
 ## Goal
 Allow types to be parameterized by values, not just other types:

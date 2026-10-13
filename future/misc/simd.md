@@ -1,6 +1,6 @@
 # SIMD Intrinsics
 
-## Status: ⬜ Not implemented
+## Status: ✅ Done
 
 ## Goal
 Expose portable SIMD via a `std::simd` module (modeled on `std::simd` in

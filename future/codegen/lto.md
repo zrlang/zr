@@ -1,6 +1,6 @@
 # Link-Time Optimization (LTO)
 
-## Status: ⬜ Not implemented
+## Status: ✅ Done
 
 ## Why
 Whole-program optimization (inlining across crate boundaries, dead-code

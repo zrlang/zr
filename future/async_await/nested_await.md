@@ -1,6 +1,6 @@
 # Nested `.await`
 
-## Status: ⬜ Not implemented
+## Status: ✅ Done
 
 ## Problem
 `.await` inside closures, `match` arms, `if` expressions and blocks must all

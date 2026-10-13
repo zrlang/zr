@@ -1,6 +1,6 @@
 # Pinning & Move Safety
 
-## Status: ⬜ Not implemented
+## Status: ✅ Done
 
 ## Problem
 `!Unpin` types (e.g. self-referential async state machines) must not be moved

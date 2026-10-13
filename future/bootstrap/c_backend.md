@@ -1,6 +1,6 @@
 # C Backend
 
-## Status: ⬜ Not started
+## Status: ✅ Done
 
 ## Why C?
 C is the universal bootstrap target: every platform has a C compiler, so a C

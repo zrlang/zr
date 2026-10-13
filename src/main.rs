@@ -27,6 +27,7 @@ mod parser;
 mod ssa;
 mod typeck;
 mod zr0;
+mod zpm;
 
 use std::env;
 use std::path::Path;

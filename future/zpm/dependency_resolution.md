@@ -1,6 +1,6 @@
 # Dependency Resolution Algorithm
 
-## Status: 🔧 Partial (basic backtracking works, no features yet)
+## Status: ✅ Done
 
 ## Algorithm: PubGrub (adapted)
 1. Incompatibilities are sets of (package, version range) tuples.

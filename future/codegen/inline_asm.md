@@ -1,6 +1,6 @@
 # Inline Assembly (`asm!`)
 
-## Status: ⬜ Not implemented
+## Status: ✅ Done
 
 ## Goal
 Provide a stable inline-asm syntax so systems programmers can drop to

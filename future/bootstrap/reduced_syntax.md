@@ -1,6 +1,6 @@
 # Reduced Syntax for `zr0`
 
-## Status: ⬜ Not started
+## Status: ✅ Done
 
 ## Goal
 Define the smallest possible grammar that is still useful and can be compiled

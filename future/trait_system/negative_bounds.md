@@ -1,6 +1,6 @@
 # Negative Trait Bounds
 
-## Status: ⬜ Not implemented
+## Status: ✅ Done
 
 ## Problem
 `where T: !Trait` expresses that `T` must *not* implement `Trait`. This is

@@ -1,6 +1,6 @@
 # `impl Trait` (RPIT & APIT)
 
-## Status: 🔧 Partial
+## Status: ✅ Done
 
 ## Problem
 `impl Trait` in return position (RPIT) hides the concrete type; in argument

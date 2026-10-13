@@ -1,6 +1,6 @@
 # Profile-Guided Optimization (PGO)
 
-## Status: ⬜ Not implemented
+## Status: ✅ Done
 
 ## Workflow
 ```

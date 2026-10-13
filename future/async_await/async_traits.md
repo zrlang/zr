@@ -1,6 +1,6 @@
 # `async` in Traits
 
-## Status: ⬜ Not implemented
+## Status: ✅ Done
 
 ## Problem
 `async fn` in traits is not object-safe (it desugars to `-> impl Future` which
