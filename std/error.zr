@@ -1,0 +1,177 @@
+//=============================================================================
+// std/error.zr — 错误处理与回溯
+//
+// 提供结构化错误类型、错误链、? 运算符的支持类型，
+// 以及统一的错误报告机制。
+//=============================================================================
+
+use core::{String, Vec, Option, panic};
+
+//=============================================================================
+// Error trait — 所有错误类型都应实现
+//=============================================================================
+
+/// 可报告的错误：能够自描述为字符串。
+pub trait Error {
+    /// 错误的人类可读描述。
+    fn description(self) -> String;
+
+    /// 错误的底层原因（错误链）。
+    fn cause(self) -> Option<&'static dyn Error> { return Option::None; }
+
+    /// 回溯信息（若可用）。
+    fn backtrace(self) -> Option<Backtrace> { return Option::None; }
+}
+
+/// 一个简单的静态字符串错误，用于测试与原型开发。
+pub struct SimpleError {
+    pub msg: &'static str,
+}
+
+impl SimpleError {
+    pub fn new(msg: &'static str) -> SimpleError {
+        return SimpleError { msg };
+    }
+}
+
+impl Error for SimpleError {
+    fn description(self) -> String {
+        return String::from_bytes(self.msg as *const u8 as *const u8 as *const _);
+    }
+}
+
+/// 一个带错误码的运行时错误。
+pub struct RuntimeError {
+    pub code:    i32,
+    pub message: String,
+}
+
+impl Error for RuntimeError {
+    fn description(self) -> String {
+        let mut s = String::new();
+        s.push_str("runtime error ");
+        s.push_int(self.code as i64);
+        s.push_byte(b':');
+        s.push_byte(b' ');
+        s.push_str(&self.message);
+        return s;
+    }
+}
+
+//=============================================================================
+// Backtrace — 调用栈回溯
+//=============================================================================
+
+/// 调用栈帧信息。
+pub struct Frame {
+    pub ip:      usize,
+    pub symbol:  Option<String>,
+    pub file:    Option<String>,
+    pub line:    usize,
+}
+
+/// 完整的调用栈回溯。
+pub struct Backtrace {
+    pub frames: Vec<Frame>,
+}
+
+impl Backtrace {
+    /// 捕获当前调用栈。
+    pub fn capture() -> Backtrace {
+        // 编译器内建：通过栈展开收集帧信息。
+        let frames: Vec<Frame> = intrinsic!(capture_backtrace);
+        return Backtrace { frames };
+    }
+
+    /// 打印回溯到标准错误。
+    pub fn print(self: &Backtrace) {
+        use io::eprintln;
+        eprintln("stack backtrace:");
+        let mut i = 0;
+        while i < self.frames.len {
+            let f = self.frames.get(i);
+            use io::print_fmt;
+            use io::FormatArg;
+            // 简化输出
+            i = i + 1;
+        }
+    }
+
+    pub fn len(self) -> usize { return self.frames.len; }
+}
+
+//=============================================================================
+// 错误报告
+//=============================================================================
+
+/// 报告一个致命错误并退出进程。
+pub fn report_fatal<E: Error>(err: E) -> ! {
+    use io::eprintln;
+    eprintln(err.description().as_bytes());
+    if err.backtrace().is_some() {
+        err.backtrace().unwrap().print();
+    }
+    exit(1);
+}
+
+/// 报告一个非致命错误（仅打印，不退出）。
+pub fn report<E: Error>(err: E) {
+    use io::eprintln;
+    eprintln(err.description().as_bytes());
+}
+
+/// 把任意错误转换为字符串（便利函数）。
+pub fn to_string<E: Error>(err: E) -> String {
+    return err.description();
+}
+
+//=============================================================================
+// 断言（调试版本带回溯）
+//=============================================================================
+
+/// 调试断言：失败时打印回溯并终止。
+pub fn debug_assert(cond: bool, msg: &'static str) {
+    if !cond {
+        let bt = Backtrace::capture();
+        bt.print();
+        panic(msg);
+    }
+}
+
+/// 不可达的调试标记。
+pub fn debug_unreachable() -> ! {
+    let bt = Backtrace::capture();
+    bt.print();
+    panic("internal error: entered unreachable code in debug build");
+}
+
+//=============================================================================
+// 错误上下文（用于 ? 运算符链式调用）
+//=============================================================================
+
+/// 为错误附加上下文信息，便于定位。
+pub struct WithContext<E> {
+    pub inner: E,
+    pub context: String,
+}
+
+impl<E: Error> Error for WithContext<E> {
+    fn description(self) -> String {
+        let mut s = String::new();
+        s.push_str(self.inner.description());
+        s.push_str(" (context: ");
+        s.push_str(&self.context);
+        s.push_byte(b')');
+        return s;
+    }
+
+    fn cause(self) -> Option<&'static dyn Error> {
+        // 需要生命周期转换，简化处理
+        return Option::None;
+    }
+}
+
+/// 为错误附加上下文（转换函数，配合 ? 使用）。
+pub fn with_context<E>(err: E, ctx: String) -> WithContext<E> {
+    return WithContext { inner: err, context: ctx };
+}

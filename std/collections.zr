@@ -1,0 +1,243 @@
+//=============================================================================
+// std/collections.zr — Vec<T> 动态数组
+//
+// 提供可增长的连续存储容器 Vec，支持 push / pop / insert / remove / sort 等。
+//=============================================================================
+
+use core::{
+    zr_alloc, zr_dealloc, zr_realloc,
+    Option, Result, panic,
+    size_of,
+};
+
+//=============================================================================
+// Vec<T> — 可增长的连续容器
+//=============================================================================
+
+pub struct Vec<T> {
+    pub data:     *mut T,
+    pub len:      usize,
+    pub capacity: usize,
+}
+
+impl<T> Vec<T> {
+    /// 创建一个空 Vec。
+    pub fn new() -> Vec<T> {
+        return Vec {
+            data:     0 as *mut T,
+            len:      0,
+            capacity: 0,
+        };
+    }
+
+    /// 以给定容量创建 Vec。
+    pub fn with_capacity(cap: usize) -> Vec<T> {
+        if cap == 0 { return Vec::new(); }
+        let data = zr_alloc(size_of::<T>() * cap, 8) as *mut T;
+        if data == 0 as *mut T { panic("out of memory"); }
+        return Vec { data, len: 0, capacity: cap };
+    }
+
+    /// 创建包含 `count` 个 `value` 副本的 Vec。
+    pub fn filled(count: usize, value: T) -> Vec<T>
+    where T: Copy
+    {
+        let mut v = Vec::with_capacity(count);
+        let mut i = 0;
+        while i < count {
+            v.push(value);
+            i = i + 1;
+        }
+        return v;
+    }
+
+    pub fn len(self) -> usize { return self.len; }
+
+    pub fn capacity(self) -> usize { return self.capacity; }
+
+    pub fn is_empty(self) -> bool { return self.len == 0; }
+
+    /// 预留至少 `additional` 的额外容量。
+    pub fn reserve(self: &mut Vec<T>, additional: usize) {
+        if self.len + additional > self.capacity {
+            let mut new_cap = if self.capacity == 0 { 2 } else { self.capacity };
+            while self.len + additional > new_cap {
+                new_cap = new_cap * 2;
+            }
+            self.grow_to(new_cap);
+        }
+    }
+
+    fn grow_to(self: &mut Vec<T>, new_cap: usize) {
+        let new_data = zr_realloc(
+            self.data as *mut void,
+            size_of::<T>() * self.capacity,
+            size_of::<T>() * new_cap,
+            8,
+        ) as *mut T;
+        if new_data == 0 as *mut T { panic("out of memory"); }
+        self.data = new_data;
+        self.capacity = new_cap;
+    }
+
+    /// 把容量缩减到恰好容纳现有元素。
+    pub fn shrink_to_fit(self: &mut Vec<T>) {
+        if self.len == 0 {
+            if self.data != 0 as *mut T {
+                zr_dealloc(self.data as *mut void, size_of::<T>() * self.capacity, 8);
+                self.data = 0 as *mut T;
+                self.capacity = 0;
+            }
+            return;
+        }
+        if self.len < self.capacity {
+            self.grow_to(self.len);
+        }
+    }
+
+    /// 在末尾追加一个元素。
+    pub fn push(self: &mut Vec<T>, value: T) {
+        self.reserve(1);
+        self.data[self.len] = value;
+        self.len = self.len + 1;
+    }
+
+    /// 弹出末尾元素，空时返回 None。
+    pub fn pop(self: &mut Vec<T>) -> Option<T> {
+        if self.len == 0 { return Option::None; }
+        self.len = self.len - 1;
+        return Option::Some(self.data[self.len]);
+    }
+
+    /// 取出指定位置的元素，越界 panic。
+    pub fn get(self, index: usize) -> T {
+        if index >= self.len { panic("Vec: index out of range"); }
+        return self.data[index];
+    }
+
+    /// 取出指定位置的元素的引用。
+    pub fn get_ref(self, index: usize) -> *const T {
+        if index >= self.len { panic("Vec: index out of range"); }
+        return &self.data[index] as *const T;
+    }
+
+    /// 取出指定位置的可变引用。
+    pub fn get_mut(self: &mut Vec<T>, index: usize) -> *mut T {
+        if index >= self.len { panic("Vec: index out of range"); }
+        return &self.data[index] as *const T as *mut T;
+    }
+
+    /// 在 `index` 处插入元素，其后元素后移。
+    pub fn insert(self: &mut Vec<T>, index: usize, value: T) {
+        if index > self.len { panic("Vec: insert index out of range"); }
+        self.reserve(1);
+        // 后移
+        let mut i = self.len;
+        while i > index {
+            self.data[i] = self.data[i - 1];
+            i = i - 1;
+        }
+        self.data[index] = value;
+        self.len = self.len + 1;
+    }
+
+    /// 移除 `index` 处的元素并返回它，其后元素前移。
+    pub fn remove(self: &mut Vec<T>, index: usize) -> Option<T> {
+        if index >= self.len { return Option::None; }
+        let value = self.data[index];
+        let mut i = index;
+        while i < self.len - 1 {
+            self.data[i] = self.data[i + 1];
+            i = i + 1;
+        }
+        self.len = self.len - 1;
+        return Option::Some(value);
+    }
+
+    /// 清空所有元素，保留容量。
+    pub fn clear(self: &mut Vec<T>) {
+        self.len = 0;
+    }
+
+    /// 判断包含某元素。
+    pub fn contains(self, item: T) -> bool
+    where T: Eq
+    {
+        let mut i = 0;
+        while i < self.len {
+            if self.data[i].eq(item) { return true; }
+            i = i + 1;
+        }
+        return false;
+    }
+
+    /// 查找元素，返回索引。
+    pub fn index_of(self, item: T) -> Option<usize>
+    where T: Eq
+    {
+        let mut i = 0;
+        while i < self.len {
+            if self.data[i].eq(item) { return Option::Some(i); }
+            i = i + 1;
+        }
+        return Option::None;
+    }
+
+    /// 原地排序。
+    pub fn sort(self: &mut Vec<T>)
+    where T: Ord
+    {
+        // 插入排序
+        let mut i = 1;
+        while i < self.len {
+            let mut j = i;
+            while j > 0 && self.data[j - 1].gt(self.data[j]) {
+                let tmp = self.data[j];
+                self.data[j] = self.data[j - 1];
+                self.data[j - 1] = tmp;
+                j = j - 1;
+            }
+            i = i + 1;
+        }
+    }
+
+    /// 取出一个切片视图。
+    pub fn as_slice(self) -> []const T {
+        return Slice { ptr: self.data as *const T, len: self.len };
+    }
+
+    /// 取出可变切片视图。
+    pub fn as_mut_slice(self) -> []mut T {
+        return SliceMut { ptr: self.data, len: self.len };
+    }
+
+    /// 释放整个 Vec（包括元素析构）。
+    pub fn destroy(self: &mut Vec<T>)
+    where T: 'static  // 逻辑上：要求 T 可析构
+    {
+        if self.data != 0 as *mut T {
+            // 逐个析构元素
+            let mut i = 0;
+            while i < self.len {
+                // 调用元素的析构逻辑（编译期内建）
+                intrinsic!(drop self.data[i]);
+                i = i + 1;
+            }
+            zr_dealloc(self.data as *mut void, size_of::<T>() * self.capacity, 8);
+            self.data = 0 as *mut T;
+            self.len = 0;
+            self.capacity = 0;
+        }
+    }
+}
+
+/// 用给定元素填满一个 Vec 到指定长度。
+pub fn vec_from_array<T: Copy>(arr: []const T) -> Vec<T> {
+    let mut v = Vec::with_capacity(arr.len);
+    let mut i = 0;
+    while i < arr.len {
+        v.push(arr.ptr[i]);
+        i = i + 1;
+    }
+    return v;
+}

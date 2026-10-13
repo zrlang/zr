@@ -1,0 +1,201 @@
+//=============================================================================
+// async_server.zr — 异步 TCP 回声服务器
+//
+// 演示 zr 的 async/await、协程、通道与组合子。
+// 真实网络 I/O 需运行时对接 epoll/io_uring，本例以模拟方式展示架构。
+//=============================================================================
+
+use core::{Option, Result, panic};
+use async::{
+    Executor, Task, spawn, yield_now, sleep, channel,
+    Sender, Receiver, Join2, Race,
+};
+use io::{println, println_int};
+
+//=============================================================================
+// 模拟的网络连接
+//=============================================================================
+
+pub struct Connection {
+    pub id:     u64,
+    pub buf:    [u8; 1024],
+    pub filled: usize,
+}
+
+impl Connection {
+    pub fn new(id: u64) -> Connection {
+        return Connection { id, buf: [0; 1024], filled: 0 };
+    }
+
+    /// 异步读取数据（模拟）。真实实现会 await 一个 I/O Future。
+    pub async fn read(self: &mut Connection, n: usize) -> usize {
+        await sleep(10);  // 模拟 I/O 延迟
+        self.filled = n;
+        return n;
+    }
+
+    /// 异步写入数据（模拟）。
+    pub async fn write(self: &mut Connection, data: []const u8) -> usize {
+        await sleep(5);
+        return data.len;
+    }
+}
+
+//=============================================================================
+// 连接处理器（每个连接一个协程）
+//=============================================================================
+
+/// 处理单个客户端连接：读取后回写。
+async fn handle_connection(conn: &mut Connection) -> Result<(), &'static str> {
+    println("connection accepted: ");
+    println_int(conn.id as i64);
+
+    // 读取请求
+    let n = await conn.read(64);
+    println("read ");
+    println_int(n as i64);
+    println(" bytes");
+
+    // 构造响应：简单的回声
+    let response: [u8; 13] = *"echo: hello\n" as *const u8 as *const [u8; 13];
+    let written = await conn.write(Slice { ptr: &response[0] as *const u8, len: 13 });
+    println("wrote ");
+    println_int(written as i64);
+    println(" bytes");
+
+    return Result::Ok(());
+}
+
+//=============================================================================
+// 主服务器循环
+//=============================================================================
+
+/// 接受新连接并把它们分发给 worker 协程。
+async fn accept_loop(port: u16) -> ! {
+    println("server listening on port ");
+    println_int(port as i64);
+    println("");
+
+    let mut executor = Executor::new();
+    let mut conn_id: u64 = 0;
+
+    loop {
+        // 模拟接受新连接（每 100ms 来一个）
+        await sleep(100);
+        conn_id = conn_id + 1;
+        let mut conn = Connection::new(conn_id);
+
+        // spawn 一个协程处理它
+        spawn(handle_connection(&mut conn));
+        println("spawned handler for connection ");
+        println_int(conn_id as i64);
+    }
+}
+
+/// 优雅关闭：等待所有连接处理完毕（简化版）。
+async fn shutdown_signal() -> () {
+    await sleep(5000);
+    println("shutdown signal received");
+}
+
+//=============================================================================
+// 并发组合子演示
+//=============================================================================
+
+/// 并发地请求两个上游服务，取较快的那个。
+async fn fetch_with_fallback() -> String {
+    let fast = async {
+        await sleep(50);
+        return String::from_bytes("from cache");
+    };
+    let slow = async {
+        await sleep(200);
+        return String::from_bytes("from origin");
+    };
+
+    // Race：谁先完成用谁
+    let result = await Race::new(fast, slow);
+    return result;
+}
+
+/// 并发地请求两个服务并合并结果。
+async fn fetch_parallel() -> (String, String) {
+    let a = async {
+        await sleep(100);
+        return String::from_bytes("result A");
+    };
+    let b = async {
+        await sleep(150);
+        return String::from_bytes("result B");
+    };
+
+    // Join：等待两者都完成
+    return await Join2::new(a, b);
+}
+
+//=============================================================================
+// 通道通信演示
+//=============================================================================
+
+/// 生产者协程：往通道发送数据。
+async fn producer(ch: &mut Sender<i32>, count: i32) {
+    let mut i = 0;
+    while i < count {
+        ch.send(i);
+        i = i + 1;
+        await yield_now();
+    }
+}
+
+/// 消费者协程：从通道接收数据。
+async fn consumer(ch: &mut Receiver<i32>, expected: i32) {
+    let mut received = 0;
+    while received < expected {
+        let v = await ch.recv();
+        received = received + 1;
+        println("consumer got: ");
+        println_int(v as i64);
+    }
+}
+
+/// 用通道协调两个协程。
+async fn channel_demo() {
+    let (mut tx, mut rx) = channel<i32>(16);
+    spawn(producer(&mut tx, 5));
+    spawn(consumer(&mut rx, 5));
+}
+
+//=============================================================================
+// 主入口
+//=============================================================================
+
+fn main() -> i32 {
+    println("=== zr async server demo ===");
+    println("");
+
+    // 启动异步运行时
+    let mut executor = Executor::new();
+
+    // 提交任务
+    executor.spawn(accept_loop(8080));
+    executor.spawn(shutdown_signal());
+
+    // 并发组合子示例
+    let race_result = executor.block_on(fetch_with_fallback());
+    println("race result: ");
+    println(race_result.as_bytes());
+
+    let (a, b) = executor.block_on(fetch_parallel());
+    println("parallel A: ");
+    print(a.as_bytes());
+    println(" B: ");
+    print(b.as_bytes());
+
+    // 通道示例
+    executor.block_on(channel_demo());
+
+    // 运行事件循环
+    executor.run();
+
+    return 0;
+}

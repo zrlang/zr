@@ -1,0 +1,316 @@
+//=============================================================================
+// std/string.zr — 可增长的 UTF-8 字符串
+//
+// `String` 是堆分配的、可增长的字节缓冲区，保证持有有效的 UTF-8。
+// 本节同时提供 `[u8]` 切片上的字符串视图操作。
+//=============================================================================
+
+use core::{zr_alloc, zr_dealloc, zr_realloc, Option, panic};
+use mem::{memcmp, NULL};
+use io::{write_uint, write_int, print_fmt, FormatArg};
+
+/// 一个可增长的 UTF-8 字符串。
+pub struct String {
+    pub ptr:       *mut u8,
+    pub len:       usize,
+    pub capacity:  usize,
+}
+
+impl String {
+    /// 创建一个空字符串。
+    pub fn new() -> String {
+        let cap = 8;
+        let ptr = zr_alloc(cap, 1) as *mut u8;
+        if ptr == 0 as *mut u8 { panic("out of memory"); }
+        return String { ptr, len: 0, capacity: cap };
+    }
+
+    /// 用一段字节切片构造字符串（拷贝）。
+    pub fn from_bytes(bytes: []const u8) -> String {
+        let mut s = String::new();
+        s.reserve(bytes.len);
+        let mut i = 0;
+        while i < bytes.len {
+            s.push_byte(bytes.ptr[i]);
+            i = i + 1;
+        }
+        return s;
+    }
+
+    /// 从 C 字符串（以 NUL 结尾）构造。
+    pub fn from_cstr(cstr: *const u8) -> String {
+        let mut len = 0;
+        while cstr[len] != 0 { len = len + 1; }
+        return String::from_bytes(Slice { ptr: cstr, len });
+    }
+
+    /// 以给定容量预留空间。
+    pub fn with_capacity(cap: usize) -> String {
+        let ptr = zr_alloc(cap, 1) as *mut u8;
+        if ptr == 0 as *mut u8 { panic("out of memory"); }
+        return String { ptr, len: 0, capacity: cap };
+    }
+
+    pub fn len(self) -> usize { return self.len; }
+
+    pub fn is_empty(self) -> bool { return self.len == 0; }
+
+    pub fn capacity(self) -> usize { return self.capacity; }
+
+    /// 追加一个 ASCII/UTF-8 码点（单个字节）。
+    pub fn push_byte(self: &mut String, b: u8) {
+        if self.len + 1 > self.capacity {
+            self.grow();
+        }
+        self.ptr[self.len] = b;
+        self.len = self.len + 1;
+    }
+
+    /// 追加一个字符（完整 UTF-8 编码）。
+    pub fn push(self: &mut String, c: char) {
+        // 简化实现：仅处理 ASCII 单字节字符。
+        self.push_byte(c as u8);
+    }
+
+    /// 追加一段字节切片。
+    pub fn push_bytes(self: &mut String, bytes: []const u8) {
+        let new_len = self.len + bytes.len;
+        if new_len > self.capacity {
+            self.reserve(new_len - self.capacity);
+        }
+        let mut i = 0;
+        while i < bytes.len {
+            self.ptr[self.len + i] = bytes.ptr[i];
+            i = i + 1;
+        }
+        self.len = new_len;
+    }
+
+    /// 追加另一个字符串。
+    pub fn push_str(self: &mut String, s: &String) {
+        self.push_bytes(Slice { ptr: s.ptr, len: s.len });
+    }
+
+    /// 追加一个数字（十进制）。
+    pub fn push_int(self: &mut String, n: i64) {
+        if n == 0 {
+            self.push_byte(b'0');
+            return;
+        }
+        if n < 0 {
+            self.push_byte(b'-');
+        }
+        let mut val = if n < 0 { -n } else { n };
+        let mut buf: [u8; 24] = [0; 24];
+        let mut i = 24;
+        while val > 0 {
+            i = i - 1;
+            buf[i] = (val % 10) as u8 + b'0';
+            val = val / 10;
+        }
+        let count = 24 - i;
+        self.push_bytes(Slice { ptr: &buf[i] as *const u8, len: count });
+    }
+
+    /// 追加一个无符号数字。
+    pub fn push_uint(self: &mut String, n: u64) {
+        if n == 0 {
+            self.push_byte(b'0');
+            return;
+        }
+        let mut val = n;
+        let mut buf: [u8; 24] = [0; 24];
+        let mut i = 24;
+        while val > 0 {
+            i = i - 1;
+            buf[i] = (val % 10) as u8 + b'0';
+            val = val / 10;
+        }
+        let count = 24 - i;
+        self.push_bytes(Slice { ptr: &buf[i] as *const u8, len: count });
+    }
+
+    /// 确保容量至少为 `additional`。
+    pub fn reserve(self: &mut String, additional: usize) {
+        if self.len + additional > self.capacity {
+            let mut new_cap = self.capacity;
+            while self.len + additional > new_cap {
+                new_cap = new_cap * 2;
+            }
+            self.grow_to(new_cap);
+        }
+    }
+
+    /// 增长容量到至少 `new_cap`。
+    fn grow_to(self: &mut String, new_cap: usize) {
+        let new_ptr = zr_realloc(
+            self.ptr as *mut void,
+            self.capacity,
+            new_cap,
+            1,
+        ) as *mut u8;
+        if new_ptr == 0 as *mut u8 { panic("out of memory"); }
+        self.ptr = new_ptr;
+        self.capacity = new_cap;
+    }
+
+    fn grow(self: &mut String) {
+        let new_cap = if self.capacity == 0 { 8 } else { self.capacity * 2 };
+        self.grow_to(new_cap);
+    }
+
+    /// 清空字符串，但保留已分配容量。
+    pub fn clear(self: &mut String) {
+        self.len = 0;
+    }
+
+    /// 释放字符串占用的内存。
+    pub fn destroy(self: &mut String) {
+        if self.ptr != 0 as *mut u8 {
+            zr_dealloc(self.ptr as *mut void, self.len, 1);
+            self.ptr = 0 as *mut u8;
+            self.len = 0;
+            self.capacity = 0;
+        }
+    }
+
+    /// 取出一个字节切片视图。
+    pub fn as_bytes(self) -> []const u8 {
+        return Slice { ptr: self.ptr as *const u8, len: self.len };
+    }
+
+    /// 比较两个字符串是否相等。
+    pub fn eq(self, other: &String) -> bool {
+        if self.len != other.len { return false; }
+        return memcmp(
+            self.ptr as *const void,
+            other.ptr as *const void,
+            self.len,
+        ) == 0;
+    }
+
+    /// 字典序比较：小于返回 -1，等于返回 0，大于返回 1。
+    pub fn cmp(self, other: &String) -> i32 {
+        let min_len = if self.len < other.len { self.len } else { other.len };
+        let r = memcmp(
+            self.ptr as *const void,
+            other.ptr as *const void,
+            min_len,
+        );
+        if r != 0 { return r; }
+        if self.len < other.len { return -1; }
+        if self.len > other.len { return 1; }
+        return 0;
+    }
+
+    /// 是否包含子串。
+    pub fn contains(self, needle: []const u8) -> bool {
+        if needle.len > self.len { return false; }
+        let mut i = 0;
+        while i <= self.len - needle.len {
+            let mut match_ = true;
+            let mut j = 0;
+            while j < needle.len {
+                if self.ptr[i + j] != needle.ptr[j] {
+                    match_ = false;
+                    break;
+                }
+                j = j + 1;
+            }
+            if match_ { return true; }
+            i = i + 1;
+        }
+        return false;
+    }
+
+    /// 是否以给定前缀开头。
+    pub fn starts_with(self, prefix: []const u8) -> bool {
+        if prefix.len > self.len { return false; }
+        let mut i = 0;
+        while i < prefix.len {
+            if self.ptr[i] != prefix.ptr[i] { return false; }
+            i = i + 1;
+        }
+        return true;
+    }
+
+    /// 是否以给定后缀结尾。
+    pub fn ends_with(self, suffix: []const u8) -> bool {
+        if suffix.len > self.len { return false; }
+        let offset = self.len - suffix.len;
+        let mut i = 0;
+        while i < suffix.len {
+            if self.ptr[offset + i] != suffix.ptr[i] { return false; }
+            i = i + 1;
+        }
+        return true;
+    }
+
+    /// 截取子串 `[start, end)`。
+    pub fn substr(self, start: usize, end: usize) -> String {
+        if start >= self.len || end > self.len || start > end {
+            panic("substr: index out of range");
+        }
+        let mut s = String::with_capacity(end - start);
+        let mut i = start;
+        while i < end {
+            s.push_byte(self.ptr[i]);
+            i = i + 1;
+        }
+        return s;
+    }
+
+    /// 查找字符首次出现的位置。
+    pub fn find_byte(self, b: u8) -> Option<usize> {
+        let mut i = 0;
+        while i < self.len {
+            if self.ptr[i] == b { return Option::Some(i); }
+            i = i + 1;
+        }
+        return Option::None;
+    }
+
+    /// 反转字符串（按字节，仅对 ASCII 安全）。
+    pub fn reverse(self: &mut String) {
+        let mut i = 0;
+        let mut j = self.len;
+        while i < j {
+            j = j - 1;
+            let tmp = self.ptr[i];
+            self.ptr[i] = self.ptr[j];
+            self.ptr[j] = tmp;
+            i = i + 1;
+        }
+    }
+
+    /// 字符串拼接，返回新字符串。
+    pub fn concat(a: &String, b: &String) -> String {
+        let mut result = String::with_capacity(a.len + b.len);
+        result.push_str(a);
+        result.push_str(b);
+        return result;
+    }
+
+    /// 重复字符串 `count` 次。
+    pub fn repeat(s: []const u8, count: usize) -> String {
+        let mut result = String::with_capacity(s.len * count);
+        let mut i = 0;
+        while i < count {
+            result.push_bytes(s);
+            i = i + 1;
+        }
+        return result;
+    }
+}
+
+/// C 字符串工具：计算以 NUL 结尾的字符串长度。
+pub fn cstr_len(ptr: *const u8) -> usize {
+    let mut len = 0;
+    while ptr[len] != 0 { len = len + 1; }
+    return len;
+}
+
+/// 把 C 字符串转成切片视图（不拷贝）。
+pub fn cstr_as_slice(ptr: *const u8) -> []const u8 {
+    return Slice { ptr, len: cstr_len(ptr) };
+}

@@ -1,0 +1,260 @@
+//=============================================================================
+// std/io.zr — 格式化输出、错误流与基础 IO
+//
+// 所有格式化输出都通过 `zr_write` 系统调用完成。本节提供面向用户的
+// `print!` / `println!` 宏风格的辅助函数，以及数值 → 字符串的格式化。
+//=============================================================================
+
+use core::{
+    zr_write, zr_read, zr_exit,
+    STDIN_FD, STDOUT_FD, STDERR_FD,
+    Option, Result, panic,
+};
+use string::String;
+
+//=============================================================================
+// 底层字节写入
+//=============================================================================
+
+/// 把一段字节写到给定的文件描述符。
+pub fn write_bytes(fd: i32, bytes: []const u8) -> isize {
+    return zr_write(fd, bytes.ptr, bytes.len);
+}
+
+/// 写一个 C 风格以 NUL 结尾的字符串。
+pub fn write_cstr(fd: i32, s: *const u8) {
+    let mut len = 0;
+    while s[len] != 0 { len = len + 1; }
+    zr_write(fd, s, len);
+}
+
+/// 写一个单字节。
+pub fn write_byte(fd: i32, b: u8) {
+    zr_write(fd, &b, 1);
+}
+
+/// 写一个字符（UTF-8 编码，可能占多个字节）。
+pub fn write_char(fd: i32, c: char) {
+    // 简化：只支持 ASCII 范围，Unicode 按需扩展。
+    write_byte(fd, c as u8);
+}
+
+//=============================================================================
+// 数值格式化（内部）
+//=============================================================================
+
+/// 把无符号 64 位整数格式化为十进制，写入 `fd`。
+/// 返回写入的字节数。
+pub fn write_uint(fd: i32, mut n: u64) -> usize {
+    if n == 0 {
+        write_byte(fd, b'0');
+        return 1;
+    }
+    // 倒序生成数字到一个小缓冲
+    let mut buf: [u8; 24] = [0; 24];
+    let mut i = 24;
+    while n > 0 {
+        i = i - 1;
+        buf[i] = (n % 10) as u8 + b'0';
+        n = n / 10;
+    }
+    let count = 24 - i;
+    zr_write(fd, &buf[i] as *const u8, count);
+    return count;
+}
+
+/// 把有符号 64 位整数格式化为十进制，写入 `fd`。
+pub fn write_int(fd: i32, n: i64) -> usize {
+    if n < 0 {
+        write_byte(fd, b'-');
+        return 1 + write_uint(fd, (-n) as u64);
+    }
+    return write_uint(fd, n as u64);
+}
+
+/// 把十六进制无符号整数写入 `fd`，`upper` 控制大小写。
+pub fn write_hex(fd: i32, mut n: u64, upper: bool) -> usize {
+    if n == 0 {
+        write_byte(fd, b'0');
+        return 1;
+    }
+    let mut buf: [u8; 16] = [0; 16];
+    let mut i = 16;
+    while n > 0 {
+        i = i - 1;
+        let d = (n % 16) as u8;
+        buf[i] = if d < 10 {
+            d + b'0'
+        } else if upper {
+            d - 10 + b'A'
+        } else {
+            d - 10 + b'a'
+        };
+        n = n / 16;
+    }
+    let count = 16 - i;
+    zr_write(fd, &buf[i] as *const u8, count);
+    return count;
+}
+
+//=============================================================================
+// 高层打印 API（用户面向）
+//=============================================================================
+
+/// 打印一段字符串，不换行。
+pub fn print(s: []const u8) {
+    write_bytes(STDOUT_FD, s);
+}
+
+/// 打印一段字符串并换行。
+pub fn println(s: []const u8) {
+    write_bytes(STDOUT_FD, s);
+    write_byte(STDOUT_FD, b'\n');
+}
+
+/// 打印一个字符，不换行。
+pub fn print_char(c: char) {
+    write_char(STDOUT_FD, c);
+}
+
+/// 打印一个字符并换行。
+pub fn println_char(c: char) {
+    write_char(STDOUT_FD, c);
+    write_byte(STDOUT_FD, b'\n');
+}
+
+/// 打印十进制整数并换行。
+pub fn println_int(n: i64) {
+    write_int(STDOUT_FD, n);
+    write_byte(STDOUT_FD, b'\n');
+}
+
+/// 打印无符号整数并换行。
+pub fn println_uint(n: u64) {
+    write_uint(STDOUT_FD, n);
+    write_byte(STDOUT_FD, b'\n');
+}
+
+/// 打印布尔值。
+pub fn print_bool(b: bool) {
+    if b { print("true"); } else { print("false"); }
+}
+
+/// 打印十六进制整数。
+pub fn print_hex_int(n: i64) {
+    write_hex(STDOUT_FD, n as u64, false);
+}
+
+/// 向标准错误打印并换行。
+pub fn eprintln(s: []const u8) {
+    write_bytes(STDERR_FD, s);
+    write_byte(STDERR_FD, b'\n');
+}
+
+/// 向标准错误打印（无换行）。
+pub fn eprint(s: []const u8) {
+    write_bytes(STDERR_FD, s);
+}
+
+//=============================================================================
+// 格式化（简化版格式化宏）
+//=============================================================================
+
+/// 把一组参数按给定格式串打印。
+/// 格式串中的 `{}` 会被顺序替换为对应参数。这是 `print!` 宏的底层。
+///
+/// 用法：`print_fmt("x={}, y={}", &[arg1, arg2])`
+/// 支持的类型通过 `FormatArg` 枚举传入。
+pub enum FormatArg<'a> {
+    Int(i64),
+    Uint(u64),
+    Bool(bool),
+    Str([]const u8),
+    Char(char),
+    Hex(u64),
+}
+
+pub fn print_fmt(fmt: []const u8, args: &[FormatArg]) {
+    let mut ai = 0;
+    let mut i = 0;
+    while i < fmt.len {
+        let c = fmt.ptr[i];
+        if c == b'{' && i + 1 < fmt.len && fmt.ptr[i + 1] == b'}' {
+            // 替换一个参数
+            if ai < args.len {
+                match args[ai] {
+                    FormatArg::Int(n)  => { write_int(STDOUT_FD, n); }
+                    FormatArg::Uint(n) => { write_uint(STDOUT_FD, n); }
+                    FormatArg::Bool(b) => { print_bool(b); }
+                    FormatArg::Str(s)  => { print(s); }
+                    FormatArg::Char(c) => { write_char(STDOUT_FD, c); }
+                    FormatArg::Hex(n)  => { write_hex(STDOUT_FD, n, false); }
+                }
+                ai = ai + 1;
+            }
+            i = i + 2;
+        } else {
+            write_byte(STDOUT_FD, c);
+            i = i + 1;
+        }
+    }
+}
+
+//=============================================================================
+// 缓冲写入器
+//=============================================================================
+
+/// 带缓冲的写入器，减少系统调用次数。
+pub struct BufWriter {
+    pub fd:     i32,
+    pub buf:    [u8; 4096],
+    pub filled: usize,
+}
+
+impl BufWriter {
+    pub fn new(fd: i32) -> BufWriter {
+        return BufWriter { fd, buf: [0; 4096], filled: 0 };
+    }
+
+    /// 写入一段字节，必要时先刷入缓冲。
+    pub fn write(self: &mut BufWriter, bytes: []const u8) {
+        if self.filled + bytes.len > 4096 {
+            self.flush();
+        }
+        if bytes.len > 4096 {
+            // 直接写入，不走缓冲
+            zr_write(self.fd, bytes.ptr, bytes.len);
+            return;
+        }
+        let mut i = 0;
+        while i < bytes.len {
+            self.buf[self.filled] = bytes.ptr[i];
+            self.filled = self.filled + 1;
+            i = i + 1;
+        }
+    }
+
+    /// 把缓冲内容刷入底层 fd。
+    pub fn flush(self: &mut BufWriter) {
+        if self.filled > 0 {
+            zr_write(self.fd, &self.buf[0] as *const u8, self.filled);
+            self.filled = 0;
+        }
+    }
+}
+
+//=============================================================================
+// 进程控制
+//=============================================================================
+
+/// 正常退出，返回退出码。
+pub fn exit(code: i32) -> ! {
+    zr_exit(code);
+}
+
+/// 标准退出码。
+pub mod status {
+    pub const SUCCESS: i32 = 0;
+    pub const FAILURE: i32 = 1;
+    pub const USAGE:   i32 = 64;
+}

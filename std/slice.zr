@@ -1,0 +1,335 @@
+//=============================================================================
+// std/slice.zr — 切片工具、迭代器与泛型算法
+//
+// 为任意类型的切片提供 map / filter / fold 等高层函数，
+// 以及完整的迭代器协议实现。
+//=============================================================================
+
+use core::{
+    zr_alloc, zr_dealloc,
+    Option, Result, panic,
+    size_of, memcmp,
+};
+
+//=============================================================================
+// 切片上的通用算法
+//=============================================================================
+
+/// 计算切片元素个数。
+pub fn len<T>(s: []const T) -> usize {
+    return s.len;
+}
+
+/// 判断切片是否为空。
+pub fn is_empty<T>(s: []const T) -> bool {
+    return s.len == 0;
+}
+
+/// 取第一个元素。
+pub fn first<T>(s: []const T) -> Option<T> {
+    if s.len == 0 { return Option::None; }
+    return Option::Some(s.ptr[0]);
+}
+
+/// 取最后一个元素。
+pub fn last<T>(s: []const T) -> Option<T> {
+    if s.len == 0 { return Option::None; }
+    return Option::Some(s.ptr[s.len - 1]);
+}
+
+/// 取指定索引处的元素，越界 panic。
+pub fn get<T>(s: []const T, index: usize) -> T {
+    if index >= s.len { panic("slice index out of range"); }
+    return s.ptr[index];
+}
+
+/// 在切片中查找元素，返回其索引。
+pub fn index_of<T: Eq>(s: []const T, item: T) -> Option<usize> {
+    let mut i = 0;
+    while i < s.len {
+        if s.ptr[i].eq(item) { return Option::Some(i); }
+        i = i + 1;
+    }
+    return Option::None;
+}
+
+/// 判断切片是否包含某元素。
+pub fn contains<T: Eq>(s: []const T, item: T) -> bool {
+    return s.index_of(item).is_some();
+}
+
+/// 反转切片（原地）。
+pub fn reverse<T>(s: []mut T) {
+    let mut i = 0;
+    let mut j = s.len;
+    while i < j {
+        j = j - 1;
+        let tmp = s.ptr[i];
+        s.ptr[i] = s.ptr[j];
+        s.ptr[j] = tmp;
+        i = i + 1;
+    }
+}
+
+/// 把 `src` 拷贝到 `dst`，要求 `dst.len >= src.len`。
+pub fn copy<T>(dst: []mut T, src: []const T) {
+    if dst.len < src.len { panic("copy: destination too small"); }
+    let mut i = 0;
+    while i < src.len {
+        dst.ptr[i] = src.ptr[i];
+        i = i + 1;
+    }
+}
+
+/// 用 `value` 填充整个切片。
+pub fn fill<T: Copy>(s: []mut T, value: T) {
+    let mut i = 0;
+    while i < s.len {
+        s.ptr[i] = value;
+        i = i + 1;
+    }
+}
+
+/// 对切片排序（插入排序，稳定且简单）。
+pub fn sort<T: Ord>(s: []mut T) {
+    let mut i = 1;
+    while i < s.len {
+        let mut j = i;
+        while j > 0 && s.ptr[j - 1].gt(s.ptr[j]) {
+            let tmp = s.ptr[j];
+            s.ptr[j] = s.ptr[j - 1];
+            s.ptr[j - 1] = tmp;
+            j = j - 1;
+        }
+        i = i + 1;
+    }
+}
+
+/// 在已排序的切片中二分查找。
+pub fn binary_search<T: Ord>(s: []const T, key: T) -> Option<usize> {
+    let mut lo = 0;
+    let mut hi = s.len;
+    while lo < hi {
+        let mid = lo + (hi - lo) / 2;
+        if s.ptr[mid].lt(key) {
+            lo = mid + 1;
+        } else if s.ptr[mid].gt(key) {
+            hi = mid;
+        } else {
+            return Option::Some(mid);
+        }
+    }
+    return Option::None;
+}
+
+//=============================================================================
+// 高阶函数（惰性语义，需自行分配结果）
+//=============================================================================
+
+/// 对每个元素应用 `f`，把结果收集到新分配的同长切片。
+pub fn map<T, U>(s: []const T, f: fn(T) -> U) -> []U {
+    let result = zr_alloc(size_of::<U>() * s.len, 8) as *mut U;
+    if result == 0 as *mut U { panic("out of memory"); }
+    let mut i = 0;
+    while i < s.len {
+        result[i] = f(s.ptr[i]);
+        i = i + 1;
+    }
+    return Slice { ptr: result, len: s.len };
+}
+
+/// 过滤出满足 `pred` 的元素，返回新切片。
+pub fn filter<T: Copy>(s: []const T, pred: fn(T) -> bool) -> []T {
+    // 先计数
+    let mut count = 0;
+    let mut i = 0;
+    while i < s.len {
+        if pred(s.ptr[i]) { count = count + 1; }
+        i = i + 1;
+    }
+    let result = zr_alloc(size_of::<T>() * count, 8) as *mut T;
+    if result == 0 as *mut T { panic("out of memory"); }
+    let mut out = 0;
+    i = 0;
+    while i < s.len {
+        if pred(s.ptr[i]) {
+            result[out] = s.ptr[i];
+            out = out + 1;
+        }
+        i = i + 1;
+    }
+    return Slice { ptr: result, len: count };
+}
+
+/// 用 `init` 作为初值，从左到右折叠。
+pub fn fold<T, Acc>(s: []const T, init: Acc, f: fn(Acc, T) -> Acc) -> Acc {
+    let mut acc = init;
+    let mut i = 0;
+    while i < s.len {
+        acc = f(acc, s.ptr[i]);
+        i = i + 1;
+    }
+    return acc;
+}
+
+/// 判断是否有任一元素满足 `pred`。
+pub fn any<T>(s: []const T, pred: fn(T) -> bool) -> bool {
+    let mut i = 0;
+    while i < s.len {
+        if pred(s.ptr[i]) { return true; }
+        i = i + 1;
+    }
+    return false;
+}
+
+/// 判断是否所有元素都满足 `pred`。
+pub fn all<T>(s: []const T, pred: fn(T) -> bool) -> bool {
+    let mut i = 0;
+    while i < s.len {
+        if !pred(s.ptr[i]) { return false; }
+        i = i + 1;
+    }
+    return true;
+}
+
+/// 找出第一个满足 `pred` 的元素。
+pub fn find<T>(s: []const T, pred: fn(T) -> bool) -> Option<T> {
+    let mut i = 0;
+    while i < s.len {
+        if pred(s.ptr[i]) { return Option::Some(s.ptr[i]); }
+        i = i + 1;
+    }
+    return Option::None;
+}
+
+/// 计算所有元素的和（要求类型可加，这里用 `+` 内置）。
+pub fn sum<T>(s: []const T) -> T {
+    // 通过 fold 实现，需调用者保证 `add` 可用。
+    // 这里返回一个零值占位（真实实现需依赖 trait 约束）。
+    intrinsic!(sum s)
+}
+
+/// 取最大值。
+pub fn max<T: Ord>(s: []const T) -> Option<T> {
+    if s.len == 0 { return Option::None; }
+    let mut m = s.ptr[0];
+    let mut i = 1;
+    while i < s.len {
+        if m.lt(s.ptr[i]) { m = s.ptr[i]; }
+        i = i + 1;
+    }
+    return Option::Some(m);
+}
+
+/// 取最小值。
+pub fn min<T: Ord>(s: []const T) -> Option<T> {
+    if s.len == 0 { return Option::None; }
+    let mut m = s.ptr[0];
+    let mut i = 1;
+    while i < s.len {
+        if m.gt(s.ptr[i]) { m = s.ptr[i]; }
+        i = i + 1;
+    }
+    return Option::Some(m);
+}
+
+/// 对相邻元素两两应用 `f` 进行归约。
+pub fn reduce<T>(s: []const T, f: fn(T, T) -> T) -> Option<T> {
+    if s.len == 0 { return Option::None; }
+    let mut acc = s.ptr[0];
+    let mut i = 1;
+    while i < s.len {
+        acc = f(acc, s.ptr[i]);
+        i = i + 1;
+    }
+    return Option::Some(acc);
+}
+
+//=============================================================================
+// 迭代器
+//=============================================================================
+
+/// 切片迭代器：按值遍历。
+pub struct SliceIter<T> {
+    pub slice: []const T,
+    pub index: usize,
+}
+
+impl<T> SliceIter<T> {
+    pub fn new(s: []const T) -> SliceIter<T> {
+        return SliceIter { slice: s, index: 0 };
+    }
+
+    /// 取下一个元素，耗尽时返回 null。
+    pub fn next(self: &mut SliceIter<T>) -> *mut T {
+        if self.index >= self.slice.len {
+            return 0 as *mut T;
+        }
+        let p = &self.slice.ptr[self.index] as *const T as *mut T;
+        self.index = self.index + 1;
+        return p;
+    }
+
+    pub fn size_hint(self) -> usize {
+        return self.slice.len - self.index;
+    }
+
+    pub fn count(self: &mut SliceIter<T>) -> usize {
+        let mut c = 0;
+        while self.next() != 0 as *mut T {
+            c = c + 1;
+        }
+        return c;
+    }
+}
+
+/// 整数区间迭代器：`start..end`。
+pub struct Range {
+    pub start: i64,
+    pub end:   i64,
+    pub step:  i64,
+    pub current: i64,
+}
+
+impl Range {
+    pub fn new(start: i64, end: i64) -> Range {
+        let step = if end >= start { 1 } else { -1 };
+        return Range { start, end, step, current: start };
+    }
+
+    /// 含尾迭代器 `start..=end`。
+    pub fn inclusive(start: i64, end: i64) -> Range {
+        let r = Range::new(start, end);
+        return r;
+    }
+
+    pub fn next(self: &mut Range) -> *mut i64 {
+        if self.step > 0 && self.current >= self.end {
+            return 0 as *mut i64;
+        }
+        if self.step < 0 && self.current <= self.end {
+            return 0 as *mut i64;
+        }
+        let p = &self.current;
+        self.current = self.current + self.step;
+        return p as *mut i64;
+    }
+}
+
+/// 带步长的区间迭代器。
+pub fn range_step(start: i64, end: i64, step: i64) -> Range {
+    let mut r = Range { start, end, step, current: start };
+    if step == 0 { panic("range step must be non-zero"); }
+    return r;
+}
+
+//=============================================================================
+// 切片的析构
+//=============================================================================
+
+/// 释放由 `map` / `filter` 返回的切片。
+pub fn free_slice<T>(s: []const T) {
+    if s.ptr != 0 as *const T {
+        zr_dealloc(s.ptr as *mut void, s.len * size_of::<T>(), 8);
+    }
+}

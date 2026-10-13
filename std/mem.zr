@@ -1,0 +1,274 @@
+//=============================================================================
+// std/mem.zr — 内存管理、指针与手动内存操作
+//
+// 提供 safe 的内存抽象（Box、切片视图）与 unsafe 的底层原语
+//（memcpy / memset / transmute 等），以及全局分配器接口。
+//=============================================================================
+
+use core::{zr_alloc, zr_dealloc, zr_realloc};
+
+//=============================================================================
+// 内存序（用于原子与 fence）
+//=============================================================================
+
+pub enum Ordering {
+    Relaxed,
+    Acquire,
+    Release,
+    AcqRel,
+    SeqCst,
+}
+
+//=============================================================================
+// 手动内存原语
+//=============================================================================
+
+/// 用 `value` 字节填充 `count` 字节。返回 `dst`（便于链式调用）。
+pub fn memset(dst: *mut void, value: u8, count: usize) -> *mut void {
+    let p = dst as *mut u8;
+    let mut i = 0;
+    while i < count {
+        p[i] = value;
+        i = i + 1;
+    }
+    return dst;
+}
+
+/// 把 `src` 的 `count` 字节复制到 `dst`。`dst` 与 `src` 不得重叠。
+pub fn memcpy(dst: *mut void, src: *const void, count: usize) -> *mut void {
+    let d = dst as *mut u8;
+    let s = src as *const u8;
+    let mut i = 0;
+    while i < count {
+        d[i] = s[i];
+        i = i + 1;
+    }
+    return dst;
+}
+
+/// 把 `src` 的 `count` 字节移动到 `dst`，支持重叠区域。
+pub fn memmove(dst: *mut void, src: *const void, count: usize) -> *mut void {
+    let d = dst as *mut u8;
+    let s = src as *const u8;
+    if (dst as usize) < (src as usize) {
+        // 从前向后复制
+        let mut i = 0;
+        while i < count {
+            d[i] = s[i];
+            i = i + 1;
+        }
+    } else {
+        // 从后向前复制
+        let mut i = count;
+        while i > 0 {
+            i = i - 1;
+            d[i] = s[i];
+        }
+    }
+    return dst;
+}
+
+/// 按字节比较两个内存区域，相等返回 0，小于返回 -1，大于返回 1。
+pub fn memcmp(a: *const void, b: *const void, count: usize) -> i32 {
+    let pa = a as *const u8;
+    let pb = b as *const u8;
+    let mut i = 0;
+    while i < count {
+        if pa[i] < pb[i] { return -1; }
+        if pa[i] > pb[i] { return 1; }
+        i = i + 1;
+    }
+    return 0;
+}
+
+/// 交换两块相同大小内存的内容。
+pub fn memswap<T>(a: *mut T, b: *mut T) {
+    let tmp: T = *a;
+    *a = *b;
+    *b = tmp;
+}
+
+/// 重新解释一块内存的类型，零运行时开销。
+pub fn transmute<Src, Dst>(src: Src) -> Dst {
+    // 编译期内建：bitcast，要求 size(Dst) == size(Src)。
+    intrinsic!(transmute src -> Dst)
+}
+
+/// 丢弃一个值，防止其析构函数（若有）被调用。
+pub fn forget<T>(_value: T) {
+    // 语义上：让编译器认为该值已被消费，但不运行析构。
+    intrinsic!(forget _value)
+}
+
+/// 在栈上零初始化一块空间，返回对其的可变指针。
+pub fn zeroed<T>() -> T {
+    intrinsic!(zeroed T)
+}
+
+/// 在未初始化状态中写入一个值（用于手动构造）。unsafe。
+pub fn write<T>(dst: *mut T, value: T) {
+    *dst = value;
+}
+
+/// 从指针读取一个值。
+pub fn read<T>(src: *const T) -> T {
+    return *src;
+}
+
+/// 手动丢弃一个值（调用其析构）。
+pub fn drop<T>(value: T) {
+    // 让编译器运行 value 的析构逻辑。
+    intrinsic!(drop value)
+}
+
+/// 计算类型 `T` 的大小（字节）。
+pub fn size_of<T>() -> usize {
+    intrinsic!(size_of T)
+}
+
+/// 计算类型 `T` 的对齐要求（字节）。
+pub fn align_of<T>() -> usize {
+    intrinsic!(align_of T)
+}
+
+//=============================================================================
+// 分配器接口
+//=============================================================================
+
+/// 全局分配器 trait：可替换的堆内存后端。
+pub trait Allocator {
+    fn alloc(self: &mut Self, layout: Layout) -> *mut void;
+    fn dealloc(self: &mut Self, ptr: *mut void, layout: Layout);
+    fn realloc(self: &mut Self, ptr: *mut void, old: Layout, new: Layout) -> *mut void;
+}
+
+/// 内存布局：大小 + 对齐。
+pub struct Layout {
+    pub size:  usize,
+    pub align: usize,
+}
+
+impl Layout {
+    /// 从大小与对齐构造一个布局，对齐向上取整到 2 的幂。
+    pub fn from_size_align(size: usize, align: usize) -> Result<Layout, &'static str> {
+        if align == 0 || (align & (align - 1)) != 0 {
+            return Result::Err("alignment must be a non-zero power of two");
+        }
+        if size == 0 {
+            return Result::Err("size must be non-zero");
+        }
+        return Result::Ok(Layout { size, align });
+    }
+
+    /// 为一个 `T` 数组构造布局。
+    pub fn array<T>(count: usize) -> Layout {
+        let sz = size_of::<T>() * count;
+        Layout { size: sz, align: align_of::<T>() }
+    }
+}
+
+/// 默认全局分配器（系统分配器）。
+pub struct SystemAllocator;
+
+impl Allocator for SystemAllocator {
+    fn alloc(self: &mut Self, layout: Layout) -> *mut void {
+        return zr_alloc(layout.size, layout.align);
+    }
+    fn dealloc(self: &mut Self, ptr: *mut void, layout: Layout) {
+        zr_dealloc(ptr, layout.size, layout.align);
+    }
+    fn realloc(self: &mut Self, ptr: *mut void, old: Layout, new: Layout) -> *mut void {
+        return zr_realloc(ptr, old.size, new.size, new.align);
+    }
+}
+
+/// 全局分配器实例（可通过链接替换）。
+pub static mut GLOBAL_ALLOCATOR: SystemAllocator = SystemAllocator;
+
+/// 分配一个 `T`，用 `value` 初始化。
+pub fn box_new<T: Clone>(value: T) -> *mut T {
+    let ptr = zr_alloc(size_of::<T>(), align_of::<T>()) as *mut T;
+    if ptr == NULL {
+        panic("out of memory");
+    }
+    *ptr = value.clone();
+    return ptr;
+}
+
+/// 释放一个先前 `box_new` 得到的指针。
+pub fn box_free<T>(ptr: *mut T) {
+    if ptr != NULL {
+        drop::<T>(*ptr);
+        zr_dealloc(ptr as *mut void, size_of::<T>(), align_of::<T>());
+    }
+}
+
+//=============================================================================
+// 手动 slice 视图（无所有权）
+//=============================================================================
+
+/// 对任意类型的只读视图：`ptr` + `len`。
+pub struct Slice<T> {
+    pub ptr: *const T,
+    pub len: usize,
+}
+
+/// 对任意类型的可变视图。
+pub struct SliceMut<T> {
+    pub ptr: *mut T,
+    pub len: usize,
+}
+
+impl<T> Slice<T> {
+    pub fn new(ptr: *const T, len: usize) -> Slice<T> {
+        return Slice { ptr, len };
+    }
+
+    pub fn get(self, index: usize) -> Option<T> {
+        if index >= self.len { return Option::None; }
+        return Option::Some(self.ptr[index]);
+    }
+
+    pub fn len(self) -> usize { return self.len; }
+
+    pub fn is_empty(self) -> bool { return self.len == 0; }
+
+    pub fn first(self) -> Option<T> {
+        if self.is_empty() { return Option::None; }
+        return Option::Some(self.ptr[0]);
+    }
+
+    pub fn last(self) -> Option<T> {
+        if self.is_empty() { return Option::None; }
+        return Option::Some(self.ptr[self.len - 1]);
+    }
+}
+
+impl<T> SliceMut<T> {
+    pub fn new(ptr: *mut T, len: usize) -> SliceMut<T> {
+        return SliceMut { ptr, len };
+    }
+
+    pub fn as_slice(self) -> Slice<T> {
+        return Slice { ptr: self.ptr as *const T, len: self.len };
+    }
+
+    pub fn len(self) -> usize { return self.len; }
+}
+
+//=============================================================================
+// 指针工具
+//=============================================================================
+
+/// 空指针常量。
+pub const NULL: *mut void = 0 as *mut void;
+
+/// 判断指针是否为空。
+pub fn is_null<T>(ptr: *const T) -> bool {
+    return ptr == NULL;
+}
+
+/// 计算 `ptr + count` 个元素偏移后的指针。
+pub fn offset<T>(ptr: *const T, count: usize) -> *const T {
+    return (ptr as usize + count * size_of::<T>()) as *const T;
+}

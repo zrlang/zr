@@ -1,0 +1,35 @@
+//=============================================================================
+// hello.zr — 经典入门程序
+//
+// 演示：函数、变量、算术运算、字符串字面量与 println。
+//=============================================================================
+
+use io::{println, println_int, print_bool};
+
+fn main() -> i32 {
+    // 基本输出
+    println("Hello, zr!");
+    println("欢迎来到 zr 语言 —— 一门融合 Rust 安全、Zig 显式与 Python 表达力的系统语言。");
+
+    // 变量绑定（不可变）
+    let x: i32 = 40;
+    let y: i32 = 2;
+
+    // 算术
+    let z = x + y;
+    println("40 + 2 =");
+    println_int(z);
+
+    // 类型推导
+    let flag = true;
+    print_bool(flag);
+
+    // 元组与解构
+    let point = (10, 20);
+    let (a, b) = point;
+    println("point =");
+    println_int(a);
+    println_int(b);
+
+    return z;
+}
