@@ -1,0 +1,61 @@
+//=============================================================================
+// std/simd.zr — 便携 SIMD 向量类型
+//
+// 提供 `#[repr(simd)]` 向量类型，编译器对其运算生成 SIMD 指令。
+//=============================================================================
+
+/// 4 个 f32 的向量。
+#[repr(simd)]
+pub struct f32x4 {
+    pub lanes: [f32; 4],
+}
+
+impl f32x4 {
+    pub fn from_array(arr: [f32; 4]) -> f32x4 {
+        return f32x4 { lanes: arr };
+    }
+
+    pub fn to_array(self) -> [f32; 4] {
+        return self.lanes;
+    }
+}
+
+/// 4 个 i32 的向量。
+#[repr(simd)]
+pub struct i32x4 {
+    pub lanes: [i32; 4],
+}
+
+impl i32x4 {
+    pub fn from_array(arr: [i32; 4]) -> i32x4 {
+        return i32x4 { lanes: arr };
+    }
+
+    pub fn to_array(self) -> [i32; 4] {
+        return self.lanes;
+    }
+}
+
+/// 2 个 f64 的向量。
+#[repr(simd)]
+pub struct f64x2 {
+    pub lanes: [f64; 2],
+}
+
+impl f64x2 {
+    pub fn from_array(arr: [f64; 2]) -> f64x2 {
+        return f64x2 { lanes: arr };
+    }
+}
+
+/// 8 个 i8 的向量。
+#[repr(simd)]
+pub struct i8x8 {
+    pub lanes: [i8; 8],
+}
+
+impl i8x8 {
+    pub fn from_array(arr: [i8; 8]) -> i8x8 {
+        return i8x8 { lanes: arr };
+    }
+}

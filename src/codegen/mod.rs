@@ -16,6 +16,9 @@ pub mod regalloc;
 pub mod frame;
 pub mod reloc;
 pub mod linker;
+pub mod dwarf;
+pub mod wasm;
+pub mod c_backend;
 
 use crate::ssa::SsaModule;
 

@@ -26,6 +26,7 @@ mod opt;
 mod parser;
 mod ssa;
 mod typeck;
+mod zr0;
 
 use std::env;
 use std::path::Path;
@@ -103,6 +104,8 @@ struct Cli {
     target: String,
     #[allow(dead_code)]
     sysroot: Option<String>,
+    /// 生成 DWARF 调试信息。
+    debug_info: bool,
     help: bool,
     version: bool,
 }
@@ -151,6 +154,7 @@ impl Cli {
                 "-O2" => cli.opt_level = OptLevel::O2,
                 "-O3" => cli.opt_level = OptLevel::O3,
                 "-Oz" => cli.opt_level = OptLevel::Oz,
+                "-g" | "--debug" => cli.debug_info = true,
                 s if s.starts_with('-') => return Err(format!("unknown argument '{s}'")),
                 _ => {
                     if cli.input.is_some() {

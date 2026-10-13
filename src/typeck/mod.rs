@@ -509,6 +509,7 @@ impl TypeChecker {
                             "C" => hir::Repr::C,
                             "packed" => hir::Repr::Packed,
                             "transparent" => hir::Repr::Transparent,
+                            "simd" => hir::Repr::Simd,
                             _ => hir::Repr::Rust,
                         };
                     }

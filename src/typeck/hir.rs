@@ -727,6 +727,8 @@ pub enum Repr {
     Align(usize),
     /// 透明布局（与第一个字段相同，用于 FFI 新类型）。
     Transparent,
+    /// SIMD 向量布局（`#[repr(simd)]`），同质向量类型。
+    Simd,
 }
 
 /// HIR 常量。
