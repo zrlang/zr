@@ -13,7 +13,7 @@ mod token;
 pub use span::Span;
 pub use token::{Token, TokenKind};
 
-struct Lexer<'a> {
+pub struct Lexer<'a> {
     /// 源码字符序列（已 UTF-8 解码）。
     src: Vec<char>,
     /// 当前读取位置。
@@ -124,6 +124,8 @@ impl<'a> Lexer<'a> {
             '=' => {
                 if self.match_char('=') {
                     TokenKind::EqEq
+                } else if self.match_char('>') {
+                    TokenKind::Rocket
                 } else {
                     TokenKind::Eq
                 }
@@ -330,6 +332,29 @@ impl<'a> Lexer<'a> {
             }
         }
 
+        // 处理科学计数法指数部分（如 `2.0e10`、`1e-5`、`3E+2`）
+        if is_float && self.pos < self.src.len()
+            && (self.src[self.pos] == 'e' || self.src[self.pos] == 'E')
+        {
+            let exp_pos = self.pos;
+            self.advance(); // e/E
+            // 可选的 +/- 号
+            if self.pos < self.src.len()
+                && (self.src[self.pos] == '+' || self.src[self.pos] == '-')
+            {
+                self.advance();
+            }
+            // 指数必须有数字
+            if self.pos < self.src.len() && self.src[self.pos].is_ascii_digit() {
+                while self.pos < self.src.len() && self.src[self.pos].is_ascii_digit() {
+                    self.advance();
+                }
+            } else {
+                // 没有数字，回退到 e 之前
+                self.pos = exp_pos;
+            }
+        }
+
         let text: String = self.src[num_start..self.pos].iter().collect();
         // 去掉下划线以便解析
         let clean: String = text.chars().filter(|c| *c != '_').collect();
@@ -533,7 +558,7 @@ impl<'a> Lexer<'a> {
     fn skip_whitespace(&mut self) {
         while self.pos < self.src.len() {
             match self.src[self.pos] {
-                ' ' | '\t' | '\r' => self.advance(),
+                ' ' | '\t' | '\r' => { self.advance(); }
                 '\n' => {
                     self.line += 1;
                     self.column = 1;
@@ -623,6 +648,8 @@ fn keyword(text: &str) -> Option<TokenKind> {
         "is" => TokenKind::KwIs,
         "ref" => TokenKind::KwRef,
         "static" => TokenKind::KwStatic,
+        "extern" => TokenKind::KwExtern,
+        "crate" => TokenKind::KwCrate,
         "anyerror" => TokenKind::KwAnyerror,
 
         // 类型关键字（单个 token，避免回退）

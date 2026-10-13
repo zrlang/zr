@@ -15,13 +15,13 @@ use std::collections::{HashMap, HashSet};
 
 use crate::error::{CompileError, ErrorKind, Result};
 use crate::parser::ast::{
-    self, Abi, Arm, Attribute, Block as AstBlock, ConstDecl as AstConst, Expression,
+    self, Abi, Arm, Attribute, AttributeArg, Block as AstBlock, ConstDecl as AstConst, Expression,
     Function as AstFunction, GenericParam as AstGeneric, Literal as AstLiteral, ModuleItem,
-    Pattern as AstPattern, Program, Statement, StaticDecl as AstStatic, StructDef as AstStruct,
+    Pattern as AstPattern, Program, Spanned, Statement, StaticDecl as AstStatic, StructDef as AstStruct,
     Type as AstType, UseDecl, UseTree, Visibility,
 };
 use crate::typeck::hir::{
-    self, BasicBlock, BasicBlockId, BreakValue, Capture, CaptureKind, ClosureExpr, Cfg, DefId,
+    BasicBlock, BasicBlockId, BreakValue, Capture, CaptureKind, ClosureExpr, Cfg, DefId,
     ExprKind, FieldIndex, ForLoop, ForProtocol, GenericId, HirArm, HirExpr, HirField, HirStmt,
     InferId, LocalId, Ty, WherePred,
 };
@@ -78,10 +78,9 @@ pub struct TypeChecker {
 
 impl Default for TypeChecker {
     fn default() -> Self {
-        // 先把所有字段初始化为独立值，再用 split-borrow 方式构造 InferCtxt。
-        // 由于 InferCtxt 借用 `self` 的多个字段（含一个 &mut），这里先对各个字段
-        // 取出引用，最后用 std::mem::replace 写回，避免"同时借用 self 又写 self.infer"。
-        let mut tc = Self {
+        // InferCtxt 借用 TypeChecker 的字段，无法在构造时直接填入。
+        // 先用 empty() 占位（指向 'static 空集合），实际检查时再按需重建。
+        Self {
             symbols: HashMap::new(),
             def_names: HashMap::new(),
             type_defs: HashMap::new(),
@@ -104,28 +103,7 @@ impl Default for TypeChecker {
             use_aliases: HashMap::new(),
             module_deps: HashMap::new(),
             visiting: HashSet::new(),
-        };
-        // 词法作用域结束后，借用的引用立即失效，因此可以安全写回 tc.infer。
-        {
-            let type_defs = &tc.type_defs;
-            let trait_defs = &tc.trait_defs;
-            let impl_blocks = &tc.impl_blocks;
-            let functions = &tc.functions;
-            let consts = &tc.consts;
-            let statics = &tc.statics;
-            let locals = &mut tc.locals;
-            let new_infer = InferCtxt::new(
-                type_defs,
-                trait_defs,
-                impl_blocks,
-                functions,
-                consts,
-                statics,
-                locals,
-            );
-            tc.infer = new_infer;
         }
-        tc
     }
 }
 
@@ -256,11 +234,12 @@ impl TypeChecker {
                     }));
                 }
                 ast::TypeDef::Alias { name, target, visibility, span, .. } => {
+                    let target_ty = self.ast_to_hir_type(target)?;
                     self.type_defs.insert(
                         id,
                         hir::HirTypeDef::Alias {
                             def_id: id,
-                            target: self.ast_to_hir_type(target)?,
+                            target: target_ty,
                             visibility: *visibility,
                             span: *span,
                         },
@@ -404,10 +383,11 @@ impl TypeChecker {
             });
         }
 
+        let repr = self.compute_repr(s);
         if let Some(hir_td) = self.type_defs.get_mut(&def_id) {
             if let hir::HirTypeDef::Struct(hs) = hir_td {
                 hs.fields = fields;
-                hs.repr = self.compute_repr(s);
+                hs.repr = repr;
             }
         }
         Ok(())
@@ -471,7 +451,16 @@ impl TypeChecker {
             if let hir::HirTypeDef::Enum(he) = hir_td {
                 he.variants = variants;
                 he.repr = e.repr.as_ref().map_or(hir::IntegerRepr::Auto, |t| {
-                    if let AstType::I(w) = t { hir::IntegerRepr::I(*w as u16) } else { hir::IntegerRepr::Auto }
+                    if let AstType::I(w) = t {
+                        match *w {
+                            8 => hir::IntegerRepr::I8,
+                            16 => hir::IntegerRepr::I16,
+                            32 => hir::IntegerRepr::I32,
+                            64 => hir::IntegerRepr::I64,
+                            128 => hir::IntegerRepr::I128,
+                            _ => hir::IntegerRepr::Auto,
+                        }
+                    } else { hir::IntegerRepr::Auto }
                 });
             }
         }
@@ -533,13 +522,13 @@ impl TypeChecker {
     fn check_traits(&mut self, prog: &Program) -> Result<()> {
         for t in &prog.traits {
             let id = self.find_def(&t.name)?;
-            let hir_t = self.trait_defs.get_mut(&id).unwrap();
+            // 先验证 super trait 存在（不可变借用），再取可变引用
             for st in &t.super_traits {
-                // 验证 super trait 存在
                 if let AstType::Named { path, .. } = st {
                     let _ = self.resolve_type_path(path)?;
                 }
             }
+            let hir_t = self.trait_defs.get_mut(&id).unwrap();
             for at in &t.assoc_types {
                 hir_t.assoc_types.push(hir::HirAssocType {
                     name: at.name.clone(),
@@ -561,7 +550,10 @@ impl TypeChecker {
         for ib in &prog.impls {
             let target = self.ast_to_hir_type(&ib.target)?;
             let trait_id = if let Some(tt) = &ib.trait_type {
-                Some(self.ast_to_hir_type(tt).as_named()?)
+                match self.ast_to_hir_type(tt)? {
+                    Ty::Named(id, _) => Some(id),
+                    _ => None,
+                }
             } else {
                 None
             };
@@ -570,15 +562,16 @@ impl TypeChecker {
                 let fid = self.find_def(&f.name)?;
                 items.push(self.fn_to_hir(f, fid));
             }
+            let where_clause: Vec<_> = ib.where_clause.iter().map(|w| WherePred {
+                lhs: self.ast_to_hir_type(&w.lhs).unwrap_or(Ty::Infer(InferId(0))),
+                trait_id: DefId(0),
+                span: w.span,
+            }).collect();
             self.impl_blocks.push(hir::HirImpl {
                 generics: ib.generics.clone(),
                 target,
                 trait_id,
-                where_clause: ib.where_clause.iter().map(|w| WherePred {
-                    lhs: self.ast_to_hir_type(&w.lhs).unwrap_or(Ty::Infer(InferId(0))),
-                    trait_id: DefId(0),
-                    span: w.span,
-                }).collect(),
+                where_clause,
                 items,
                 assoc_types: Vec::new(),
                 span: ib.span,
@@ -638,7 +631,7 @@ impl TypeChecker {
         &mut self,
         prog: &Program,
     ) -> Result<Vec<hir::HirFunction>> {
-        let mut result = Vec::new();
+        let mut result: Vec<hir::HirFunction> = Vec::new();
         for f in &prog.functions {
             let id = self.find_def(&f.name)?;
             self.current_function = Some(id);
@@ -782,13 +775,13 @@ impl TypeChecker {
                     span: *span,
                 })
             }
-            Statement::Const(c, span) => {
-                let ty = self.ast_to_hir_type(&c.ty)?;
-                let value = self.check_const_expr(&c.value, &ty)?;
-                let def = self.alloc_def(c.name.clone());
+            Statement::Const(name, ast_ty, value_expr, span) => {
+                let ty = self.ast_to_hir_type(ast_ty)?;
+                let value = self.check_const_expr(value_expr, &ty)?;
+                let def = self.alloc_def(name.clone());
                 self.consts.insert(def, hir::HirConst {
                     def_id: def,
-                    name: c.name.clone(),
+                    name: name.clone(),
                     visibility: crate::parser::ast::Visibility::Private,
                     ty: ty.clone(),
                     value: Box::new(value),
@@ -797,6 +790,7 @@ impl TypeChecker {
                 Ok(HirStmt::Item)
             }
             Statement::Expr(e, span) => Ok(HirStmt::Expr(Box::new(self.check_expr(e, &Ty::Unit)?), *span)),
+            Statement::Item(_) => Ok(HirStmt::Item),
         }
     }
 
@@ -931,6 +925,11 @@ impl TypeChecker {
                 let _target = self.ast_to_hir_type(target)?;
                 return Ok(HirExpr { kind: ExprKind::Is(Box::new(_inner), _target.clone()), ty: Ty::Bool, span });
             }
+            Expression::In(e, target, _) => {
+                let inner = self.check_expr(e, &Ty::Infer(InferId(0)))?;
+                let _target = self.check_expr(target, &Ty::Infer(InferId(0)))?;
+                return Ok(HirExpr { kind: ExprKind::Is(Box::new(inner), Ty::Bool), ty: Ty::Bool, span });
+            }
             Expression::Block(b, _) => {
                 let inner = self.check_block(b, expected)?;
                 let ty = inner.tail.as_ref().map(|t| t.ty.clone()).unwrap_or(Ty::Unit);
@@ -1015,9 +1014,10 @@ impl TypeChecker {
                 return Ok(HirExpr { kind: ExprKind::Break(BreakValue::Label(label.clone().unwrap_or_default())), ty: Ty::Never, span });
             }
             Expression::Return(value, _) => {
+                let ret_ty = self.infer.return_ty.clone().unwrap_or(Ty::Unit);
                 let v = if let Some(val) = value {
-                    let e = self.check_expr(val, self.infer.return_ty.as_ref().unwrap_or(&Ty::Unit))?;
-                    self.infer.unify(&e.ty, self.infer.return_ty.as_ref().unwrap_or(&Ty::Unit), span).ok();
+                    let e = self.check_expr(val, &ret_ty)?;
+                    self.infer.unify(&e.ty, &ret_ty, span).ok();
                     Some(Box::new(e))
                 } else {
                     None
@@ -1030,10 +1030,10 @@ impl TypeChecker {
             }
             Expression::Try(e, pat, catch, _) => {
                 let inner = self.check_expr(e, &Ty::Infer(InferId(0)))?;
-                let handler = if let Some((_p, b)) = pat.as_ref().zip(catch.as_ref()) {
+                let handler = if let Some(p) = pat {
                     let _ = self.lower_pattern(p, &inner.ty)?;
                     Some(Box::new(HirExpr {
-                        kind: ExprKind::Block(self.check_block(b, &Ty::Infer(InferId(0)))?),
+                        kind: ExprKind::Block(self.check_block(catch, &Ty::Infer(InferId(0)))?),
                         ty: Ty::Infer(InferId(0)),
                         span,
                     }))
@@ -1050,9 +1050,9 @@ impl TypeChecker {
                 if let Some(rep) = repeat {
                     let elem = self.infer.fresh_infer(span);
                     let _ = self.check_expr(rep, &Ty::Uint(64));
-                    let _ = self.check_expr(e, &elem)?;
+                    let first = self.check_expr(&elems[0], &elem)?;
                     return Ok(HirExpr {
-                        kind: ExprKind::Array(vec![elems[0].clone()], elem.clone()),
+                        kind: ExprKind::Array(vec![first], elem.clone()),
                         ty: Ty::Array(Box::new(elem), hir::ArrayLen::Dynamic),
                         span,
                     });
@@ -1087,8 +1087,9 @@ impl TypeChecker {
             Expression::Comptime(e, _) => {
                 // comptime 块：表达式必须在编译期可求值
                 let inner = self.check_expr(e, expected)?;
+                let inner_ty = inner.ty.clone();
                 let _ = self.eval_const_expr(e)?;
-                return Ok(HirExpr { kind: ExprKind::Comptime(Box::new(inner)), ty: inner.ty, span });
+                return Ok(HirExpr { kind: ExprKind::Comptime(Box::new(inner)), ty: inner_ty, span });
             }
             Expression::Await(e, _) => {
                 let inner = self.check_expr(e, &Ty::Infer(InferId(0)))?;
@@ -1337,11 +1338,8 @@ impl TypeChecker {
         span: ast::Span,
     ) -> Result<HirExpr> {
         let def_id = self.resolve_path(path, span)?;
-        let hir_td = self.type_defs.get(&def_id).ok_or_else(|| {
-            CompileError::name_error(format!("unknown type `{}`", path.join("::")))
-        })?;
-        let struct_def = match hir_td {
-            hir::HirTypeDef::Struct(s) => s,
+        let field_tys: Vec<(String, Ty)> = match self.type_defs.get(&def_id) {
+            Some(hir::HirTypeDef::Struct(s)) => s.fields.iter().map(|f| (f.name.clone(), f.ty.clone())).collect(),
             _ => return Err(CompileError::type_error(format!(
                 "`{}` is not a struct",
                 path.join("::")
@@ -1351,13 +1349,13 @@ impl TypeChecker {
         let mut hir_fields = Vec::new();
         let mut seen = HashSet::new();
         for (name, expr) in fields {
-            let field_idx = struct_def.fields.iter().position(|f| &f.name == name);
+            let field_idx = field_tys.iter().position(|(n, _)| n == name);
             let idx = match field_idx {
                 Some(i) => i,
                 None => {
                     return Err(CompileError::name_error(format!(
                         "no field `{}` on struct `{}`",
-                        name, struct_def.name
+                        name, path.join("::")
                     ))
                     .with_span(span));
                 }
@@ -1370,16 +1368,16 @@ impl TypeChecker {
                 .with_span(span));
             }
             seen.insert(name.clone());
-            let f = &struct_def.fields[idx];
-            let hir_expr = self.check_expr(expr, &f.ty)?;
+            let fty = &field_tys[idx].1;
+            let hir_expr = self.check_expr(expr, fty)?;
             hir_fields.push((idx, hir_expr));
         }
         // 检查是否有未初始化的字段（结构体字面量要求全部初始化）
-        for f in &struct_def.fields {
-            if !seen.contains(&f.name) {
+        for (name, _) in &field_tys {
+            if !seen.contains(name) {
                 return Err(CompileError::type_error(format!(
                     "missing field `{}` in struct literal for `{}`",
-                    f.name, struct_def.name
+                    name, path.join("::")
                 ))
                 .with_span(span));
             }
@@ -1525,7 +1523,7 @@ impl TypeChecker {
                 let def_id = self.resolve_path(path, *span)?;
                 let hir_fields: Result<Vec<_>> = fields.iter()
                     .map(|fp| {
-                        let fty = self.field_type(&def_id, &fp.name, *span)?;
+                        let fty = self.field_type(def_id, &fp.name, *span)?;
                         Ok((0, self.lower_pattern(&fp.pattern, &fty)?))
                     })
                     .collect();
@@ -1545,7 +1543,9 @@ impl TypeChecker {
                 hir::HirPattern::Slice(pats.iter().map(|p| self.lower_pattern(p, ty)).collect::<Result<_>>()?, None, Vec::new())
             }
             AstPattern::Range(start, end, inclusive, _) => {
-                hir::HirPattern::Range(start.clone(), end.clone(), if *inclusive { hir::RangeInclusivity::Inclusive } else { hir::RangeInclusivity::Exclusive })
+                let s = self.check_expr(start, &Ty::Infer(InferId(0)))?;
+                let en = self.check_expr(end, &Ty::Infer(InferId(0)))?;
+                hir::HirPattern::Range(Box::new(s), Box::new(en), if *inclusive { hir::RangeInclusivity::Inclusive } else { hir::RangeInclusivity::Exclusive })
             }
             AstPattern::Ref(inner, mutability, _) => {
                 hir::HirPattern::Ref(Box::new(self.lower_pattern(inner, ty)?), *mutability)
@@ -1595,7 +1595,7 @@ impl TypeChecker {
             self.scope_stack.last_mut().unwrap().push(local);
             hir_params.push((self.lower_pattern(p, &ty)?, ty.clone()));
         }
-        let ret_ty = ret.map(|t| self.ast_to_hir_type(t)).unwrap_or_else(|| self.infer.fresh_infer(span));
+        let ret_ty = ret.as_ref().map(|t| self.ast_to_hir_type(t)).unwrap_or_else(|| Ok(self.infer.fresh_infer(span)))?;
         let body_expr = HirExpr {
             kind: ExprKind::Block(self.check_block(body, &ret_ty)?),
             ty: ret_ty.clone(),
@@ -1611,12 +1611,12 @@ impl TypeChecker {
             abi: Abi::Zr,
         };
         Ok(HirExpr {
-            kind: ExprKind::Closure(ClosureExpr {
+            kind: ExprKind::Closure(Box::new(ClosureExpr {
                 params: hir_params,
                 captures,
                 ty: fn_ty.clone(),
                 body: body_expr,
-            }),
+            })),
             ty: fn_ty,
             span,
         })
@@ -1637,7 +1637,7 @@ impl TypeChecker {
     // 借用检查
     // ==================================================================
 
-    fn borrow_check(&self, functions: &[hir::HirFunction]) -> Result<()> {
+    fn borrow_check(&mut self, functions: &[hir::HirFunction]) -> Result<()> {
         for f in functions {
             if let Some(b) = &f.body {
                 let cfg = self.build_cfg(b)?;
@@ -1650,7 +1650,7 @@ impl TypeChecker {
         Ok(())
     }
 
-    fn build_cfg(&self, block: &hir::HirBlock) -> Result<Cfg> {
+    fn build_cfg(&mut self, block: &hir::HirBlock) -> Result<Cfg> {
         let mut cfg = Cfg::default();
         let start = self.alloc_bb();
         cfg.start = start;
@@ -1756,7 +1756,7 @@ impl TypeChecker {
     // 类型转换辅助
     // ==================================================================
 
-    fn ast_to_hir_type(&self, t: &AstType) -> Result<Ty> {
+    fn ast_to_hir_type(&mut self, t: &AstType) -> Result<Ty> {
         Ok(match t {
             AstType::I(w) => Ty::Int(*w as u16),
             AstType::U(w) => Ty::Uint(*w as u16),
@@ -1861,7 +1861,7 @@ impl TypeChecker {
             Expression::Continue(_, _) => Ty::Never,
             Expression::Loop(_, _) => Ty::Never,
             Expression::Throw(_, _) => Ty::Never,
-            Expression::StructInit(path, _, _, _) => {
+            Expression::StructInit(path, _, _) => {
                 let id = self.resolve_path(path, ast::Span::unknown()).unwrap_or(DefId(0));
                 Ty::Named(id, Vec::new())
             }
@@ -1878,7 +1878,7 @@ impl TypeChecker {
             }
             Expression::Lambda(_, ret, _, _) => {
                 let params = Vec::new();
-                let ret_ty = ret.map(|t| self.ast_to_hir_type(t)).unwrap_or_else(|| self.infer.fresh_infer(e.span()));
+                let ret_ty = ret.as_ref().map(|t| self.ast_to_hir_type(t)).unwrap_or_else(|| Ok(self.infer.fresh_infer(e.span())))?;
                 Ty::Function { params, ret: Box::new(ret_ty), is_async: false, abi: Abi::Zr }
             }
             Expression::Await(_, _) => self.infer.fresh_infer(e.span()),
@@ -1952,11 +1952,11 @@ impl TypeChecker {
         }
     }
 
-    fn lower_const_expr(&self, e: &Expression) -> Result<HirExpr> {
+    fn lower_const_expr(&mut self, e: &Expression) -> Result<HirExpr> {
         self.check_expr(e, &Ty::Infer(InferId(0)))
     }
 
-    fn check_const_expr(&self, e: &Expression, expected: &Ty) -> Result<HirExpr> {
+    fn check_const_expr(&mut self, e: &Expression, expected: &Ty) -> Result<HirExpr> {
         self.check_expr(e, expected)
     }
 
@@ -2427,7 +2427,7 @@ pub mod print {
             }
             ExprKind::Range(a, b, inclusive) => {
                 print_expr(a, 0);
-                print!("..={}", if *inclusive { "=" } else { "" });
+                print!("..{}", matches!(inclusive, hir::RangeInclusivity::Inclusive).then_some("=").unwrap_or(""));
                 print_expr(b, 0);
             }
             ExprKind::CompileError(msg) => print!("@compileError({:?})", msg),

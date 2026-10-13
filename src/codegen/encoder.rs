@@ -93,7 +93,7 @@ pub fn emit_function(unit: &mut CompilationUnit, func: &SsaFunction) {
 
     // 函数序言：push rbp; mov rbp, rsp
     emit1(unit, 0x55);
-    emit2(unit, 0x48, 0x89, 0xe5);
+    emit3(unit, 0x48, 0x89, 0xe5);
 
     // 遍历基本块，线性发射指令。
     for block in &func.blocks {
@@ -109,7 +109,7 @@ pub fn emit_function(unit: &mut CompilationUnit, func: &SsaFunction) {
                     emit_mov_rr(unit, Gpr::Rax, r);
                 }
                 // 尾声：mov rsp, rbp; pop rbp; ret
-                emit2(unit, 0x48, 0x89, 0xec);
+                emit3(unit, 0x48, 0x89, 0xec);
                 emit1(unit, 0x5d);
                 emit1(unit, 0xc3);
             }
@@ -192,7 +192,7 @@ fn emit_const(unit: &mut CompilationUnit, result: SsaValue, value: SsaConst) {
         SsaConst::Float(_bits) => {
             // 浮点常量：简化实现加载 0.0（完整实现需 xmm 寄存器 + .rodata 中的位模式）
             // 这里仅生成 `xor xmm0, xmm0`，避免未定义行为
-            emit2(unit, 0x66, 0x0f, 0x57, 0xc0);
+            emit4(unit, 0x66, 0x0f, 0x57, 0xc0);
         }
         SsaConst::Unit => {
             // Unit 值无需加载
@@ -219,8 +219,8 @@ fn emit_binary(unit: &mut CompilationUnit, result: SsaValue, op: SsaBinaryOp, lh
         }
         // 乘法 / 除法 / 取模 / 移位：需要专用指令编码（简化实现）
         Mul => emit_mul(unit, dst, l, r),
-        Div => emit_div(unit, dst, l, r, signed = true),
-        Rem => emit_rem(unit, dst, l, r, signed = true),
+        Div => emit_div(unit, dst, l, r, true),
+        Rem => emit_rem(unit, dst, l, r, true),
         Shl => emit_shift(unit, 4, dst, l, r), // shl
         Shr => emit_shift(unit, 5, dst, l, r), // shr (logical)
         // 逻辑运算（短路由前端展开，此处做位运算语义）
@@ -228,7 +228,7 @@ fn emit_binary(unit: &mut CompilationUnit, result: SsaValue, op: SsaBinaryOp, lh
             if dst != l {
                 emit_mov_rr(unit, dst, l);
             }
-            emit_full_alu(unit, alu_opcode(op), dst, r);
+            emit_full_alu(unit, alu_opcode(op).unwrap_or(0), dst, r);
         }
         // 比较运算：cmp l, r; setcc; movzx
         Eq | Ne | Lt | Gt | Le | Ge => {
@@ -252,7 +252,7 @@ fn emit_unary(unit: &mut CompilationUnit, result: SsaValue, op: crate::ssa::SsaU
             // xor eax, eax; test r, r; sete al
             emit2(unit, 0x31, 0xc0); // xor eax, eax
             emit_test_rr(unit, r, r);
-            emit2(unit, 0x0f, 0x94, 0xc0); // sete al
+            emit3(unit, 0x0f, 0x94, 0xc0); // sete al
             emit_mov_rr(unit, dst, Gpr::Rax);
         }
         BitNot => {
@@ -262,7 +262,7 @@ fn emit_unary(unit: &mut CompilationUnit, result: SsaValue, op: crate::ssa::SsaU
             }
             emit1(unit, 0x48);
             emit1(unit, 0xf7);
-            modrm(unit, 3, 2, dst); // /2 = NOT
+            modrm(unit, 3, 2, dst.bits()); // /2 = NOT
         }
         Neg => {
             // mov dst, r; neg dst
@@ -271,7 +271,7 @@ fn emit_unary(unit: &mut CompilationUnit, result: SsaValue, op: crate::ssa::SsaU
             }
             emit1(unit, 0x48);
             emit1(unit, 0xf7);
-            modrm(unit, 3, 3, dst); // /3 = NEG
+            modrm(unit, 3, 3, dst.bits()); // /3 = NEG
         }
     }
 }
@@ -588,7 +588,7 @@ fn emit_div(unit: &mut CompilationUnit, dst: Gpr, l: Gpr, r: Gpr, signed: bool) 
     if src.rex_bit() { rex |= 0x01; }
     emit1(unit, rex);
     emit1(unit, 0xf7);
-    modrm(unit, 3, 7, src); // /7 = IDIV
+    modrm(unit, 3, 7, src.bits()); // /7 = IDIV
 }
 
 /// 有符号取模：同上用 idiv，结果在 RDX。
@@ -613,7 +613,7 @@ fn emit_shift(unit: &mut CompilationUnit, code: u8, dst: Gpr, l: Gpr, r: Gpr) {
     if dst.rex_bit() { rex |= 0x01; }
     emit1(unit, rex);
     emit1(unit, 0xd3);
-    modrm(unit, 3, code, dst);
+    modrm(unit, 3, code, dst.bits());
 }
 
 /// 占位：ALU 编码的完整分发（后续优化器会替换此简化版本）。

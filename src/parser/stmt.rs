@@ -23,7 +23,7 @@
 //! ```
 
 use crate::error::CompileError;
-use crate::lexer::TokenKind;
+use crate::lexer::{Span, TokenKind};
 use crate::parser::ast::*;
 use crate::parser::Parser;
 

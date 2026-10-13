@@ -15,9 +15,10 @@ mod pass_manager;
 use crate::ssa::SsaModule;
 
 /// 优化等级。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum OptLevel {
     /// `-O0`：不优化，仅保证编译速度。
+    #[default]
     O0,
     /// `-O1`：基本优化（常量折叠、DCE）。
     O1,

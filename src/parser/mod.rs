@@ -31,7 +31,7 @@
 //!                 | loop_expr | lambda | array | tuple | struct_init
 //! ```
 
-mod ast;
+pub mod ast;
 mod decl;
 mod expr;
 mod stmt;
@@ -62,7 +62,7 @@ impl Parser {
         let mut program = Program::default();
         program.attrs = self.parse_inner_attrs()?;
 
-        while !self.check(&TokenKind::Eof) {
+        while !self.is_at_end() {
             let item = self.parse_module_item()?;
             match item {
                 ModuleItem::Function(f) => program.functions.push(f),
@@ -105,22 +105,22 @@ impl Parser {
             return self.parse_static(vis, attrs).map(ModuleItem::Static);
         }
         if self.match_kind(&TokenKind::KwStruct) {
-            return decl::parse_struct_def(self, vis, attrs).map(ModuleItem::TypeDef);
+            return self.parse_struct_def(vis, attrs).map(ModuleItem::TypeDef);
         }
         if self.match_kind(&TokenKind::KwEnum) {
-            return decl::parse_enum_def(self, vis, attrs).map(ModuleItem::TypeDef);
+            return self.parse_enum_def(vis, attrs).map(ModuleItem::TypeDef);
         }
         if self.match_kind(&TokenKind::KwUnion) {
-            return decl::parse_union_def(self, vis, attrs).map(ModuleItem::TypeDef);
+            return self.parse_union_def(vis, attrs).map(ModuleItem::TypeDef);
         }
         if self.match_kind(&TokenKind::KwType) {
-            return decl::parse_type_alias(self, vis, attrs).map(ModuleItem::TypeDef);
+            return self.parse_type_alias(vis, attrs).map(ModuleItem::TypeDef);
         }
         if self.match_kind(&TokenKind::KwTrait) {
-            return decl::parse_trait_def(self, vis, attrs).map(ModuleItem::Trait);
+            return self.parse_trait_def(vis, attrs).map(ModuleItem::Trait);
         }
         if self.match_kind(&TokenKind::KwImpl) {
-            return decl::parse_impl_block(self, attrs).map(ModuleItem::Impl);
+            return self.parse_impl_block(attrs).map(ModuleItem::Impl);
         }
 
         Err(self.unexpected(&[
@@ -225,13 +225,7 @@ impl Parser {
             let value = self.parse_expression()?;
             self.consume(&TokenKind::Semicolon, "expected ';' after constant")?;
             let span = Span::unknown();
-            return Ok(Statement::Const(ConstDecl {
-                name,
-                visibility: crate::parser::ast::Visibility::Private,
-                ty,
-                value,
-                span,
-            }));
+            return Ok(Statement::Const(name, ty, value, span));
         }
         // 表达式语句
         let expr = self.parse_expression()?;
@@ -246,7 +240,7 @@ impl Parser {
     fn parse_let_stmt(
         &mut self,
         mutable: bool,
-    ) -> Result<Statement, CompileError> {
+    ) -> Result<Statement> {
         let span = self.peek().span;
         // `mut name` 语法糖
         let (mutability, pattern) = if !mutable && self.check(&TokenKind::KwMut) {
@@ -431,7 +425,9 @@ impl Parser {
                 | TokenKind::KwFor | TokenKind::KwLoop | TokenKind::KwReturn | TokenKind::KwPub => {
                     return;
                 }
-                _ => self.advance(),
+                _ => {
+                    self.advance();
+                }
             }
         }
     }

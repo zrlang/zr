@@ -86,7 +86,7 @@ pub fn assemble_elf(unit: &CompilationUnit) -> io::Result<Vec<u8>> {
     buf.extend_from_slice(&phnum.to_le_bytes()); // e_phnum
     buf.extend_from_slice(&64u16.to_le_bytes()); // e_shentsize
     buf.extend_from_slice(&(SECTION_COUNT as u16).to_le_bytes()); // e_shnum
-    buf.extend_from_slice(&(SHSTRTAB_IDX as u16).to_le_bytes()); // e_shstrndx
+    buf.extend_from_slice(&(SHN_SHSTRTAB as u16).to_le_bytes()); // e_shstrndx
 
     // === Program Headers（仅可执行文件）===
     if is_exec {

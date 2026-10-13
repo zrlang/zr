@@ -279,7 +279,7 @@ mod tests {
 
     #[test]
     fn cli_opt_levels() {
-        assert_eq!(Cli::parse(&["zr".into(), "-O2", "a.zr".into()]).unwrap().opt_level, OptLevel::O2);
-        assert_eq!(Cli::parse(&["zr".into(), "-Oz", "a.zr".into()]).unwrap().opt_level, OptLevel::Oz);
+        assert_eq!(Cli::parse(&["zr".into(), "-O2".to_string(), "a.zr".into()]).unwrap().opt_level, OptLevel::O2);
+        assert_eq!(Cli::parse(&["zr".into(), "-Oz".to_string(), "a.zr".into()]).unwrap().opt_level, OptLevel::Oz);
     }
 }

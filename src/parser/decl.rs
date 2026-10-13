@@ -1,7 +1,7 @@
 //! 声明（declaration）解析：函数、类型、trait、impl、const、static、mod、use、extern。
 
 use crate::error::CompileError;
-use crate::lexer::TokenKind;
+use crate::lexer::{Span, TokenKind};
 use crate::parser::ast::*;
 use crate::parser::Parser;
 
@@ -32,6 +32,26 @@ impl Parser {
             while self.match_kind(&TokenKind::ColonColon) {
                 if self.match_kind(&TokenKind::Star) {
                     return Ok(UseTree::Group(vec![UseTree::Glob]));
+                }
+                if self.match_kind(&TokenKind::LBrace) {
+                    let mut trees = Vec::new();
+                    if !self.check(&TokenKind::RBrace) {
+                        trees.push(self.parse_use_tree()?);
+                        while self.match_kind(&TokenKind::Comma) {
+                            if self.check(&TokenKind::RBrace) {
+                                break;
+                            }
+                            trees.push(self.parse_use_tree()?);
+                        }
+                    }
+                    self.consume(&TokenKind::RBrace, "expected '}' to close use group")?;
+                    let group = UseTree::Group(trees);
+                    // 把已解析的 path 包装到 group 外面
+                    let mut tree = UseTree::Name(path[0].clone());
+                    for seg in path.into_iter().skip(1) {
+                        tree = UseTree::Group(vec![tree, UseTree::Name(seg)]);
+                    }
+                    return Ok(UseTree::Group(vec![tree, group]));
                 }
                 path.push(self.consume_ident("expected name")?);
             }
@@ -102,7 +122,7 @@ impl Parser {
         _attrs: Vec<Attribute>,
     ) -> Result<ExternBlock, CompileError> {
         let span = self.previous().span;
-        let abi = if self.match_kind(&TokenKind::StringLiteral) {
+        let abi = if self.match_kind(&TokenKind::StringLiteral(String::new())) {
             // 上一个 token 已被消费，abi 字符串需要从 previous() 获取
             match &self.previous().kind {
                 TokenKind::StringLiteral(s) => match s.as_str() {
@@ -473,7 +493,7 @@ impl Parser {
         } else {
             None
         };
-        Ok(Variant::Variant { name, payload, discriminant, span })
+        Ok(Variant { name, payload, discriminant, span })
     }
 
     // ==================================================================
@@ -584,7 +604,7 @@ impl Parser {
             }
         }
         let default = if self.match_kind(&TokenKind::Eq) {
-            Some(self.parse_type()?);
+            Some(self.parse_type()?)
         } else {
             None
         };
@@ -608,7 +628,7 @@ impl Parser {
         };
         let target = self.parse_type()?;
         let trait_type = if self.match_kind(&TokenKind::KwFor) {
-            Some(target)
+            Some(target.clone())
         } else {
             None
         };

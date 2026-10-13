@@ -7,7 +7,7 @@
 //!
 //! 节点都携带 `Span`，便于后续阶段定位错误。
 
-use crate::lexer::Span;
+pub use crate::lexer::Span;
 
 // ======================================================================
 // 顶层
@@ -125,7 +125,7 @@ pub struct ExternBlock {
     pub span: Span,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum Abi {
     C,
     Cdecl,
@@ -148,7 +148,7 @@ pub enum ExternItem {
 // ======================================================================
 
 /// 类型表达式。
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum Type {
     /// `i8`..`i128`
     I(usize),
@@ -196,12 +196,25 @@ pub enum Type {
 }
 
 /// 数组长度（可以是编译期常量表达式）。
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone)]
 pub enum ArrayLen {
     /// 编译期已知长度。
     Const(Box<Expression>),
     /// 动态长度（仅在 `&[T]` 切片中使用，或作为未定长数组）。
     Dynamic,
+}
+
+// Expression 未实现 PartialEq，这里用 Debug 输出做近似比较。
+impl PartialEq for ArrayLen {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (ArrayLen::Dynamic, ArrayLen::Dynamic) => true,
+            (ArrayLen::Const(a), ArrayLen::Const(b)) => {
+                format!("{:?}", a) == format!("{:?}", b)
+            }
+            _ => false,
+        }
+    }
 }
 
 /// 可变性。
@@ -731,13 +744,6 @@ pub struct ImplBlock {
 // ======================================================================
 // Span 便捷实现
 // ======================================================================
-
-impl Span {
-    /// 构造一个未知 span。
-    pub const fn unknown() -> Self {
-        Self::new(0, 0, 0, 0)
-    }
-}
 
 /// 从表达式提取 span 的便捷 trait。
 pub trait Spanned {

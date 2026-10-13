@@ -21,7 +21,7 @@ use crate::parser::ast::Span;
 use super::hir::{
     self, BasicBlockId, BreakValue, CaptureKind, ClosureExpr, Cfg, DefId, ExprKind,
     FieldIndex, ForLoop, ForProtocol, GenericId, HirExpr, HirStmt, InferId, LocalId,
-    Ty, WherePred,
+    Ty, TypeScheme, WherePred,
 };
 
 /// 类型推断上下文。
@@ -103,7 +103,7 @@ fn empty_locals() -> &'static mut HashMap<LocalId, Ty> {
     static mut V: OnceLock<HashMap<LocalId, Ty>> = OnceLock::new();
     // SAFETY: `empty()` 只在 `Default::default()` 里调用，且紧接着被 `new()` 覆盖，
     // 返回的引用不会被跨调用/跨线程使用。
-    unsafe { V.get_or_init(HashMap::new); &mut *V.get_mut().unwrap().as_mut_ptr() }
+    unsafe { V.get_or_init(HashMap::new); V.get_mut().unwrap() }
 }
 
 /// 借用区间（NLL）。
@@ -204,6 +204,118 @@ impl<'a> InferCtxt<'a> {
         Ty::Infer(id)
     }
 
+    /// 计算类型的大小（字节）。简化实现：64 位目标。
+    pub fn size_of(&self, ty: &Ty) -> usize {
+        match ty {
+            Ty::Int(w) | Ty::Uint(w) => (*w as usize).max(8) / 8,
+            Ty::Float(w) => (*w as usize) / 8,
+            Ty::Bool => 1,
+            Ty::Char => 4,
+            Ty::Str => 16, // ptr + len
+            Ty::Unit | Ty::Never => 0,
+            Ty::Pointer(..) | Ty::Reference(..) => 8,
+            Ty::Array(inner, len) => {
+                let n = match len {
+                    hir::ArrayLen::Const(_) => 1, // 简化：无法求值时按 1 计
+                    hir::ArrayLen::Dynamic => 0,
+                };
+                self.size_of(inner) * n
+            }
+            Ty::Slice(..) => 16, // ptr + len
+            Ty::Tuple(tys) => {
+                let mut sz = 0usize;
+                for t in tys {
+                    let a = self.align_of(t);
+                    sz = (sz + a - 1) / a * a;
+                    sz += self.size_of(t);
+                }
+                sz
+            }
+            Ty::Function { .. } => 8,
+            Ty::Optional(inner) => self.size_of(inner) + 1,
+            Ty::ErrorUnion(ok, _) => self.size_of(ok) + 1,
+            Ty::Named(def_id, _) => {
+                match self.type_defs.get(def_id) {
+                    Some(hir::HirTypeDef::Struct(s)) => {
+                        let mut sz = 0usize;
+                        for f in &s.fields {
+                            let a = self.align_of(&f.ty);
+                            sz = (sz + a - 1) / a * a;
+                            sz += self.size_of(&f.ty);
+                        }
+                        sz
+                    }
+                    Some(hir::HirTypeDef::Enum(e)) => {
+                        let tag = match e.repr {
+                            hir::IntegerRepr::I8 | hir::IntegerRepr::U8 => 1,
+                            hir::IntegerRepr::I16 | hir::IntegerRepr::U16 => 2,
+                            hir::IntegerRepr::I32 | hir::IntegerRepr::U32 => 4,
+                            _ => 8,
+                        };
+                        let mut max_payload = 0usize;
+                        for v in &e.variants {
+                            let payload_size = match &v.payload {
+                                hir::HirVariantPayload::Tuple(tys) => {
+                                    tys.iter().map(|t| self.size_of(t)).max().unwrap_or(0)
+                                }
+                                hir::HirVariantPayload::Struct(fields) => {
+                                    fields.iter().map(|f| self.size_of(&f.ty)).max().unwrap_or(0)
+                                }
+                                hir::HirVariantPayload::Unit => 0,
+                            };
+                            max_payload = max_payload.max(payload_size);
+                        }
+                        tag + max_payload
+                    }
+                    Some(hir::HirTypeDef::Union(u)) => {
+                        u.fields.iter().map(|f| self.size_of(&f.ty)).max().unwrap_or(0)
+                    }
+                    Some(hir::HirTypeDef::Alias { target, .. }) => self.size_of(target),
+                    None => 0,
+                }
+            }
+            Ty::Alias(inner) => self.size_of(inner),
+            Ty::Opaque(_) => 0,
+            Ty::Param(_) | Ty::Infer(_) => 0,
+        }
+    }
+
+    /// 计算类型的对齐（字节）。简化实现：64 位目标。
+    pub fn align_of(&self, ty: &Ty) -> usize {
+        match ty {
+            Ty::Int(w) | Ty::Uint(w) => {
+                let b = (*w as usize).max(8) / 8;
+                b.min(8)
+            }
+            Ty::Float(32) => 4,
+            Ty::Float(_) => 8,
+            Ty::Bool => 1,
+            Ty::Char => 4,
+            Ty::Str | Ty::Slice(..) => 8,
+            Ty::Unit | Ty::Never => 1,
+            Ty::Pointer(..) | Ty::Reference(..) | Ty::Function { .. } => 8,
+            Ty::Array(inner, _) => self.align_of(inner),
+            Ty::Tuple(tys) => tys.iter().map(|t| self.align_of(t)).max().unwrap_or(1),
+            Ty::Optional(inner) | Ty::ErrorUnion(inner, _) => self.align_of(inner).max(1),
+            Ty::Named(def_id, _) => {
+                match self.type_defs.get(def_id) {
+                    Some(hir::HirTypeDef::Struct(s)) => {
+                        s.fields.iter().map(|f| self.align_of(&f.ty)).max().unwrap_or(1)
+                    }
+                    Some(hir::HirTypeDef::Enum(_)) => 8,
+                    Some(hir::HirTypeDef::Union(u)) => {
+                        u.fields.iter().map(|f| self.align_of(&f.ty)).max().unwrap_or(1)
+                    }
+                    Some(hir::HirTypeDef::Alias { target, .. }) => self.align_of(target),
+                    None => 1,
+                }
+            }
+            Ty::Alias(inner) => self.align_of(inner),
+            Ty::Opaque(_) => 1,
+            Ty::Param(_) | Ty::Infer(_) => 1,
+        }
+    }
+
     /// 创建一个新的类型参数。
     pub fn fresh_generic(&mut self, name: &str) -> Ty {
         let id = GenericId(self.next_infer);
@@ -239,7 +351,7 @@ impl<'a> InferCtxt<'a> {
                 params: params.iter().map(|t| self.resolve(t)).collect(),
                 ret: Box::new(self.resolve(ret)),
                 is_async: *is_async,
-                abi: *abi,
+                abi: abi.clone(),
             },
             Ty::Optional(t) => Ty::Optional(Box::new(self.resolve(t))),
             Ty::ErrorUnion(t, e) => {
@@ -514,8 +626,8 @@ impl<'a> InferCtxt<'a> {
             ),
             Ty::Array(t, len) => {
                 let l = match len {
-                    hir::ArrayLen::Const(_) => "_".into(),
-                    hir::ArrayLen::Dynamic => "_".into(),
+                    hir::ArrayLen::Const(_) => "_".to_string(),
+                    hir::ArrayLen::Dynamic => "_".to_string(),
                 };
                 format!("[{}; {}]", self.type_name(t), l)
             }
@@ -744,32 +856,55 @@ impl fmt::Display for Ty {
 mod tests {
     use super::*;
 
+    /// 测试用的 InferCtxt 构造辅助，避免临时值生命周期问题。
+    struct TestCtxt {
+        type_defs: HashMap<DefId, hir::HirTypeDef>,
+        trait_defs: HashMap<DefId, hir::HirTrait>,
+        impl_blocks: Vec<hir::HirImpl>,
+        functions: HashMap<DefId, hir::HirFunction>,
+        consts: HashMap<DefId, hir::HirConst>,
+        statics: HashMap<DefId, hir::HirStatic>,
+        locals: HashMap<LocalId, Ty>,
+    }
+
+    impl TestCtxt {
+        fn new() -> Self {
+            Self {
+                type_defs: HashMap::new(),
+                trait_defs: HashMap::new(),
+                impl_blocks: Vec::new(),
+                functions: HashMap::new(),
+                consts: HashMap::new(),
+                statics: HashMap::new(),
+                locals: HashMap::new(),
+            }
+        }
+
+        fn cx(&mut self) -> InferCtxt<'_> {
+            InferCtxt::new(
+                &self.type_defs,
+                &self.trait_defs,
+                &self.impl_blocks,
+                &self.functions,
+                &self.consts,
+                &self.statics,
+                &mut self.locals,
+            )
+        }
+    }
+
     #[test]
     fn unify_int_types() {
-        let mut cx = InferCtxt::new(
-            &HashMap::new(),
-            &HashMap::new(),
-            &[],
-            &HashMap::new(),
-            &HashMap::new(),
-            &HashMap::new(),
-            &mut HashMap::new(),
-        );
+        let mut t = TestCtxt::new();
+        let mut cx = t.cx();
         let span = Span::unknown();
         cx.unify(&Ty::Int(32), &Ty::Int(32), span).unwrap();
     }
 
     #[test]
     fn unify_infer_var() {
-        let mut cx = InferCtxt::new(
-            &HashMap::new(),
-            &HashMap::new(),
-            &[],
-            &HashMap::new(),
-            &HashMap::new(),
-            &HashMap::new(),
-            &mut HashMap::new(),
-        );
+        let mut t = TestCtxt::new();
+        let mut cx = t.cx();
         let span = Span::unknown();
         let v = cx.fresh_infer(span);
         cx.unify(&v, &Ty::Int(64), span).unwrap();
@@ -778,15 +913,8 @@ mod tests {
 
     #[test]
     fn occurs_check_prevents_infinite_type() {
-        let mut cx = InferCtxt::new(
-            &HashMap::new(),
-            &HashMap::new(),
-            &[],
-            &HashMap::new(),
-            &HashMap::new(),
-            &HashMap::new(),
-            &mut HashMap::new(),
-        );
+        let mut t = TestCtxt::new();
+        let mut cx = t.cx();
         let span = Span::unknown();
         let v = cx.fresh_infer(span);
         let list = Ty::Named(DefId(1), vec![v.clone()]);
@@ -796,30 +924,16 @@ mod tests {
 
     #[test]
     fn subtype_int_promotion() {
-        let mut cx = InferCtxt::new(
-            &HashMap::new(),
-            &HashMap::new(),
-            &[],
-            &HashMap::new(),
-            &HashMap::new(),
-            &HashMap::new(),
-            &mut HashMap::new(),
-        );
+        let mut t = TestCtxt::new();
+        let mut cx = t.cx();
         let span = Span::unknown();
         cx.subtype(&Ty::Int(8), &Ty::Int(32), span).unwrap();
     }
 
     #[test]
     fn never_is_bottom_type() {
-        let mut cx = InferCtxt::new(
-            &HashMap::new(),
-            &HashMap::new(),
-            &[],
-            &HashMap::new(),
-            &HashMap::new(),
-            &HashMap::new(),
-            &mut HashMap::new(),
-        );
+        let mut t = TestCtxt::new();
+        let mut cx = t.cx();
         let span = Span::unknown();
         cx.subtype(&Ty::Never, &Ty::Int(32), span).unwrap();
     }

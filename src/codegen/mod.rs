@@ -39,9 +39,10 @@ pub struct CompilationUnit {
 }
 
 /// 输出文件类型。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum OutputKind {
     /// 可重定位目标文件（`.o`）。
+    #[default]
     Relocatable,
     /// 可执行文件。
     Executable,

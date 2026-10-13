@@ -63,8 +63,8 @@ pub fn build_dominator_tree(func: &SsaFunction) -> Vec<DomNode> {
             // 其余前驱与 first_pred 取交集
             let mut new_idom = first_pred;
             for &p in &func.blocks[b].preds {
-                if *p != first_pred && *p < n {
-                    new_idom = intersect(&nodes, new_idom, *p);
+                if p != first_pred && p < n {
+                    new_idom = intersect(&nodes, new_idom, p);
                 }
             }
 

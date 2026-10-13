@@ -129,6 +129,10 @@ pub enum TokenKind {
     KwRef,
     /// `static`
     KwStatic,
+    /// `extern`
+    KwExtern,
+    /// `crate`
+    KwCrate,
 
     // ===== 类型关键字 =====
     /// `i8`..`i128`

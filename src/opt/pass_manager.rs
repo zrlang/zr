@@ -4,7 +4,7 @@
 //! 当前为语义正确的骨架实现（保留全部指令，不破坏语义），
 //! 后续可在不改动接口的前提下逐步填充实际优化逻辑。
 
-use crate::ssa::{SsaBasicBlock, SsaFunction, SsaInstr, SsaModule, SsaTerminator, SsaValue};
+use crate::ssa::{SsaBasicBlock, SsaConst, SsaFunction, SsaInstr, SsaModule, SsaTerminator, SsaValue};
 
 /// 常量折叠：把已知常量的运算替换为结果常量。
 ///
@@ -20,7 +20,7 @@ pub fn fold_constants(mut module: SsaModule) -> SsaModule {
                 if let Some(folded) = try_fold(&block.instrs[i]) {
                     block.instrs[i] = SsaInstr::Const {
                         result: block.instrs[i].result().expect("instruction has no result"),
-                        value: folded,
+                        value: SsaConst::Int(folded),
                     };
                 }
                 i += 1;

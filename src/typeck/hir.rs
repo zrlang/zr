@@ -9,7 +9,7 @@
 //!
 //! HIR 是后续 MIR 降级、借用检查、模式穷尽性检查、闭包转换的输入。
 
-use crate::parser::ast::{Abi, Attribute, GenericParam, Span, Visibility};
+use crate::parser::ast::{Abi, Attribute, GenericParam, Pattern, Span, Visibility};
 use crate::typeck::Ty as HirType;
 
 /// 一个 HIR 程序（已通过类型检查）。
@@ -79,8 +79,14 @@ pub enum Ty {
     Opaque(DefId),
 }
 
+impl Default for Ty {
+    fn default() -> Self {
+        Ty::Unit
+    }
+}
+
 /// 数组长度。
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone)]
 pub enum ArrayLen {
     /// 编译期常量。
     Const(Box<HirExpr>),
@@ -88,12 +94,33 @@ pub enum ArrayLen {
     Dynamic,
 }
 
-/// 可变性。
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum Mutability {
-    Immutable,
-    Mutable,
+// HirExpr 未实现 PartialEq/Eq/Hash，这里用 Debug 输出做近似实现。
+impl PartialEq for ArrayLen {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (ArrayLen::Dynamic, ArrayLen::Dynamic) => true,
+            (ArrayLen::Const(a), ArrayLen::Const(b)) => {
+                format!("{:?}", a) == format!("{:?}", b)
+            }
+            _ => false,
+        }
+    }
 }
+
+impl Eq for ArrayLen {}
+
+impl std::hash::Hash for ArrayLen {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        std::mem::discriminant(self).hash(state);
+        if let ArrayLen::Const(e) = self {
+            format!("{:?}", e).hash(state);
+        }
+    }
+}
+
+/// 可变性。
+/// 可变性（直接复用 AST 定义，避免类型分裂）。
+pub use crate::parser::ast::Mutability;
 
 /// 定义 ID（指向符号表中的某个定义）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -112,7 +139,7 @@ pub struct InferId(pub u32);
 pub struct LocalId(pub u32);
 
 /// 基本块 ID。
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 pub struct BasicBlockId(pub u32);
 
 /// 类型方案（带量化）。
@@ -191,7 +218,7 @@ pub enum ExprKind {
     /// `defer` 延迟表达式。
     Defer(Box<HirExpr>),
     /// `try` / `catch`。
-    Try(Box<HirExpr>, Option<HirExpr>),
+    Try(Box<HirExpr>, Option<Box<HirExpr>>),
     /// `throw`。
     Throw(Box<HirExpr>),
     /// 数组字面量。
@@ -201,7 +228,7 @@ pub enum ExprKind {
     /// 结构体字面量（字段顺序已按定义重排）。
     Struct(DefId, Vec<(usize, HirExpr)>),
     /// Lambda / 闭包（已确定捕获列表与类型）。
-    Closure(ClosureExpr),
+    Closure(Box<ClosureExpr>),
     /// `comptime` 块。
     Comptime(Box<HirExpr>),
     /// `await`。
@@ -227,7 +254,7 @@ pub enum ExprKind {
 }
 
 /// 字面量（HIR 层已类型化）。
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone)]
 pub enum HirLiteral {
     Int(i128),
     Float(f64),
@@ -239,6 +266,28 @@ pub enum HirLiteral {
     /// 零初始化（`std::mem::zeroed()`）。
     Zero(Ty),
 }
+
+impl PartialEq for HirLiteral {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (HirLiteral::Int(a), HirLiteral::Int(b)) => a == b,
+            (HirLiteral::Float(a), HirLiteral::Float(b)) => a == b,
+            (HirLiteral::String(a), HirLiteral::String(b)) => a == b,
+            (HirLiteral::Char(a), HirLiteral::Char(b)) => a == b,
+            (HirLiteral::Bool(a), HirLiteral::Bool(b)) => a == b,
+            (HirLiteral::Zero(a), HirLiteral::Zero(b)) => a == b,
+            (HirLiteral::Composite(a), HirLiteral::Composite(b)) => {
+                a.len() == b.len()
+                    && a.iter().zip(b.iter()).all(|(x, y)| {
+                        format!("{:?}", x) == format!("{:?}", y)
+                    })
+            }
+            _ => false,
+        }
+    }
+}
+
+impl Eq for HirLiteral {}
 
 /// 二元运算符。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -349,7 +398,7 @@ pub enum ForProtocol {
 #[derive(Debug, Clone)]
 pub struct ClosureExpr {
     /// 参数列表（已声明为匿名结构体字段）。
-    pub params: Vec<(Pattern, Ty)>,
+    pub params: Vec<(HirPattern, Ty)>,
     /// 捕获列表（按引用 / 按值）。
     pub captures: Vec<Capture>,
     /// 函数指针类型。

@@ -20,7 +20,7 @@
 //! | 13 | 后缀：`()`（调用）, `[]`（索引）, `.`（字段）, `?` | 左结合 |
 
 use crate::error::CompileError;
-use crate::lexer::TokenKind;
+use crate::lexer::{Span, TokenKind};
 use crate::parser::ast::*;
 use crate::parser::Parser;
 
@@ -80,6 +80,37 @@ impl Parser {
                 let right = self.parse_expr_bp(Prec::ASSIGN)?;
                 left = Expression::Assign(Box::new(left), op, Box::new(right), op_span);
                 continue;
+            }
+
+            // 后缀运算符：函数调用、字段访问、索引
+            match op_kind {
+                TokenKind::LParen => {
+                    self.advance(); // (
+                    let args = self.parse_call_args()?;
+                    self.consume(&TokenKind::RParen, "expected ')'")?;
+                    left = Expression::Call(Box::new(left), args, op_span);
+                    continue;
+                }
+                TokenKind::Dot => {
+                    self.advance(); // .
+                    let field = self.consume_ident("expected field name")?;
+                    left = Expression::Field(Box::new(left), field, op_span);
+                    continue;
+                }
+                TokenKind::LBracket => {
+                    self.advance(); // [
+                    let index = self.parse_expression()?;
+                    self.consume(&TokenKind::RBracket, "expected ']'")?;
+                    left = Expression::Index(Box::new(left), Box::new(index), op_span);
+                    continue;
+                }
+                TokenKind::KwAs => {
+                    self.advance(); // as
+                    let ty = self.parse_type()?;
+                    left = Expression::Cast(Box::new(left), ty, op_span);
+                    continue;
+                }
+                _ => {}
             }
 
             // 二元运算符
@@ -308,7 +339,13 @@ impl Parser {
                 return Ok(Expression::Path(path, span));
             }
             // 结构体字面量：`Point { x: 1, y: 2 }`
-            if self.match_kind(&TokenKind::LBrace) {
+            // 仅当 `{` 后紧跟「标识符 :」时才视为结构体字面量，
+            // 避免与 `if cond { ... }` 的块语法冲突。
+            if self.check(&TokenKind::LBrace)
+                && self.peek_n(1).map(|t| matches!(t.kind, TokenKind::Ident(_))).unwrap_or(false)
+                && self.peek_n(2).map(|t| t.kind == TokenKind::Colon).unwrap_or(false)
+            {
+                self.advance(); // {
                 return self.parse_struct_literal(vec![n], span);
             }
             return Ok(Expression::Variable(n, span));
@@ -325,23 +362,23 @@ impl Parser {
     // ===== 字面量 =====
 
     fn parse_literal(&mut self) -> Result<Option<Literal>, CompileError> {
-        let tk = &self.peek().kind;
+        let tk = self.peek().kind.clone();
         Ok(Some(match tk {
             TokenKind::IntLiteral(v) => {
                 self.advance();
-                Literal::Int(*v, None)
+                Literal::Int(v, None)
             }
             TokenKind::FloatLiteral(v) => {
                 self.advance();
-                Literal::Float(*v, None)
+                Literal::Float(v, None)
             }
             TokenKind::StringLiteral(s) => {
                 self.advance();
-                Literal::String(s.clone())
+                Literal::String(s)
             }
             TokenKind::CharLiteral(c) => {
                 self.advance();
-                Literal::Char(*c)
+                Literal::Char(c)
             }
             TokenKind::KwTrue => {
                 self.advance();
@@ -505,6 +542,36 @@ impl Parser {
         Ok(Expression::StructInit(path, fields, span))
     }
 
+    /// 解析函数调用参数列表（不含括号）。
+    fn parse_call_args(&mut self) -> Result<Vec<Argument>, CompileError> {
+        let mut args = Vec::new();
+        if self.check(&TokenKind::RParen) {
+            return Ok(args);
+        }
+        loop {
+            // 命名参数：`name: value`
+            if let TokenKind::Ident(name) = &self.peek().kind {
+                if self.peek_n(1).map(|t| t.kind == TokenKind::Colon).unwrap_or(false) {
+                    let name = name.clone();
+                    self.advance(); // ident
+                    self.advance(); // :
+                    let value = self.parse_expression()?;
+                    args.push(Argument::Named(name, value));
+                } else {
+                    let value = self.parse_expression()?;
+                    args.push(Argument::Pos(value));
+                }
+            } else {
+                let value = self.parse_expression()?;
+                args.push(Argument::Pos(value));
+            }
+            if !self.match_kind(&TokenKind::Comma) {
+                break;
+            }
+        }
+        Ok(args)
+    }
+
     // ===== 运算符优先级表 =====
 
     fn infix_binding_power(&self, kind: &TokenKind) -> Option<(Prec, Prec)> {
@@ -531,7 +598,7 @@ impl Parser {
 
             TokenKind::Star | TokenKind::Slash | TokenKind::Percent => (Prec::FACTOR, Prec(Prec::FACTOR.0 + 1)),
 
-            TokenKind::As => (Prec::CAST, Prec::UNARY),
+            TokenKind::KwAs => (Prec::CAST, Prec::UNARY),
 
             TokenKind::Dot | TokenKind::LParen | TokenKind::LBracket | TokenKind::Question => {
                 (Prec::CALL, Prec::CALL)
@@ -658,7 +725,7 @@ mod tests {
         let e = expr("1 + 2 * 3");
         match e {
             Expression::Binary(l, BinaryOp::Add, r, _) => {
-                assert_eq!(*l, Expression::Literal(Literal::Int(1, None), Span::unknown()));
+                assert!(matches!(*l, Expression::Literal(Literal::Int(1, None), _)));
                 assert!(matches!(*r, Expression::Binary(_, BinaryOp::Mul, _, _)));
             }
             _ => panic!("wrong shape: {:?}", e),
@@ -754,7 +821,7 @@ mod tests {
 // `intrinsic!` 宏解析辅助
 // ==================================================================
 
-impl<'a> Parser<'a> {
+impl Parser {
     /// 解析 `intrinsic!` 宏的第一个"操作"标识符，映射到 IntrinsicKind。
     ///
     /// 支持的写法（括号前的标识符）：

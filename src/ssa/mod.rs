@@ -16,6 +16,7 @@ pub mod print;
 pub use print::print_module;
 
 use crate::mir::{self, MirInstr, MirModule, MirTerminator, MirValue};
+use std::cell::Cell;
 
 /// 一个 SSA 模块，包含若干函数。
 #[derive(Debug, Clone, Default)]
@@ -180,10 +181,10 @@ pub fn from_mir(mir: &MirModule) -> SsaModule {
 
 /// 把单个 MIR 函数转为 SSA。
 fn convert_function(func: &mir::MirFunction) -> SsaFunction {
-    let mut next_value: u32 = 0;
-    let mut alloc = || {
-        let v = SsaValue(next_value);
-        next_value += 1;
+    let next_value: Cell<u32> = Cell::new(0);
+    let alloc = || {
+        let v = SsaValue(next_value.get());
+        next_value.set(next_value.get() + 1);
         v
     };
 
@@ -214,8 +215,8 @@ fn convert_function(func: &mir::MirFunction) -> SsaFunction {
                     instrs.push(SsaInstr::Binary {
                         result: v,
                         op: convert_binary_op(*op),
-                        lhs: value_to_ssa(a, &mut next_value),
-                        rhs: value_to_ssa(b, &mut next_value),
+                        lhs: value_to_ssa(a, &next_value),
+                        rhs: value_to_ssa(b, &next_value),
                     });
                     let _ = name;
                 }
@@ -224,11 +225,11 @@ fn convert_function(func: &mir::MirFunction) -> SsaFunction {
                     instrs.push(SsaInstr::Unary {
                         result: v,
                         op: convert_unary_op(*op),
-                        operand: value_to_ssa(x, &mut next_value),
+                        operand: value_to_ssa(x, &next_value),
                     });
                     let _ = name;
                 }
-                MirInstr::Call(name, args) => {
+                MirInstr::Call(name, _ret, args) => {
                     let v = alloc();
                     let _ = args;
                     instrs.push(SsaInstr::Var {
@@ -240,16 +241,19 @@ fn convert_function(func: &mir::MirFunction) -> SsaFunction {
                     let v = alloc();
                     instrs.push(SsaInstr::Var {
                         result: v,
-                        name: format!("load_{}", ptr.id()),
+                        name: format!("load_{:?}", ptr),
                     });
                 }
                 MirInstr::Store(_ptr, _val) => {
                     // Store 不产生新值
                 }
+                MirInstr::Drop(_) => {
+                    // Drop 不产生新值
+                }
             }
         }
 
-        let term = convert_terminator(&block.term);
+        let term = convert_terminator(&block.term, &next_value);
         blocks.push(SsaBasicBlock {
             id: block.id,
             preds: block.preds.clone(),
@@ -305,7 +309,12 @@ fn convert_unary_op(op: mir::MirUnaryOp) -> SsaUnaryOp {
 }
 
 /// 把 MIR 值转为 SSA 值（含常量物化）。
-fn value_to_ssa(val: &MirValue, next: &mut u32) -> SsaValue {
+fn value_to_ssa(val: &MirValue, next: &Cell<u32>) -> SsaValue {
+    let alloc = || {
+        let v = SsaValue(next.get());
+        next.set(next.get() + 1);
+        v
+    };
     match val {
         MirValue::Var(name) => {
             // 变量名 -> 简单哈希为 u32，真实实现需维护版本映射表
@@ -313,36 +322,36 @@ fn value_to_ssa(val: &MirValue, next: &mut u32) -> SsaValue {
             SsaValue(h)
         }
         MirValue::Int(i) => {
-            let v = SsaValue(*next);
-            *next += 1;
+            let v = alloc();
             let _ = i;
             v
         }
         MirValue::Bool(b) => {
-            let v = SsaValue(*next);
-            *next += 1;
+            let v = alloc();
             let _ = b;
             v
         }
-        MirValue::Unit => {
-            let v = SsaValue(*next);
-            *next += 1;
-            v
-        }
+        MirValue::Unit => alloc(),
+        MirValue::Float(_) | MirValue::Str(_) => alloc(),
     }
 }
 
 /// 把 MIR 终结器转为 SSA 终结器。
-fn convert_terminator(term: &MirTerminator) -> SsaTerminator {
+fn convert_terminator(term: &MirTerminator, next_value: &Cell<u32>) -> SsaTerminator {
+    let alloc = || {
+        let v = SsaValue(next_value.get());
+        next_value.set(next_value.get() + 1);
+        v
+    };
     match term {
         MirTerminator::Goto(target) => SsaTerminator::Goto(*target),
-        MirTerminator::Branch { cond, then_block, else_block } => SsaTerminator::Branch {
-            cond: SsaValue(cond.id()),
+        MirTerminator::Branch { cond: _, then_block, else_block } => SsaTerminator::Branch {
+            cond: alloc(),
             then_block: *then_block,
             else_block: *else_block,
         },
-        MirTerminator::Return(v) => {
-            SsaTerminator::Return(v.as_ref().map(|val| SsaValue(val.id())))
+        MirTerminator::Return(_) => {
+            SsaTerminator::Return(Some(alloc()))
         }
         MirTerminator::Call { target, ret, next } => SsaTerminator::Goto(*next),
         MirTerminator::Switch { discr: _, cases, default } => {
