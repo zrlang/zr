@@ -209,6 +209,63 @@ pub fn run_all() {
 }
 
 //=============================================================================
+// Waker / Context
+//=============================================================================
+
+/// 可被唤醒的对象 trait。
+/// 运行时通过它通知 Future 其等待的事件已就绪。
+pub trait Wake {
+    /// 唤醒并消费 self（所有权转移）。
+    fn wake(self: Box<Self>);
+    /// 唤醒但不消费 self（借用）。
+    fn wake_by_ref(self: &Self);
+}
+
+/// Waker：对 `Wake` trait 对象的轻量封装。
+/// 由运行时创建，通过 `Context` 传递给 `Future::poll`。
+pub struct Waker {
+    /// 指向实现了 `Wake` 的 trait 对象。
+    pub wake: *mut dyn Wake,
+}
+
+impl Waker {
+    /// 创建一个新的 Waker。
+    pub fn new(w: *mut dyn Wake) -> Waker {
+        return Waker { wake: w };
+    }
+
+    /// 唤醒关联的任务（消费 waker）。
+    pub fn wake(self) {
+        let w = unsafe { Box::from_raw(self.wake) };
+        w.wake();
+    }
+
+    /// 唤醒关联的任务（不消费 waker）。
+    pub fn wake_by_ref(self: &Waker) {
+        let w = unsafe { &*self.wake };
+        w.wake_by_ref();
+    }
+}
+
+/// 轮询上下文：包含唤醒器，传递给 `Future::poll`。
+pub struct Context<'a> {
+    /// 当前任务的唤醒器。
+    pub waker: &'a Waker,
+}
+
+impl<'a> Context<'a> {
+    /// 创建上下文。
+    pub fn new(waker: &'a Waker) -> Context<'a> {
+        return Context { waker };
+    }
+
+    /// 获取唤醒器引用。
+    pub fn waker(self: &'a Context<'a>) -> &'a Waker {
+        return self.waker;
+    }
+}
+
+//=============================================================================
 // 协程原语
 //=============================================================================
 

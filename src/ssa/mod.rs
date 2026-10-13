@@ -250,6 +250,14 @@ fn convert_function(func: &mir::MirFunction) -> SsaFunction {
                 MirInstr::Drop(_) => {
                     // Drop 不产生新值
                 }
+                MirInstr::Await(name, future) => {
+                    let v = alloc();
+                    instrs.push(SsaInstr::Var {
+                        result: v,
+                        name: name.clone(),
+                    });
+                    let _ = future;
+                }
             }
         }
 

@@ -80,6 +80,9 @@ pub enum MirInstr {
     Store(MirValue, MirValue),
     /// 显式 drop（对应 RAII）。
     Drop(MirValue),
+    /// await 点：暂停当前协程，等待 future 就绪。
+    /// `name = await future`。
+    Await(String, MirValue),
 }
 
 /// MIR 终结器。

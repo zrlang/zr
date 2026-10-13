@@ -220,6 +220,22 @@ pub struct HirExpr {
     pub span: Span,
 }
 
+/// 内联汇编表达式（HIR）。
+#[derive(Debug, Clone)]
+pub struct HirAsmExpr {
+    pub template: String,
+    pub outputs: Vec<HirAsmOperand>,
+    pub inputs: Vec<HirAsmOperand>,
+    pub options: Vec<String>,
+}
+
+/// HIR 汇编操作数。
+#[derive(Debug, Clone)]
+pub struct HirAsmOperand {
+    pub constraint: String,
+    pub expr: Box<HirExpr>,
+}
+
 /// 表达式种类。
 #[derive(Debug, Clone)]
 pub enum ExprKind {
@@ -283,6 +299,8 @@ pub enum ExprKind {
     Comptime(Box<HirExpr>),
     /// `await`。
     Await(Box<HirExpr>),
+    /// 内联汇编。
+    Asm(HirAsmExpr),
     /// `yield`。
     Yield(Box<HirExpr>),
     /// `spawn`。

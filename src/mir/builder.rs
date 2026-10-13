@@ -203,6 +203,13 @@ fn lower_expr(b: &mut Builder, expr: &HirExpr) -> MirValue {
             b.current_block_mut().term = MirTerminator::Return(rv);
             MirValue::Unit
         }
+        Await(future) => {
+            // await 表达式：先计算 future，然后生成 await 点
+            let f = lower_expr(b, future);
+            let name = format!("t{}", b.temp_id());
+            b.current_block_mut().instrs.push(MirInstr::Await(name.clone(), f));
+            MirValue::Var(name)
+        }
         _ => {
             // 其他表达式（Call/Match/For/Struct 等）骨架阶段降级为占位
             MirValue::Unit

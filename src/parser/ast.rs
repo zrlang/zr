@@ -197,6 +197,8 @@ pub enum Type {
     Anytype,
     /// `impl Trait`：存在性类型（返回位置 RPIT / 参数位置 APIT）。
     ImplTrait(Vec<Type>),
+    /// `Pin<T>`：固定指针类型。
+    Pin(Box<Type>),
 }
 
 /// 数组长度（可以是编译期常量表达式）。
@@ -287,6 +289,28 @@ pub enum Literal {
 // 表达式
 // ======================================================================
 
+/// 内联汇编表达式。
+#[derive(Debug, Clone)]
+pub struct AsmExpr {
+    /// 汇编模板字符串。
+    pub template: String,
+    /// 输出操作数：`out(reg) name`。
+    pub outputs: Vec<AsmOperand>,
+    /// 输入操作数：`in(reg) expr`。
+    pub inputs: Vec<AsmOperand>,
+    /// 选项：`pure`, `nomem`, `nostack` 等。
+    pub options: Vec<String>,
+}
+
+/// 汇编操作数。
+#[derive(Debug, Clone)]
+pub struct AsmOperand {
+    /// 寄存器约束，如 `reg`, `"rax"`。
+    pub constraint: String,
+    /// 关联的表达式（输入）或名称（输出）。
+    pub expr: Expression,
+}
+
 /// 表达式。
 #[derive(Debug, Clone)]
 pub enum Expression {
@@ -356,6 +380,8 @@ pub enum Expression {
     Comptime(Box<Expression>, Span),
     /// `await` 异步表达式。
     Await(Box<Expression>, Span),
+    /// 内联汇编 `asm!(...)`。
+    Asm(AsmExpr, Span),
     /// `yield` 协程产出值。
     Yield(Box<Expression>, Span),
     /// `spawn` 派生协程。
@@ -815,6 +841,7 @@ impl Spanned for Expression {
             Expression::Lambda(_, _, _, s) => *s,
             Expression::Comptime(_, s) => *s,
             Expression::Await(_, s) => *s,
+            Expression::Asm(_, s) => *s,
             Expression::Yield(_, s) => *s,
             Expression::Spawn(_, s) => *s,
             Expression::Labeled(_, _, s) => *s,

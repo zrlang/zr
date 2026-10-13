@@ -221,6 +221,15 @@ impl Parser {
             return Ok(Expression::Defer(Box::new(expr), span));
         }
 
+        // ===== asm! 内联汇编 =====
+        if self.check(&TokenKind::Ident("asm".into()))
+            && self.peek_n(1).map(|t| t.kind == TokenKind::Bang).unwrap_or(false)
+        {
+            self.advance(); // asm
+            self.advance(); // !
+            return self.parse_asm(span);
+        }
+
         // ===== try / throw =====
         if self.match_kind(&TokenKind::KwTry) {
             let expr = self.parse_expression()?;
@@ -914,5 +923,82 @@ impl Parser {
             }
             _ => None,
         }
+    }
+
+    /// 解析 `asm!(...)` 内联汇编。
+    fn parse_asm(&mut self, span: Span) -> Result<Expression, CompileError> {
+        self.consume(&TokenKind::LParen, "expected '(' after asm!")?;
+
+        // 第一个参数：模板字符串
+        let template = match self.peek().kind.clone() {
+            TokenKind::StringLiteral(s) => {
+                self.advance();
+                s
+            }
+            _ => return Err(self.unexpected(&["string literal"])),
+        };
+
+        let mut outputs = Vec::new();
+        let mut inputs = Vec::new();
+        let mut options = Vec::new();
+
+        // 解析操作数和选项
+        while self.match_kind(&TokenKind::Comma) {
+            if self.check(&TokenKind::RBrace) || self.check(&TokenKind::RParen) {
+                break;
+            }
+            // 检查是否是 options(...)
+            if self.check(&TokenKind::Ident("options".into())) {
+                self.advance();
+                self.consume(&TokenKind::LParen, "expected '(' after options")?;
+                while !self.check(&TokenKind::RParen) && !self.is_at_end() {
+                    if let TokenKind::Ident(opt) = self.peek().kind.clone() {
+                        options.push(opt);
+                        self.advance();
+                    } else {
+                        self.advance();
+                    }
+                    self.match_kind(&TokenKind::Comma);
+                }
+                self.consume(&TokenKind::RParen, "expected ')' to close options")?;
+                continue;
+            }
+            // 解析操作数：in/out(reg) expr
+            let is_out = self.check(&TokenKind::Ident("out".into()));
+            let is_in = self.check(&TokenKind::Ident("in".into()));
+            if !is_out && !is_in {
+                // 跳过未知参数
+                self.advance();
+                continue;
+            }
+            self.advance(); // in/out
+            self.consume(&TokenKind::LParen, "expected '(' after in/out")?;
+            let constraint = match self.peek().kind.clone() {
+                TokenKind::Ident(c) => {
+                    self.advance();
+                    c
+                }
+                TokenKind::StringLiteral(s) => {
+                    self.advance();
+                    s
+                }
+                _ => return Err(self.unexpected(&["register constraint"])),
+            };
+            self.consume(&TokenKind::RParen, "expected ')' after constraint")?;
+            let expr = self.parse_expression()?;
+            let operand = crate::parser::ast::AsmOperand { constraint, expr };
+            if is_out {
+                outputs.push(operand);
+            } else {
+                inputs.push(operand);
+            }
+        }
+
+        self.consume(&TokenKind::RParen, "expected ')' to close asm!")?;
+
+        Ok(Expression::Asm(
+            crate::parser::ast::AsmExpr { template, outputs, inputs, options },
+            span,
+        ))
     }
 }

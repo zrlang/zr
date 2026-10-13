@@ -631,7 +631,12 @@ impl TypeChecker {
     fn check_function_signatures(&mut self, prog: &Program) -> Result<()> {
         for f in &prog.functions {
             let id = self.find_def(&f.name)?;
-            let ret = self.ast_to_hir_type(&f.return_type)?;
+            let mut ret = self.ast_to_hir_type(&f.return_type)?;
+            // async fn 的返回类型降级为 `impl Future<Output = T>`（不透明类型）
+            if f.is_async && !matches!(ret, Ty::Opaque(_)) {
+                let opaque_id = self.alloc_def(format!("async_future_{}", self.next_def));
+                ret = Ty::Opaque(opaque_id);
+            }
             if let Some(hf) = self.functions.get_mut(&id) {
                 hf.return_type = ret;
             }
@@ -1110,6 +1115,34 @@ impl TypeChecker {
             Expression::Await(e, _) => {
                 let inner = self.check_expr(e, &Ty::Infer(InferId(0)))?;
                 return Ok(HirExpr { kind: ExprKind::Await(Box::new(inner)), ty: Ty::Infer(InferId(0)), span });
+            }
+            Expression::Asm(asm, _) => {
+                let outputs: Vec<_> = asm.outputs.iter().map(|o| hir::HirAsmOperand {
+                    constraint: o.constraint.clone(),
+                    expr: Box::new(self.check_expr(&o.expr, &Ty::Infer(InferId(0))).unwrap_or(HirExpr {
+                        kind: hir::ExprKind::Literal(hir::HirLiteral::Composite(Vec::new())),
+                        ty: Ty::Unit,
+                        span,
+                    })),
+                }).collect();
+                let inputs: Vec<_> = asm.inputs.iter().map(|i| hir::HirAsmOperand {
+                    constraint: i.constraint.clone(),
+                    expr: Box::new(self.check_expr(&i.expr, &Ty::Infer(InferId(0))).unwrap_or(HirExpr {
+                        kind: hir::ExprKind::Literal(hir::HirLiteral::Composite(Vec::new())),
+                        ty: Ty::Unit,
+                        span,
+                    })),
+                }).collect();
+                return Ok(HirExpr {
+                    kind: ExprKind::Asm(hir::HirAsmExpr {
+                        template: asm.template.clone(),
+                        outputs,
+                        inputs,
+                        options: asm.options.clone(),
+                    }),
+                    ty: Ty::Unit,
+                    span,
+                });
             }
             Expression::Yield(e, _) => {
                 let inner = self.check_expr(e, &Ty::Infer(InferId(0)))?;
@@ -1783,6 +1816,10 @@ impl TypeChecker {
             AstType::Void => Ty::Unit,
             AstType::Never => Ty::Never,
             AstType::Named { path, generics } => {
+                // 特殊处理 Pin<T>
+                if path.len() == 1 && path[0] == "Pin" && generics.len() == 1 {
+                    return Ok(Ty::Pin(Box::new(self.ast_to_hir_type(&generics[0])?)));
+                }
                 let id = self.resolve_type_path(path)?;
                 Ty::Named(id, generics.iter().map(|g| self.ast_to_hir_type(g)).collect::<Result<_>>()?)
             }
@@ -1828,6 +1865,7 @@ impl TypeChecker {
                 }
                 Ty::Opaque(opaque_id)
             }
+            AstType::Pin(inner) => Ty::Pin(Box::new(self.ast_to_hir_type(inner)?)),
         })
     }
 
@@ -2423,6 +2461,9 @@ pub mod print {
             ExprKind::Await(e) => {
                 print!("await ");
                 print_expr(e, 0);
+            }
+            ExprKind::Asm(asm) => {
+                print!("asm!(\"{}\")", asm.template);
             }
             ExprKind::Yield(e) => {
                 print!("yield ");
