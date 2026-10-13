@@ -12,13 +12,8 @@
 //! ```
 
 pub mod encoder;
-pub mod regalloc;
-pub mod frame;
-pub mod reloc;
 pub mod linker;
-pub mod dwarf;
 pub mod wasm;
-pub mod c_backend;
 
 use crate::ssa::SsaModule;
 
@@ -49,8 +44,6 @@ pub enum OutputKind {
     Relocatable,
     /// 可执行文件。
     Executable,
-    /// 汇编文本（`.s`）。
-    Assembly,
 }
 
 /// 重定位条目。
@@ -62,21 +55,13 @@ pub struct Relocation {
     pub symbol: String,
     /// 重定位类型。
     pub kind: RelocationKind,
-    /// 加数（用于 PC 相对寻址的偏移修正）。
-    pub addend: i64,
 }
 
 /// 重定位类型（x86-64 ELF 定义子集）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RelocationKind {
-    /// 绝对 64 位。
-    Abs64,
     /// PC 相对 32 位。
     PcRel32,
-    /// GOT 条目 64 位。
-    Got64,
-    /// PLT 条目 32 位。
-    Plt32,
 }
 
 /// 符号。
@@ -94,8 +79,6 @@ pub struct Symbol {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SymbolSection {
     Text,
-    Data,
-    Rodata,
     Undefined,
 }
 
@@ -103,7 +86,6 @@ pub enum SymbolSection {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SymbolKind {
     Function,
-    Object,
     Section,
 }
 
@@ -225,24 +207,3 @@ fn link_with_system_linker(unit: &CompilationUnit, output: &std::path::Path) -> 
     Ok(())
 }
 
-/// 把编译产物写为可重定位目标文件。
-pub fn emit_object(unit: &CompilationUnit, path: &std::path::Path) -> std::io::Result<()> {
-    use std::fs::File;
-    use std::io::Write;
-    let mut unit = unit.clone();
-    unit.kind = OutputKind::Relocatable;
-    let elf = linker::assemble_elf(&unit)?;
-    let mut f = File::create(path)?;
-    f.write_all(&elf)?;
-    Ok(())
-}
-
-/// 把编译产物写为汇编文本。
-pub fn emit_asm(unit: &CompilationUnit, path: &std::path::Path) -> std::io::Result<()> {
-    use std::fs::File;
-    use std::io::Write;
-    let asm = encoder::disassemble(unit);
-    let mut f = File::create(path)?;
-    f.write_all(asm.as_bytes())?;
-    Ok(())
-}

@@ -35,7 +35,7 @@ impl Parser {
 
     /// 解析或模式 `p1 | p2 | ...`。
     fn parse_pattern_or(&mut self) -> Result<Pattern, CompileError> {
-        let mut pat = self.parse_pattern_single()?;
+        let pat = self.parse_pattern_single()?;
         // 目前或模式暂不展开为独立节点，第一个分支作为主模式
         while self.check(&TokenKind::Pipe) && self.next_can_start_pattern() {
             self.advance(); // |

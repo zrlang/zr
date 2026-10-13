@@ -244,7 +244,7 @@ impl<'a> Lexer<'a> {
                 // `next_token` 已经 advance 过 `_`，这里不再 advance
                 return Token::new(TokenKind::Underscore, Span::new(start, self.pos, line, col));
             }
-            'a'..='z' | 'A'..='Z' | '_' => return self.read_ident(start, line, col),
+            'a'..='z' | 'A'..='Z' => return self.read_ident(start, line, col),
 
             // ===== 标签（Zig 风格：`name:` 出现在语句起始） =====
             // 普通冒号已在上方处理，标签由解析器在语句起始处特殊处理

@@ -482,7 +482,7 @@ impl Parser {
     pub fn parse_enum_def(
         &mut self,
         visibility: Visibility,
-        attrs: Vec<Attribute>,
+        _attrs: Vec<Attribute>,
     ) -> Result<TypeDef, CompileError> {
         let span = self.previous().span;
         let name = self.consume_ident("expected enum name")?;
@@ -567,7 +567,7 @@ impl Parser {
     pub fn parse_union_def(
         &mut self,
         visibility: Visibility,
-        attrs: Vec<Attribute>,
+        _attrs: Vec<Attribute>,
     ) -> Result<TypeDef, CompileError> {
         let span = self.previous().span;
         let name = self.consume_ident("expected union name")?;

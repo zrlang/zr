@@ -20,8 +20,6 @@ use crate::typeck::hir::{self, HirModule};
 #[derive(Debug, Clone, Default)]
 pub struct MirModule {
     pub functions: Vec<MirFunction>,
-    /// 全局常量（CTFE 结果）。
-    pub constants: Vec<MirConstant>,
 }
 
 /// 一个 MIR 函数。
@@ -30,37 +28,18 @@ pub struct MirFunction {
     pub name: String,
     pub params: Vec<MirParam>,
     pub blocks: Vec<MirBasicBlock>,
-    pub is_async: bool,
-    /// 局部变量表（含类型，供栈帧布局用）。
-    pub locals: Vec<MirLocal>,
 }
 
 /// 函数参数。
 #[derive(Debug, Clone)]
-pub struct MirParam {
-    pub name: String,
-    pub ty: MirType,
-}
-
-/// MIR 局部变量。
-#[derive(Debug, Clone)]
-pub struct MirLocal {
-    pub name: String,
-    pub ty: MirType,
-    /// 是否可变。
-    pub mutable: bool,
-}
+pub struct MirParam;
 
 /// MIR 基本块。
 #[derive(Debug, Clone)]
 pub struct MirBasicBlock {
     pub id: usize,
-    pub preds: Vec<usize>,
-    pub succs: Vec<usize>,
     pub instrs: Vec<MirInstr>,
     pub term: MirTerminator,
-    /// 本块的 drop 作用域（骨架：占位）。
-    pub drop_scope: Option<usize>,
 }
 
 /// MIR 指令。
@@ -72,14 +51,6 @@ pub enum MirInstr {
     Binary(String, MirValue, MirBinaryOp, MirValue),
     /// 一元运算 `name = op x`。
     Unary(String, MirUnaryOp, MirValue),
-    /// 函数调用（结果绑定到 name）。
-    Call(String, MirValue, Vec<MirValue>),
-    /// 内存读取 `name = *ptr`。
-    Load(MirValue),
-    /// 内存写入 `*ptr = value`。
-    Store(MirValue, MirValue),
-    /// 显式 drop（对应 RAII）。
-    Drop(MirValue),
     /// await 点：暂停当前协程，等待 future 就绪。
     /// `name = await future`。
     Await(String, MirValue),
@@ -92,24 +63,11 @@ pub enum MirTerminator {
     Goto(usize),
     /// 条件分支。
     Branch {
-        cond: MirValue,
         then_block: usize,
         else_block: usize,
     },
     /// 函数返回。
-    Return(Option<MirValue>),
-    /// 调用终结器（用于分离调用点/返回点，方便栈展开）。
-    Call {
-        target: usize,
-        ret: Option<String>,
-        next: usize,
-    },
-    /// 多路分支（对应 `match`）。
-    Switch {
-        discr: MirValue,
-        cases: Vec<(MirValue, usize)>,
-        default: usize,
-    },
+    Return,
     /// 不可达（发散调用 / `!` 类型）。
     Unreachable,
 }
@@ -150,42 +108,13 @@ pub enum MirUnaryOp {
     Deref,
 }
 
-/// MIR 类型（轻量表示）。
-#[derive(Debug, Clone, PartialEq)]
-pub enum MirType {
-    I(usize),
-    U(usize),
-    F(usize),
-    Bool,
-    /// 指针类型（指向的类型）。
-    Ptr(Box<MirType>),
-    /// 切片。
-    Slice(Box<MirType>),
-    /// 元组。
-    Tuple(Vec<MirType>),
-    /// 命名类型（按定义 ID 引用）。
-    Named(u32, Vec<MirType>),
-    /// `()`。
-    Unit,
-}
-
-/// MIR 全局常量。
-#[derive(Debug, Clone)]
-pub struct MirConstant {
-    pub name: String,
-    pub ty: MirType,
-    pub value: MirValue,
-}
-
 /// 从 HIR 模块降级到 MIR。
 ///
 /// 降级过程：
 /// 1. 为每个函数建立基本块（入口块 + 控制流拆分的后续块）。
 /// 2. 把 HIR 表达式逐条降级为 MIR 指令，控制结构脱糖为终结器。
-/// 3. 收集全局常量。
 pub fn lower(hir: &HirModule) -> MirModule {
     let mut functions = Vec::with_capacity(hir.functions.len());
-    let mut constants = Vec::new();
 
     for func in &hir.functions {
         if let Some(body) = &func.body {
@@ -193,31 +122,5 @@ pub fn lower(hir: &HirModule) -> MirModule {
         }
     }
 
-    // 收集顶层常量
-    for c in &hir.consts {
-        constants.push(MirConstant {
-            name: c.name.clone(),
-            ty: lower_type(&c.ty),
-            value: MirValue::Unit, // 骨架：CTFE 结果待填充
-        });
-    }
-
-    MirModule { functions, constants }
-}
-
-/// 把 HIR 类型降级为 MIR 类型。
-pub fn lower_type(ty: &hir::Ty) -> MirType {
-    use hir::Ty::*;
-    match ty {
-        Int(w) => MirType::I(*w as usize),
-        Uint(w) => MirType::U(*w as usize),
-        Float(w) => MirType::F(*w as usize),
-        Bool => MirType::Bool,
-        Unit | Never => MirType::Unit,
-        Pointer(inner, _) => MirType::Ptr(Box::new(lower_type(inner))),
-        Slice(inner, _) => MirType::Slice(Box::new(lower_type(inner))),
-        Tuple(ts) => MirType::Tuple(ts.iter().map(lower_type).collect()),
-        Named(id, args) => MirType::Named(id.0, args.iter().map(lower_type).collect()),
-        _ => MirType::Unit,
-    }
+    MirModule { functions }
 }

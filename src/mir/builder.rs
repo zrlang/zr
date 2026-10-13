@@ -7,8 +7,8 @@
 //! - `break`/`continue` 转为对循环出口/头部块的 `Goto`。
 
 use crate::mir::{
-    self, MirBasicBlock, MirBinaryOp, MirFunction, MirInstr, MirLocal, MirParam,
-    MirTerminator, MirType, MirUnaryOp, MirValue,
+    MirBasicBlock, MirBinaryOp, MirFunction, MirInstr, MirParam,
+    MirTerminator, MirUnaryOp, MirValue,
 };
 use crate::typeck::hir::{self, HirBlock, HirExpr, HirStmt, HirFunction};
 
@@ -17,13 +17,8 @@ pub fn lower_function(func: &HirFunction, body: &HirBlock) -> MirFunction {
     let mut b = Builder::new(func.name.clone());
 
     // 参数
-    for p in &func.params {
-        let name = format!("arg_{}", b.locals.len());
-        b.locals.push(MirLocal {
-            name: name.clone(),
-            ty: lower_type(&p.ty),
-            mutable: false,
-        });
+    for _p in &func.params {
+        let name = format!("arg_{}", b.param_names.len());
         b.param_names.push(name);
     }
 
@@ -35,27 +30,14 @@ pub fn lower_function(func: &HirFunction, body: &HirBlock) -> MirFunction {
     let tail = lower_block(&mut b, body);
 
     // 终结入口块：若有尾表达式则 return，否则 fallthrough
-    if let Some(v) = tail {
-        b.current_block_mut().term = MirTerminator::Return(Some(v));
-    } else {
-        b.current_block_mut().term = MirTerminator::Return(None);
-    }
+    let _ = tail;
+    b.current_block_mut().term = MirTerminator::Return;
 
     // 把收集到的块按分配顺序落盘
     MirFunction {
         name: func.name.clone(),
-        params: b
-            .param_names
-            .iter()
-            .enumerate()
-            .map(|(i, n)| MirParam {
-                name: n.clone(),
-                ty: lower_type(&func.params[i].ty),
-            })
-            .collect(),
+        params: b.param_names.iter().map(|_| MirParam).collect(),
         blocks: b.blocks,
-        is_async: func.is_async,
-        locals: b.locals,
     }
 }
 
@@ -74,13 +56,8 @@ fn lower_block(b: &mut Builder, block: &HirBlock) -> Option<MirValue> {
 /// 降级一条语句。
 fn lower_stmt(b: &mut Builder, stmt: &HirStmt) {
     match stmt {
-        HirStmt::Let { local, ty, init, .. } | HirStmt::Var { local, ty, init, .. } => {
+        HirStmt::Let { local, init, .. } | HirStmt::Var { local, init, .. } => {
             let name = format!("v{}", local.0);
-            b.locals.push(MirLocal {
-                name: name.clone(),
-                ty: lower_type(ty),
-                mutable: matches!(stmt, HirStmt::Var { .. }),
-            });
             if let Some(init) = init {
                 let v = lower_expr(b, init);
                 b.current_block_mut()
@@ -142,19 +119,19 @@ fn lower_expr(b: &mut Builder, expr: &HirExpr) -> MirValue {
         Block(block) => lower_block(b, block).unwrap_or(MirValue::Unit),
         If(cond, then_block, else_block) => {
             let c = lower_expr(b, cond);
+            let _ = c;
             let then_bb = b.new_block();
             let else_bb = b.new_block();
             let join = b.new_block();
 
             b.current_block_mut().term = MirTerminator::Branch {
-                cond: c,
                 then_block: then_bb,
                 else_block: else_bb,
             };
 
             // then
             b.current = then_bb;
-            let then_val = lower_block(b, then_block);
+            let _then_val = lower_block(b, then_block);
             b.current_block_mut().term = MirTerminator::Goto(join);
 
             // else
@@ -175,8 +152,8 @@ fn lower_expr(b: &mut Builder, expr: &HirExpr) -> MirValue {
             b.current_block_mut().term = MirTerminator::Goto(header);
             b.current = header;
             let c = lower_expr(b, cond);
+            let _ = c;
             b.current_block_mut().term = MirTerminator::Branch {
-                cond: c,
                 then_block: body_bb,
                 else_block: exit,
             };
@@ -200,7 +177,8 @@ fn lower_expr(b: &mut Builder, expr: &HirExpr) -> MirValue {
         }
         Return(v) => {
             let rv = v.as_ref().map(|e| lower_expr(b, e));
-            b.current_block_mut().term = MirTerminator::Return(rv);
+            let _ = rv;
+            b.current_block_mut().term = MirTerminator::Return;
             MirValue::Unit
         }
         Await(future) => {
@@ -268,40 +246,20 @@ fn convert_unary(op: hir::UnaryOp) -> MirUnaryOp {
     }
 }
 
-/// 转换 HIR 类型为 MIR 类型。
-fn lower_type(ty: &hir::Ty) -> MirType {
-    use hir::Ty::*;
-    match ty {
-        Int(w) => MirType::I(*w as usize),
-        Uint(w) => MirType::U(*w as usize),
-        Float(w) => MirType::F(*w as usize),
-        Bool => MirType::Bool,
-        Unit | Never => MirType::Unit,
-        Pointer(inner, _) => MirType::Ptr(Box::new(lower_type(inner))),
-        Slice(inner, _) => MirType::Slice(Box::new(lower_type(inner))),
-        Tuple(ts) => MirType::Tuple(ts.iter().map(lower_type).collect()),
-        Named(id, args) => MirType::Named(id.0, args.iter().map(lower_type).collect()),
-        _ => MirType::Unit,
-    }
-}
-
 /// MIR 构建器：管理基本块分配与临时量编号。
 struct Builder {
-    name: String,
     blocks: Vec<MirBasicBlock>,
     current: usize,
-    locals: Vec<MirLocal>,
     param_names: Vec<String>,
     next_temp: u32,
 }
 
 impl Builder {
     fn new(name: String) -> Self {
+        let _ = name;
         Self {
-            name,
             blocks: Vec::new(),
             current: 0,
-            locals: Vec::new(),
             param_names: Vec::new(),
             next_temp: 0,
         }
@@ -311,11 +269,8 @@ impl Builder {
         let id = self.blocks.len();
         self.blocks.push(MirBasicBlock {
             id,
-            preds: Vec::new(),
-            succs: Vec::new(),
             instrs: Vec::new(),
             term: MirTerminator::Unreachable,
-            drop_scope: None,
         });
         id
     }

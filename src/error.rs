@@ -23,28 +23,14 @@ pub struct CompileError {
 /// 错误分类。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ErrorKind {
-    /// 词法错误（非法字符、未闭合的字符串字面量等）。
-    Lex,
     /// 语法错误。
     Parse,
     /// 类型错误 / 类型推导失败。
     Type,
     /// 名称解析错误（未定义变量、重复定义、循环模块依赖）。
     Name,
-    /// 借用检查错误。
-    Borrow,
-    /// 模式匹配错误（不可穷尽、重复绑定）。
-    Pattern,
-    /// 泛型 / trait 错误。
-    Generic,
     /// trait 一致性错误（孤儿规则、重叠 impl）。
     Coherence,
-    /// 编译期求值错误（CTFE）。
-    ConstEval,
-    /// 代码生成错误。
-    Codegen,
-    /// 链接错误。
-    Link,
     /// 内部编译器错误（bug）。
     Internal,
 }

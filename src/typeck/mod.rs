@@ -13,19 +13,18 @@ pub mod infer;
 
 use std::collections::{HashMap, HashSet};
 
-use crate::error::{CompileError, ErrorKind, Result};
+use crate::error::{CompileError, Result};
 use crate::parser::ast::{
-    self, Abi, Arm, Attribute, AttributeArg, Block as AstBlock, ConstDecl as AstConst, Expression,
-    Function as AstFunction, GenericParam as AstGeneric, Literal as AstLiteral, ModuleItem,
-    Pattern as AstPattern, Program, Spanned, Span, Statement, StaticDecl as AstStatic, StructDef as AstStruct,
-    Type as AstType, UseDecl, UseTree, Visibility,
+    self, Abi, Arm, AttributeArg, Block as AstBlock, Expression, Literal as AstLiteral,
+    Pattern as AstPattern, Program, Spanned, Span, Statement, StructDef as AstStruct,
+    Type as AstType, UseTree,
 };
 use crate::typeck::hir::{
-    BasicBlock, BasicBlockId, BreakValue, Capture, CaptureKind, ClosureExpr, Cfg, DefId,
-    ExprKind, FieldIndex, ForLoop, ForProtocol, GenericId, HirArm, HirExpr, HirField, HirStmt,
+    BasicBlock, BasicBlockId, BreakValue, Capture, ClosureExpr, Cfg, DefId,
+    ExprKind, FieldIndex, ForLoop, ForProtocol, HirArm, HirExpr, HirField, HirStmt,
     InferId, LocalId, Ty, WherePred,
 };
-use crate::typeck::infer::{Constraint, InferCtxt, RegionInferer};
+use crate::typeck::infer::InferCtxt;
 
 /// 类型检查器。
 #[derive(Debug)]
@@ -46,8 +45,6 @@ pub struct TypeChecker {
     consts: HashMap<DefId, hir::HirConst>,
     /// 静态变量表。
     statics: HashMap<DefId, hir::HirStatic>,
-    /// 关联类型表。
-    assoc_types: HashMap<(DefId, String), hir::HirAssocType>,
     /// 局部变量表（当前作用域链）。
     locals: HashMap<LocalId, Ty>,
     /// 推断上下文。
@@ -66,14 +63,8 @@ pub struct TypeChecker {
     current_function: Option<DefId>,
     /// 错误集合（延迟报告，允许错误恢复）。
     errors: Vec<CompileError>,
-    /// 模式绑定列表（用于穷尽性检查）。
-    pattern_bindings: Vec<(LocalId, Ty)>,
     /// 导入解析缓存。
     use_aliases: HashMap<String, DefId>,
-    /// 模块图（用于循环依赖检测）。
-    module_deps: HashMap<DefId, Vec<DefId>>,
-    /// 已处理的模块集合（用于循环检测）。
-    visiting: HashSet<DefId>,
 }
 
 impl Default for TypeChecker {
@@ -89,7 +80,6 @@ impl Default for TypeChecker {
             impl_blocks: Vec::new(),
             consts: HashMap::new(),
             statics: HashMap::new(),
-            assoc_types: HashMap::new(),
             locals: HashMap::new(),
             infer: InferCtxt::empty(),
             next_def: 1,
@@ -99,10 +89,7 @@ impl Default for TypeChecker {
             scope_stack: Vec::new(),
             current_function: None,
             errors: Vec::new(),
-            pattern_bindings: Vec::new(),
             use_aliases: HashMap::new(),
-            module_deps: HashMap::new(),
-            visiting: HashSet::new(),
         }
     }
 }
@@ -234,7 +221,7 @@ impl TypeChecker {
                         span: u.span,
                     }));
                 }
-                ast::TypeDef::Alias { name, target, visibility, span, .. } => {
+                ast::TypeDef::Alias { name: _, target, visibility, span, .. } => {
                     let target_ty = self.ast_to_hir_type(target)?;
                     self.type_defs.insert(
                         id,
@@ -653,7 +640,7 @@ impl TypeChecker {
         &mut self,
         prog: &Program,
     ) -> Result<Vec<hir::HirFunction>> {
-        let mut result: Vec<hir::HirFunction> = Vec::new();
+        let _result: Vec<hir::HirFunction> = Vec::new();
         for f in &prog.functions {
             let id = self.find_def(&f.name)?;
             self.current_function = Some(id);
@@ -740,7 +727,7 @@ impl TypeChecker {
 
     fn check_stmt(&mut self, s: &Statement) -> Result<HirStmt> {
         match s {
-            Statement::Let(pat, ty_ann, init, span) => {
+            Statement::Let(_pat, ty_ann, init, span) => {
                 let ty = if let Some(t) = ty_ann {
                     self.ast_to_hir_type(t)?
                 } else if let Some(e) = init {
@@ -770,7 +757,7 @@ impl TypeChecker {
                     span: *span,
                 })
             }
-            Statement::Var(pat, ty_ann, init, span) => {
+            Statement::Var(_pat, ty_ann, init, span) => {
                 let ty = if let Some(t) = ty_ann {
                     self.ast_to_hir_type(t)?
                 } else if let Some(e) = init {
@@ -826,7 +813,7 @@ impl TypeChecker {
             Expression::Variable(name, _) => {
                 let id = self.resolve_name(name, span)?;
                 if let Some(local) = self.as_local(id) {
-                    let ty = self.locals.get(&local).cloned().unwrap_or(Ty::Infer(InferId(0)));
+                    let _ty = self.locals.get(&local).cloned().unwrap_or(Ty::Infer(InferId(0)));
                     ExprKind::Local(local)
                 } else {
                     ExprKind::Def(id)
@@ -995,7 +982,7 @@ impl TypeChecker {
                 };
                 return Ok(HirExpr { kind: ExprKind::While(Box::new(c), b, else_hir), ty: Ty::Unit, span });
             }
-            Expression::For(pat, iter, body, _) => {
+            Expression::For(_pat, iter, body, _) => {
                 let it = self.check_expr(iter, &Ty::Infer(InferId(0)))?;
                 let var = self.alloc_local();
                 let var_ty = self.infer.fresh_infer(span);
@@ -1153,7 +1140,7 @@ impl TypeChecker {
                 let inner = self.check_expr(e, &Ty::Infer(InferId(0)))?;
                 return Ok(HirExpr { kind: ExprKind::Spawn(Box::new(inner)), ty: Ty::Infer(InferId(0)), span });
             }
-            Expression::Labeled(label, e, _) => {
+            Expression::Labeled(_label, e, _) => {
                 let inner = self.check_expr(e, expected)?;
                 self.infer.record_borrow(LocalId(0), infer::BorrowKind::Shared, 0);
                 return Ok(HirExpr { kind: inner.kind, ty: inner.ty, span });
@@ -1241,7 +1228,7 @@ impl TypeChecker {
         &mut self,
         callee: &Expression,
         args: &[ast::Argument],
-        expected: &Ty,
+        _expected: &Ty,
         span: ast::Span,
     ) -> Result<HirExpr> {
         let callee_ty = self.infer_expr_ty(callee)?;
@@ -1384,7 +1371,7 @@ impl TypeChecker {
         &mut self,
         path: &[String],
         fields: &[(String, Expression)],
-        expected: &Ty,
+        _expected: &Ty,
         span: ast::Span,
     ) -> Result<HirExpr> {
         let def_id = self.resolve_path(path, span)?;
@@ -1546,7 +1533,7 @@ impl TypeChecker {
                     _ => hir::HirPattern::Wildcard,
                 }
             }
-            AstPattern::Binding(name, mutability, sub, _) => {
+            AstPattern::Binding(_name, mutability, sub, _) => {
                 let local = self.alloc_local();
                 self.locals.insert(local, ty.clone());
                 self.infer.locals.insert(local, ty.clone());
@@ -1771,7 +1758,7 @@ impl TypeChecker {
             return Err(CompileError::name_error("empty path").with_span(span));
         }
         let first = path[0].clone();
-        let mut id = self.resolve_name(&first, span)?;
+        let id = self.resolve_name(&first, span)?;
         for seg in &path[1..] {
             // 路径继续：查找 id 的成员
             if let Some(hir_td) = self.type_defs.get(&id) {
@@ -1797,7 +1784,7 @@ impl TypeChecker {
         self.resolve_path(path, ast::Span::unknown())
     }
 
-    fn as_local(&self, id: DefId) -> Option<LocalId> {
+    fn as_local(&self, _id: DefId) -> Option<LocalId> {
         // 若 id 对应某个局部变量则返回
         None
     }
@@ -2243,349 +2230,6 @@ fn parse_int_type(name: &str) -> Option<u16> {
         "i8" => Some(8), "i16" => Some(16), "i32" => Some(32), "i64" => Some(64), "i128" => Some(128),
         "u8" => Some(8), "u16" => Some(16), "u32" => Some(32), "u64" => Some(64), "u128" => Some(128),
         _ => None,
-    }
-}
-
-/// HIR 打印（调试用）。
-pub mod print {
-    use super::*;
-
-    /// 打印整个 HIR 模块。
-    pub fn print_module(module: &hir::HirModule) {
-        println!("=== HIR ===");
-        for f in &module.functions {
-            print_function(f);
-        }
-    }
-
-    fn print_function(f: &hir::HirFunction) {
-        print!("fn {}(", f.name);
-        for (i, p) in f.params.iter().enumerate() {
-            if i > 0 { print!(", "); }
-            print!("_{}: {}", p.local.0, type_name(&p.ty));
-        }
-        println!(") -> {}", type_name(&f.return_type));
-        if let Some(b) = &f.body {
-            print_block(b, 2);
-        }
-    }
-
-    fn print_block(b: &hir::HirBlock, indent: usize) {
-        for s in &b.stmts {
-            print_stmt(s, indent);
-        }
-        if let Some(t) = &b.tail {
-            print_expr(t, indent);
-        }
-    }
-
-    fn print_stmt(s: &HirStmt, indent: usize) {
-        let pad = " ".repeat(indent);
-        match s {
-            HirStmt::Let { local, ty, init, .. } => {
-                print!("{}let _{}: {} = ", pad, local.0, type_name(ty));
-                if let Some(i) = init { print_expr(i, 0); } else { print!("?"); }
-                println!();
-            }
-            HirStmt::Var { local, ty, init, .. } => {
-                print!("{}var _{}: {} = ", pad, local.0, type_name(ty));
-                if let Some(i) = init { print_expr(i, 0); } else { print!("?"); }
-                println!();
-            }
-            HirStmt::Const { def, ty, value, .. } => {
-                println!("{}const #{}: {} = ...", pad, def.0, type_name(ty));
-                let _ = value;
-            }
-            HirStmt::Expr(e, _) => {
-                print!("{}", pad);
-                print_expr(e, 0);
-                println!();
-            }
-            HirStmt::Item => {}
-        }
-    }
-
-    fn print_expr(e: &HirExpr, indent: usize) {
-        let pad = " ".repeat(indent);
-        match &e.kind {
-            ExprKind::Literal(l) => print!("{}", literal_name(l)),
-            ExprKind::Local(id) => print!("_{}", id.0),
-            ExprKind::Def(id) => print!("def#{}", id.0),
-            ExprKind::Binary(op, l, r) => {
-                print!("(");
-                print_expr(l, 0);
-                print!(" {:?} ", op);
-                print_expr(r, 0);
-                print!(")");
-            }
-            ExprKind::Unary(op, e) => {
-                print!("{:?} ", op);
-                print_expr(e, 0);
-            }
-            ExprKind::Assign(l, r) => {
-                print!("(");
-                print_expr(l, 0);
-                print!(" = ");
-                print_expr(r, 0);
-                print!(")");
-            }
-            ExprKind::Call(callee, args) => {
-                print_expr(callee, 0);
-                print!("(");
-                for (i, a) in args.iter().enumerate() {
-                    if i > 0 { print!(", "); }
-                    print_expr(a, 0);
-                }
-                print!(")");
-            }
-            ExprKind::MethodCall(recv, _, args) => {
-                print_expr(recv, 0);
-                print!(".<method>(");
-                for (i, a) in args.iter().enumerate() {
-                    if i > 0 { print!(", "); }
-                    print_expr(a, 0);
-                }
-                print!(")");
-            }
-            ExprKind::Field(e, idx) => {
-                print_expr(e, 0);
-                match idx {
-                    FieldIndex::Named(i) => print!(".f{}", i),
-                    FieldIndex::Pos(i) => print!(".{}", i),
-                }
-            }
-            ExprKind::Block(b) => {
-                println!(" {{");
-                print_block(b, indent + 2);
-                print!("{}}}", pad);
-            }
-            ExprKind::If(cond, then_b, else_b) => {
-                print!("if ");
-                print_expr(cond, 0);
-                println!(" {{");
-                print_block(then_b, indent + 2);
-                print!("{}}}", pad);
-                if let Some(eb) = else_b {
-                    println!(" else {{");
-                    print_block(eb, indent + 2);
-                    print!("{}}}", pad);
-                }
-            }
-            ExprKind::Match(scrut, arms) => {
-                print!("match ");
-                print_expr(scrut, 0);
-                println!(" {{");
-                for arm in arms {
-                    print!("{}", " ".repeat(indent + 2));
-                    print!("/* pattern */ => ");
-                    print_expr(&arm.body, 0);
-                    println!();
-                }
-                print!("{}}}", pad);
-            }
-            ExprKind::Return(v) => {
-                print!("return ");
-                if let Some(v) = v { print_expr(v, 0); }
-            }
-            ExprKind::Break(_) => print!("break"),
-            ExprKind::Loop(b) => {
-                println!("loop {{");
-                print_block(b, indent + 2);
-                print!("{}}}", pad);
-            }
-            ExprKind::While(cond, body, _) => {
-                print!("while ");
-                print_expr(cond, 0);
-                println!(" {{");
-                print_block(body, indent + 2);
-                print!("{}}}", pad);
-            }
-            ExprKind::For(fl) => {
-                print!("for _ in ");
-                print_expr(&fl.iter, 0);
-                println!(" {{");
-                print_block(&fl.body, indent + 2);
-                print!("{}}}", pad);
-            }
-            ExprKind::Array(elems, _) => {
-                print!("[");
-                for (i, e) in elems.iter().enumerate() {
-                    if i > 0 { print!(", "); }
-                    print_expr(e, 0);
-                }
-                print!("]");
-            }
-            ExprKind::Tuple(elems) => {
-                print!("(");
-                for (i, e) in elems.iter().enumerate() {
-                    if i > 0 { print!(", "); }
-                    print_expr(e, 0);
-                }
-                print!(")");
-            }
-            ExprKind::Struct(id, fields) => {
-                print!("struct#{} {{ ", id.0);
-                for (i, (idx, e)) in fields.iter().enumerate() {
-                    if i > 0 { print!(", "); }
-                    print!("f{} = ", idx);
-                    print_expr(e, 0);
-                }
-                print!(" }}");
-            }
-            ExprKind::Closure(c) => {
-                print!("|");
-                for (i, (_, t)) in c.params.iter().enumerate() {
-                    if i > 0 { print!(", "); }
-                    print!("{}", type_name(t));
-                }
-                print!("| {{ ... }}");
-            }
-            ExprKind::Cast(e, t) => {
-                print_expr(e, 0);
-                print!(" as {}", type_name(t));
-            }
-            ExprKind::Deref(e) => {
-                print!("*");
-                print_expr(e, 0);
-            }
-            ExprKind::AddrOf(e, _) => {
-                print!("&");
-                print_expr(e, 0);
-            }
-            ExprKind::Index(e, i) => {
-                print_expr(e, 0);
-                print!("[");
-                print_expr(i, 0);
-                print!("]");
-            }
-            ExprKind::Intrinsic(k, _) => print!("{:?}()", k),
-            ExprKind::Await(e) => {
-                print!("await ");
-                print_expr(e, 0);
-            }
-            ExprKind::Asm(asm) => {
-                print!("asm!(\"{}\")", asm.template);
-            }
-            ExprKind::Yield(e) => {
-                print!("yield ");
-                print_expr(e, 0);
-            }
-            ExprKind::Spawn(e) => {
-                print!("spawn ");
-                print_expr(e, 0);
-            }
-            ExprKind::Defer(e) => {
-                print!("defer ");
-                print_expr(e, 0);
-            }
-            ExprKind::Try(e, _) => {
-                print!("try ");
-                print_expr(e, 0);
-            }
-            ExprKind::Throw(e) => {
-                print!("throw ");
-                print_expr(e, 0);
-            }
-            ExprKind::Comptime(e) => {
-                print!("comptime ");
-                print_expr(e, 0);
-            }
-            ExprKind::Is(e, t) => {
-                print_expr(e, 0);
-                print!(" is {}", type_name(t));
-            }
-            ExprKind::Interpolated(_) => print!("\"...\" (interpolated)"),
-            ExprKind::Never(e) => {
-                print_expr(e, 0);
-            }
-            ExprKind::TryOperator(e) => {
-                print_expr(e, 0);
-                print!("?");
-            }
-            ExprKind::Range(a, b, inclusive) => {
-                print_expr(a, 0);
-                print!("..{}", matches!(inclusive, hir::RangeInclusivity::Inclusive).then_some("=").unwrap_or(""));
-                print_expr(b, 0);
-            }
-            ExprKind::CompileError(msg) => print!("@compileError({:?})", msg),
-        }
-    }
-
-    fn literal_name(l: &hir::HirLiteral) -> String {
-        match l {
-            hir::HirLiteral::Int(v) => v.to_string(),
-            hir::HirLiteral::Float(v) => v.to_string(),
-            hir::HirLiteral::String(s) => format!("\"{}\"", s),
-            hir::HirLiteral::Char(c) => format!("'{}'", c),
-            hir::HirLiteral::Bool(b) => b.to_string(),
-            hir::HirLiteral::Composite(_) => "composite".into(),
-            hir::HirLiteral::Zero(_) => "zeroed".into(),
-        }
-    }
-
-    fn type_name(ty: &Ty) -> String {
-        match ty {
-            Ty::Int(w) => format!("i{}", w),
-            Ty::Uint(w) => format!("u{}", w),
-            Ty::Float(w) => format!("f{}", w),
-            Ty::Bool => "bool".into(),
-            Ty::Char => "char".into(),
-            Ty::Str => "str".into(),
-            Ty::Unit => "()".into(),
-            Ty::Never => "!".into(),
-            Ty::Named(id, args) => {
-                if args.is_empty() {
-                    format!("type#{}", id.0)
-                } else {
-                    format!("type#{}<...>", id.0)
-                }
-            }
-            Ty::Pointer(t, m) => format!(
-                "*{}{}",
-                if matches!(m, hir::Mutability::Mutable) { "mut " } else { "" },
-                type_name(t)
-            ),
-            Ty::Reference(t, m) => format!(
-                "&{}{}",
-                if matches!(m, hir::Mutability::Mutable) { "mut " } else { "" },
-                type_name(t)
-            ),
-            Ty::Array(t, _) => format!("[{}; _]", type_name(t)),
-            Ty::Slice(t, m) => format!(
-                "[]{}",
-                if matches!(m, hir::Mutability::Mutable) { "mut " } else { "" },
-            ),
-            Ty::Tuple(ts) => format!(
-                "({})",
-                ts.iter().map(type_name).collect::<Vec<_>>().join(", ")
-            ),
-            Ty::Function { params, ret, .. } => {
-                format!("fn({}) -> {}", params.iter().map(type_name).collect::<Vec<_>>().join(", "), type_name(ret))
-            }
-            Ty::Optional(t) => format!("{}?", type_name(t)),
-            Ty::ErrorUnion(t, e) => format!("{}!{}", type_name(t), type_name(e)),
-            Ty::Param(g) => format!("T{}", g.0),
-            Ty::Infer(_) => "_".into(),
-            Ty::Alias(t) => type_name(t),
-            Ty::Opaque(id) => format!("opaque({})", id.0),
-            Ty::Pin(inner) => format!("Pin<{}>", type_name(inner)),
-            Ty::Projection { self_ty, trait_id, assoc_name } => {
-                format!("<{} as trait#{}>::{}", type_name(self_ty), trait_id.0, assoc_name)
-            }
-        }
-    }
-}
-
-/// 类型检查器可发送的约束包装（用于并行编译）。
-#[derive(Debug, Clone)]
-pub struct ConstraintSet {
-    pub constraints: Vec<Constraint>,
-}
-
-impl ConstraintSet {
-    /// 合并两组约束。
-    pub fn merge(&mut self, other: Self) {
-        self.constraints.extend(other.constraints);
     }
 }
 

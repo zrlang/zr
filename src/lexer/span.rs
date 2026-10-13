@@ -28,26 +28,6 @@ impl Span {
     pub const fn unknown() -> Self {
         Self::new(0, 0, 0, 0)
     }
-
-    /// 两个相邻 span 合并为一个更大的区间。
-    pub fn merge(self, other: Span) -> Span {
-        Span {
-            start: self.start.min(other.start),
-            end: self.end.max(other.end),
-            line: self.line.min(other.line),
-            column: if self.line <= other.line { self.column } else { other.column },
-        }
-    }
-
-    /// 构造一个零长度 span（用于插入的错误占位）。
-    pub fn point(line: usize, column: usize) -> Span {
-        Span::new(0, 0, line, column)
-    }
-
-    /// 是否为「未知位置」。
-    pub fn is_unknown(self) -> bool {
-        self.line == 0
-    }
 }
 
 impl fmt::Display for Span {

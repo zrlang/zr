@@ -4,7 +4,7 @@
 //! 当前为语义正确的骨架实现（保留全部指令，不破坏语义），
 //! 后续可在不改动接口的前提下逐步填充实际优化逻辑。
 
-use crate::ssa::{SsaBasicBlock, SsaConst, SsaFunction, SsaInstr, SsaModule, SsaTerminator, SsaValue};
+use crate::ssa::{SsaConst, SsaInstr, SsaModule, SsaValue};
 
 /// 常量折叠：把已知常量的运算替换为结果常量。
 ///
@@ -32,7 +32,7 @@ pub fn fold_constants(mut module: SsaModule) -> SsaModule {
 
 /// 尝试折叠一条指令，返回折叠后的常量值。
 fn try_fold(instr: &SsaInstr) -> Option<i128> {
-    use crate::ssa::SsaInstr::*;
+    
     // 当前 SSA 指令集尚未暴露算术运算变体（骨架阶段），
     // 此处预留接口，待 SSA 构造补齐后填充。
     let _ = instr;
@@ -100,14 +100,4 @@ pub fn optimize_loops(mut module: SsaModule) -> SsaModule {
         let _ = func;
     }
     module
-}
-
-/// 让未被使用的导入在骨架阶段不产生编译警告。
-#[allow(dead_code)]
-fn _suppress_unused_warning(
-    _v: SsaValue,
-    _b: &SsaBasicBlock,
-    _t: &SsaTerminator,
-    _f: &SsaFunction,
-) {
 }

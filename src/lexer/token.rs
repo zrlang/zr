@@ -25,8 +25,6 @@ pub enum TokenKind {
     StringLiteral(String),
     /// 字符字面量。
     CharLiteral(char),
-    /// 布尔字面量。
-    BoolLiteral(bool),
 
     // ===== 标识符与关键字 =====
     /// 标识符 / 关键字。
@@ -278,18 +276,6 @@ pub struct Token {
 impl Token {
     pub fn new(kind: TokenKind, span: Span) -> Self {
         Self { kind, span }
-    }
-
-    /// 是否为字面量 token。
-    pub fn is_literal(&self) -> bool {
-        matches!(
-            self.kind,
-            TokenKind::IntLiteral(_)
-                | TokenKind::FloatLiteral(_)
-                | TokenKind::StringLiteral(_)
-                | TokenKind::CharLiteral(_)
-                | TokenKind::BoolLiteral(_)
-        )
     }
 }
 

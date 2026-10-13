@@ -11,7 +11,7 @@
 //! 3. trait 求解：选择满足 bound 的具体实现（含 specialization）。
 //! 4. 闭包：捕获分析 + 类型推导。
 
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::HashMap;
 use std::fmt;
 use std::sync::OnceLock;
 
@@ -19,9 +19,8 @@ use crate::error::{CompileError, ErrorKind, Result};
 use crate::parser::ast::Span;
 
 use super::hir::{
-    self, BasicBlockId, BreakValue, CaptureKind, ClosureExpr, Cfg, DefId, ExprKind,
-    FieldIndex, ForLoop, ForProtocol, GenericId, HirExpr, HirStmt, InferId, LocalId,
-    Ty, TypeScheme, WherePred,
+    self, Cfg, DefId, GenericId, InferId, LocalId,
+    Ty, TypeScheme,
 };
 
 /// 类型推断上下文。
@@ -197,7 +196,7 @@ impl<'a> InferCtxt<'a> {
     }
 
     /// 创建一个新的推断变量。
-    pub fn fresh_infer(&mut self, span: Span) -> Ty {
+    pub fn fresh_infer(&mut self, _span: Span) -> Ty {
         let id = InferId(self.next_infer);
         self.next_infer += 1;
         self.vars.insert(id, Ty::Infer(id));
@@ -321,7 +320,7 @@ impl<'a> InferCtxt<'a> {
     }
 
     /// 创建一个新的类型参数。
-    pub fn fresh_generic(&mut self, name: &str) -> Ty {
+    pub fn fresh_generic(&mut self, _name: &str) -> Ty {
         let id = GenericId(self.next_infer);
         self.next_infer += 1;
         Ty::Param(id)

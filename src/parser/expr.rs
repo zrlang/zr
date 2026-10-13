@@ -42,15 +42,7 @@ impl Prec {
     const FACTOR: Self = Self(11);
     const CAST: Self = Self(12);
     const UNARY: Self = Self(13);
-    const POSTFIX: Self = Self(14);
     const CALL: Self = Self(15);
-}
-
-/// 运算符结合性。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Assoc {
-    Left,
-    Right,
 }
 
 impl Parser {

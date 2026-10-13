@@ -9,18 +9,12 @@ use std::collections::HashMap;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WasmType {
     I32,
-    I64,
-    F32,
-    F64,
 }
 
 impl WasmType {
     pub fn as_str(self) -> &'static str {
         match self {
             WasmType::I32 => "i32",
-            WasmType::I64 => "i64",
-            WasmType::F32 => "f32",
-            WasmType::F64 => "f64",
         }
     }
 }
@@ -30,11 +24,7 @@ impl WasmType {
 pub enum WasmInstr {
     LocalGet(u32),
     LocalSet(u32),
-    LocalTee(u32),
     I32Const(i32),
-    I64Const(i64),
-    F32Const(f32),
-    F64Const(f64),
     Add(WasmType),
     Sub(WasmType),
     Mul(WasmType),
@@ -42,7 +32,6 @@ pub enum WasmInstr {
     Rem(WasmType),
     Not,
     Return,
-    Drop,
     /// 直接注入的 WAT 文本。
     Raw(String),
 }
@@ -164,11 +153,7 @@ impl WasmInstr {
         match self {
             WasmInstr::LocalGet(i) => format!("local.get {}", i),
             WasmInstr::LocalSet(i) => format!("local.set {}", i),
-            WasmInstr::LocalTee(i) => format!("local.tee {}", i),
             WasmInstr::I32Const(v) => format!("i32.const {}", v),
-            WasmInstr::I64Const(v) => format!("i64.const {}", v),
-            WasmInstr::F32Const(v) => format!("f32.const {}", v),
-            WasmInstr::F64Const(v) => format!("f64.const {}", v),
             WasmInstr::Add(t) => format!("{}.add", t.as_str()),
             WasmInstr::Sub(t) => format!("{}.sub", t.as_str()),
             WasmInstr::Mul(t) => format!("{}.mul", t.as_str()),
@@ -176,7 +161,6 @@ impl WasmInstr {
             WasmInstr::Rem(t) => format!("{}.rem", t.as_str()),
             WasmInstr::Not => "i32.eqz".to_string(),
             WasmInstr::Return => "return".to_string(),
-            WasmInstr::Drop => "drop".to_string(),
             WasmInstr::Raw(s) => s.clone(),
         }
     }
@@ -206,13 +190,6 @@ impl WasmFunction {
                         let idx = ensure_local(result, &mut local_map, &mut locals, &mut next_local);
                         match value {
                             SsaConst::Int(i) => body.push(WasmInstr::I32Const(*i as i32)),
-                            SsaConst::Bool(b) => body.push(WasmInstr::I32Const(if *b { 1 } else { 0 })),
-                            SsaConst::Float(f) => {
-                                let bits = *f;
-                                let val = f64::from_bits(bits);
-                                body.push(WasmInstr::F64Const(val));
-                            }
-                            SsaConst::Unit => body.push(WasmInstr::I32Const(0)),
                         }
                         body.push(WasmInstr::LocalSet(idx));
                     }
@@ -248,11 +225,6 @@ impl WasmFunction {
                     }
                     SsaInstr::Var { result, name: _ } => {
                         let _ = ensure_local(result, &mut local_map, &mut locals, &mut next_local);
-                    }
-                    SsaInstr::Cast { result, operand, to: _ } => {
-                        let idx = ensure_local(result, &mut local_map, &mut locals, &mut next_local);
-                        emit_value_ref(*operand, &local_map, &mut body);
-                        body.push(WasmInstr::LocalSet(idx));
                     }
                 }
             }

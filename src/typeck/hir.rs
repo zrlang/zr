@@ -9,8 +9,7 @@
 //!
 //! HIR 是后续 MIR 降级、借用检查、模式穷尽性检查、闭包转换的输入。
 
-use crate::parser::ast::{Abi, Attribute, GenericParam, Pattern, Span, Visibility};
-use crate::typeck::Ty as HirType;
+use crate::parser::ast::{Abi, Attribute, GenericParam, Span, Visibility};
 
 /// 一个 HIR 程序（已通过类型检查）。
 #[derive(Debug, Clone, Default)]

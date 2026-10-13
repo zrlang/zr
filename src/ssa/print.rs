@@ -1,6 +1,6 @@
 //! SSA 模块的可读文本表示（调试用）。
 
-use super::{SsaBinaryOp, SsaModule, SsaUnaryOp};
+use super::SsaModule;
 
 /// 打印整个 SSA 模块。
 pub fn print_module(module: &SsaModule) {
@@ -26,9 +26,6 @@ pub fn print_module(module: &SsaModule) {
                             op,
                             rhs.id()
                         )
-                    }
-                    super::SsaInstr::Cast { result, operand, to } => {
-                        println!("%{} = cast<{:?}>(%{})", result.id(), to, operand.id())
                     }
                     super::SsaInstr::Var { result, name } => {
                         println!("%{} = var {}", result.id(), name)

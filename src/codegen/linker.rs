@@ -43,20 +43,24 @@ pub fn assemble_elf(unit: &CompilationUnit) -> io::Result<Vec<u8>> {
     let data = &unit.data;
     let rodata = &unit.rodata;
 
+    // 构建符号表与字符串表（必须在计算偏移前完成）。
+    let (strtab, symtab) = build_symbol_tables(unit);
+
     // 可执行文件用虚拟地址布局；可重定位目标文件没有加载地址概念。
     let is_exec = unit.kind == crate::codegen::OutputKind::Executable;
 
     // ---------- 文件偏移布局 ----------
     let e_phoff: u64 = 64; // ELF header 紧接 Program Header
     let ph_size: u64 = if is_exec { 56 * 3 } else { 0 }; // text / rodata / data 三个 PT_LOAD
-    let sh_size: u64 = 64 * SECTION_COUNT as u64;
 
     // 各段文件偏移
     let shstrtab_off = align_up(64 + ph_size, SECT_ALIGN);
     let text_off = align_up(shstrtab_off + shstrtab_len(), SECT_ALIGN);
     let rodata_off = align_up(text_off + text.len() as u64, SECT_ALIGN);
     let data_off = align_up(rodata_off + rodata.len() as u64, SECT_ALIGN);
-    let sh_off = align_up(data_off + data.len() as u64, SECT_ALIGN);
+    let symtab_off = align_up(data_off + data.len() as u64, SECT_ALIGN);
+    let strtab_off = align_up(symtab_off + symtab.len() as u64, SECT_ALIGN);
+    let sh_off = align_up(strtab_off + strtab.len() as u64, SECT_ALIGN);
 
     // ---------- 虚拟地址布局 ----------
     // 三个 PT_LOAD 段共享同一个虚拟基址起点（按页对齐）。
@@ -127,11 +131,13 @@ pub fn assemble_elf(unit: &CompilationUnit) -> io::Result<Vec<u8>> {
     )?;
     // idx 4: .symtab
     write_section_header(
-        &mut buf, SHN_SYMTAB, 2, 0, 0, 0, 0, SHN_STRTAB, 1, 8,
+        &mut buf, SHN_SYMTAB, 2, 0, 0, symtab_off,
+        symtab.len() as u64, SHN_STRTAB, 1, 8,
     )?;
     // idx 5: .strtab
     write_section_header(
-        &mut buf, SHN_STRTAB, 3, 0, 0, 0, 0, 0, 0, 1,
+        &mut buf, SHN_STRTAB, 3, 0, 0, strtab_off,
+        strtab.len() as u64, 0, 0, 1,
     )?;
     // idx 6: .shstrtab
     write_section_header(
@@ -148,6 +154,10 @@ pub fn assemble_elf(unit: &CompilationUnit) -> io::Result<Vec<u8>> {
     buf.extend_from_slice(rodata);
     pad_to(&mut buf, data_off as usize)?;
     buf.extend_from_slice(data);
+    pad_to(&mut buf, symtab_off as usize)?;
+    buf.extend_from_slice(&symtab);
+    pad_to(&mut buf, strtab_off as usize)?;
+    buf.extend_from_slice(&strtab);
 
     Ok(buf)
 }
@@ -189,11 +199,6 @@ fn apply_relocations(unit: &mut CompilationUnit) {
             continue;
         };
         match reloc.kind {
-            RelocationKind::Abs64 => {
-                let value = target_va.wrapping_add(reloc.addend as u64);
-                let bytes = value.to_le_bytes();
-                unit.code[reloc.offset..reloc.offset + 8].copy_from_slice(&bytes);
-            }
             RelocationKind::PcRel32 => {
                 // PC 相对：target - (instr_addr + instr_len)。
                 // reloc.offset 指向立即数字段的第一个字节，call 的 instr_addr = offset - 1。
@@ -201,9 +206,6 @@ fn apply_relocations(unit: &mut CompilationUnit) {
                 let delta = (target_va as i64) - (instr_addr + 5);
                 let imm = (delta as i32).to_le_bytes();
                 unit.code[reloc.offset..reloc.offset + 4].copy_from_slice(&imm);
-            }
-            RelocationKind::Got64 | RelocationKind::Plt32 => {
-                // 骨架：GOT/PLT 需由链接器分配条目。
             }
         }
     }
@@ -305,17 +307,16 @@ fn align_up(addr: u64, align: u64) -> u64 {
     (addr + align - 1) & !(align - 1)
 }
 
-/// 把符号转为 ELF 符号表条目（供 `.symtab` 使用，当前未启用）。
-#[allow(dead_code)]
-fn symbol_to_elf(sym: &Symbol) -> Vec<u8> {
+/// 把符号转为 ELF 符号表条目（供 `.symtab` 使用）。
+/// `name_offset` 是符号名在 `.strtab` 中的偏移。
+fn symbol_to_elf(sym: &Symbol, name_offset: u32) -> Vec<u8> {
     let mut b = Vec::new();
     // st_name
-    b.extend_from_slice(&0u32.to_le_bytes());
+    b.extend_from_slice(&name_offset.to_le_bytes());
     // st_info: bind(高4) + type(低4)
-    let bind = 1u8; // STB_GLOBAL
+    let bind = if sym.global { 1u8 } else { 0u8 }; // STB_GLOBAL or STB_LOCAL
     let ty = match sym.kind {
         SymbolKind::Function => 2u8, // STT_FUNC
-        SymbolKind::Object => 1u8,   // STT_OBJECT
         SymbolKind::Section => 3u8,  // STT_SECTION
     };
     b.push((bind << 4) | ty);
@@ -324,8 +325,6 @@ fn symbol_to_elf(sym: &Symbol) -> Vec<u8> {
     // st_shndx
     let shndx = match sym.section {
         SymbolSection::Text => SHN_TEXT as u16,
-        SymbolSection::Data => SHN_DATA as u16,
-        SymbolSection::Rodata => SHN_RODATA as u16,
         SymbolSection::Undefined => 0,
     };
     b.extend_from_slice(&shndx.to_le_bytes());
@@ -334,4 +333,26 @@ fn symbol_to_elf(sym: &Symbol) -> Vec<u8> {
     // st_size
     b.extend_from_slice(&(sym.size as u64).to_le_bytes());
     b
+}
+
+/// 构建 `.strtab`（符号名字符串表）和 `.symtab`（符号表）数据。
+///
+/// 返回 (strtab_bytes, symtab_bytes)。
+fn build_symbol_tables(unit: &CompilationUnit) -> (Vec<u8>, Vec<u8>) {
+    let mut strtab: Vec<u8> = vec![0]; // 首项为 NUL
+    let mut symtab: Vec<u8> = Vec::new();
+
+    // ELF 要求 symtab[0] 是一个全零的未定义符号。
+    symtab.extend_from_slice(&[0u8; 24]);
+
+    for sym in &unit.symbols {
+        // 将符号名追加到 strtab
+        let name_offset = strtab.len() as u32;
+        strtab.extend_from_slice(sym.name.as_bytes());
+        strtab.push(0);
+        // 生成符号表条目
+        symtab.extend_from_slice(&symbol_to_elf(sym, name_offset));
+    }
+
+    (strtab, symtab)
 }

@@ -20,7 +20,7 @@ use crate::ssa::{SsaBinaryOp, SsaConst, SsaFunction, SsaInstr, SsaTerminator, Ss
 /// x86-64 通用寄存器（System V ABI），按 ModR/M 的 reg 字段编号。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Gpr {
-    Rax, Rcx, Rdx, Rbx, Rsp, Rbp, Rsi, Rdi, R8, R9, R10, R11, R12, R13, R14, R15,
+    Rax, Rcx, Rdx, Rsi, Rdi, R8, R9, R10, R11, R12, R13, R14, R15,
 }
 
 impl Gpr {
@@ -28,8 +28,7 @@ impl Gpr {
     fn bits(self) -> u8 {
         use Gpr::*;
         match self {
-            Rax => 0, Rcx => 1, Rdx => 2, Rbx => 3,
-            Rsp => 4, Rbp => 5, Rsi => 6, Rdi => 7,
+            Rax => 0, Rcx => 1, Rdx => 2, Rsi => 6, Rdi => 7,
             R8 => 0, R9 => 1, R10 => 2, R11 => 3,
             R12 => 4, R13 => 5, R14 => 6, R15 => 7,
         }
@@ -48,13 +47,6 @@ const ALLOCATABLE: [Gpr; 13] = [
     Gpr::Rax, Gpr::Rcx, Gpr::Rdx, Gpr::Rsi, Gpr::Rdi,
     Gpr::R8, Gpr::R9, Gpr::R10, Gpr::R11, Gpr::R12, Gpr::R13, Gpr::R14, Gpr::R15,
 ];
-
-/// 调用约定使用的寄存器：
-/// - 参数：RDI, RSI, RDX, RCX, R8, R9
-/// - 返回值：RAX
-/// - callee-save：RBX, RBP, R12–R15（调用前需保存）
-const CALLER_SAVE: &[Gpr] = &[Gpr::Rax, Gpr::Rcx, Gpr::Rdx, Gpr::Rsi, Gpr::Rdi, Gpr::R8, Gpr::R9, Gpr::R10, Gpr::R11];
-const CALLEE_SAVE: &[Gpr] = &[Gpr::Rbx, Gpr::Rbp, Gpr::R12, Gpr::R13, Gpr::R14, Gpr::R15];
 
 /// 把 SSA value 映射到物理寄存器（虚拟分配）。
 fn alloc_reg(v: SsaValue) -> Gpr {
@@ -156,14 +148,6 @@ fn emit_instr(unit: &mut CompilationUnit, instr: &SsaInstr) {
         SsaInstr::Const { result, value } => emit_const(unit, *result, *value),
         SsaInstr::Binary { result, op, lhs, rhs } => emit_binary(unit, *result, *op, *lhs, *rhs),
         SsaInstr::Unary { result, op, operand } => emit_unary(unit, *result, *op, *operand),
-        SsaInstr::Cast { result, operand, to: _ } => {
-            // 简化：截断/扩展用 mov，类型转换留待优化器处理
-            let r = alloc_reg(*operand);
-            let dst = alloc_reg(*result);
-            if dst != r {
-                emit_mov_rr(unit, dst, r);
-            }
-        }
         SsaInstr::Var { .. } => {
             // Var 是 φ 合并前的引用，运行时无需动作
         }
@@ -180,22 +164,6 @@ fn emit_const(unit: &mut CompilationUnit, result: SsaValue, value: SsaConst) {
             emit1(unit, rex);
             emit1(unit, 0xb8 + dst.bits());
             emit8(unit, i as u64);
-        }
-        SsaConst::Bool(b) => {
-            // 布尔值加载为 0/1（用 xor reg, reg; sete 的技巧简化为 mov imm）
-            let v = if b { 1u64 } else { 0 };
-            let rex = 0x48u8 | if dst.rex_bit() { 0x01 } else { 0 };
-            emit1(unit, rex);
-            emit1(unit, 0xb8 + dst.bits());
-            emit8(unit, v);
-        }
-        SsaConst::Float(_bits) => {
-            // 浮点常量：简化实现加载 0.0（完整实现需 xmm 寄存器 + .rodata 中的位模式）
-            // 这里仅生成 `xor xmm0, xmm0`，避免未定义行为
-            emit4(unit, 0x66, 0x0f, 0x57, 0xc0);
-        }
-        SsaConst::Unit => {
-            // Unit 值无需加载
         }
     }
 }
@@ -348,14 +316,6 @@ fn modrm(unit: &mut CompilationUnit, mm: u8, reg: u8, rm: u8) {
     unit.code.push((mm << 6) | ((reg & 7) << 3) | (rm & 7));
 }
 
-/// 生成 SIB 字节（用于 [reg] 寻址，scale=0, index=rm, base=rm 的形式用 ModR/M 即可）。
-/// 这里用最简单的 [rm] 寻址（mod=00, r/m=rm），RSP/R12 需要 SIB，简化处理。
-fn emit_sib_indirect(unit: &mut CompilationUnit, base: Gpr) {
-    // mod=00, r/m=100 表示 SIB follows
-    unit.code.push(0x04); // mod=00, reg=000 (占位), r/m=100
-    unit.code.push(0x20 | base.bits()); // scale=00, index=100(=none), base=bits
-}
-
 /// `mov r64, r64`：REX.W + 0x89 /r  (89 = MR, reg=src, r/m=dst)
 /// 实际用 0x89 modrm(3, src, dst)：dst = src
 fn emit_mov_rr(unit: &mut CompilationUnit, dst: Gpr, src: Gpr) {
@@ -405,67 +365,6 @@ fn emit_movzx(unit: &mut CompilationUnit, dst: Gpr) {
     modrm(unit, 3, dst.bits(), dst.bits()); // 源和目的用同一寄存器
 }
 
-/// ALU 指令：op dst, src
-/// 编码：REX.W + (0x01 | op<<3) /r  for add/sub/and/or/xor/cmp
-/// 实际用 MR 形式（0x01：reg=src, r/m=dst 表示 dst OP= src）
-/// 简化：用 0x01 (add) 族，/r 里 reg=src, r/m=dst
-/// 注：此函数已被 `emit_full_alu` 取代，保留为后备实现。
-#[allow(dead_code)]
-fn emit_alu_rm(unit: &mut CompilationUnit, _op: u8, dst: Gpr, src: Gpr) {
-    // 简化处理：只实现 add(0x01) 和 sub(0x29) 和 and(0x21) 和 or(0x09) 和 xor(0x31)
-    // 这里统一用 add 演示，实际应按 op 分发
-    let mut rex = 0x48u8;
-    if src.rex_bit() { rex |= 0x04; }
-    if dst.rex_bit() { rex |= 0x01; }
-    emit1(unit, rex);
-    // 0x01 = add r/m64, r64; 0x29 = sub r/m64, r64
-    // 此处为占位：真实实现需按 alu_opcode 分发
-    emit1(unit, 0x01); // add
-    modrm(unit, 3, src.bits(), dst.bits());
-}
-
-/// `push r64`：0x50 + rd  （REX 前缀可选，仅 R8+ 需要 REX.B）
-fn emit_push_r(unit: &mut CompilationUnit, r: Gpr) {
-    let mut prefix = 0u8;
-    if r.rex_bit() {
-        prefix = 0x41; // REX.B
-    }
-    if prefix != 0 {
-        emit1(unit, prefix);
-    }
-    emit1(unit, 0x50 + r.bits());
-}
-
-/// `pop r64`：0x58 + rd
-fn emit_pop_r(unit: &mut CompilationUnit, r: Gpr) {
-    let mut prefix = 0u8;
-    if r.rex_bit() {
-        prefix = 0x41;
-    }
-    if prefix != 0 {
-        emit1(unit, prefix);
-    }
-    emit1(unit, 0x58 + r.bits());
-}
-
-/// `call rel32`：0xE8 + imm32（需重定位）
-pub fn emit_call(unit: &mut CompilationUnit, target: &str) {
-    let offset = unit.code.len() + 1; // 立即数字段起始
-    emit1(unit, 0xe8);
-    emit4(unit, 0x00, 0x00, 0x00, 0x00);
-    unit.relocations.push(crate::codegen::Relocation {
-        offset,
-        symbol: target.to_string(),
-        kind: crate::codegen::RelocationKind::PcRel32,
-        addend: -4,
-    });
-}
-
-/// `ret`：0xC3
-pub fn emit_ret(unit: &mut CompilationUnit) {
-    emit1(unit, 0xc3);
-}
-
 /// `jmp rel32`：0xE9 + imm32（需重定位）
 pub fn emit_jmp(unit: &mut CompilationUnit, target: &str) {
     let offset = unit.code.len() + 1;
@@ -475,7 +374,6 @@ pub fn emit_jmp(unit: &mut CompilationUnit, target: &str) {
         offset,
         symbol: target.to_string(),
         kind: crate::codegen::RelocationKind::PcRel32,
-        addend: -4,
     });
 }
 
@@ -489,7 +387,6 @@ pub fn emit_jcc_rel32(unit: &mut CompilationUnit, cc: u8, target: &str) {
         offset,
         symbol: target.to_string(),
         kind: crate::codegen::RelocationKind::PcRel32,
-        addend: -4,
     });
 }
 
@@ -512,7 +409,6 @@ pub fn emit_start_wrapper(unit: &mut CompilationUnit) {
         offset: call_offset,
         symbol: "main".to_string(),
         kind: crate::codegen::RelocationKind::PcRel32,
-        addend: -4,
     });
 
     // mov edi, eax（把 main 的返回值作为 exit 状态码）
@@ -534,29 +430,6 @@ pub fn emit_start_wrapper(unit: &mut CompilationUnit) {
     });
     unit.entry = "_start".to_string();
 }
-
-/// 反汇编（生成人类可读的汇编文本，用于 `--dump-asm`）。
-pub fn disassemble(unit: &CompilationUnit) -> String {
-    let mut out = String::new();
-    out.push_str("\t.section .text\n");
-    out.push_str("\t.globl _start\n");
-    out.push_str("_start:\n");
-    for (i, b) in unit.code.iter().enumerate() {
-        out.push_str(&format!("\t.byte 0x{:02x}\t# offset {}\n", b, i));
-    }
-    if !unit.data.is_empty() {
-        out.push_str("\t.section .data\n");
-        for b in &unit.data {
-            out.push_str(&format!("\t.byte 0x{:02x}\n", b));
-        }
-    }
-    out
-}
-
-/// 占位：CALLER_SAVE/CALLEE_SAVE 在当前简化分配器中未使用，
-/// 保留以供后续替换为真实线性扫描分配器时引用。
-#[allow(dead_code)]
-const _: Option<&Gpr> = None;
 
 /// `imul r64, r/m64`：REX.W + 0x0F 0xAF /r
 /// 计算 dst = dst * src（结果可能溢出，溢出检测需额外检查）。
@@ -616,8 +489,7 @@ fn emit_shift(unit: &mut CompilationUnit, code: u8, dst: Gpr, l: Gpr, r: Gpr) {
     modrm(unit, 3, code, dst.bits());
 }
 
-/// 占位：ALU 编码的完整分发（后续优化器会替换此简化版本）。
-#[allow(dead_code)]
+/// ALU 编码的完整分发：op dst, src（dst OP= src）。
 fn emit_full_alu(unit: &mut CompilationUnit, op: u8, dst: Gpr, src: Gpr) {
     // op: 0=add, 1=or, 4=and, 5=sub, 6=xor
     let opcode = match op {

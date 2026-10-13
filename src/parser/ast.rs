@@ -823,7 +823,7 @@ impl Spanned for Expression {
             Expression::Cast(_, _, s) => *s,
             Expression::Is(_, _, s) => *s,
             Expression::In(_, _, s) => *s,
-            Expression::Block(b, s) => *s,
+            Expression::Block(_b, s) => *s,
             Expression::If(_, _, _, s) => *s,
             Expression::Match(_, _, s) => *s,
             Expression::While(_, _, _, s) => *s,

@@ -10,7 +10,6 @@
 //! - 在控制流汇合点插入 φ（phi）函数，把来自不同前驱的值合并。
 //! - 支配树（dominator tree）是构造 φ 函数的理论基础。
 
-pub mod domtree;
 pub mod print;
 
 pub use print::print_module;
@@ -30,20 +29,14 @@ pub struct SsaFunction {
     pub name: String,
     pub params: Vec<SsaValue>,
     pub blocks: Vec<SsaBasicBlock>,
-    pub is_async: bool,
 }
 
 /// 一个 SSA 基本块。
 #[derive(Debug, Clone)]
 pub struct SsaBasicBlock {
     pub id: usize,
-    pub preds: Vec<usize>,
-    pub succs: Vec<usize>,
     pub instrs: Vec<SsaInstr>,
     pub term: SsaTerminator,
-    /// 该块在最终机器码中的起始偏移（由代码生成器在发射时填写）。
-    /// 用于 Goto/Branch 重定位回填目标地址。
-    pub start_offset: usize,
 }
 
 /// SSA 指令。
@@ -66,12 +59,6 @@ pub enum SsaInstr {
         op: SsaBinaryOp,
         lhs: SsaValue,
         rhs: SsaValue,
-    },
-    /// 类型转换 `v = cast<ty>(x)`。
-    Cast {
-        result: SsaValue,
-        operand: SsaValue,
-        to: SsaType,
     },
     /// 变量引用（用于 φ 函数合并前的原始变量）。
     Var {
@@ -102,11 +89,6 @@ pub enum SsaTerminator {
 pub struct SsaValue(pub u32);
 
 impl SsaValue {
-    /// 创建一个新值。
-    pub fn new(id: u32) -> Self {
-        Self(id)
-    }
-
     /// 返回底层 ID。
     pub fn id(self) -> u32 {
         self.0
@@ -117,9 +99,6 @@ impl SsaValue {
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum SsaConst {
     Int(i128),
-    Float(u64), // 以位模式存储，避免 f64 不可 Eq
-    Bool(bool),
-    Unit,
 }
 
 /// 一元运算。
@@ -142,17 +121,6 @@ pub enum SsaBinaryOp {
     And, Or,
 }
 
-/// SSA 类型（轻量表示，仅用于代码生成与推断）。
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum SsaType {
-    I(usize),
-    U(usize),
-    F(usize),
-    Bool,
-    Ptr,
-    Void,
-}
-
 impl SsaInstr {
     /// 返回此指令定义的值（若有）。
     pub fn result(&self) -> Option<SsaValue> {
@@ -160,7 +128,6 @@ impl SsaInstr {
             SsaInstr::Const { result, .. } => Some(*result),
             SsaInstr::Unary { result, .. } => Some(*result),
             SsaInstr::Binary { result, .. } => Some(*result),
-            SsaInstr::Cast { result, .. } => Some(*result),
             SsaInstr::Var { result, .. } => Some(*result),
         }
     }
@@ -229,27 +196,6 @@ fn convert_function(func: &mir::MirFunction) -> SsaFunction {
                     });
                     let _ = name;
                 }
-                MirInstr::Call(name, _ret, args) => {
-                    let v = alloc();
-                    let _ = args;
-                    instrs.push(SsaInstr::Var {
-                        result: v,
-                        name: name.clone(),
-                    });
-                }
-                MirInstr::Load(ptr) => {
-                    let v = alloc();
-                    instrs.push(SsaInstr::Var {
-                        result: v,
-                        name: format!("load_{:?}", ptr),
-                    });
-                }
-                MirInstr::Store(_ptr, _val) => {
-                    // Store 不产生新值
-                }
-                MirInstr::Drop(_) => {
-                    // Drop 不产生新值
-                }
                 MirInstr::Await(name, future) => {
                     let v = alloc();
                     instrs.push(SsaInstr::Var {
@@ -264,11 +210,8 @@ fn convert_function(func: &mir::MirFunction) -> SsaFunction {
         let term = convert_terminator(&block.term, &next_value);
         blocks.push(SsaBasicBlock {
             id: block.id,
-            preds: block.preds.clone(),
-            succs: block.succs.clone(),
             instrs,
             term,
-            start_offset: 0,
         });
     }
 
@@ -276,7 +219,6 @@ fn convert_function(func: &mir::MirFunction) -> SsaFunction {
         name: func.name.clone(),
         params,
         blocks,
-        is_async: func.is_async,
     }
 }
 
@@ -351,20 +293,16 @@ fn convert_terminator(term: &MirTerminator, next_value: &Cell<u32>) -> SsaTermin
         next_value.set(next_value.get() + 1);
         v
     };
+    let _ = alloc;
     match term {
         MirTerminator::Goto(target) => SsaTerminator::Goto(*target),
-        MirTerminator::Branch { cond: _, then_block, else_block } => SsaTerminator::Branch {
-            cond: alloc(),
+        MirTerminator::Branch { then_block, else_block } => SsaTerminator::Branch {
+            cond: SsaValue(0),
             then_block: *then_block,
             else_block: *else_block,
         },
-        MirTerminator::Return(_) => {
-            SsaTerminator::Return(Some(alloc()))
-        }
-        MirTerminator::Call { target, ret, next } => SsaTerminator::Goto(*next),
-        MirTerminator::Switch { discr: _, cases, default } => {
-            // 骨架：默认分支兜底
-            SsaTerminator::Goto(*default)
+        MirTerminator::Return => {
+            SsaTerminator::Return(None)
         }
         MirTerminator::Unreachable => SsaTerminator::Unreachable,
     }

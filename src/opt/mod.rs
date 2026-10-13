@@ -11,8 +11,6 @@
 //! ```
 
 mod pass_manager;
-pub mod lto;
-pub mod pgo;
 
 use crate::ssa::SsaModule;
 

@@ -46,15 +46,12 @@ use crate::lexer::{Token, TokenKind, Span};
 pub struct Parser {
     tokens: Vec<Token>,
     pos: usize,
-    /// 用于生成合成 span 的源长度缓存。
-    source_len: usize,
 }
 
 impl Parser {
     /// 创建解析器。
     pub fn new(tokens: Vec<Token>) -> Self {
-        let source_len = tokens.iter().map(|t| t.span.end).max().unwrap_or(0);
-        Self { tokens, pos: 0, source_len }
+        Self { tokens, pos: 0 }
     }
 
     /// 解析整个编译单元。
@@ -366,20 +363,6 @@ impl Parser {
         std::mem::discriminant(&self.peek().kind) == std::mem::discriminant(kind)
     }
 
-    /// 仅用于字面量的宽泛匹配。
-    fn check_lit(&self) -> bool {
-        matches!(
-            self.peek().kind,
-            TokenKind::IntLiteral(_)
-                | TokenKind::FloatLiteral(_)
-                | TokenKind::StringLiteral(_)
-                | TokenKind::CharLiteral(_)
-                | TokenKind::BoolLiteral(_)
-                | TokenKind::KwTrue
-                | TokenKind::KwFalse
-        )
-    }
-
     /// 若匹配则消费，返回 true。
     fn match_kind(&mut self, kind: &TokenKind) -> bool {
         if self.check(kind) {
@@ -433,27 +416,6 @@ impl Parser {
         ))
         .with_kind(ErrorKind::Parse)
         .with_span(span)
-    }
-
-    /// 同步恢复：跳过到下一个安全 token。
-    fn synchronize(&mut self) {
-        self.advance();
-        while !self.is_at_end() {
-            if self.previous().kind == TokenKind::Semicolon {
-                return;
-            }
-            match self.peek().kind {
-                TokenKind::KwFn | TokenKind::KwLet | TokenKind::KwConst | TokenKind::KwVar
-                | TokenKind::KwStruct | TokenKind::KwEnum | TokenKind::KwImpl | TokenKind::KwTrait
-                | TokenKind::KwMod | TokenKind::KwUse | TokenKind::KwIf | TokenKind::KwWhile
-                | TokenKind::KwFor | TokenKind::KwLoop | TokenKind::KwReturn | TokenKind::KwPub => {
-                    return;
-                }
-                _ => {
-                    self.advance();
-                }
-            }
-        }
     }
 }
 
