@@ -369,12 +369,17 @@ impl Parser {
         self.tokens.get(self.pos + n)
     }
 
-    /// 判断当前 token 是否为给定种类。
+    /// 判断当前 token 是否为给定 token。
+    ///
+    /// 这里必须做**完整相等比较**，不能只比枚举判别值：`Ident`、`IntLiteral`
+    /// 这类变体带 payload，只比 discriminant 的话
+    /// `check(&Ident("asm"))` 会匹配上**任意**标识符——曾经就让
+    /// `intrinsic!(...)` 被误当成 `asm!(...)` 送进内联汇编解析器。
     fn check(&self, kind: &TokenKind) -> bool {
         if self.is_at_end() {
             return false;
         }
-        std::mem::discriminant(&self.peek().kind) == std::mem::discriminant(kind)
+        &self.peek().kind == kind
     }
 
     /// 若匹配则消费，返回 true。
@@ -401,10 +406,17 @@ impl Parser {
         if let TokenKind::Ident(name) = &self.peek().kind {
             let n = name.clone();
             self.advance();
-            Ok(n)
-        } else {
-            Err(self.expected(msg, &TokenKind::Ident(String::new())))
+            return Ok(n);
         }
+        // 关键字在"名字位置"退化成标识符：标准库里就有
+        // `trait Default { fn default() -> Self; }` 这种写法，
+        // 直接拒绝会让整个模块编译不过。
+        if let Some(kw) = self.peek().kind.keyword_text() {
+            let n = kw.to_string();
+            self.advance();
+            return Ok(n);
+        }
+        Err(self.expected(msg, &TokenKind::Ident(String::new())))
     }
 
     /// 路径段：标识符，**或者**被当作标识符的关键字。

@@ -71,6 +71,12 @@ pub struct TypeChecker {
     errors: Vec<CompileError>,
     /// 导入解析缓存。
     use_aliases: HashMap<String, DefId>,
+    /// 已加载的标准库模块名。
+    ///
+    /// `use io::{println}` 里的 `io` 不是一个可调用的符号，而是模块
+    /// 限定符——标准库的定义已经被并进当前编译单元，所以这里只需要
+    /// 知道"这个名字是模块"，不用再解析成 DefId。
+    known_modules: HashSet<String>,
 }
 
 impl Default for TypeChecker {
@@ -98,6 +104,7 @@ impl Default for TypeChecker {
             current_function: None,
             errors: Vec::new(),
             use_aliases: HashMap::new(),
+            known_modules: HashSet::new(),
         }
     }
 }
@@ -109,6 +116,11 @@ impl TypeChecker {
     }
 
     /// 执行完整类型检查，返回 HIR 模块。
+    /// 告知类型检查器哪些名字是已加载的标准库模块。
+    pub fn set_known_modules(&mut self, modules: HashSet<String>) {
+        self.known_modules = modules;
+    }
+
     pub fn check_program(&mut self, prog: &Program) -> Result<hir::HirModule> {
         // ===== 阶段 1：声明收集（pass 1）=====
         self.collect_declarations(prog)?;
@@ -264,6 +276,10 @@ impl TypeChecker {
     fn resolve_use_tree(&mut self, tree: &UseTree, span: &ast::Span) -> Result<()> {
         match tree {
             UseTree::Name(name) => {
+                if self.known_modules.contains(name) {
+                    // 模块限定符：定义已经被并进当前编译单元，无需再解析
+                    return Ok(());
+                }
                 if let Some(id) = self.symbols.get(name).copied() {
                     self.use_aliases.insert(name.clone(), id);
                 } else {
@@ -1016,14 +1032,23 @@ impl TypeChecker {
                 ))
                 .with_span(span));
             }
-            Expression::Intrinsic(kind, types, _) => {
+            Expression::Intrinsic(kind, types, operands, _) => {
                 let hir_types: Result<Vec<Ty>> = types.iter()
                     .map(|t| self.ast_to_hir_type(t))
                     .collect();
-                let _ = hir_types?;
+                let mut hir_types = hir_types?;
                 let _ = self.lower_intrinsic(*kind);
+                // 表达式实参也要检查（`intrinsic!(drop x)` 里的 `x`）
+                for op in operands {
+                    let expected = Ty::Infer(InferId(0));
+                    let _ = self.check_expr(op, &expected)?;
+                }
                 let ty = match kind {
                     ast::IntrinsicKind::SizeOf | ast::IntrinsicKind::AlignOf => Ty::Uint(64),
+                    // `transmute src -> Dst` 的结果类型就是 Dst
+                    ast::IntrinsicKind::Transmute => {
+                        hir_types.pop().unwrap_or(Ty::Infer(InferId(0)))
+                    }
                     ast::IntrinsicKind::TypeOf => Ty::Infer(InferId(0)),
                     _ => Ty::Infer(InferId(0)),
                 };
@@ -1374,6 +1399,15 @@ impl TypeChecker {
             AstLiteral::Bool(b) => {
                 (ExprKind::Literal(hir::HirLiteral::Bool(*b)), Ty::Bool)
             }
+            AstLiteral::Byte(v) => {
+                (ExprKind::Literal(hir::HirLiteral::Int(*v as i128)), Ty::Uint(8))
+            }
+            AstLiteral::ByteString(bytes) => (
+                ExprKind::Literal(hir::HirLiteral::String(
+                    bytes.iter().map(|b| *b as char).collect(),
+                )),
+                Ty::Slice(Box::new(Ty::Uint(8)), ast::Mutability::Immutable),
+            ),
         })
     }
 
@@ -1706,6 +1740,11 @@ impl TypeChecker {
             Expression::Literal(AstLiteral::String(_), _) => Ty::Str,
             Expression::Literal(AstLiteral::Char(_), _) => Ty::Char,
             Expression::Literal(AstLiteral::Bool(_), _) => Ty::Bool,
+            Expression::Literal(AstLiteral::Byte(_), _) => Ty::Uint(8),
+            Expression::Literal(AstLiteral::ByteString(_), _) => Ty::Slice(
+                Box::new(Ty::Uint(8)),
+                crate::parser::ast::Mutability::Immutable,
+            ),
             Expression::Variable(name, _) => {
                 if let Some(id) = self.symbols.get(name).copied() {
                     if let Some(t) = self.consts.get(&id) { t.ty.clone() }

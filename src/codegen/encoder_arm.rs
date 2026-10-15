@@ -331,6 +331,15 @@ fn push_branch_reloc(unit: &mut CompilationUnit, instr_start: usize, target: &st
     ));
 }
 
+/// 基本块标签：`<函数名>.bb<编号>`。
+///
+/// 早先只用 `bb<编号>`，于是**不同函数的同名块会共用一个符号**——`main`
+/// 的 `bb1` 和 `f` 的 `bb1` 撞在一起，`main` 里的分支会跳进别的函数。
+/// 加上函数名前缀后每个块的标签全局唯一。
+fn block_label(func: &str, id: usize) -> String {
+    format!("{func}.bb{id}")
+}
+
 // ==================================================================
 // 函数与指令发射
 // ==================================================================
@@ -343,7 +352,7 @@ pub fn emit_function(target: &Target, unit: &mut CompilationUnit, func: &SsaFunc
 
     for block in &func.blocks {
         unit.symbols.push(Symbol {
-            name: format!("bb{}", block.id),
+            name: block_label(&func.name, block.id),
             section: SymbolSection::Text,
             offset: 0,
             size: 0,
@@ -369,14 +378,14 @@ pub fn emit_function(target: &Target, unit: &mut CompilationUnit, func: &SsaFunc
                 }
                 emit_pop_pc(unit);
             }
-            SsaTerminator::Goto(target) => emit_b(unit, &format!("bb{target}")),
+            SsaTerminator::Goto(target) => emit_b(unit, &block_label(&func.name, *target)),
             SsaTerminator::Branch { cond, then_block, else_block } => {
                 let r = alloc_reg(*cond);
                 emit_cmp(unit, r, r);
                 // cond == 0 时跳到 else，否则顺序执行 then
                 // （x86-64 的 `jz else; jmp then` 与之等价）
-                emit_b_cond(unit, cc::EQ, &format!("bb{else_block}"));
-                emit_b(unit, &format!("bb{then_block}"));
+                emit_b_cond(unit, cc::EQ, &block_label(&func.name, *else_block));
+                emit_b(unit, &block_label(&func.name, *then_block));
             }
             SsaTerminator::Unreachable => emit_spin(unit),
         }
@@ -609,7 +618,7 @@ mod tests {
         let block_off = |n: usize| {
             unit.symbols
                 .iter()
-                .find(|s| s.name == format!("bb{n}"))
+                .find(|s| s.name == block_label("pick", n))
                 .expect("块标签")
                 .offset
         };

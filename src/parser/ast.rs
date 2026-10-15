@@ -247,6 +247,10 @@ pub enum Literal {
     String(String),
     Char(char),
     Bool(bool),
+    /// 字节字面量：`b'x'` / `b"str"`。
+    Byte(u8),
+    /// 字节串字面量：`b"str"`，按**原始字节**保存（不做 UTF-8 转义）。
+    ByteString(Vec<u8>),
 }
 
 // ======================================================================
@@ -341,7 +345,11 @@ pub enum Expression {
     /// `goto label;`
     Goto(String, Span),
     /// `sizeof(T)` / `typeof(e)` / `alignof(T)`
-    Intrinsic(IntrinsicKind, Vec<Type>, Span),
+    /// `intrinsic!(op types... args...)`
+    ///
+    /// 同时保存类型实参和**表达式**实参——`intrinsic!(transmute x -> u32)`
+    /// 的 `x` 是表达式，`intrinsic!(size_of T)` 的 `T` 是类型。
+    Intrinsic(IntrinsicKind, Vec<Type>, Vec<Expression>, Span),
 }
 
 /// 内置编译器内置函数。
@@ -512,6 +520,8 @@ pub struct Function {
 /// 泛型参数。
 #[derive(Debug, Clone)]
 pub enum GenericParam {
+    /// 生命周期参数：`<'a>`。
+    Lifetime,
     /// 类型参数：`<T>` / `<T: Trait>`。
     Type,
     /// 常量参数：`<const N: usize>`。
@@ -698,7 +708,7 @@ impl Spanned for Expression {
             Expression::Spawn(_, s) => *s,
             Expression::Labeled(_, _, s) => *s,
             Expression::Goto(_, s) => *s,
-            Expression::Intrinsic(_, _, s) => *s,
+            Expression::Intrinsic(_, _, _, s) => *s,
         }
     }
 }

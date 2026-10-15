@@ -269,6 +269,15 @@ fn emit_branch(unit: &mut CompilationUnit, funct3: u32, rs1: Reg, rs2: Reg, targ
     ));
 }
 
+/// 基本块标签：`<函数名>.bb<编号>`。
+///
+/// 早先只用 `bb<编号>`，于是**不同函数的同名块会共用一个符号**——`main`
+/// 的 `bb1` 和 `f` 的 `bb1` 撞在一起，`main` 里的分支会跳进别的函数。
+/// 加上函数名前缀后每个块的标签全局唯一。
+fn block_label(func: &str, id: usize) -> String {
+    format!("{func}.bb{id}")
+}
+
 // ==================================================================
 // 函数与指令发射
 // ==================================================================
@@ -284,7 +293,7 @@ pub fn emit_function(target: &Target, unit: &mut CompilationUnit, func: &SsaFunc
 
     for block in &func.blocks {
         unit.symbols.push(Symbol {
-            name: format!("bb{}", block.id),
+            name: block_label(&func.name, block.id),
             section: SymbolSection::Text,
             offset: 0,
             size: 0,
@@ -308,15 +317,15 @@ pub fn emit_function(target: &Target, unit: &mut CompilationUnit, func: &SsaFunc
                 }
                 emit_ret(unit);
             }
-            SsaTerminator::Goto(target) => emit_j(unit, &format!("bb{target}")),
+            SsaTerminator::Goto(target) => emit_j(unit, &block_label(&func.name, *target)),
             SsaTerminator::Branch { cond, then_block, else_block } => {
                 // RISC-V 没有条件执行，用"跳过一条跳转"来表达二选一：
                 //   beq cond, zero, else   // cond == 0 时直接走 else
                 //   jal zero, then         // 否则顺序落到 then
                 // 注意判断方向：cond != 0（真）必须落到 then_block。
                 let r = alloc_reg(*cond);
-                emit_branch(unit, 0b000, r, Reg::ZERO, &format!("bb{else_block}")); // beq
-                emit_j(unit, &format!("bb{then_block}"));
+                emit_branch(unit, 0b000, r, Reg::ZERO, &block_label(&func.name, *else_block)); // beq
+                emit_j(unit, &block_label(&func.name, *then_block));
             }
             SsaTerminator::Unreachable => emit_spin(unit),
         }
@@ -616,7 +625,7 @@ mod tests {
         let block_off = |n: usize| {
             unit.symbols
                 .iter()
-                .find(|s| s.name == format!("bb{n}"))
+                .find(|s| s.name == block_label("pick", n))
                 .expect("块标签")
                 .offset
         };

@@ -16,6 +16,7 @@
 #![allow(clippy::module_name_repetitions)]
 #![warn(unused_imports, unused_variables, dead_code)]
 
+mod stdlib;
 mod codegen;
 mod error;
 mod lexer;
@@ -212,14 +213,18 @@ fn compile(input: &str, cmd: &Cli) -> Result<(), String> {
 
     // 3. 语法分析
     let mut parser = parser::Parser::new(tokens);
-    let ast = parser.parse().map_err(|e| e.to_string())?;
+    let mut ast = parser.parse().map_err(|e| e.to_string())?;
     if cmd.dump_ast {
         println!("=== AST ===");
         println!("{:#?}", ast);
     }
 
+    // 3.5 加载标准库：把源文件 `use` 到的模块（及其传递依赖）并进来。
+    let loaded = stdlib::load(&mut ast)?;
+
     // 4. 类型检查 + HIR
     let mut checker = typeck::TypeChecker::new();
+    checker.set_known_modules(loaded.modules);
     let hir = checker.check_program(&ast).map_err(|e| e.to_string())?;
     if cmd.dump_hir {
         println!("=== HIR ===");

@@ -91,12 +91,13 @@ impl<'a> Lexer<'a> {
                     TokenKind::MinusEq
                 } else if self.match_char('>') {
                     TokenKind::Arrow
-                } else if self.peek().is_ascii_digit() {
-                    // 负数由解析器的 unary 规则处理，这里只回退一个字符
-                    self.pos -= 1;
-                    self.column -= 1;
-                    return self.read_number(start, line, col);
                 } else {
+                    // 负数由解析器的 unary 规则处理：这里照常产出 `-`，
+                    // 下一个 token 会是那个整数字面量。
+                    //
+                    // 早先这里会 `self.pos -= 1` 再把 `-` 的位置当作数字起点
+                    // 调 read_number，导致 num_start 指在 `-` 上、数字循环
+                    // 一个字符也读不到，整个词法分析死循环。
                     TokenKind::Minus
                 }
             }
@@ -250,7 +251,14 @@ impl<'a> Lexer<'a> {
             '0'..='9' => return self.read_number(start, line, col),
 
             // ===== 标识符与关键字 =====
+            // 单独的 `_` 是通配符；但 `_foo` 是普通标识符——早先这里
+            // 无条件产出 Underscore，把 `_value` 切成了 `_` + `value`
+            // 两个 token，参数名 `_value` 因此解析失败。
             '_' => {
+                let next = self.peek();
+                if next.is_alphanumeric() || next == '_' {
+                    return self.read_ident(start, line, col);
+                }
                 // `next_token` 已经 advance 过 `_`，这里不再 advance
                 return Token::new(TokenKind::Underscore, Span::new(start, self.pos, line, col));
             }

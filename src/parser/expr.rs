@@ -147,6 +147,32 @@ impl Parser {
     /// 解析前缀表达式（字面量、标识符、一元运算符、控制流等）。
     fn parse_prefix(&mut self) -> Result<Expression, CompileError> {
         let span = self.peek().span;
+        // 字节字面量：`b'x'` / `b"str"`。词法器不认识这个前缀，所以在
+        // 看到标识符 `b` 且下一个 token 是引号时手工拼一个。
+        if let TokenKind::Ident(name) = &self.peek().kind {
+            if name == "b" {
+                let next = self.peek_n(1).map(|t| t.kind.clone());
+                match next {
+                    Some(TokenKind::CharLiteral(_)) => {
+                        self.advance();
+                        if let TokenKind::CharLiteral(c) = self.advance().kind {
+                            return Ok(Expression::Literal(Literal::Byte(c as u32 as u8), span));
+                        }
+                    }
+                    Some(TokenKind::StringLiteral(_)) => {
+                        self.advance();
+                        if let TokenKind::StringLiteral(s) = self.advance().kind {
+                            return Ok(Expression::Literal(
+                                Literal::ByteString(s.chars().map(|c| c as u32 as u8).collect()),
+                                span,
+                            ));
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+
         let kind = self.peek().kind.clone();
 
         // ===== 字面量 =====
@@ -351,26 +377,55 @@ impl Parser {
                 self.consume(&TokenKind::LParen, "expected '(' after `intrinsic!`")?;
                 let kind = self.parse_intrinsic_kind()?;
                 let mut types = Vec::new();
-                // 解析可选的类型参数列表（例如 `size_of T` 中的 `T`）
+                let mut operands = Vec::new();
+
+                // 有的内建第一个实参是**表达式**（`transmute src -> Dst`、
+                // `drop x`），有的是**类型**（`size_of T`）。先把实参统一
+                // 解析出来：能当类型就当类型，否则按表达式处理。
                 while !self.check(&TokenKind::RParen) && !self.check(&TokenKind::Eof) {
-                    if self.check(&TokenKind::Arrow) {
-                        break;
-                    }
                     if let Some(ty) = self.try_parse_type() {
                         types.push(ty);
                     } else {
+                        let e = self.parse_expression()?;
+                        operands.push(e);
+                        // `transmute src -> Dst` 的目标类型
+                        if self.match_kind(&TokenKind::Arrow) {
+                            types.push(self.parse_type()?);
+                            break;
+                        }
+                    }
+                    if !self.match_kind(&TokenKind::Comma) {
                         break;
                     }
                 }
                 self.consume(&TokenKind::RParen, "expected ')' to close `intrinsic!`")?;
-                return Ok(Expression::Intrinsic(kind, types, span));
+                return Ok(Expression::Intrinsic(kind, types, operands, span));
             }
             if self.match_kind(&TokenKind::ColonColon) {
+                // 泛型实参（turbofish）：`size_of::<T>()` 的 `::<T>`
+                if self.check(&TokenKind::Lt) {
+                    self.advance();
+                    let _args = self.parse_generic_args()?;
+                    // turbofish 后面必定跟着调用
+                    if self.match_kind(&TokenKind::LParen) {
+                        let args = self.parse_call_args()?;
+                        self.consume(&TokenKind::RParen, "expected ')'")?;
+                        return Ok(Expression::Call(
+                            Box::new(Expression::Variable(n, span)),
+                            args,
+                            span,
+                        ));
+                    }
+                    return Ok(Expression::Variable(n, span));
+                }
                 // 路径：`a::b::c`
                 let mut path = vec![n];
-                path.push(self.consume_ident("expected path segment")?);
+                path.push(self.consume_path_segment("expected path segment")?);
                 while self.match_kind(&TokenKind::ColonColon) {
-                    path.push(self.consume_ident("expected path segment")?);
+                    if self.check(&TokenKind::Lt) {
+                        break;
+                    }
+                    path.push(self.consume_path_segment("expected path segment")?);
                 }
                 return Ok(Expression::Path(path, span));
             }
@@ -405,7 +460,18 @@ impl Parser {
             return Ok(Expression::Variable("self".into(), span));
         }
 
-        Err(CompileError::internal(format!("unexpected expression start: {:?}", kind)))
+        // 走到这里说明这个关键字不参与表达式语法，可以当普通标识符用
+        // （例如标准库里的 `return default`）。
+        if let Some(kw) = kind.keyword_text() {
+            self.advance();
+            return Ok(Expression::Variable(kw.to_string(), span));
+        }
+
+        Err(CompileError::internal(format!(
+            "unexpected expression start: {:?} at line {}",
+            kind,
+            self.peek().span.line
+        )))
     }
 
     // ===== 字面量 =====
@@ -451,7 +517,10 @@ impl Parser {
         let then = self.parse_block()?;
         let else_branch = if self.match_kind(&TokenKind::KwElse) {
             if self.check(&TokenKind::KwIf) {
-                // `else if` 作为嵌套 if 表达式
+                // `else if` 作为嵌套 if 表达式。`parse_if` 假定 `if` 已经被
+                // 匹配掉了，所以这里必须先把 `if` 吃掉，否则递归进去时
+                // 当前 token 还是 `if`，条件会被解析成一个嵌套 if。
+                self.advance();
                 let (c2, t2, e2, _) = self.parse_if()?;
                 Some(Box::new(Expression::If(c2, t2, e2, Span::unknown())))
             } else {
@@ -621,6 +690,10 @@ impl Parser {
                 args.push(Argument::Pos(value));
             }
             if !self.match_kind(&TokenKind::Comma) {
+                break;
+            }
+            // 允许省略最后一个实参后的逗号：`f(a, b,)`
+            if self.check(&TokenKind::RParen) {
                 break;
             }
         }

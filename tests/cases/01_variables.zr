@@ -1,0 +1,66 @@
+//=============================================================================
+// tests/cases/01_variables.zr — 对应《Rust 程序设计语言》「变量与可变性」
+//
+// 覆盖：不可变绑定、`mut` 重新赋值、shadowing（同名遮蔽）。
+//
+// 约定：整个文件是一个自检程序。`main` 返回 0 表示全部通过；
+// 返回非 0 的编号表示第几条断言失败，便于定位。
+//=============================================================================
+
+/// 把两个数相加（无分支的纯函数）。
+fn add(a: i32, b: i32) -> i32 {
+    return a + b;
+}
+
+fn main() -> i32 {
+    // --- 不可变绑定 ---
+    let x: i32 = 20;
+    let y: i32 = 22;
+    if add(x, y) != 42 {
+        return 1;
+    }
+
+    // --- mut + 重新赋值 ---
+    let mut counter: i32 = 0;
+    counter = counter + 1;
+    if counter != 1 {
+        return 2;
+    }
+    counter = counter + 41;
+    if counter != 42 {
+        return 3;
+    }
+
+    // --- shadowing：同名绑定遮蔽前一个 ---
+    let shadowed: i32 = 1;
+    let shadowed: i32 = 2;
+    let shadowed: i32 = shadowed + 40;
+    if shadowed != 42 {
+        return 4;
+    }
+
+    // 不同类型的 shadowing：内层绑定不会影响外层
+    let wide: i64 = 42;
+    let wide: i32 = 7;
+    if wide != 7 {
+        return 5;
+    }
+    if wide + 35 != 42 {
+        return 6;
+    }
+
+    // --- 表达式中的绑定顺序（先声明后使用）---
+    let first: i32 = 6;
+    let second: i32 = add(first, 1);
+    if second != 7 {
+        return 7;
+    }
+
+    // --- 局部变量作为实参 ---
+    let base: i32 = 20;
+    if add(base, 22) != 42 {
+        return 8;
+    }
+
+    return 0;
+}

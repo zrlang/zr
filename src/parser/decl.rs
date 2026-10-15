@@ -152,8 +152,9 @@ impl Parser {
         _attrs: Vec<Attribute>,
     ) -> Result<ExternBlock, CompileError> {
         let _span = self.previous().span;
-        if self.match_kind(&TokenKind::StringLiteral(String::new())) {
-            // abi 字符串已被消费，丢弃
+        // `extern "C" { ... }` —— abi 名字是字符串，内容暂时丢弃。
+        if matches!(self.peek().kind, TokenKind::StringLiteral(_)) {
+            self.advance();
         }
         self.consume(&TokenKind::LBrace, "expected '{' after extern")?;
         while !self.check(&TokenKind::RBrace) && !self.is_at_end() {
@@ -714,6 +715,18 @@ impl Parser {
                 let _ = self.parse_expression()?;
             }
             Ok(GenericParam::Const)
+        } else if matches!(self.peek().kind, TokenKind::Lifetime(_)) {
+            // 生命周期参数：`struct Foo<'a> { ... }`
+            self.advance();
+            if self.match_kind(&TokenKind::Colon) {
+                // 生命周期约束：目前直接跳过
+                while !matches!(self.peek().kind, TokenKind::Gt | TokenKind::Comma | TokenKind::Eof)
+                    && !self.is_at_end()
+                {
+                    self.advance();
+                }
+            }
+            Ok(GenericParam::Lifetime)
         } else {
             let _name = self.consume_ident("expected generic parameter name")?;
             if self.match_kind(&TokenKind::Colon) {

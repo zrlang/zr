@@ -249,6 +249,15 @@ mod cc {
     pub const LE: u32 = 0b1101;
 }
 
+/// 基本块标签：`<函数名>.bb<编号>`。
+///
+/// 早先只用 `bb<编号>`，于是**不同函数的同名块会共用一个符号**——`main`
+/// 的 `bb1` 和 `f` 的 `bb1` 撞在一起，`main` 里的分支会跳进别的函数。
+/// 加上函数名前缀后每个块的标签全局唯一。
+fn block_label(func: &str, id: usize) -> String {
+    format!("{func}.bb{id}")
+}
+
 // ==================================================================
 // 函数与指令发射
 // ==================================================================
@@ -262,7 +271,7 @@ pub fn emit_function(target: &Target, unit: &mut CompilationUnit, func: &SsaFunc
     // 先为每个基本块占位一个符号，块偏移在发射完成后回填。
     for block in &func.blocks {
         unit.symbols.push(Symbol {
-            name: format!("bb{}", block.id),
+            name: block_label(&func.name, block.id),
             section: SymbolSection::Text,
             offset: 0,
             size: 0,
@@ -289,15 +298,15 @@ pub fn emit_function(target: &Target, unit: &mut CompilationUnit, func: &SsaFunc
                 emit_epilogue(unit);
                 emit_ret(unit);
             }
-            SsaTerminator::Goto(target) => emit_b(unit, &format!("bb{target}")),
+            SsaTerminator::Goto(target) => emit_b(unit, &block_label(&func.name, *target)),
             SsaTerminator::Branch { cond, then_block, else_block } => {
                 let r = alloc_reg(*cond);
                 emit_cmp(unit, r, r);
                 emit_cond_branch(
                     unit,
                     cc::NE,
-                    &format!("bb{then_block}"),
-                    &format!("bb{else_block}"),
+                    &block_label(&func.name, *then_block),
+                    &block_label(&func.name, *else_block),
                 );
             }
             SsaTerminator::Unreachable => emit_brk(unit),

@@ -64,6 +64,15 @@ const ALLOCATABLE: [Gpr; 10] = [
 ];
 
 /// 把 SSA value 映射到物理寄存器（虚拟分配）。
+/// 基本块标签：`<函数名>.bb<编号>`。
+///
+/// 早先只用 `bb<编号>`，于是**不同函数的同名块会共用一个符号**——`main`
+/// 的 `bb1` 和 `f` 的 `bb1` 撞在一起，`main` 里的分支会跳进别的函数。
+/// 加上函数名前缀后每个块的标签全局唯一。
+fn block_label(func: &str, id: usize) -> String {
+    format!("{func}.bb{id}")
+}
+
 fn alloc_reg(v: SsaValue) -> Gpr {
     ALLOCATABLE[(v.id() as usize) % ALLOCATABLE.len()]
 }
@@ -78,7 +87,7 @@ pub fn emit_function(target: &Target, unit: &mut CompilationUnit, func: &SsaFunc
     let sym_base = unit.symbols.len();
     for block in &func.blocks {
         unit.symbols.push(Symbol {
-            name: format!("bb{}", block.id),
+            name: block_label(&func.name, block.id),
             section: SymbolSection::Text,
             offset: 0, // 稍后回填
             size: 0,
@@ -109,13 +118,13 @@ pub fn emit_function(target: &Target, unit: &mut CompilationUnit, func: &SsaFunc
                 emit1(unit, 0x5d);
                 emit1(unit, 0xc3);
             }
-            SsaTerminator::Goto(target) => emit_jmp(unit, &format!("bb{target}")),
+            SsaTerminator::Goto(target) => emit_jmp(unit, &block_label(&func.name, *target)),
             SsaTerminator::Branch { cond, then_block, else_block } => {
                 // test cond, cond; jz else; jmp then
                 let r = alloc_reg(*cond);
                 emit_test_rr(unit, r, r);
-                emit_jcc_rel32(unit, 0x84, &format!("bb{else_block}")); // jz
-                emit_jmp(unit, &format!("bb{then_block}"));
+                emit_jcc_rel32(unit, 0x84, &block_label(&func.name, *else_block)); // jz
+                emit_jmp(unit, &block_label(&func.name, *then_block));
             }
             SsaTerminator::Unreachable => emit_ud2(unit),
         }

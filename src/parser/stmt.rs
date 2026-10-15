@@ -68,6 +68,22 @@ impl Parser {
     }
 
     /// 解析单个模式。
+    /// 解析变体模式的 `(p1, p2, ...)` 实参列表（不含左括号）。
+    fn parse_pattern_call_args(&mut self) -> Result<Vec<Pattern>, CompileError> {
+        let mut args = Vec::new();
+        if !self.check(&TokenKind::RParen) {
+            args.push(self.parse_pattern()?);
+            while self.match_kind(&TokenKind::Comma) {
+                if self.check(&TokenKind::RParen) {
+                    break;
+                }
+                args.push(self.parse_pattern()?);
+            }
+        }
+        self.consume(&TokenKind::RParen, "expected ')'")?;
+        Ok(args)
+    }
+
     pub(crate) fn parse_pattern_single(&mut self) -> Result<Pattern, CompileError> {
         let span = self.peek().span;
 
@@ -155,27 +171,55 @@ impl Parser {
             return Ok(Pattern::Wildcard(span));
         }
 
+        // 关键字当绑定名：`fn unwrap_or(self, default: T)` 里的 `default`。
+        // 先把它还原成文本再走下面和普通标识符一样的路径。
+        if let Some(kw) = self.peek().kind.keyword_text() {
+            if !matches!(self.peek().kind, TokenKind::KwTrue | TokenKind::KwFalse) {
+                let ident = kw.to_string();
+                self.advance();
+                return Ok(Pattern::Binding(
+                    ident,
+                    crate::parser::ast::Mutability::Immutable,
+                    None,
+                    span,
+                ));
+            }
+        }
+
         // 绑定：`name` / `name @ subpat` / `mut name`
         if let TokenKind::Ident(name) = &self.peek().kind {
             let ident = name.clone();
             self.advance();
+
+            // 限定路径模式：`Enum::Variant(p)` / `module::Type { .. }`
+            if self.check(&TokenKind::ColonColon) {
+                let mut path = vec![ident.clone()];
+                while self.match_kind(&TokenKind::ColonColon) {
+                    path.push(self.consume_path_segment("expected path segment in pattern")?);
+                }
+                if self.match_kind(&TokenKind::LBrace) {
+                    return self.parse_struct_pattern(path, span);
+                }
+                if self.match_kind(&TokenKind::LParen) {
+                    let args = self.parse_pattern_call_args()?;
+                    return Ok(Pattern::Variant { path, args, span });
+                }
+                // unit 变体：`Color::Red => ...` —— 退化成最后一段的绑定名
+                let last = path.last().cloned().unwrap_or(ident);
+                return Ok(Pattern::Binding(
+                    last,
+                    crate::parser::ast::Mutability::Immutable,
+                    None,
+                    span,
+                ));
+            }
 
             // 枚举变体 / 结构体模式：`Name { ... }` 或 `Name(p1, p2)`
             if self.match_kind(&TokenKind::LBrace) {
                 return self.parse_struct_pattern(vec![ident], span);
             }
             if self.match_kind(&TokenKind::LParen) {
-                let mut args = Vec::new();
-                if !self.check(&TokenKind::RParen) {
-                    args.push(self.parse_pattern()?);
-                    while self.match_kind(&TokenKind::Comma) {
-                        if self.check(&TokenKind::RParen) {
-                            break;
-                        }
-                        args.push(self.parse_pattern()?);
-                    }
-                }
-                self.consume(&TokenKind::RParen, "expected ')'")?;
+                let args = self.parse_pattern_call_args()?;
                 return Ok(Pattern::Variant {
                     path: vec![ident],
                     args,

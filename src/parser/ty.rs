@@ -154,6 +154,11 @@ impl Parser {
             return Ok(Type::Array(Box::new(elem), len));
         }
 
+        // 永不复返类型 `!`
+        if self.match_kind(&TokenKind::Bang) {
+            return Ok(Type::Never);
+        }
+
         // 生命周期标注：`&'a T` 里的 `'a`（类型检查阶段直接丢弃）
         if let TokenKind::Lifetime(_) = self.peek().kind {
             self.advance();
@@ -229,7 +234,7 @@ impl Parser {
     }
 
     /// 解析泛型实参 `<T, U, 42>`。
-    fn parse_generic_args(&mut self) -> Result<Vec<Type>, crate::error::CompileError> {
+    pub(crate) fn parse_generic_args(&mut self) -> Result<Vec<Type>, crate::error::CompileError> {
         let mut args = Vec::new();
         if !self.check(&TokenKind::Gt) {
             args.push(self.parse_type()?);
