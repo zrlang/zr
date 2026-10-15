@@ -40,6 +40,8 @@ impl Reg {
     pub const RA: Reg = Reg(1);
     /// zero 寄存器（x0，恒为 0，写入被丢弃）。
     pub const ZERO: Reg = Reg(0);
+    /// 栈指针 x2。
+    pub const SP: Reg = Reg(2);
 
     /// 5 位寄存器号。
     fn bits(self) -> u8 {
@@ -274,6 +276,110 @@ fn emit_branch(unit: &mut CompilationUnit, funct3: u32, rs1: Reg, rs2: Reg, targ
 /// 早先只用 `bb<编号>`，于是**不同函数的同名块会共用一个符号**——`main`
 /// 的 `bb1` 和 `f` 的 `bb1` 撞在一起，`main` 里的分支会跳进别的函数。
 /// 加上函数名前缀后每个块的标签全局唯一。
+/// `sd src, offset(base)`（RV64）/ `sw`（RV32）。
+fn emit_store(unit: &mut CompilationUnit, wide: bool, src: Reg, base: Reg, off: i32) {
+    let (op, imm_bits) = if wide { (0x23u32, 7u32) } else { (0x23, 12) };
+    let f3 = if wide { 3u32 } else { 2 };
+    // S 型：imm[11:5] | rs2 | rs1 | imm[4:0] | opcode
+    let hi = ((off >> 5) & ((1 << imm_bits) - 1)) as u32 & 0x7f;
+    let lo = (off as u32) & 0x1f;
+    insn(
+        unit,
+        hi << 25 | (src.bits() as u32) << 20 | (base.bits() as u32) << 15 | f3 << 12 | lo << 7 | op,
+    );
+}
+
+/// `ld rd, offset(base)`（RV64）/ `lw`（RV32）。
+fn emit_load(unit: &mut CompilationUnit, wide: bool, rd: Reg, base: Reg, off: i32) {
+    let f3 = if wide { 3u32 } else { 2 };
+    let imm = off as u32 & 0xfff;
+    insn(
+        unit,
+        imm << 20 | (base.bits() as u32) << 15 | f3 << 12 | (rd.bits() as u32) << 7 | 0x03,
+    );
+}
+
+/// 一个块的后继。
+fn successors(block: &crate::ssa::SsaBasicBlock) -> Vec<usize> {
+    match &block.term {
+        SsaTerminator::Goto(t) => vec![*t],
+        SsaTerminator::Branch { then_block, else_block, .. } => vec![*then_block, *else_block],
+        _ => Vec::new(),
+    }
+}
+
+/// 在当前块末尾把本块持有的值写进后继块的各个 φ 寄存器（并行拷贝）。
+///
+/// psABI 里可分配的 caller-save 寄存器（t0-t6）已经用满了，没有空闲寄存器
+/// 做中转，所以遇到环时借栈上 16 字节的临时槽打散。
+fn emit_phi_copies(
+    unit: &mut CompilationUnit,
+    func: &SsaFunction,
+    succ: usize,
+    from: usize,
+    wide: bool,
+) {
+    let Some(block) = func.blocks.iter().find(|b| b.id == succ) else {
+        return;
+    };
+    let mut moves: Vec<(Reg, Reg)> = Vec::new();
+    for instr in &block.instrs {
+        let SsaInstr::Phi { result, incoming, .. } = instr else {
+            continue;
+        };
+        let Some((_, src)) = incoming.iter().find(|(p, _)| *p == from) else {
+            continue;
+        };
+        let (dst, src) = (alloc_reg(*result), alloc_reg(*src));
+        if dst != src {
+            moves.push((dst, src));
+        }
+    }
+    if moves.is_empty() {
+        return;
+    }
+    // 有环才需要栈槽
+    let has_cycle = moves
+        .iter()
+        .any(|(dst, _)| moves.iter().any(|(_, src)| src == dst));
+    if has_cycle {
+        emit_addi(unit, Reg::SP, Reg::SP, -16);
+    }
+    while !moves.is_empty() {
+        let safe = moves
+            .iter()
+            .position(|(dst, _)| !moves.iter().any(|(_, src)| src == dst));
+        match safe {
+            Some(at) => {
+                let (dst, src) = moves.remove(at);
+                emit_mv(unit, dst, src);
+            }
+            None => {
+                // 环：把某个源压栈，并标记哪些搬运的源来自栈
+                let src = moves[0].1;
+                emit_store(unit, wide, src, Reg::SP, 0);
+                let mut pending = Vec::new();
+                for (dst, s) in moves.drain(..) {
+                    if s == src {
+                        pending.push(dst);
+                    } else {
+                        pending.push(dst);
+                    }
+                }
+                // 先做与被存源无关的搬运不可能（那就是环），所以全部
+                // 从栈槽取：逐个弹出即可，顺序已由 emit_mv 的源保证
+                for dst in pending {
+                    emit_load(unit, wide, dst, Reg::SP, 0);
+                }
+                break;
+            }
+        }
+    }
+    if has_cycle {
+        emit_addi(unit, Reg::SP, Reg::SP, 16);
+    }
+}
+
 fn block_label(func: &str, id: usize) -> String {
     format!("{func}.bb{id}")
 }
@@ -308,6 +414,10 @@ pub fn emit_function(target: &Target, unit: &mut CompilationUnit, func: &SsaFunc
         block_offsets.push(unit.code.len());
         for instr in &block.instrs {
             emit_instr(unit, instr);
+        }
+        let wide = matches!(target.arch(), Arch::RiscV64);
+        for succ in successors(block) {
+            emit_phi_copies(unit, func, succ, block.id, wide);
         }
         match &block.term {
             SsaTerminator::Return(ret_val) => {
@@ -366,6 +476,8 @@ fn emit_instr(unit: &mut CompilationUnit, instr: &SsaInstr) {
             emit_jal(unit, Reg::RA, callee);
             emit_mv(unit, alloc_reg(*result), Reg::A0);
         }
+        // φ 的实际拷贝由前驱末尾的 emit_phi_copies 发出
+        SsaInstr::Phi { .. } => {}
         SsaInstr::Var { .. } => {}
     }
 }

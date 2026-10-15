@@ -69,6 +69,59 @@ const ALLOCATABLE: [Gpr; 10] = [
 /// 早先只用 `bb<编号>`，于是**不同函数的同名块会共用一个符号**——`main`
 /// 的 `bb1` 和 `f` 的 `bb1` 撞在一起，`main` 里的分支会跳进别的函数。
 /// 加上函数名前缀后每个块的标签全局唯一。
+/// 一个块的后继。
+fn successors(block: &crate::ssa::SsaBasicBlock) -> Vec<usize> {
+    match &block.term {
+        SsaTerminator::Goto(t) => vec![*t],
+        SsaTerminator::Branch { then_block, else_block, .. } => vec![*then_block, *else_block],
+        _ => Vec::new(),
+    }
+}
+
+/// 在当前块（`from`）末尾，把本块持有的值写进后继块 `succ` 的各个 φ 寄存器。
+///
+/// 多个 φ 的写入彼此独立但必须**同时**读源：直接按顺序 `mov` 会在存在
+/// 环（`x = y; y = x`）时读到已被改写的值。做法和实参搬运一样——反复挑
+/// "目标不再是任何源"的先执行，都挑不出就先用 rax 暂存把环打开。
+fn emit_phi_copies(unit: &mut CompilationUnit, func: &SsaFunction, succ: usize, from: usize) {
+    let Some(block) = func.blocks.iter().find(|b| b.id == succ) else {
+        return;
+    };
+    let mut moves: Vec<(Gpr, Gpr)> = Vec::new();
+    for instr in &block.instrs {
+        let SsaInstr::Phi { result, incoming, .. } = instr else {
+            continue;
+        };
+        let Some((_, src)) = incoming.iter().find(|(p, _)| *p == from) else {
+            continue;
+        };
+        let (dst, src) = (alloc_reg(*result), alloc_reg(*src));
+        if dst != src {
+            moves.push((dst, src));
+        }
+    }
+    while !moves.is_empty() {
+        let safe = moves
+            .iter()
+            .position(|(dst, _)| !moves.iter().any(|(_, src)| src == dst));
+        match safe {
+            Some(at) => {
+                let (dst, src) = moves.remove(at);
+                emit_mov_rr(unit, dst, src);
+            }
+            None => {
+                let src = moves[0].1;
+                emit_mov_rr(unit, SCRATCH_AX, src);
+                for m in moves.iter_mut() {
+                    if m.1 == src {
+                        m.1 = SCRATCH_AX;
+                    }
+                }
+            }
+        }
+    }
+}
+
 fn block_label(func: &str, id: usize) -> String {
     format!("{func}.bb{id}")
 }
@@ -106,6 +159,11 @@ pub fn emit_function(target: &Target, unit: &mut CompilationUnit, func: &SsaFunc
         block_offsets.push(unit.code.len());
         for instr in &block.instrs {
             emit_instr(unit, instr);
+        }
+        // φ 是"在每个前驱末尾"的并行拷贝：跳转之前必须把本块持有的值
+        // 写进后继块各个 φ 的目标寄存器。
+        for succ in successors(block) {
+            emit_phi_copies(unit, func, succ, block.id);
         }
         match &block.term {
             SsaTerminator::Return(ret_val) => {
@@ -158,6 +216,8 @@ fn emit_instr(unit: &mut CompilationUnit, instr: &SsaInstr) {
             emit_call(unit, callee);
             emit_mov_rr(unit, alloc_reg(*result), SCRATCH_AX);
         }
+        // φ 的实际拷贝由前驱末尾的 emit_phi_copies 发出
+        SsaInstr::Phi { .. } => {}
         SsaInstr::Var { .. } => {
             // Var 是 φ 合并前的引用，运行时无需动作
         }

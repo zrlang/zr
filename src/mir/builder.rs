@@ -142,21 +142,35 @@ fn lower_expr(b: &mut Builder, expr: &HirExpr) -> MirValue {
                 else_block: else_bb,
             });
 
-            // 分支体里可能已经用 `return` 终结了块，这时不能再补 `goto join`
+            // `if` 作为**表达式**时的值合流：两个分支各自把结果写进同一个
+            // 临时名，join 块读这个临时名。两个前驱都定义同名变量，
+            // SSA 阶段的 φ 插入正好会在这里合流。
+            let temp = format!("t{}", b.temp_id());
+
+            // 分支体里可能已经用 `return` 终结了块，这时不能再补指令/跳转
             //（否则会把 return 覆盖掉，分支体里的返回永远到不了）。
             b.current = then_bb;
-            let _then_val = lower_block(b, then_block);
+            let then_val = lower_block(b, then_block);
+            b.assign_if_open(&temp, then_val.unwrap_or(MirValue::Unit));
             b.terminate_if_open(MirTerminator::Goto(join));
 
             // else
             b.current = else_bb;
+            let has_else = else_block.is_some();
             if let Some(eb) = else_block {
-                let _ = lower_block(b, eb);
+                let else_val = lower_block(b, eb).unwrap_or(MirValue::Unit);
+                b.assign_if_open(&temp, else_val);
             }
             b.terminate_if_open(MirTerminator::Goto(join));
 
             b.current = join;
-            MirValue::Unit
+            // 没有 else 分支的 `if` 当语句用，值恒为空：不造临时名，
+            // 省掉一条永远没人读的定义（以及它占用的寄存器）。
+            if has_else {
+                MirValue::Var(temp)
+            } else {
+                MirValue::Unit
+            }
         }
         While(cond, body) => {
             let header = b.new_block();
@@ -300,6 +314,15 @@ impl Builder {
     fn terminate_if_open(&mut self, term: MirTerminator) {
         if self.current_block_mut().term.is_none() {
             self.current_block_mut().term = Some(term);
+        }
+    }
+
+    /// 块还没终结时才追加赋值——块已经 `return` 的话不能再插指令。
+    fn assign_if_open(&mut self, name: &str, val: MirValue) {
+        if self.current_block_mut().term.is_none() {
+            self.current_block_mut()
+                .instrs
+                .push(MirInstr::Assign(name.to_string(), val));
         }
     }
 

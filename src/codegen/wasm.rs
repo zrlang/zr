@@ -431,6 +431,9 @@ impl WasmFunction {
                         let idx = ensure_local(result, &mut local_map, &mut locals, &mut next_local);
                         body.push(WasmInstr::LocalSet(idx));
                     }
+                    SsaInstr::Phi { result, .. } => {
+                        ensure_local(result, &mut local_map, &mut locals, &mut next_local);
+                    }
                     SsaInstr::Var { result, .. } => {
                         ensure_local(result, &mut local_map, &mut locals, &mut next_local);
                     }

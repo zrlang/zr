@@ -67,11 +67,11 @@ fn main() -> ExitCode {
     };
 
     match compile(input, &cmd) {
-        Ok(()) => {
+        Ok(out_path) => {
             eprintln!(
                 "zr: compiled {} -> {} ({})",
                 input,
-                cmd.output.display(),
+                out_path.display(),
                 cmd.opt_level.name()
             );
             ExitCode::SUCCESS
@@ -158,6 +158,13 @@ impl Cli {
         if cli.input.is_none() {
             cli.help = true;
         }
+        // 没给 `-o` 就用输入文件名当输出名。少了这一步输出路径是空串，
+        // 平台链接器会收到一个空的 `-o` 参数而失败。
+        if cli.output.as_os_str().is_empty() {
+            if let Some(input) = &cli.input {
+                cli.output = std::path::PathBuf::from(input);
+            }
+        }
         Ok(cli)
     }
 }
@@ -186,7 +193,7 @@ fn print_usage(prog: &str) {
 }
 
 /// 编译单个文件。
-fn compile(input: &str, cmd: &Cli) -> Result<(), String> {
+fn compile(input: &str, cmd: &Cli) -> Result<std::path::PathBuf, String> {
     // 0. 解析目标三元组（缺省为宿主平台）
     let target = resolve_target(&cmd.target)?;
     if !target.is_supported() {
@@ -251,9 +258,10 @@ fn compile(input: &str, cmd: &Cli) -> Result<(), String> {
     // 7.5 发射 LLVM IR（若指定 --emit-llvm）
     if cmd.emit_llvm {
         let ir = emit_llvm_ir(&target, &ssa_module);
-        std::fs::write(&cmd.output, ir)
-            .map_err(|e| format!("cannot write LLVM IR to '{}': {e}", cmd.output.display()))?;
-        return Ok(());
+        let out = Path::new(&cmd.output).to_path_buf();
+        std::fs::write(&out, ir)
+            .map_err(|e| format!("cannot write LLVM IR to '{}': {e}", out.display()))?;
+        return Ok(out);
     }
 
     // 7.6 目标选择：wasm32 走栈式字节码后端
@@ -267,7 +275,7 @@ fn compile(input: &str, cmd: &Cli) -> Result<(), String> {
         let out = output_with_extension(Path::new(&cmd.output), &target);
         std::fs::write(&out, bytes)
             .map_err(|e| format!("cannot write wasm to '{}': {e}", out.display()))?;
-        return Ok(());
+        return Ok(out);
     }
 
     // 8. 代码生成（按目标架构选择指令后端）
@@ -288,16 +296,18 @@ fn compile(input: &str, cmd: &Cli) -> Result<(), String> {
 
     // 9. 输出目标文件 / 可执行文件
     if cmd.no_link {
-        codegen::emit_object(&target, &unit, Path::new(&cmd.output))
+        let obj = object_output_path(Path::new(&cmd.output), &target);
+        codegen::emit_object(&target, &unit, &obj)
             .map_err(|e| format!("object writer: {e}"))?;
+        Ok(obj)
     } else {
-        codegen::emit_executable(&target, &unit, Path::new(&cmd.output)).map_err(|e| {
+        let exe = output_with_extension(Path::new(&cmd.output), &target);
+        codegen::emit_executable(&target, &unit, &exe).map_err(|e| {
             format!("linker: {e}\nnote: {}", codegen::runtime_diagnostic(&target))
         })?;
-        make_executable(Path::new(&cmd.output), &target)?;
+        make_executable(&exe, &target)?;
+        Ok(exe)
     }
-
-    Ok(())
 }
 
 /// 解析 `--target`（空串表示宿主平台）。
@@ -309,19 +319,49 @@ fn resolve_target(triple: &str) -> Result<Target, String> {
     }
 }
 
-/// 为没有扩展名的输出路径补上平台约定（`app` → `app.exe` / `app.wasm`）。
+/// 推导产物文件名。
+///
+/// 规则：
+/// * `foo.zr` → `foo`（去掉源码后缀）再补平台扩展名。**必须**去掉，
+///   否则默认输出会把源文件本身覆盖掉；
+/// * `foo`    → `foo` + 平台扩展名（Windows 的 `.exe` / wasm 的 `.wasm`）；
+/// * `foo.bin` → 原样保留（用户显式指定了产物名）。
 fn output_with_extension(path: &Path, target: &Target) -> std::path::PathBuf {
-    match path.extension() {
+    let platform_ext = target.exe_extension();
+    match path.extension().and_then(|e| e.to_str()) {
+        // 源文件名：去掉 `.zr` 再补平台后缀
+        Some("zr") => {
+            let base = path.with_extension("");
+            if platform_ext.is_empty() {
+                base
+            } else {
+                let mut name = base.as_os_str().to_os_string();
+                name.push(platform_ext);
+                std::path::PathBuf::from(name)
+            }
+        }
         Some(_) => path.to_path_buf(),
         None => {
-            let ext = target.exe_extension();
-            if ext.is_empty() {
+            if platform_ext.is_empty() {
                 path.to_path_buf()
             } else {
                 let mut name = path.as_os_str().to_os_string();
-                name.push(ext);
+                name.push(platform_ext);
                 std::path::PathBuf::from(name)
             }
+        }
+    }
+}
+
+/// `-c` 的目标文件名：没有扩展名时补 `.o`。
+fn object_output_path(path: &Path, target: &Target) -> std::path::PathBuf {
+    let _ = target;
+    match path.extension() {
+        Some(_) => path.to_path_buf(),
+        None => {
+            let mut name = path.as_os_str().to_os_string();
+            name.push(".o");
+            std::path::PathBuf::from(name)
         }
     }
 }
@@ -456,6 +496,18 @@ fn emit_llvm_ir(target: &Target, module: &ssa::SsaModule) -> String {
                             callee,
                             "i64",
                             a.join(", ")
+                        ));
+                    }
+                    ssa::SsaInstr::Phi { result, name, incoming } => {
+                        let ins: Vec<String> = incoming
+                            .iter()
+                            .map(|(p, v)| format!("[bb{p}: %{}]", v.id()))
+                            .collect();
+                        out.push_str(&format!(
+                            "  %{} = phi i64 {} {}\n",
+                            result.id(),
+                            name,
+                            ins.join(", ")
                         ));
                     }
                     SsaInstr::Var { result, name } => {

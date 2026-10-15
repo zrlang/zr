@@ -254,6 +254,58 @@ mod cc {
 /// 早先只用 `bb<编号>`，于是**不同函数的同名块会共用一个符号**——`main`
 /// 的 `bb1` 和 `f` 的 `bb1` 撞在一起，`main` 里的分支会跳进别的函数。
 /// 加上函数名前缀后每个块的标签全局唯一。
+/// AArch64 上借 x18（平台寄存器，AAPCS64 允许临时使用）做 φ 搬运的中转。
+const PHI_TMP: Reg = Reg(18);
+
+/// 一个块的后继。
+fn successors(block: &crate::ssa::SsaBasicBlock) -> Vec<usize> {
+    match &block.term {
+        SsaTerminator::Goto(t) => vec![*t],
+        SsaTerminator::Branch { then_block, else_block, .. } => vec![*then_block, *else_block],
+        _ => Vec::new(),
+    }
+}
+
+/// 在当前块末尾把本块持有的值写进后继块的各个 φ 寄存器（并行拷贝）。
+fn emit_phi_copies(unit: &mut CompilationUnit, func: &SsaFunction, succ: usize, from: usize) {
+    let Some(block) = func.blocks.iter().find(|b| b.id == succ) else {
+        return;
+    };
+    let mut moves: Vec<(Reg, Reg)> = Vec::new();
+    for instr in &block.instrs {
+        let SsaInstr::Phi { result, incoming, .. } = instr else {
+            continue;
+        };
+        let Some((_, src)) = incoming.iter().find(|(p, _)| *p == from) else {
+            continue;
+        };
+        let (dst, src) = (alloc_reg(*result), alloc_reg(*src));
+        if dst != src {
+            moves.push((dst, src));
+        }
+    }
+    while !moves.is_empty() {
+        let safe = moves
+            .iter()
+            .position(|(dst, _)| !moves.iter().any(|(_, src)| src == dst));
+        match safe {
+            Some(at) => {
+                let (dst, src) = moves.remove(at);
+                emit_mov_rr(unit, dst, src);
+            }
+            None => {
+                let src = moves[0].1;
+                emit_mov_rr(unit, PHI_TMP, src);
+                for m in moves.iter_mut() {
+                    if m.1 == src {
+                        m.1 = PHI_TMP;
+                    }
+                }
+            }
+        }
+    }
+}
+
 fn block_label(func: &str, id: usize) -> String {
     format!("{func}.bb{id}")
 }
@@ -288,6 +340,9 @@ pub fn emit_function(target: &Target, unit: &mut CompilationUnit, func: &SsaFunc
         block_offsets.push(unit.code.len());
         for instr in &block.instrs {
             emit_instr(unit, instr);
+        }
+        for succ in successors(block) {
+            emit_phi_copies(unit, func, succ, block.id);
         }
         match &block.term {
             SsaTerminator::Return(ret_val) => {
@@ -347,6 +402,8 @@ fn emit_instr(unit: &mut CompilationUnit, instr: &SsaInstr) {
             emit_call(unit, callee);
             emit_mov_rr(unit, alloc_reg(*result), Reg(0));
         }
+        // φ 的实际拷贝由前驱末尾的 emit_phi_copies 发出
+        SsaInstr::Phi { .. } => {}
         // `Var` 只是 SSA 值的命名引用，运行时不产生代码。
         SsaInstr::Var { .. } => {}
     }
