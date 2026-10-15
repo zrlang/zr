@@ -2,14 +2,30 @@
 // tests/cases/05_logic.zr — 对应《Rust 程序设计语言》「运算符」
 //
 // 覆盖：布尔字面量与逻辑运算 ! ||。
+//
+// 注意：断言必须和 Rust 的真实语义一致。`!(false || false)` 是 `true`
+// （`false || false` 为 `false`，取反得 `true`），早先这里把它当成
+// `false` 断言，等于在断言"编译器的 bug"。
 //=============================================================================
 
 fn main() -> i32 {
+    // !true == false
     if !true {
         return 1;
     }
-    if !(false || false) {
+    // !false == true，应该进 then 分支
+    if !false {
+        // 通过
+    } else {
         return 2;
+    }
+    // !(true || false) == !(true) == false
+    if !(true || false) {
+        return 3;
+    }
+    // !(false || false) == !(false) == true，且 true == false 为假
+    if !(false || false) == false {
+        return 4;
     }
     return 0;
 }

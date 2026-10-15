@@ -850,9 +850,14 @@ impl TypeChecker {
                     let e_expr = if let Expression::Block(b, _) = e.as_ref() {
                         self.check_block(b, expected)?
                     } else {
-                        self.check_expr(e, expected)?;
-                        // 包装为块
-                        hir::HirBlock { stmts: Vec::new(), tail: None }
+                        // `else` 后面直接跟一个表达式（`else if ...` / `else 3`），
+                        // 把它当尾表达式包成单表达式块。结果必须放进 `tail`，
+                        // 否则这里会把它丢掉，MIR 侧看到的就是 `Unit`。
+                        let checked = self.check_expr(e, expected)?;
+                        hir::HirBlock {
+                            stmts: Vec::new(),
+                            tail: Some(Box::new(checked)),
+                        }
                     };
                     Some(e_expr)
                 } else {

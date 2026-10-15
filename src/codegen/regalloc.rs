@@ -1,138 +1,178 @@
-//! 寄存器分配（Register Allocation）。
+//! 寄存器分配：活跃区间 + 线性扫描。
 //!
-//! 实现线性扫描（Linear Scan）算法：
-//! 1. 计算每条指令的活变量区间（live interval）。
-//! 2. 按区间起点升序处理，维护活跃区间栈。
-//! 3. 区间起点到达时分配可用寄存器；终点到达时释放。
-//! 4. 无可用寄存器时，把存活最长的区间溢出（spill）到栈槽。
+//! 之前 `alloc_reg` 直接用 `id % 池大小` 取模——两个**同时存活**的值
+//! 只要编号同余就会抢同一个寄存器，后定义的把先定义的值冲掉。优化 pass
+//! 增大了编号，隐藏了几百行的这种冲突，于是 `-O2` 生成的代码是错的。
 //!
-//! 设计参考：
-//! - LLVM：RegAlloc 抽象层支持多种分配器（greedy、PBQP、linear scan）。
-//! - GCC：IRA（Graph Coloring）。
-//! - Zig：Aro 后端用线性扫描的变体。
+//! 这里按真正��活跃区间来分配：
+//!
+//! 1. 把函数的块按线性顺序排开，指令按序编号，得到每个值的
+//!    `[起点, 终点]` 活跃区间（φ 的每个传入值单独算一条）；
+//! 2. 按起点排序做线性扫描：与当前区间**相交**的旧区间占着寄存器，
+//!    只回收已经结束的；
+//! 3. 池子满了就把结束最早的区间挤出（溢出）。溢出值没有栈槽，
+//!    只能退化成与被挤出的值共用寄存器——这仍然比取模安全得多，
+//!    因为交叠只发生在真正的溢出点。
 
-/// x86-64 调用约定中的通用寄存器（System V ABI）。
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum Register {
-    /// 参数 / 返回值（RDI, RSI, RDX, RCX, R8, R9）。
-    Rdi, Rsi, Rdx, Rcx, R8, R9,
-    /// 被调用者保存（需 callee-save）。
-    Rbx, Rbp, R12, R13, R14, R15,
-    /// 调用者保存（caller-save，临时用）。
-    Rax, R10, R11,
-    /// 栈指针。
-    Rsp,
-}
+use std::collections::HashMap;
 
-impl Register {
-    /// 返回此寄存器的 x86-64 编号（用于 ModR/M 的 reg 字段）。
-    pub fn code(self) -> u8 {
-        use Register::*;
-        match self {
-            Rax => 0, Rcx => 1, Rdx => 2, Rbx => 3,
-            Rsp => 4, Rbp => 5, Rsi => 6, Rdi => 7,
-            R8 => 8, R9 => 9, R10 => 10, R11 => 11,
-            R12 => 12, R13 => 13, R14 => 14, R15 => 15,
-        }
+use crate::ssa::{SsaInstr, SsaTerminator, SsaValue, SsaFunction};
+
+/// 线性扫描结果：`值 id -> 寄存器下标`。
+pub type RegMap = HashMap<u32, usize>;
+
+/// x86-64 SysV 里由**被调用方**保存、跨调用仍然有效的寄存器下标
+/// （对应 `ALLOCATABLE` 的 R12–R15）。
+pub const CALLEE_SAVE_IDX: [usize; 4] = [6, 7, 8, 9];
+
+/// 计算函数的寄存器分配。
+///
+/// `pool_size` 是可分配寄存器的个数；返回值里超出该范围的都没有。
+pub fn allocate_registers(func: &SsaFunction, pool_size: usize) -> RegMap {
+    let (intervals, calls) = live_intervals(func);
+    if intervals.is_empty() || pool_size == 0 {
+        return HashMap::new();
     }
 
-    /// 参数寄存器（按位置）。
-    pub fn arg_reg(i: usize) -> Option<Register> {
-        use Register::*;
-        match i {
-            0 => Some(Rdi), 1 => Some(Rsi), 2 => Some(Rdx),
-            3 => Some(Rcx), 4 => Some(R8), 5 => Some(R9),
-            _ => None,
-        }
-    }
-}
+    // 按起点排序；同起点时终点短的先放（更容易共用）。
+    // 必须把值 id 也放进排序键：`intervals` 是 HashMap，迭代顺序带随机
+    // 哈希种子，只按 (start, end) 排序的话，同区间的值谁先分配是随机
+    // 的——同一个程序编译两次会得到不同的（有时是错的）寄存器分配。
+    let mut ordered: Vec<(u32, usize, usize)> =
+        intervals.iter().map(|(v, (s, e))| (*v, *s, *e)).collect();
+    ordered.sort_by_key(|(v, s, e)| (*s, *e, *v));
 
-/// 活变量区间。
-#[derive(Debug, Clone)]
-pub struct LiveInterval {
-    /// 变量标识。
-    pub var: u32,
-    /// 区间起点（指令序号）。
-    pub start: usize,
-    /// 区间终点（指令序号）。
-    pub end: usize,
-    /// 分配的寄存器（若溢出则为 None）。
-    pub reg: Option<Register>,
-    /// 栈槽索引（溢出时使用）。
-    pub spill_slot: Option<usize>,
-}
+    let mut map: RegMap = HashMap::new();
+    // 每个寄存器当前区间的终点；`usize::MAX` 表示空闲
+    let mut free_at: Vec<usize> = vec![0; pool_size];
+    let mut owners: Vec<Option<u32>> = vec![None; pool_size];
 
-/// 寄存器分配器。
-#[derive(Debug, Default)]
-pub struct RegAlloc {
-    /// 可用寄存器池（caller-save 优先）。
-    regs: Vec<Register>,
-    /// 当前活跃区间（按终点升序）。
-    active: Vec<LiveInterval>,
-    /// 下一个栈槽索引。
-    next_slot: usize,
-}
+    let all_idx: Vec<usize> = (0..pool_size).collect();
 
-impl RegAlloc {
-    /// 创建针对 x86-64 System V ABI 的分配器。
-    pub fn new() -> Self {
-        use Register::*;
-        // 调用者保存的通用寄存器优先分配
-        let regs = vec![Rax, Rcx, Rdx, Rsi, Rdi, R8, R9, R10, R11, Rbx, R12, R13, R14, R15];
-        Self {
-            regs,
-            active: Vec::new(),
-            next_slot: 0,
-        }
-    }
-
-    /// 对一组活区间执行线性扫描分配。
-    pub fn allocate(&mut self, mut intervals: Vec<LiveInterval>) -> Vec<LiveInterval> {
-        // 按起点升序排序
-        intervals.sort_by_key(|i| i.start);
-
-        for mut iv in &mut intervals {
-            // 释放已结束的区间
-            self.expire_old(iv.start);
-            if let Some(reg) = self.regs.pop() {
-                iv.reg = Some(reg);
-                self.active.push(iv.clone());
-            } else {
-                // 溢出：把存活最长的区间换出
-                self.spill_at(iv.clone());
+    for (val, start, end) in ordered {
+        // 回收所有已经结束的区间
+        for i in 0..pool_size {
+            if owners[i].is_some() && free_at[i] < start {
+                owners[i] = None;
             }
         }
+        // 跨调用存活的值只能放 callee-save 寄存器：其余（GPR、rax、rdx…）
+        // 都是 caller-save，`call` 返回时会被被调用方覆盖掉。
+        //
+        // 判据是"调用之后还有没有用"（`start < c < end`）。把区间右端
+        // 正好等于调用位置的值也算进来是错的：那只是 `call` 的实参，
+        // `call` 自己会读它，返回后不需要它 —— 而这样会把大量普通值挤进
+        // 只有 4 个的 callee-save 集合，逼出本来不会发生的冲突。
+        let spans_call = calls.iter().any(|&c| start < c && c < end);
+        let allowed: &[usize] = if spans_call {
+            &CALLEE_SAVE_IDX
+        } else {
+            &all_idx
+        };
+        // 找一个没人要的寄存器
+        let slot = allowed.iter().copied().find(|i| owners[*i].is_none());
+        let slot = match slot {
+            Some(i) => i,
+            None => {
+                // 池子满了：挤掉结束最早的那个
+                let victim = allowed
+                    .iter()
+                    .copied()
+                    .min_by_key(|i| free_at[*i])
+                    .expect("池非空");
+                owners[victim] = None;
+                victim
+            }
+        };
+        owners[slot] = Some(val);
+        free_at[slot] = end;
+        map.insert(val, slot);
+    }
+    map
+}
 
-        intervals
+/// 每个值的活跃区间 `[首定义, 末使用]`（线性位置）。
+fn live_intervals(func: &SsaFunction) -> (HashMap<u32, (usize, usize)>, Vec<usize>) {
+    let mut iv: HashMap<u32, (usize, usize)> = HashMap::new();
+    let mut pos = 0usize;
+    let mut calls: Vec<usize> = Vec::new();
+
+    // 函数参数：入口处就算定义；上界由第一次使用来抬高
+    for p in &func.params {
+        iv.insert(p.id(), (0, 0));
     }
 
-    /// 释放终点 <= pos 的区间，归还寄存器。
-    fn expire_old(&mut self, pos: usize) {
-        let mut keep = Vec::new();
-        for iv in self.active.drain(..) {
-            if iv.end > pos {
-                keep.push(iv);
-            } else if let Some(reg) = iv.reg {
-                self.regs.push(reg);
+    for block in &func.blocks {
+        // 块内的 phi 必须在所有指令之前求值
+        let n_phi = block
+            .instrs
+            .iter()
+            .take_while(|i| matches!(i, SsaInstr::Phi { .. }))
+            .count();
+        for instr in block.instrs.iter().take(n_phi) {
+            touch_use(instr, &mut iv, pos);
+            if let SsaInstr::Phi { result, incoming, .. } = instr {
+                // φ 的结果在**所有**传入值都算完之后才"活"，否则会与它们冲突
+                iv.insert(result.id(), (pos, pos));
+                for (_, v) in incoming {
+                    extend(*v, &mut iv, pos);
+                }
+            }
+            pos += 1;
+        }
+
+        for instr in block.instrs.iter().skip(n_phi) {
+            if matches!(instr, SsaInstr::Call { .. }) {
+                calls.push(pos);
+            }
+            touch_use(instr, &mut iv, pos);
+            if let Some(r) = instr.result() {
+                iv.insert(r.id(), (pos, pos));
+            }
+            pos += 1;
+        }
+
+        // 终结符引用也算一次使用
+        match &block.term {
+            SsaTerminator::Return(Some(v)) => extend(*v, &mut iv, pos),
+            SsaTerminator::Branch { cond, .. } => extend(*cond, &mut iv, pos),
+            _ => {}
+        }
+        pos += 1;
+    }
+    (iv, calls)
+}
+
+/// 记一条指令里的每个操作数为「使用」，并把它们的区间延长到 `pos`。
+fn touch_use(instr: &SsaInstr, iv: &mut HashMap<u32, (usize, usize)>, pos: usize) {
+    match instr {
+        SsaInstr::Const { .. } | SsaInstr::Var { .. } => {}
+        SsaInstr::Unary { operand, .. } => extend(*operand, iv, pos),
+        SsaInstr::Binary { lhs, rhs, .. } => {
+            extend(*lhs, iv, pos);
+            extend(*rhs, iv, pos);
+        }
+        SsaInstr::Phi { incoming, .. } => {
+            for (_, v) in incoming {
+                extend(*v, iv, pos);
             }
         }
-        self.active = keep;
-    }
-
-    /// 溢出处理：把存活最长的区间换到栈上。
-    fn spill_at(&mut self, iv: LiveInterval) {
-        if let Some(longest) = self.active.iter().max_by_key(|a| a.end) {
-            let spill_target = longest.clone();
-            // 把 longest 换到栈槽
-            self.next_slot += 1;
-            // 注：此处仅记录决策，真实实现需插入 spill/reload 指令
-            let _ = spill_target;
+        SsaInstr::Copy { src, .. } => extend(*src, iv, pos),
+        SsaInstr::Call { args, .. } => {
+            for a in args {
+                extend(*a, iv, pos);
+            }
         }
-        let _ = iv;
     }
+}
 
-    /// 当前已分配的栈槽数量（用于栈帧大小计算）。
-    pub fn stack_slots(&self) -> usize {
-        self.next_slot
+/// 把 `v` 的活跃区间下界补上（首次使用）并延长上界到 `pos`。
+fn extend(v: SsaValue, iv: &mut HashMap<u32, (usize, usize)>, pos: usize) {
+    let e = iv.entry(v.id()).or_insert((pos, pos));
+    if e.0 > pos {
+        e.0 = pos;
+    }
+    if pos > e.1 {
+        e.1 = pos;
     }
 }

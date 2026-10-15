@@ -23,6 +23,7 @@ use crate::codegen::target::{Arch, Os, Target};
 use crate::codegen::{
     CompilationUnit, Relocation, RelocationKind, Symbol, SymbolKind, SymbolSection,
 };
+use std::collections::HashMap;
 use crate::ssa::{SsaBinaryOp, SsaConst, SsaFunction, SsaInstr, SsaTerminator, SsaValue};
 
 /// x86-64 通用寄存器（System V ABI / Microsoft x64 ABI 共用编号）。
@@ -122,17 +123,64 @@ fn emit_phi_copies(unit: &mut CompilationUnit, func: &SsaFunction, succ: usize, 
     }
 }
 
+/// 本函数实际用到的 callee-save 寄存器（按 push 顺序）。
+fn callee_saved_regs(map: &HashMap<u32, usize>) -> Vec<Gpr> {
+    ALLOCATABLE
+        .iter()
+        .copied()
+        .filter(|r| matches!(r, Gpr::R12 | Gpr::R13 | Gpr::R14 | Gpr::R15))
+        .filter(|r| map.values().any(|idx| ALLOCATABLE[*idx] == *r))
+        .collect()
+}
+
+/// `push r64`：`41 5<8+reg>`。
+fn emit_push_r(unit: &mut CompilationUnit, r: Gpr) {
+    emit2(unit, 0x41, 0x50 + r.bits());
+}
+
+/// `pop r64`：`41 58<8+reg>`。
+fn emit_pop_r(unit: &mut CompilationUnit, r: Gpr) {
+    emit2(unit, 0x41, 0x58 + r.bits());
+}
+
 fn block_label(func: &str, id: usize) -> String {
     format!("{func}.bb{id}")
 }
 
+// 当前函数的「值 id -> 寄存器下标」映射。寄存器分配要跨整个函数做
+// 活跃区间分析，结果没法用纯函数 `alloc_reg(v)` 表达，所以放在
+// thread_local 里：`emit_function` 开头写入、结尾清空。编译是单线程的，
+// 这样够用，也免得把映射逐层传进每个发射函数。
+thread_local! {
+    static REG_MAP: std::cell::RefCell<HashMap<u32, usize>> =
+        std::cell::RefCell::new(HashMap::new());
+}
+
+/// 取 `v` 的寄存器下标；没有分配记录时退回取模。
+fn reg_index(v: SsaValue) -> usize {
+    REG_MAP.with(|m| {
+        m.borrow()
+            .get(&v.id())
+            .copied()
+            .unwrap_or((v.id() as usize) % ALLOCATABLE.len())
+    })
+}
+
+/// 把 SSA value 映射到物理寄存器（线性扫描的结果）。
 fn alloc_reg(v: SsaValue) -> Gpr {
-    ALLOCATABLE[(v.id() as usize) % ALLOCATABLE.len()]
+    ALLOCATABLE[reg_index(v)]
 }
 
 /// 发射一个函数的机器码。
 pub fn emit_function(target: &Target, unit: &mut CompilationUnit, func: &SsaFunction) {
     debug_assert_eq!(target.arch(), Arch::X86_64, "x86-64 后端只能用于 x86_64 目标");
+    // 先做活跃区间分析 + 线性扫描，确定每个值落在哪个寄存器
+    let map = crate::codegen::regalloc::allocate_registers(func, ALLOCATABLE.len());
+    // callee-save 集合要在发射尾声时再用，所以这里留一份
+    let callee_saved = callee_saved_regs(&map);
+    REG_MAP.with(|m| {
+        *m.borrow_mut() = map;
+    });
     let start = unit.code.len();
 
     // SSA 基本块是只读的，采用两遍策略：先为每个块占位一个符号，
@@ -154,6 +202,11 @@ pub fn emit_function(target: &Target, unit: &mut CompilationUnit, func: &SsaFunc
     // 函数序言：push rbp; mov rbp, rsp
     emit1(unit, 0x55);
     emit3(unit, 0x48, 0x89, 0xe5);
+    // R12–R15 是 callee-save：分配器可能用到，用到就存，返回前还原
+    for r in &callee_saved {
+        emit_push_r(unit, *r);
+    }
+    emit_param_moves(unit, func);
 
     for block in &func.blocks {
         block_offsets.push(unit.code.len());
@@ -171,7 +224,10 @@ pub fn emit_function(target: &Target, unit: &mut CompilationUnit, func: &SsaFunc
                 if let Some(v) = ret_val {
                     emit_mov_rr(unit, SCRATCH_AX, alloc_reg(*v));
                 }
-                // 尾声：mov rsp, rbp; pop rbp; ret
+                // 尾声：pop callee-save; mov rsp, rbp; pop rbp; ret
+                for r in callee_saved.iter().rev() {
+                    emit_pop_r(unit, *r);
+                }
                 emit3(unit, 0x48, 0x89, 0xec);
                 emit1(unit, 0x5d);
                 emit1(unit, 0xc3);
@@ -218,6 +274,12 @@ fn emit_instr(unit: &mut CompilationUnit, instr: &SsaInstr) {
         }
         // φ 的实际拷贝由前驱末尾的 emit_phi_copies 发出
         SsaInstr::Phi { .. } => {}
+        SsaInstr::Copy { result, src } => {
+            let (d, s) = (alloc_reg(*result), alloc_reg(*src));
+            if d != s {
+                emit_mov_rr(unit, d, s);
+            }
+        }
         SsaInstr::Var { .. } => {
             // Var 是 φ 合并前的引用，运行时无需动作
         }
@@ -478,11 +540,25 @@ fn emit_call_args(unit: &mut CompilationUnit, args: &[SsaValue]) {
     }
     // 超过 6 个的实参走栈上传参区，本后端尚未实现。
 
+    emit_parallel_moves(unit, &moves);
+}
+
+/// 并行搬运 `(dst, src)`：允许 dst/src 重叠，靠环检测保证正确。
+///
+/// 直接按顺序发 `mov` 会在有环时互相覆盖（例如
+/// `rdi->rsi` 与 `rsi->rdi`），所以先发那些"目标没被别的搬运当源读"的，
+/// 剩下的环用 `rax`（不参与分配）中转打开。
+fn emit_parallel_moves(unit: &mut CompilationUnit, moves: &[(Gpr, Gpr)]) {
+    let mut moves: Vec<(Gpr, Gpr)> = moves
+        .iter()
+        .copied()
+        .filter(|(dst, src)| dst != src)
+        .collect();
     while !moves.is_empty() {
         // 目标不再被任何待执行的搬运读取 -> 可以安全执行
-        let safe = moves.iter().position(|(dst, _)| {
-            !moves.iter().any(|(_, src)| src == dst)
-        });
+        let safe = moves
+            .iter()
+            .position(|(dst, _)| !moves.iter().any(|(_, src)| src == dst));
         match safe {
             Some(at) => {
                 let (dst, src) = moves.remove(at);
@@ -500,6 +576,19 @@ fn emit_call_args(unit: &mut CompilationUnit, args: &[SsaValue]) {
             }
         }
     }
+}
+
+/// 函数序言里搬运形参：ABI 实参寄存器 -> 分配器给形参选的寄存器。
+///
+/// 之前完全没有这一步，形参直接从"分配器选的寄存器"读，而调用方是按
+/// SysV 约定（rdi/rsi/rdx/...）放的实参，两者对不上就会读到垃圾。
+fn emit_param_moves(unit: &mut CompilationUnit, func: &SsaFunction) {
+    let n = func.params.len().min(ARG_REGS.len());
+    let moves: Vec<(Gpr, Gpr)> = (0..n)
+        .map(|i| (alloc_reg(func.params[i]), ARG_REGS[i]))
+        .collect();
+    emit_parallel_moves(unit, &moves);
+    // 超过 6 个的形参走栈上传参区，本后端尚未实现。
 }
 
 /// `call rel32`：0xE8 + imm32（需重定位）。

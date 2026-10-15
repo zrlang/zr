@@ -30,6 +30,7 @@ pub mod linker;
 pub mod macho;
 pub mod objfile;
 pub mod pe;
+pub mod regalloc;
 pub mod target;
 pub mod wasm;
 

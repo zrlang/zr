@@ -241,8 +241,10 @@ fn build_coff_symbols(unit: &CompilationUnit) -> (Vec<u8>, Vec<u8>) {
             strings.extend_from_slice(sym.name.as_bytes());
             strings.push(0);
             // 偏移相对于字符串表首字节（含 4 字节长度字段）。
+            // 间接引用只占 8 字节名字字段里的**前 4 字节**，后面 4 字节补 0；
+            // 直接把 4 字节写进 8 字节字段会 panic。
             let encoded = (strings.len() as u32) | 0x2000_0000;
-            name_field.copy_from_slice(&encoded.to_le_bytes());
+            name_field[..4].copy_from_slice(&encoded.to_le_bytes());
         }
 
         symbols.extend_from_slice(&name_field);

@@ -94,6 +94,7 @@ struct Cli {
     dump_hir: bool,
     dump_mir: bool,
     dump_ssa: bool,
+    dump_ssa_after: bool,
     dump_asm: bool,
     emit_llvm: bool,
     no_link: bool,
@@ -127,6 +128,7 @@ impl Cli {
                 "--dump-hir" => cli.dump_hir = true,
                 "--dump-mir" => cli.dump_mir = true,
                 "--dump-ssa" => cli.dump_ssa = true,
+                "--dump-ssa-after" => cli.dump_ssa_after = true,
                 "--dump-asm" => cli.dump_asm = true,
                 "--emit-llvm" => cli.emit_llvm = true,
                 "--wat" => cli.wat = true,
@@ -186,6 +188,7 @@ fn print_usage(prog: &str) {
     println!("    --dump-hir          Dump HIR");
     println!("    --dump-mir          Dump MIR");
     println!("    --dump-ssa          Dump SSA");
+    println!("    --dump-ssa-after    Dump SSA after optimization");
     println!("    --dump-asm          Dump assembly");
     println!("    --emit-llvm         Emit LLVM IR (future)");
     println!("    -h, --help          Show this help");
@@ -254,6 +257,10 @@ fn compile(input: &str, cmd: &Cli) -> Result<std::path::PathBuf, String> {
 
     // 7. 优化
     ssa_module = opt::run(ssa_module, cmd.opt_level);
+    if cmd.dump_ssa_after {
+        println!("=== SSA (after {} optimization) ===", cmd.opt_level.name());
+        ssa::print_module(&ssa_module);
+    }
 
     // 7.5 发射 LLVM IR（若指定 --emit-llvm）
     if cmd.emit_llvm {
@@ -509,6 +516,9 @@ fn emit_llvm_ir(target: &Target, module: &ssa::SsaModule) -> String {
                             name,
                             ins.join(", ")
                         ));
+                    }
+                    SsaInstr::Copy { result, src } => {
+                        out.push_str(&format!("  %{} = copy %{} ; {}\n", result.id(), src.id(), src.id()));
                     }
                     SsaInstr::Var { result, name } => {
                         out.push_str(&format!("  ; var {} -> %{}\n", name, result.id()));

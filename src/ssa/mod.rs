@@ -81,6 +81,15 @@ pub enum SsaInstr {
         /// `(前驱块号, 该前驱传入的值)`。
         incoming: Vec<(usize, SsaValue)>,
     },
+    /// 寄存器间复制：`result = src`。
+    ///
+    /// 优化 pass 用它表达 `x + 0 -> x`、`CSE/GVN 复用已有值` 这类
+    /// 替换。**不能**用 `Var` 代替：`Var` 只是名字占位，后端不发射任何
+    /// 指令，目标寄存器会保持未定义。
+    Copy {
+        result: SsaValue,
+        src: SsaValue,
+    },
     /// 变量引用（用于 φ 函数合并前的原始变量）。
     Var {
         result: SsaValue,
@@ -117,7 +126,7 @@ impl SsaValue {
 }
 
 /// SSA 常量。
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum SsaConst {
     Int(i128),
     /// 布尔常量。
@@ -158,6 +167,7 @@ impl SsaInstr {
             SsaInstr::Unary { result, .. } => Some(*result),
             SsaInstr::Binary { result, .. } => Some(*result),
             SsaInstr::Phi { result, .. } => Some(*result),
+            SsaInstr::Copy { result, .. } => Some(*result),
             SsaInstr::Call { result, .. } => Some(*result),
             SsaInstr::Var { result, .. } => Some(*result),
         }
@@ -550,4 +560,164 @@ fn materialize(
         }),
     }
     v
+}
+
+impl SsaConst {
+    /// 整数值（其他变体返回 `None`）。
+    pub fn as_int(&self) -> Option<i128> {
+        match self {
+            SsaConst::Int(v) => Some(*v),
+            _ => None,
+        }
+    }
+}
+
+/// 从 `(块号, SSA 终结符)` 列表求每个块的前驱。
+pub fn predecessors_of(blocks: &[(usize, &SsaTerminator)]) -> HashMap<usize, Vec<usize>> {
+    let mut map: HashMap<usize, Vec<usize>> = HashMap::new();
+    for (id, term) in blocks {
+        for s in ssa_successors(term) {
+            map.entry(s).or_default().push(*id);
+        }
+    }
+    map
+}
+
+/// SSA 终结符的后继块。
+pub fn ssa_successors(term: &SsaTerminator) -> Vec<usize> {
+    match term {
+        SsaTerminator::Goto(t) => vec![*t],
+        SsaTerminator::Branch {
+            then_block,
+            else_block,
+            ..
+        } => vec![*then_block, *else_block],
+        _ => Vec::new(),
+    }
+}
+
+/// 支配树：每个块的直接支配者（idom）。
+///
+/// Cooper–Harvey–Kennedy 迭代算法：先算逆后序，再按逆后序反复用
+/// 「所有前驱的 idom 的最近公共祖先」更新自己，直到不动点。
+///
+/// GVN 这类需要判断"某定义是否支配某使用"的变换**必须**依赖真实支配
+/// 关系——按块号或 RPO 出现顺序近似会把兄弟分支上的值误当成支配值，
+/// 替换后就是错代码。
+pub fn dominator_tree(blocks: &[SsaBasicBlock]) -> HashMap<usize, usize> {
+    let n = blocks.len();
+    let mut idom: HashMap<usize, usize> = HashMap::new();
+    if n == 0 {
+        return idom;
+    }
+    let order = ssa_rpo_indices(blocks); // 块**下标**的 RPO
+    let id: Vec<usize> = blocks.iter().map(|b| b.id).collect();
+    let pos: HashMap<usize, usize> = id.iter().enumerate().map(|(i, b)| (*b, i)).collect();
+    // 块号 -> RPO 序号（越大越"深"）
+    let rank: HashMap<usize, usize> = order.iter().enumerate().map(|(r, &i)| (id[i], r)).collect();
+
+    let preds = predecessors_of(&blocks.iter().map(|b| (b.id, &b.term)).collect::<Vec<_>>());
+    let entry = blocks[0].id;
+    idom.insert(entry, entry);
+
+    let mut changed = true;
+    while changed {
+        changed = false;
+        for &i in &order {
+            if i == 0 {
+                continue;
+            }
+            let b = id[i];
+            let Some(ps) = preds.get(&b) else { continue };
+            let mut new_idom: Option<usize> = None;
+            for &p in ps {
+                if !idom.contains_key(&p) {
+                    continue; // 前驱尚未定 idom
+                }
+                new_idom = Some(match new_idom {
+                    None => p,
+                    Some(cur) => intersect(&idom, &rank, p, cur),
+                });
+            }
+            if let Some(ni) = new_idom {
+                if idom.get(&b) != Some(&ni) {
+                    idom.insert(b, ni);
+                    changed = true;
+                }
+            }
+        }
+    }
+    let _ = pos;
+    idom
+}
+
+/// RPO 下的块下标序列（不是块号）。
+fn ssa_rpo_indices(blocks: &[SsaBasicBlock]) -> Vec<usize> {
+    let n = blocks.len();
+    let mut visited = vec![false; n];
+    let mut post = Vec::with_capacity(n);
+    if n == 0 {
+        return post;
+    }
+    let idx: HashMap<usize, usize> = blocks.iter().enumerate().map(|(i, b)| (b.id, i)).collect();
+    let mut stack: Vec<(usize, usize)> = vec![(0, 0)];
+    visited[0] = true;
+    while let Some((node, ci)) = stack.pop() {
+        let succs = ssa_successors(&blocks[node].term);
+        if ci < succs.len() {
+            stack.push((node, ci + 1));
+            if let Some(&ni) = idx.get(&succs[ci]) {
+                if !visited[ni] {
+                    visited[ni] = true;
+                    stack.push((ni, 0));
+                }
+            }
+        } else {
+            post.push(node);
+        }
+    }
+    post.reverse();
+    post
+}
+
+/// 支配树上的最近公共祖先：先把 RPO 更深的那个往上提，齐平后一起上溯。
+fn intersect(
+    idom: &HashMap<usize, usize>,
+    rank: &HashMap<usize, usize>,
+    mut a: usize,
+    mut b: usize,
+) -> usize {
+    const UNREACHED: usize = usize::MAX;
+    let ra = |x: usize| *rank.get(&x).unwrap_or(&0);
+    while a != b {
+        if ra(a) <= ra(b) {
+            match idom.get(&b) {
+                Some(&p) if p != b => b = p,
+                _ => return a,
+            }
+        } else {
+            match idom.get(&a) {
+                Some(&p) if p != a => a = p,
+                _ => return b,
+            }
+        }
+    }
+    let _ = UNREACHED;
+    a
+}
+
+/// `a` 是否支配 `b`（含 `a == b`）。
+pub fn dominates(idom: &HashMap<usize, usize>, a: usize, b: usize) -> bool {
+    let mut cur = b;
+    // 支配树深度有限，用步数上限避免 idom 成环时死循环
+    for _ in 0..=idom.len() {
+        if cur == a {
+            return true;
+        }
+        match idom.get(&cur) {
+            Some(&p) if p != cur => cur = p,
+            _ => return false,
+        }
+    }
+    false
 }

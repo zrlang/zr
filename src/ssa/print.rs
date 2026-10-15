@@ -36,6 +36,9 @@ pub fn print_module(module: &SsaModule) {
                             incoming.iter().map(|(p, v)| format!("[bb{p}: %{}]", v.id())).collect();
                         println!("%{} = φ {} {}", result.id(), name, ins.join(" "));
                     }
+                    super::SsaInstr::Copy { result, src } => {
+                        println!("%{} = copy %{}", result.id(), src.id())
+                    }
                     super::SsaInstr::Var { result, name } => {
                         println!("%{} = var {}", result.id(), name)
                     }

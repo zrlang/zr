@@ -482,6 +482,12 @@ fn emit_instr(unit: &mut CompilationUnit, instr: &SsaInstr) {
         }
         // φ 的实际拷贝由前驱末尾的 emit_phi_copies 发出
         SsaInstr::Phi { .. } => {}
+        SsaInstr::Copy { result, src } => {
+            let (d, s) = (alloc_reg(*result), alloc_reg(*src));
+            if d != s {
+                emit_mov_rr(unit, d, s);
+            }
+        }
         SsaInstr::Var { .. } => {}
     }
 }

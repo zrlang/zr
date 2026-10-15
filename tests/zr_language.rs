@@ -17,20 +17,27 @@ fn cases_dir() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/cases")
 }
 
+/// 需要逐个验证的优化等级。
+///
+/// 每个等级都要真跑一遍：优化 pass 只要有一条改坏了语义，用例就会在
+/// 某个等级上红。只测默认等级会漏掉这类问题。
+const OPT_LEVELS: [&str; 5] = ["-O0", "-O1", "-O2", "-O3", "-Oz"];
+
 /// 编译并运行一个 `.zr` 用例，返回它的退出码。
 ///
 /// 编译失败会 panic（连编译都过不了的用例不能算"通过"）；运行超时或崩溃
 /// 同样视为失败。
-fn run_case(zr: &str, source: &Path, out: &Path) -> i32 {
+fn run_case(zr: &str, source: &Path, out: &Path, opt: &str) -> i32 {
     let compile = Command::new(zr)
         .arg(source)
+        .arg(opt)
         .arg("-o")
         .arg(out)
         .output()
         .expect("failed to spawn the zr compiler");
     assert!(
         compile.status.success(),
-        "编译失败: {}\n{}",
+        "编译失败 ({opt}): {}\n{}",
         source.display(),
         String::from_utf8_lossy(&compile.stderr)
     );
@@ -41,7 +48,7 @@ fn run_case(zr: &str, source: &Path, out: &Path) -> i32 {
     let code = run.status.code().unwrap_or(-1);
     if !run.status.success() {
         panic!(
-            "运行失败: {}\n退出码 {}\nstdout: {}\nstderr: {}",
+            "运行失败 ({opt}): {}\n退出码 {}\nstdout: {}\nstderr: {}",
             source.display(),
             code,
             String::from_utf8_lossy(&run.stdout),
@@ -69,14 +76,16 @@ fn zr_language_cases() {
     let mut failures = Vec::new();
     for case in &cases {
         let name = case.file_stem().unwrap().to_string_lossy().to_string();
-        let out = std::env::temp_dir().join(format!("zr_case_{name}"));
-        let code = run_case(zr, case, &out);
-        let _ = std::fs::remove_file(&out);
-        if code == 0 {
-            println!("ok   {name}");
-        } else {
-            println!("FAIL {name} (断言 #{code})");
-            failures.push(name);
+        for opt in OPT_LEVELS {
+            let out = std::env::temp_dir().join(format!("zr_case_{name}"));
+            let code = run_case(zr, case, &out, opt);
+            let _ = std::fs::remove_file(&out);
+            if code == 0 {
+                println!("ok   {name} {opt}");
+            } else {
+                println!("FAIL {name} {opt} (断言 #{code})");
+                failures.push(format!("{name} {opt}"));
+            }
         }
     }
 
