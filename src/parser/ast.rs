@@ -256,21 +256,15 @@ pub enum Literal {
 /// 内联汇编表达式。
 #[derive(Debug, Clone)]
 pub struct AsmExpr {
-    /// 汇编模板字符串。
-    pub template: String,
     /// 输出操作数：`out(reg) name`。
     pub outputs: Vec<AsmOperand>,
     /// 输入操作数：`in(reg) expr`。
     pub inputs: Vec<AsmOperand>,
-    /// 选项：`pure`, `nomem`, `nostack` 等。
-    pub options: Vec<String>,
 }
 
 /// 汇编操作数。
 #[derive(Debug, Clone)]
 pub struct AsmOperand {
-    /// 寄存器约束，如 `reg`, `"rax"`。
-    pub constraint: String,
     /// 关联的表达式（输入）或名称（输出）。
     pub expr: Expression,
 }
@@ -508,21 +502,11 @@ pub struct Arm {
 #[derive(Debug, Clone)]
 pub struct Function {
     pub name: String,
-    pub visibility: Visibility,
-    pub attrs: Vec<Attribute>,
     pub is_async: bool,
-    /// 是否不返回（如 `fn abort() -> never`）。
-    pub is_noreturn: bool,
-    pub is_const: bool, // 编译期可执行
-    /// 是否为 `default fn`（可被特化覆盖）。
-    pub is_default: bool,
-    pub abi: Abi,
-    pub generics: Vec<GenericParam>,
     pub params: Vec<Param>,
     pub receiver: Option<Receiver>, // `self` / `&self` / `&mut self`
     pub return_type: Type,
     pub body: Option<Block>, // `None` = 声明（extern）
-    pub span: Span,
 }
 
 /// 泛型参数。
@@ -536,21 +520,13 @@ pub enum GenericParam {
 
 /// `where` 子句谓词。
 #[derive(Debug, Clone)]
-pub struct WherePred {
-    pub lhs: Type,
-    /// `for<'a, 'b>` 绑定的生命周期（HRTB）。
-    pub for_lifetimes: Vec<String>,
-    /// 是否为负边界：`T: !Trait`。
-    pub negated: bool,
-    pub span: Span,
-}
+pub struct WherePred;
 
 /// 函数参数。
 #[derive(Debug, Clone)]
 pub struct Param {
     pub pattern: Pattern,
     pub ty: Type,
-    pub span: Span,
 }
 
 /// 方法接收者。
@@ -576,8 +552,6 @@ pub enum TypeDef {
     Alias {
         name: String,
         target: Type,
-        visibility: Visibility,
-        span: Span,
     },
 }
 
@@ -586,29 +560,22 @@ pub enum TypeDef {
 pub struct Field {
     pub name: String,
     pub ty: Type,
-    pub visibility: Visibility,
-    pub span: Span,
 }
 
 /// 结构体定义。
 #[derive(Debug, Clone)]
 pub struct StructDef {
     pub name: String,
-    pub visibility: Visibility,
     pub attrs: Vec<Attribute>,
-    pub generics: Vec<GenericParam>,
     pub fields: Vec<Field>,
-    pub span: Span,
 }
 
 /// 枚举变体。
 #[derive(Debug, Clone)]
 pub struct Variant {
-    pub name: String,
     /// payload：无 / 元组 / 结构体。
     pub payload: VariantPayload,
     pub discriminant: Option<Expression>, // 显式赋值
-    pub span: Span,
 }
 
 #[derive(Debug, Clone)]
@@ -622,22 +589,16 @@ pub enum VariantPayload {
 #[derive(Debug, Clone)]
 pub struct EnumDef {
     pub name: String,
-    pub visibility: Visibility,
-    pub generics: Vec<GenericParam>,
     /// 底层整数类型（默认 `i32`）。
     pub repr: Option<Type>,
     pub variants: Vec<Variant>,
-    pub span: Span,
 }
 
 /// 联合体定义。
 #[derive(Debug, Clone)]
 pub struct UnionDef {
     pub name: String,
-    pub visibility: Visibility,
-    pub generics: Vec<GenericParam>,
     pub fields: Vec<Field>,
-    pub span: Span,
 }
 
 // ======================================================================
@@ -648,21 +609,16 @@ pub struct UnionDef {
 #[derive(Debug, Clone)]
 pub struct ConstDecl {
     pub name: String,
-    pub visibility: Visibility,
     pub ty: Type,
     pub value: Expression,
-    pub span: Span,
 }
 
 /// 全局静态变量。
 #[derive(Debug, Clone)]
 pub struct StaticDecl {
     pub name: String,
-    pub visibility: Visibility,
-    pub mutable: bool,
     pub ty: Type,
     pub init: Expression,
-    pub span: Span,
 }
 
 // ======================================================================
@@ -673,32 +629,22 @@ pub struct StaticDecl {
 #[derive(Debug, Clone)]
 pub struct TraitDef {
     pub name: String,
-    pub visibility: Visibility,
-    pub generics: Vec<GenericParam>,
     pub super_traits: Vec<Type>,
     pub assoc_types: Vec<AssocType>,
     pub methods: Vec<Function>,
     pub attrs: Vec<Attribute>,
-    pub span: Span,
 }
 
 /// 关联类型：`type Item;` / `type Item: Iterator;`。
 #[derive(Debug, Clone)]
-pub struct AssocType {
-    pub name: String,
-    pub default: Option<Type>,
-    pub span: Span,
-}
+pub struct AssocType;
 
 /// impl 块。
 #[derive(Debug, Clone)]
 pub struct ImplBlock {
-    pub generics: Vec<GenericParam>,
     pub target: Type, // 实现的目标类型
     pub trait_type: Option<Type>, // `impl Trait for T` 中的 Trait
     pub where_clause: Vec<WherePred>,
-    pub items: Vec<Function>,
-    pub assoc_types: Vec<AssocType>,
     pub span: Span,
 }
 

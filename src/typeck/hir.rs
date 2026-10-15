@@ -118,10 +118,6 @@ pub use crate::parser::ast::Mutability;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct DefId(pub u32);
 
-/// 类型参数 ID。
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct GenericId(pub u32);
-
 /// 推断变量 ID。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct InferId(pub u32);
@@ -229,8 +225,6 @@ pub enum HirLiteral {
     String(String),
     Char(char),
     Bool(bool),
-    /// 复合字面量（数组 / 结构体 / 元组）。
-    Composite(Vec<HirExpr>),
 }
 
 impl PartialEq for HirLiteral {
@@ -241,12 +235,6 @@ impl PartialEq for HirLiteral {
             (HirLiteral::String(a), HirLiteral::String(b)) => a == b,
             (HirLiteral::Char(a), HirLiteral::Char(b)) => a == b,
             (HirLiteral::Bool(a), HirLiteral::Bool(b)) => a == b,
-            (HirLiteral::Composite(a), HirLiteral::Composite(b)) => {
-                a.len() == b.len()
-                    && a.iter().zip(b.iter()).all(|(x, y)| {
-                        format!("{:?}", x) == format!("{:?}", y)
-                    })
-            }
             _ => false,
         }
     }
@@ -277,13 +265,6 @@ pub enum FieldIndex {
     Named(usize),
     /// 元组/结构体位置字段。
     Pos(usize),
-}
-
-/// 范围包含性。
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum RangeInclusivity {
-    Exclusive,
-    Inclusive,
 }
 
 /// 内置函数。
@@ -493,22 +474,15 @@ pub struct HirStatic {
 /// HIR trait 定义。
 #[derive(Debug, Clone)]
 pub struct HirTrait {
-    pub super_traits: Vec<DefId>,
     pub assoc_types: Vec<HirAssocType>,
-    pub methods: Vec<HirFunction>,
     /// 是否为 marker trait（`#[marker]`），如 `Send`、`Sync`、`Unpin`。
     /// marker trait 没有方法，且可以有多个 impl（只要不重叠）。
     pub is_marker: bool,
-    /// auto trait（自动为所有类型实现，除非有显式 `!Trait` impl）。
-    pub is_auto: bool,
 }
 
 /// 关联类型。
 #[derive(Debug, Clone)]
-pub struct HirAssocType {
-    pub name: String,
-    pub default: Option<Ty>,
-}
+pub struct HirAssocType;
 
 /// HIR impl 块。
 #[derive(Debug, Clone)]
@@ -516,7 +490,6 @@ pub struct HirImpl {
     pub target: Ty,
     pub trait_id: Option<DefId>,
     pub where_clause: Vec<WherePred>,
-    pub assoc_types: Vec<HirAssocType>,
     pub span: Span,
 }
 

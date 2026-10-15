@@ -201,7 +201,6 @@ fn mir_literal(lit: &hir::HirLiteral) -> MirValue {
         Bool(b) => MirValue::Bool(*b),
         Char(c) => MirValue::Int(*c as i128),
         String(s) => MirValue::Str(s.clone()),
-        _ => MirValue::Unit,
     }
 }
 

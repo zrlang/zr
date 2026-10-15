@@ -28,6 +28,12 @@ impl Span {
     pub const fn unknown() -> Self {
         Self::new(0, 0, 0, 0)
     }
+
+    /// 判断是否为未知位置的 span。
+    #[cfg(test)]
+    pub const fn is_unknown(&self) -> bool {
+        self.start == 0 && self.end == 0 && self.line == 0 && self.column == 0
+    }
 }
 
 impl fmt::Display for Span {

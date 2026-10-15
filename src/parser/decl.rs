@@ -1,7 +1,7 @@
 //! 声明（declaration）解析：函数、类型、trait、impl、const、static、mod、use、extern。
 
 use crate::error::CompileError;
-use crate::lexer::{Span, TokenKind};
+use crate::lexer::TokenKind;
 use crate::parser::ast::*;
 use crate::parser::Parser;
 
@@ -174,17 +174,17 @@ impl Parser {
 
     pub fn parse_function(
         &mut self,
-        visibility: Visibility,
-        attrs: Vec<Attribute>,
+        _visibility: Visibility,
+        _attrs: Vec<Attribute>,
         is_async: bool,
-        is_default: bool,
+        _is_default: bool,
     ) -> Result<Function, CompileError> {
-        let span = self.previous().span;
-        let is_const = self.match_kind(&TokenKind::KwComptime);
+        let _span = self.previous().span;
+        let _is_const = self.match_kind(&TokenKind::KwComptime);
         let name = self.consume_ident("expected function name")?;
 
         // 泛型参数
-        let generics = if self.match_kind(&TokenKind::Lt) {
+        let _generics = if self.match_kind(&TokenKind::Lt) {
             self.parse_generic_params()?
         } else {
             vec![]
@@ -245,23 +245,15 @@ impl Parser {
             Some(self.parse_block()?)
         };
 
-        let is_noreturn = matches!(return_type, Type::Never);
+        let _is_noreturn = matches!(return_type, Type::Never);
 
         Ok(Function {
             name,
-            visibility,
-            attrs,
             is_async,
-            is_noreturn,
-            is_const,
-            is_default,
-            abi: Abi::Zr,
-            generics,
             params,
             receiver,
             return_type,
             body,
-            span,
         })
     }
 
@@ -270,7 +262,7 @@ impl Parser {
         let pattern = self.parse_pattern()?;
         self.consume(&TokenKind::Colon, "expected ':' after parameter name")?;
         let ty = self.parse_type()?;
-        Ok(Param { pattern, ty, span: Span::unknown() })
+        Ok(Param { pattern, ty })
     }
 
     fn parse_receiver(&mut self) -> Result<Receiver, CompileError> {
@@ -300,9 +292,9 @@ impl Parser {
     }
 
     fn parse_where_pred(&mut self) -> Result<WherePred, CompileError> {
-        let span = self.peek().span;
+        let _span = self.peek().span;
         // 支持 `for<'a> T: Trait` 高阶 trait 边界
-        let for_lifetimes = if self.match_kind(&TokenKind::KwFor) {
+        let _for_lifetimes = if self.match_kind(&TokenKind::KwFor) {
             self.consume(&TokenKind::Lt, "expected '<' after 'for'")?;
             let mut lts = Vec::new();
             if !self.check(&TokenKind::Gt) {
@@ -319,11 +311,11 @@ impl Parser {
         } else {
             Vec::new()
         };
-        let lhs = self.parse_type()?;
+        let _lhs = self.parse_type()?;
         self.consume(&TokenKind::Colon, "expected ':' in where predicate")?;
-        let negated = self.match_kind(&TokenKind::Bang);
+        let _negated = self.match_kind(&TokenKind::Bang);
         let _ = self.parse_type()?;
-        Ok(WherePred { lhs, for_lifetimes, negated, span })
+        Ok(WherePred)
     }
 
     // ==================================================================
@@ -332,33 +324,33 @@ impl Parser {
 
     pub fn parse_const(
         &mut self,
-        visibility: Visibility,
+        _visibility: Visibility,
         _attrs: Vec<Attribute>,
     ) -> Result<ConstDecl, CompileError> {
-        let span = self.previous().span;
+        let _span = self.previous().span;
         let name = self.consume_ident("expected constant name")?;
         self.consume(&TokenKind::Colon, "expected ':'")?;
         let ty = self.parse_type()?;
         self.consume(&TokenKind::Eq, "expected '='")?;
         let value = self.parse_expression()?;
         self.consume(&TokenKind::Semicolon, "expected ';'")?;
-        Ok(ConstDecl { name, visibility, ty, value, span })
+        Ok(ConstDecl { name, ty, value })
     }
 
     pub fn parse_static(
         &mut self,
-        visibility: Visibility,
+        _visibility: Visibility,
         _attrs: Vec<Attribute>,
     ) -> Result<StaticDecl, CompileError> {
-        let span = self.previous().span;
-        let mutable = self.match_kind(&TokenKind::KwMut);
+        let _span = self.previous().span;
+        let _mutable = self.match_kind(&TokenKind::KwMut);
         let name = self.consume_ident("expected static name")?;
         self.consume(&TokenKind::Colon, "expected ':'")?;
         let ty = self.parse_type()?;
         self.consume(&TokenKind::Eq, "expected '='")?;
         let init = self.parse_expression()?;
         self.consume(&TokenKind::Semicolon, "expected ';'")?;
-        Ok(StaticDecl { name, visibility, mutable, ty, init, span })
+        Ok(StaticDecl { name, ty, init })
     }
 
     // ==================================================================
@@ -367,12 +359,12 @@ impl Parser {
 
     pub fn parse_struct_def(
         &mut self,
-        visibility: Visibility,
+        _visibility: Visibility,
         attrs: Vec<Attribute>,
     ) -> Result<TypeDef, CompileError> {
-        let span = self.previous().span;
+        let _span = self.previous().span;
         let name = self.consume_ident("expected struct name")?;
-        let generics = if self.match_kind(&TokenKind::Lt) {
+        let _generics = if self.match_kind(&TokenKind::Lt) {
             self.parse_generic_params()?
         } else {
             vec![]
@@ -385,8 +377,6 @@ impl Parser {
                 fields.push(Field {
                     name: String::new(),
                     ty: self.parse_type()?,
-                    visibility: Visibility::Private,
-                    span: Span::unknown(),
                 });
                 while self.match_kind(&TokenKind::Comma) {
                     if self.check(&TokenKind::RParen) {
@@ -395,8 +385,6 @@ impl Parser {
                     fields.push(Field {
                         name: String::new(),
                         ty: self.parse_type()?,
-                        visibility: Visibility::Private,
-                        span: Span::unknown(),
                     });
                 }
             }
@@ -404,18 +392,15 @@ impl Parser {
             self.consume(&TokenKind::Semicolon, "expected ';' after tuple struct")?;
             return Ok(TypeDef::Struct(StructDef {
                 name,
-                visibility,
                 attrs,
-                generics,
                 fields,
-                span,
             }));
         }
 
         self.consume(&TokenKind::LBrace, "expected '{' after struct name")?;
         let mut fields = Vec::new();
         while !self.check(&TokenKind::RBrace) && !self.is_at_end() {
-            let fvis = self.parse_visibility();
+            let _fvis = self.parse_visibility();
             let fname = self.consume_ident("expected field name")?;
             self.consume(&TokenKind::Colon, "expected ':' after field name")?;
             let fty = self.parse_type()?;
@@ -426,19 +411,14 @@ impl Parser {
             fields.push(Field {
                 name: fname,
                 ty: fty,
-                visibility: fvis,
-                span: Span::unknown(),
             });
             self.consume(&TokenKind::Comma, "expected ',' after field")?;
         }
         self.consume(&TokenKind::RBrace, "expected '}' to close struct")?;
         Ok(TypeDef::Struct(StructDef {
             name,
-            visibility,
             attrs,
-            generics,
             fields,
-            span,
         }))
     }
 
@@ -448,12 +428,12 @@ impl Parser {
 
     pub fn parse_enum_def(
         &mut self,
-        visibility: Visibility,
+        _visibility: Visibility,
         _attrs: Vec<Attribute>,
     ) -> Result<TypeDef, CompileError> {
-        let span = self.previous().span;
+        let _span = self.previous().span;
         let name = self.consume_ident("expected enum name")?;
-        let generics = if self.match_kind(&TokenKind::Lt) {
+        let _generics = if self.match_kind(&TokenKind::Lt) {
             self.parse_generic_params()?
         } else {
             vec![]
@@ -476,12 +456,12 @@ impl Parser {
             }
         }
         self.consume(&TokenKind::RBrace, "expected '}' to close enum")?;
-        Ok(TypeDef::Enum(EnumDef { name, visibility, generics, repr, variants, span }))
+        Ok(TypeDef::Enum(EnumDef { name, repr, variants }))
     }
 
     fn parse_variant(&mut self) -> Result<Variant, CompileError> {
-        let span = self.peek().span;
-        let name = self.consume_ident("expected variant name")?;
+        let _span = self.peek().span;
+        let _name = self.consume_ident("expected variant name")?;
         let payload = if self.match_kind(&TokenKind::LParen) {
             let mut types = Vec::new();
             if !self.check(&TokenKind::RParen) {
@@ -508,8 +488,6 @@ impl Parser {
                 fields.push(Field {
                     name: fname,
                     ty: fty,
-                    visibility: Visibility::Private,
-                    span: Span::unknown(),
                 });
                 self.consume(&TokenKind::Comma, "expected ',' after field")?;
             }
@@ -523,7 +501,7 @@ impl Parser {
         } else {
             None
         };
-        Ok(Variant { name, payload, discriminant, span })
+        Ok(Variant { payload, discriminant })
     }
 
     // ==================================================================
@@ -532,12 +510,12 @@ impl Parser {
 
     pub fn parse_union_def(
         &mut self,
-        visibility: Visibility,
+        _visibility: Visibility,
         _attrs: Vec<Attribute>,
     ) -> Result<TypeDef, CompileError> {
-        let span = self.previous().span;
+        let _span = self.previous().span;
         let name = self.consume_ident("expected union name")?;
-        let generics = if self.match_kind(&TokenKind::Lt) {
+        let _generics = if self.match_kind(&TokenKind::Lt) {
             self.parse_generic_params()?
         } else {
             vec![]
@@ -545,20 +523,18 @@ impl Parser {
         self.consume(&TokenKind::LBrace, "expected '{'")?;
         let mut fields = Vec::new();
         while !self.check(&TokenKind::RBrace) && !self.is_at_end() {
-            let fvis = self.parse_visibility();
+            let _fvis = self.parse_visibility();
             let fname = self.consume_ident("expected field name")?;
             self.consume(&TokenKind::Colon, "expected ':'")?;
             let fty = self.parse_type()?;
             fields.push(Field {
                 name: fname,
                 ty: fty,
-                visibility: fvis,
-                span: Span::unknown(),
             });
             self.consume(&TokenKind::Comma, "expected ',' after field")?;
         }
         self.consume(&TokenKind::RBrace, "expected '}'")?;
-        Ok(TypeDef::Union(UnionDef { name, visibility, generics, fields, span }))
+        Ok(TypeDef::Union(UnionDef { name, fields }))
     }
 
     // ==================================================================
@@ -567,10 +543,10 @@ impl Parser {
 
     pub fn parse_type_alias(
         &mut self,
-        visibility: Visibility,
+        _visibility: Visibility,
         _attrs: Vec<Attribute>,
     ) -> Result<TypeDef, CompileError> {
-        let span = self.previous().span;
+        let _span = self.previous().span;
         let name = self.consume_ident("expected type name")?;
         let _generics = if self.match_kind(&TokenKind::Lt) {
             self.parse_generic_params()?
@@ -580,7 +556,7 @@ impl Parser {
         self.consume(&TokenKind::Eq, "expected '=' in type alias")?;
         let target = self.parse_type()?;
         self.consume(&TokenKind::Semicolon, "expected ';'")?;
-        Ok(TypeDef::Alias { name, target, visibility, span })
+        Ok(TypeDef::Alias { name, target })
     }
 
     // ==================================================================
@@ -589,12 +565,12 @@ impl Parser {
 
     pub fn parse_trait_def(
         &mut self,
-        visibility: Visibility,
+        _visibility: Visibility,
         attrs: Vec<Attribute>,
     ) -> Result<TraitDef, CompileError> {
-        let span = self.previous().span;
+        let _span = self.previous().span;
         let name = self.consume_ident("expected trait name")?;
-        let generics = if self.match_kind(&TokenKind::Lt) {
+        let _generics = if self.match_kind(&TokenKind::Lt) {
             self.parse_generic_params()?
         } else {
             vec![]
@@ -621,12 +597,12 @@ impl Parser {
             }
         }
         self.consume(&TokenKind::RBrace, "expected '}'")?;
-        Ok(TraitDef { name, visibility, generics, super_traits, assoc_types, methods, attrs, span })
+        Ok(TraitDef { name, super_traits, assoc_types, methods, attrs })
     }
 
     fn parse_assoc_type(&mut self) -> Result<AssocType, CompileError> {
-        let span = self.peek().span;
-        let name = self.consume_ident("expected associated type name")?;
+        let _span = self.peek().span;
+        let _name = self.consume_ident("expected associated type name")?;
         if self.match_kind(&TokenKind::Colon) {
             // 消费 trait bounds 但不存储
             let _ = self.parse_type()?;
@@ -634,13 +610,13 @@ impl Parser {
                 let _ = self.parse_type()?;
             }
         }
-        let default = if self.match_kind(&TokenKind::Eq) {
+        let _default = if self.match_kind(&TokenKind::Eq) {
             Some(self.parse_type()?)
         } else {
             None
         };
         self.consume(&TokenKind::Semicolon, "expected ';'")?;
-        Ok(AssocType { name, default, span })
+        Ok(AssocType)
     }
 
     // ==================================================================
@@ -652,7 +628,7 @@ impl Parser {
         _attrs: Vec<Attribute>,
     ) -> Result<ImplBlock, CompileError> {
         let span = self.previous().span;
-        let generics = if self.match_kind(&TokenKind::Lt) {
+        let _generics = if self.match_kind(&TokenKind::Lt) {
             self.parse_generic_params()?
         } else {
             vec![]
@@ -674,19 +650,19 @@ impl Parser {
             vec![]
         };
         self.consume(&TokenKind::LBrace, "expected '{'")?;
-        let mut items = Vec::new();
-        let mut assoc_types = Vec::new();
+        let mut _items = Vec::new();
+        let mut _assoc_types = Vec::new();
         while !self.check(&TokenKind::RBrace) && !self.is_at_end() {
             if self.match_kind(&TokenKind::KwType) {
-                assoc_types.push(self.parse_assoc_type()?);
+                _assoc_types.push(self.parse_assoc_type()?);
             } else {
                 let is_async = self.match_kind(&TokenKind::KwAsync);
                 self.consume(&TokenKind::KwFn, "expected 'fn'")?;
-                items.push(self.parse_function(Visibility::Private, vec![], is_async, false)?);
+                _items.push(self.parse_function(Visibility::Private, vec![], is_async, false)?);
             }
         }
         self.consume(&TokenKind::RBrace, "expected '}'")?;
-        Ok(ImplBlock { generics, target, trait_type, where_clause, items, assoc_types, span })
+        Ok(ImplBlock { target, trait_type, where_clause, span })
     }
 
     // ==================================================================

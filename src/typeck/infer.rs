@@ -19,7 +19,7 @@ use crate::error::{CompileError, ErrorKind, Result};
 use crate::parser::ast::Span;
 
 use super::hir::{
-    self, Cfg, DefId, GenericId, InferId, LocalId,
+    self, Cfg, DefId, InferId, LocalId,
     Ty,
 };
 
@@ -28,114 +28,37 @@ use super::hir::{
 pub struct InferCtxt<'a> {
     /// 推断变量 → 类型映射（单向）。
     pub vars: HashMap<InferId, Ty>,
-    /// 约束集合。
-    pub constraints: Vec<Constraint>,
     /// 下一个推断变量 ID。
     pub next_infer: u32,
-    /// 类型参数 ID → 具体类型（单态化时用）。
-    pub substitution: HashMap<GenericId, Ty>,
-    /// trait 求解缓存：`(trait_id, self_ty) -> impl_id`。
-    pub impl_cache: HashMap<(DefId, Ty), DefId>,
     /// 当前函数返回类型（用于 `return` 检查）。
     pub return_ty: Option<Ty>,
-    /// 当前所在函数 ID（用于错误消息）。
-    pub current_function: Option<DefId>,
     /// 借用信息（NLL 用）：每个局部的生命周期区间。
     pub borrow_intervals: Vec<BorrowInterval>,
-    /// 所有错误（收集后统一报告）。
-    pub errors: Vec<CompileError>,
     /// 类型定义表（用于查找字段、变体）。
     pub type_defs: &'a HashMap<DefId, hir::HirTypeDef>,
-    /// trait 表。
-    pub trait_defs: &'a HashMap<DefId, hir::HirTrait>,
     /// impl 表。
     pub impl_blocks: &'a [hir::HirImpl],
     /// 函数表。
     pub functions: &'a HashMap<DefId, hir::HirFunction>,
     /// 变量 → 类型映射（局部变量）。
     pub locals: &'a mut HashMap<LocalId, Ty>,
-    /// 常量表（用于 CTFE 交叉引用）。
-    pub consts: &'a HashMap<DefId, hir::HirConst>,
-    /// 静态变量表。
-    pub statics: &'a HashMap<DefId, hir::HirStatic>,
 }
 
-/// 类型约束。
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub enum Constraint {
-    /// 相等约束 `T1 == T2`。
-    Eq(Ty, Ty, Span),
-    /// 子类型约束 `T1 <: T2`。
-    Subtype(Ty, Ty, Span),
-    /// trait bound `T: Trait`。
-    TraitBound(Ty, DefId, Span),
-    /// 生命周期约束 `'a: 'b`。
-    RegionOutlives(RegionId, RegionId, Span),
-}
-
-/// 生命周期区域 ID。
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct RegionId(pub u32);
+/// 借用区间（NLL）。
+#[derive(Debug, Clone)]
+pub struct BorrowInterval;
 
 /// `'static` 空集合，用于 `InferCtxt::empty()` 占位（避免未初始化引用）。
 fn empty_type_defs() -> &'static HashMap<DefId, hir::HirTypeDef> {
     static V: OnceLock<HashMap<DefId, hir::HirTypeDef>> = OnceLock::new();
     V.get_or_init(HashMap::new)
 }
-fn empty_trait_defs() -> &'static HashMap<DefId, hir::HirTrait> {
-    static V: OnceLock<HashMap<DefId, hir::HirTrait>> = OnceLock::new();
-    V.get_or_init(HashMap::new)
-}
 fn empty_functions() -> &'static HashMap<DefId, hir::HirFunction> {
     static V: OnceLock<HashMap<DefId, hir::HirFunction>> = OnceLock::new();
     V.get_or_init(HashMap::new)
 }
-fn empty_consts() -> &'static HashMap<DefId, hir::HirConst> {
-    static V: OnceLock<HashMap<DefId, hir::HirConst>> = OnceLock::new();
-    V.get_or_init(HashMap::new)
-}
-fn empty_statics() -> &'static HashMap<DefId, hir::HirStatic> {
-    static V: OnceLock<HashMap<DefId, hir::HirStatic>> = OnceLock::new();
-    V.get_or_init(HashMap::new)
-}
 fn empty_locals() -> &'static mut HashMap<LocalId, Ty> {
-    static mut V: OnceLock<HashMap<LocalId, Ty>> = OnceLock::new();
-    // SAFETY: `empty()` 只在 `Default::default()` 里调用，且紧接着被 `new()` 覆盖，
-    // 返回的引用不会被跨调用/跨线程使用。
-    unsafe { V.get_or_init(HashMap::new); V.get_mut().unwrap() }
-}
-
-/// 借用区间（NLL）。
-#[derive(Debug, Clone)]
-pub struct BorrowInterval {
-    pub local: LocalId,
-    /// 借用开始的程序点。
-    pub start: usize,
-    /// 借用结束的程序点（None = 直到作用域结束）。
-    pub end: Option<usize>,
-    /// 借用种类。
-    pub kind: BorrowKind,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum BorrowKind {
-    /// 共享借用 `&T`。
-    Shared,
-    /// 可变借用 `&mut T`。
-    Mutable,
-    /// 唯一不可变借用（类似 `&uniq T`）。
-    Unique,
-    /// 通过指针的借用 `*mut T`（unsafe）。
-    Raw,
-}
-
-/// 类型推断结果。
-#[derive(Debug, Default)]
-pub struct InferResult {
-    /// 已求解的类型映射。
-    pub type_map: HashMap<InferId, Ty>,
-    /// 残余约束（未解决的）。
-    pub residual: Vec<Constraint>,
+    Box::leak(Box::new(HashMap::new()))
 }
 
 impl<'a> InferCtxt<'a> {
@@ -147,51 +70,13 @@ impl<'a> InferCtxt<'a> {
     pub fn empty() -> Self {
         Self {
             vars: HashMap::new(),
-            constraints: Vec::new(),
             next_infer: 0,
-            substitution: HashMap::new(),
-            impl_cache: HashMap::new(),
             return_ty: None,
-            current_function: None,
             borrow_intervals: Vec::new(),
-            errors: Vec::new(),
             type_defs: empty_type_defs(),
-            trait_defs: empty_trait_defs(),
             impl_blocks: &[],
             functions: empty_functions(),
-            consts: empty_consts(),
-            statics: empty_statics(),
             locals: empty_locals(),
-        }
-    }
-
-    /// 创建一个新的推断上下文。
-    pub fn new(
-        type_defs: &'a HashMap<DefId, hir::HirTypeDef>,
-        trait_defs: &'a HashMap<DefId, hir::HirTrait>,
-        impl_blocks: &'a [hir::HirImpl],
-        functions: &'a HashMap<DefId, hir::HirFunction>,
-        consts: &'a HashMap<DefId, hir::HirConst>,
-        statics: &'a HashMap<DefId, hir::HirStatic>,
-        locals: &'a mut HashMap<LocalId, Ty>,
-    ) -> Self {
-        Self {
-            vars: HashMap::new(),
-            constraints: Vec::new(),
-            next_infer: 0,
-            substitution: HashMap::new(),
-            impl_cache: HashMap::new(),
-            return_ty: None,
-            current_function: None,
-            borrow_intervals: Vec::new(),
-            errors: Vec::new(),
-            type_defs,
-            trait_defs,
-            impl_blocks,
-            functions,
-            consts,
-            statics,
-            locals,
         }
     }
 
@@ -415,24 +300,6 @@ impl<'a> InferCtxt<'a> {
         }
     }
 
-    /// 发生性检查（Occurs Check），防止无限类型。
-    fn occurs_check(&self, generic: GenericId, ty: &Ty) -> bool {
-        let _ = generic;
-        match ty {
-            Ty::Infer(_) => false,
-            Ty::Pointer(t, _) | Ty::Reference(t, _) | Ty::Array(t, _) | Ty::Slice(t, _) => {
-                self.occurs_check(generic, t)
-            }
-            Ty::Tuple(ts) | Ty::Function { params: ts, .. } => {
-                ts.iter().any(|t| self.occurs_check(generic, t))
-            }
-            Ty::Optional(t) | Ty::ErrorUnion(t, _) => self.occurs_check(generic, t),
-            Ty::Named(_, args) => args.iter().any(|a| self.occurs_check(generic, a)),
-            Ty::Pin(t) => self.occurs_check(generic, t),
-            _ => false,
-        }
-    }
-
     /// 将推断变量绑定到一个非推断类型。
     fn bind_infer(&mut self, id: InferId, ty: &Ty, span: Span) -> Result<()> {
         // 发生性检查
@@ -557,28 +424,6 @@ impl<'a> InferCtxt<'a> {
         true
     }
 
-    /// 判断两个类型是否在结构上匹配（用于 impl 选择）。
-    fn types_match(&self, a: &Ty, b: &Ty) -> bool {
-        match (a, b) {
-            (Ty::Infer(_), _) | (_, Ty::Infer(_)) => true,
-            (Ty::Named(id1, args1), Ty::Named(id2, args2)) => {
-                id1 == id2 && args1.len() == args2.len()
-                    && args1.iter().zip(args2.iter()).all(|(x, y)| self.types_match(x, y))
-            }
-            (Ty::Pointer(t1, m1), Ty::Pointer(t2, m2))
-            | (Ty::Reference(t1, m1), Ty::Reference(t2, m2)) => {
-                m1 == m2 && self.types_match(t1, t2)
-            }
-            (Ty::Array(t1, _), Ty::Array(t2, _)) => self.types_match(t1, t2),
-            (Ty::Slice(t1, m1), Ty::Slice(t2, m2)) => m1 == m2 && self.types_match(t1, t2),
-            (Ty::Tuple(ts1), Ty::Tuple(ts2)) => {
-                ts1.len() == ts2.len()
-                    && ts1.iter().zip(ts2.iter()).all(|(x, y)| self.types_match(x, y))
-            }
-            _ => a == b,
-        }
-    }
-
     // ===== 错误消息辅助 =====
 
     fn type_mismatch(&self, expected: &Ty, found: &Ty, span: Span) -> CompileError {
@@ -700,96 +545,11 @@ impl<'a> InferCtxt<'a> {
         }
     }
 
-    /// 求解所有约束（主入口）。
-    pub fn solve(&mut self) -> Result<InferResult> {
-        // 使用 Robinson 统一算法
-        let constraints = std::mem::take(&mut self.constraints);
-        for c in &constraints {
-            match c {
-                Constraint::Eq(a, b, span) => self.unify(a, b, *span)?,
-                Constraint::Subtype(a, b, span) => self.subtype(a, b, *span)?,
-                Constraint::TraitBound(ty, trait_id, span) => {
-                    self.check_trait_impl_for_type(ty, *trait_id, *span)?;
-                }
-                Constraint::RegionOutlives(a, b, span) => {
-                    self.check_region_outlives(*a, *b, *span)?;
-                }
-            }
-        }
-        Ok(InferResult {
-            type_map: self.vars.clone(),
-            residual: Vec::new(),
-        })
-    }
-
-    fn check_trait_impl_for_type(
-        &mut self,
-        ty: &Ty,
-        trait_id: DefId,
-        span: Span,
-    ) -> Result<()> {
-        let ty = self.resolve(ty);
-        match &ty {
-            Ty::Named(id, _) => self.check_trait_impl(*id, trait_id, span),
-            Ty::Int(_) | Ty::Uint(_) | Ty::Float(_) | Ty::Bool => {
-                // 内建类型默认 impl 常用 trait（Copy, Clone, Eq, Hash 等）
-                self.check_builtin_trait_impl(&ty, trait_id, span)
-            }
-            Ty::Pointer(_, _) | Ty::Reference(_, _) => {
-                self.check_builtin_trait_impl(&ty, trait_id, span)
-            }
-            _ => Err(CompileError::type_error(format!(
-                "type `{}` does not implement trait `{}`",
-                self.type_name(&ty),
-                self.type_id_name(trait_id)
-            ))
-            .with_span(span)),
-        }
-    }
-
-    fn check_builtin_trait_impl(
-        &self,
-        _ty: &Ty,
-        _trait_id: DefId,
-        _span: Span,
-    ) -> Result<()> {
-        // 内建类型自动实现基础 trait（Copy, Clone, Eq, Hash, Ord, Display 等）
-        // 简化：假设内建类型都能满足基础 trait 约束
-        Ok(())
-    }
-
-    fn check_region_outlives(
-        &self,
-        _a: RegionId,
-        _b: RegionId,
-        _span: Span,
-    ) -> Result<()> {
-        // 生命周期约束求解（NLL liveness analysis）
-        Ok(())
-    }
-
     /// 记录一次借用，用于后续借用检查。
-    pub fn record_borrow(
-        &mut self,
-        local: LocalId,
-        kind: BorrowKind,
-        start: usize,
-    ) -> usize {
+    pub fn record_borrow(&mut self) -> usize {
         let idx = self.borrow_intervals.len();
-        self.borrow_intervals.push(BorrowInterval {
-            local,
-            start,
-            end: None,
-            kind,
-        });
+        self.borrow_intervals.push(BorrowInterval);
         idx
-    }
-
-    /// 结束一个借用区间。
-    pub fn end_borrow(&mut self, idx: usize, point: usize) {
-        if let Some(b) = self.borrow_intervals.get_mut(idx) {
-            b.end = Some(point);
-        }
     }
 
     /// 借用检查（NLL 风格）：检测悬垂引用与重叠可变借用。
@@ -801,24 +561,6 @@ impl<'a> InferCtxt<'a> {
         // 此处为框架实现
         let _ = (&self.borrow_intervals, &mut errors);
         errors
-    }
-}
-
-/// 区域推断（NLL）。
-#[derive(Debug, Default)]
-pub struct RegionInferer {
-    /// 区域 → 约束集合。
-    pub constraints: Vec<(RegionId, RegionId)>,
-    /// 已求解的区域映射。
-    pub solution: HashMap<RegionId, usize>,
-}
-
-impl RegionInferer {
-    /// 求解区域约束。
-    pub fn solve(&mut self) -> Result<()> {
-        // 使用约束图的最近公共祖先 / 作用域树算法
-        // 此处为框架实现
-        Ok(())
     }
 }
 
@@ -855,55 +597,16 @@ impl fmt::Display for Ty {
 mod tests {
     use super::*;
 
-    /// 测试用的 InferCtxt 构造辅助，避免临时值生命周期问题。
-    struct TestCtxt {
-        type_defs: HashMap<DefId, hir::HirTypeDef>,
-        trait_defs: HashMap<DefId, hir::HirTrait>,
-        impl_blocks: Vec<hir::HirImpl>,
-        functions: HashMap<DefId, hir::HirFunction>,
-        consts: HashMap<DefId, hir::HirConst>,
-        statics: HashMap<DefId, hir::HirStatic>,
-        locals: HashMap<LocalId, Ty>,
-    }
-
-    impl TestCtxt {
-        fn new() -> Self {
-            Self {
-                type_defs: HashMap::new(),
-                trait_defs: HashMap::new(),
-                impl_blocks: Vec::new(),
-                functions: HashMap::new(),
-                consts: HashMap::new(),
-                statics: HashMap::new(),
-                locals: HashMap::new(),
-            }
-        }
-
-        fn cx(&mut self) -> InferCtxt<'_> {
-            InferCtxt::new(
-                &self.type_defs,
-                &self.trait_defs,
-                &self.impl_blocks,
-                &self.functions,
-                &self.consts,
-                &self.statics,
-                &mut self.locals,
-            )
-        }
-    }
-
     #[test]
     fn unify_int_types() {
-        let mut t = TestCtxt::new();
-        let mut cx = t.cx();
+        let mut cx = InferCtxt::empty();
         let span = Span::unknown();
         cx.unify(&Ty::Int(32), &Ty::Int(32), span).unwrap();
     }
 
     #[test]
     fn unify_infer_var() {
-        let mut t = TestCtxt::new();
-        let mut cx = t.cx();
+        let mut cx = InferCtxt::empty();
         let span = Span::unknown();
         let v = cx.fresh_infer(span);
         cx.unify(&v, &Ty::Int(64), span).unwrap();
@@ -912,8 +615,7 @@ mod tests {
 
     #[test]
     fn occurs_check_prevents_infinite_type() {
-        let mut t = TestCtxt::new();
-        let mut cx = t.cx();
+        let mut cx = InferCtxt::empty();
         let span = Span::unknown();
         let v = cx.fresh_infer(span);
         let list = Ty::Named(DefId(1), vec![v.clone()]);
@@ -923,16 +625,14 @@ mod tests {
 
     #[test]
     fn subtype_int_promotion() {
-        let mut t = TestCtxt::new();
-        let mut cx = t.cx();
+        let mut cx = InferCtxt::empty();
         let span = Span::unknown();
         cx.subtype(&Ty::Int(8), &Ty::Int(32), span).unwrap();
     }
 
     #[test]
     fn never_is_bottom_type() {
-        let mut t = TestCtxt::new();
-        let mut cx = t.cx();
+        let mut cx = InferCtxt::empty();
         let span = Span::unknown();
         cx.subtype(&Ty::Never, &Ty::Int(32), span).unwrap();
     }

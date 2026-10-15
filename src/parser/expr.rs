@@ -922,7 +922,7 @@ impl Parser {
         self.consume(&TokenKind::LParen, "expected '(' after asm!")?;
 
         // 第一个参数：模板字符串
-        let template = match self.peek().kind.clone() {
+        let _template = match self.peek().kind.clone() {
             TokenKind::StringLiteral(s) => {
                 self.advance();
                 s
@@ -932,7 +932,7 @@ impl Parser {
 
         let mut outputs = Vec::new();
         let mut inputs = Vec::new();
-        let mut options = Vec::new();
+        let mut _options = Vec::new();
 
         // 解析操作数和选项
         while self.match_kind(&TokenKind::Comma) {
@@ -945,7 +945,7 @@ impl Parser {
                 self.consume(&TokenKind::LParen, "expected '(' after options")?;
                 while !self.check(&TokenKind::RParen) && !self.is_at_end() {
                     if let TokenKind::Ident(opt) = self.peek().kind.clone() {
-                        options.push(opt);
+                        _options.push(opt);
                         self.advance();
                     } else {
                         self.advance();
@@ -965,7 +965,7 @@ impl Parser {
             }
             self.advance(); // in/out
             self.consume(&TokenKind::LParen, "expected '(' after in/out")?;
-            let constraint = match self.peek().kind.clone() {
+            let _constraint = match self.peek().kind.clone() {
                 TokenKind::Ident(c) => {
                     self.advance();
                     c
@@ -978,7 +978,7 @@ impl Parser {
             };
             self.consume(&TokenKind::RParen, "expected ')' after constraint")?;
             let expr = self.parse_expression()?;
-            let operand = crate::parser::ast::AsmOperand { constraint, expr };
+            let operand = crate::parser::ast::AsmOperand { expr };
             if is_out {
                 outputs.push(operand);
             } else {
@@ -989,7 +989,7 @@ impl Parser {
         self.consume(&TokenKind::RParen, "expected ')' to close asm!")?;
 
         Ok(Expression::Asm(
-            crate::parser::ast::AsmExpr { template, outputs, inputs, options },
+            crate::parser::ast::AsmExpr { outputs, inputs },
             span,
         ))
     }

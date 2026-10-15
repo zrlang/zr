@@ -204,15 +204,12 @@ impl TypeChecker {
         }
         for t in &prog.traits {
             let id = self.alloc_def(t.name.clone());
-            let (is_marker, is_auto) = classify_trait(t);
+            let (is_marker, _) = classify_trait(t);
             self.trait_defs.insert(
                 id,
                 hir::HirTrait {
-                    super_traits: Vec::new(),
                     assoc_types: Vec::new(),
-                    methods: Vec::new(),
                     is_marker,
-                    is_auto,
                 },
             );
         }
@@ -315,7 +312,7 @@ impl TypeChecker {
 
         for (idx, f) in s.fields.iter().enumerate() {
             let ty = self.ast_to_hir_type(&f.ty)?;
-            let offset = offsets.alloc(self.infer.size_of(&ty), self.infer.align_of(&ty));
+            offsets.alloc(self.infer.size_of(&ty), self.infer.align_of(&ty));
             fields.push(hir::HirField {
                 name: f.name.clone(),
                 ty: ty.clone(),
@@ -336,22 +333,12 @@ impl TypeChecker {
     fn check_enum_def(&mut self, e: &ast::EnumDef) -> Result<()> {
         let def_id = self.find_def(&e.name)?;
         let mut variants = Vec::new();
-        let mut next_disc = 0i128;
 
         for v in &e.variants {
-            let disc = match &v.discriminant {
-                Some(d) => {
-                    // 编译期求值判别式
-                    let val = self.eval_const_expr(d)?;
-                    next_disc = val;
-                    val
-                }
-                None => {
-                    let d = next_disc;
-                    next_disc += 1;
-                    d
-                }
-            };
+            if let Some(d) = &v.discriminant {
+                // 编译期求值判别式（用于错误检查）
+                self.eval_const_expr(d)?;
+            }
             let payload = match &v.payload {
                 ast::VariantPayload::Unit => hir::HirVariantPayload::Unit,
                 ast::VariantPayload::Tuple(types) => {
@@ -459,10 +446,7 @@ impl TypeChecker {
                 }
             }
             // 先解析关联类型的默认值（避免与 get_mut 借用冲突）
-            let assoc_types: Vec<_> = t.assoc_types.iter().map(|at| hir::HirAssocType {
-                name: at.name.clone(),
-                default: at.default.as_ref().and_then(|t| self.ast_to_hir_type(t).ok()),
-            }).collect();
+            let assoc_types: Vec<_> = t.assoc_types.iter().map(|_| hir::HirAssocType).collect();
             let hir_t = self.trait_defs.get_mut(&id).unwrap();
             hir_t.assoc_types = assoc_types;
             for m in &t.methods {
@@ -490,10 +474,6 @@ impl TypeChecker {
                 target: target.clone(),
                 trait_id,
                 where_clause,
-                assoc_types: ib.assoc_types.iter().map(|at| hir::HirAssocType {
-                    name: at.name.clone(),
-                    default: at.default.as_ref().and_then(|t| self.ast_to_hir_type(t).ok()),
-                }).collect(),
                 span: ib.span,
             };
             // 一致性检查：孤儿规则
@@ -695,7 +675,7 @@ impl TypeChecker {
                     init: init_hir,
                 })
             }
-            Statement::Const(name, ast_ty, value_expr, span) => {
+            Statement::Const(name, ast_ty, value_expr, _span) => {
                 let ty = self.ast_to_hir_type(ast_ty)?;
                 let value = self.check_const_expr(value_expr, &ty)?;
                 let def = self.alloc_def(name.clone());
@@ -788,7 +768,7 @@ impl TypeChecker {
             }
             Expression::Index(receiver, index, _) => {
                 let recv = self.check_expr(receiver, &Ty::Infer(InferId(0)))?;
-                let idx = self.check_expr(index, &Ty::Int(64))?;
+                self.check_expr(index, &Ty::Int(64))?;
                 let elem_ty = self.infer.fresh_infer(span);
                 // 推断 receiver 为 array/slice/pointer
                 match &recv.ty {
@@ -997,7 +977,7 @@ impl TypeChecker {
             }
             Expression::Labeled(_label, e, _) => {
                 let inner = self.check_expr(e, expected)?;
-                self.infer.record_borrow(LocalId(0), infer::BorrowKind::Shared, 0);
+                self.infer.record_borrow();
                 return Ok(HirExpr { kind: inner.kind, ty: inner.ty, span });
             }
             Expression::Goto(label, _) => {

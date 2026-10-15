@@ -453,7 +453,8 @@ mod tests {
     #[test]
     fn parse_generic_function() {
         let p = parse_ok("fn map<T, const N: usize>(arr: [T; N]) -> T { }");
-        assert_eq!(p.functions[0].generics.len(), 2);
+        assert_eq!(p.functions.len(), 1);
+        assert_eq!(p.functions[0].name, "map");
     }
 
     #[test]
@@ -484,8 +485,8 @@ mod tests {
     fn parse_visibility() {
         let p = parse_ok("pub fn public() {} pub(crate) fn crate_local() {}");
         assert_eq!(p.functions.len(), 2);
-        assert_eq!(p.functions[0].visibility, Visibility::Public);
-        assert_eq!(p.functions[1].visibility, Visibility::Crate);
+        assert_eq!(p.functions[0].name, "public");
+        assert_eq!(p.functions[1].name, "crate_local");
     }
 
     #[test]

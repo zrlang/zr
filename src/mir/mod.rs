@@ -14,7 +14,7 @@
 
 pub mod builder;
 
-use crate::typeck::hir::{self, HirModule};
+use crate::typeck::hir::HirModule;
 
 /// 一个 MIR 模块。
 #[derive(Debug, Clone, Default)]
