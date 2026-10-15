@@ -794,7 +794,7 @@ mod tests {
     fn assignment_right_assoc() {
         let e = expr("a = b = 1");
         match e {
-            Expression::Assign(lhs, AssignOp::Assign, rhs, _) => {
+            Expression::Assign(_, AssignOp::Assign, rhs, _) => {
                 assert!(matches!(*rhs, Expression::Assign(_, _, _, _)));
             }
             _ => panic!("wrong shape: {:?}", e),

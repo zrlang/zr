@@ -29,9 +29,8 @@ pub fn lower_function(func: &HirFunction, body: &HirBlock) -> MirFunction {
     // 降级函数体
     let tail = lower_block(&mut b, body);
 
-    // 终结入口块：若有尾表达式则 return，否则 fallthrough
-    let _ = tail;
-    b.current_block_mut().term = MirTerminator::Return;
+    // 终结入口块：尾表达式的值即函数返回值。
+    b.current_block_mut().term = MirTerminator::Return(tail);
 
     // 把收集到的块按分配顺序落盘
     MirFunction {
@@ -174,9 +173,8 @@ fn lower_expr(b: &mut Builder, expr: &HirExpr) -> MirValue {
         }
         Return(v) => {
             let rv = v.as_ref().map(|e| lower_expr(b, e));
-            let _ = rv;
-            b.current_block_mut().term = MirTerminator::Return;
-            MirValue::Unit
+            b.current_block_mut().term = MirTerminator::Return(rv.clone());
+            rv.unwrap_or(MirValue::Unit)
         }
         Await(future) => {
             // await 表达式：先计算 future，然后生成 await 点

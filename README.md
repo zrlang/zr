@@ -216,7 +216,10 @@ fn read_config(path: &str) -> Result<Config, IoError> {
 ### 环境要求
 
 - Rust 工具链 ≥ 1.70（用于构建 zr 编译器本身）
-- Linux x86-64（当前支持的目标平台）
+- 宿主平台：Linux / macOS / Windows（x86-64 与 aarch64）
+- 交叉编译时需要对应目标的 C 工具链（clang / as / lld-link / mingw）
+- 编译嵌入式目标时需要对应的裸机工具链（`arm-none-eabi-gcc`、
+  `riscv64-unknown-elf-gcc`，或支持这些目标的 clang）
 
 ### 构建编译器
 
@@ -239,8 +242,16 @@ zr build app.zr -O2 -o app
 # 只编译不链接（生成目标文件）
 zr build lib.zr -c -o lib.o
 
-# 交叉编译（规划中）
-zr build app.zr --target aarch64-linux-gnu -o app-arm64
+# 交叉编译：目标三元组与 cargo --target 同名
+zr app.zr --target aarch64-unknown-linux-gnu -o app-arm64
+zr app.zr --target aarch64-apple-darwin -o app-macos-arm64
+zr app.zr --target x86_64-pc-windows-msvc -o app.exe
+zr app.zr --target wasm32-unknown-unknown -o app.wasm
+zr app.zr --target wasm32-unknown-unknown --wat -o app.wat
+
+# 嵌入式（裸机）交叉编译：直接产出可烧录的 ELF 映像
+zr app.zr --target arm-none-eabi -o app.elf
+zr app.zr --target riscv64-unknown-none -o app.elf
 
 # 查看中间表示（调试用）
 zr build program.zr --dump-ssa
@@ -774,14 +785,14 @@ OPTIONS:
   -o, --output <FILE>     输出文件名
   -O0..-O3, -Oz           优化级别
   -c                      只编译不链接
-  --target <TRIPLE>       目标三元组
-  --sysroot <DIR>         sysroot 目录
+  --target <TRIPLE>       目标三元组（默认：宿主平台）
+  --wat                   输出 WebAssembly 文本（wasm32 专用）
   --dump-tokens           dump 词法分析结果
   --dump-ast              dump AST
   --dump-hir              dump HIR
   --dump-mir              dump MIR
   --dump-ssa              dump SSA
-  --dump-asm              dump 汇编
+  --dump-asm              dump 机器码
   --emit-llvm             输出 LLVM IR（规划中）
   -h, --help              显示帮助
   -V, --version           显示版本
@@ -850,8 +861,43 @@ zr 编译器采用经典的多阶段架构：
    │   ├─ 线性扫描寄存器分配
    │   ├─ 栈帧布局
    │   └─ 汇编/机器码发射
-   ▼ ⑧ ELF Linker ── 生成 Linux x86-64 可执行文件
+   ▼ ⑧ Container Writer ─ ELF / Mach-O / PE-COFF / wasm
+       └─ 平台链接器（ld · cc · lld-link）完成最终链接
 ```
+
+### 目标平台
+
+| 目标三元组 | 指令后端 | 容器格式 | 运行时 | 链接方式 |
+|------------|----------|----------|--------|----------|
+| `arm-none-eabi` | ARM32（A32） | ELF32 裸机映像 | `runtime/rt_arm_baremetal.s`（semihosting） | 无需链接器 |
+| `riscv32-unknown-none` | RV32IMAC | ELF32 裸机映像 | `runtime/rt_riscv_baremetal.s`（semihosting） | 无需链接器 |
+| `riscv64-unknown-none` | RV64IMAC | ELF64 裸机映像 | `runtime/rt_riscv_baremetal.s`（semihosting） | 无需链接器 |
+| `x86_64-unknown-linux-gnu` | x86-64 | ELF | `runtime/rt_linux_x86_64.s`（裸系统调用） | `ld -static` 或 gcc |
+| `aarch64-unknown-linux-gnu` | AArch64 | ELF | `runtime/rt_linux_aarch64.s`（裸系统调用） | `ld -static` 或 gcc |
+| `x86_64-apple-darwin` | x86-64 | Mach-O | `runtime/rt_macos_x86_64.s`（libSystem） | `cc` / `clang` |
+| `aarch64-apple-darwin` | AArch64 | Mach-O | `runtime/rt_macos_arm64.s`（libSystem） | `clang -target` |
+| `x86_64-pc-windows-msvc` | x86-64 | PE/COFF | `runtime/rt_windows_x86_64.s`（kernel32） | `lld-link` / mingw |
+| `aarch64-pc-windows-msvc` | AArch64 | PE/COFF | `runtime/rt_windows_arm64.s`（kernel32） | `lld-link` / mingw |
+| `wasm32-unknown-unknown` | 栈式字节码 | wasm | 模块导入（`zr.*`） | 无需链接器 |
+| `wasm32-wasi` | 栈式字节码 | wasm | 模块导入（`zr.*`） | 无需链接器 |
+
+要点：
+
+- **启动约定按平台不同**：Linux 的 `_start` 直接用系统调用退出进程
+  （不依赖运行时）；macOS / Windows 的 `_start` 调用运行时的 `zr_exit`
+  （分别转发到 libc 与 `ExitProcess`）；**裸机**的 `_start` 调用 `main`
+  后停在自循环（没有"退出进程"，靠调试器或复位接管）。
+- **裸机镜像没有 Program Header**：`e_entry` 直接指向 `_start`，节地址
+  从 `0x08000000`（Cortex-M 向量表）起算，烧录工具 / 仿真器按节加载即可。
+  ARM 用 A32 编码（`thumbv7em-*` 暂不支持，会被显式拒绝），除法用
+  `sdiv`/`mls`，因此需要 ARMv7-R/A（M 核没有硬件除法）。
+- **RISC-V 没有条件执行**：比较结果用 `seqz`/`slt` 显式物化；
+  除法余数固定写回 `a0`，需要一次搬运；常量用 `lui`+`addi` 拼装。
+- **运行时按目标分别构建**：`build.rs` 为每个可用目标产出
+  `libzrrt-<平台>.a`，编译器链接用户程序时按目标三元组自动选取；
+  缺少交叉工具链时该目标会被安静跳过（编译器本身不依赖运行时）。
+- **`-c` 产出目标文件**：三种原生容器都可直接交给平台链接器；
+  wasm 没有可重定位对象，`-c` 与链接等价。
 
 ### 设计参考
 
@@ -899,8 +945,9 @@ zr 编译器采用经典的多阶段架构：
 - [x] 借用检查器框架
 - [x] MIR / SSA 降级
 - [x] 优化 pass 框架
-- [x] x86-64 代码生成
-- [x] ELF 输出
+- [x] x86-64、AArch64、ARM32、RISC-V 32/64 代码生成
+- [x] ELF32 / ELF64 / Mach-O / PE-COFF / wasm 输出
+- [x] Linux / macOS / Windows × x86-64 / aarch64 + 裸机 ARM / RISC-V + wasm32
 - [x] 标准库（core / io / string / collections / async / error）
 
 ### v0.6.0（计划中） 🚧
@@ -912,7 +959,8 @@ zr 编译器采用经典的多阶段架构：
 
 ### v0.7.0（计划中） 📋
 - [ ] 增量编译
-- [ ] 交叉编译（AArch64 / RISC-V / WASM）
+- [ ] 更多架构（wasm64 / Thumb-2）与平台（FreeBSD / Android / iOS）
+- [ ] 32 位目标的多字长（i64）算术
 - [ ] 包管理器 `zr pkg`
 - [ ] 格式化器 `zr fmt`
 - [ ] 语言服务器（LSP）

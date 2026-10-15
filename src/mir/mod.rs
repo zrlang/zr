@@ -66,8 +66,8 @@ pub enum MirTerminator {
         then_block: usize,
         else_block: usize,
     },
-    /// 函数返回。
-    Return,
+    /// 函数返回（携带返回值；`None` 表示返回单元值）。
+    Return(Option<MirValue>),
     /// 不可达（发散调用 / `!` 类型）。
     Unreachable,
 }

@@ -1,15 +1,21 @@
 //! ELF 链接与文件格式构造。
 //!
-//! 产出 Linux x86-64 ELF64 可执行文件。ELF 结构：
+//! 覆盖 64 位（Linux x86-64 / aarch64、RISC-V 64）与 32 位
+//! （Linux x86、i386、ARM、Cortex-M、RISC-V 32）两类目标：
 //! ```text
-//! ELF Header (64B)
-//! Program Header (56B × n)   [仅可执行文件]
+//! ELF Header        (64B / 52B)
+//! Program Header    (56B / 32B × n)  [仅宿主平台的可执行文件]
 //! .shstrtab
-//! .text                     [R-X, 虚拟基址 0x400000]
-//! .rodata
-//! .data                     [RW-]
-//! Section Headers (64B × m)
+//! .text             [R-X]
+//! .rodata / .data
+//! .symtab / .strtab
+//! .rela.text        [仅对象文件]
+//! Section Headers   (64B / 40B × m)
 //! ```
+//!
+//! **裸机目标**（`arm-none-eabi`、`riscv32/64-unknown-none`）没有操作系统
+//! 加载器，因此不写 Program Header：`e_entry` 直接指向 `_start`，节地址
+//! 从 `image_base`（默认 0x08000000）开始，烧录工具 / 仿真器按节加载即可。
 //!
 //! 设计参考：
 //! - Rust：`rustc_codegen_llvm` 通过 LLVM 的 MC 层产出目标文件。
@@ -17,17 +23,16 @@
 //! - Python：`pyinstaller` 打包为可执行文件（思路类比）。
 //!
 //! 关键不变量：
-//! - `sh_addr`（以及 Program Header 的 `p_vaddr`/`p_paddr`）必须是**加载后的虚拟地址**，
-//!   而 `sh_offset` 是**文件内偏移**。两者绝不能混用。
-//! - 所有重定位（`call` 的 PC 相对偏移、绝对符号引用）必须在写出文件前应用，
-//!   否则生成的可执行文件在运行时会调用到地址 0。
+//! - `sh_addr`（以及 Program Header 的 `p_vaddr`/`p_paddr`）必须是**加载后
+//!   的虚拟地址**，而 `sh_offset` 是**文件内偏移**，两者绝不能混用。
+//! - 自构造可执行文件时重定位必须先回填；写成目标文件时则要输出
+//!   `.rela.text`，把修正工作交给平台链接器。
 
 use std::io::{self, Write};
 
-use crate::codegen::{CompilationUnit, Symbol, SymbolKind, SymbolSection};
-
-/// 进程虚拟基址。Linux x86-64 传统约定为 0x400000。
-const VIRT_BASE: u64 = 0x400000;
+use crate::codegen::objfile::{align_up, elf_reloc_type};
+use crate::codegen::target::{Os, Target};
+use crate::codegen::{CompilationUnit, OutputKind, Symbol, SymbolKind, SymbolSection};
 
 /// 页对齐（PT_LOAD 段必须按页对齐）。
 const PAGE_ALIGN: u64 = 0x1000;
@@ -35,125 +40,193 @@ const PAGE_ALIGN: u64 = 0x1000;
 /// 段对齐（段内数据按 16 字节对齐）。
 const SECT_ALIGN: u64 = 16;
 
+/// ELF32 / ELF64 的结构体尺寸。
+struct ElfClass {
+    ehsize: u64,
+    phentsize: u64,
+    phnum: u16,
+    shentsize: u64,
+    /// Sym64/Sym32 条目大小（`.symtab` 的 sh_entsize）。
+    sym_entsize: u64,
+    /// Rela64/Rela32 条目大小（`.rela.text` 的 sh_entsize）。
+    rela_entsize: u64,
+}
+
+const ELF64: ElfClass = ElfClass {
+    ehsize: 64,
+    phentsize: 56,
+    phnum: 3,
+    shentsize: 64,
+    sym_entsize: 24,
+    rela_entsize: 24,
+};
+const ELF32: ElfClass = ElfClass {
+    ehsize: 52,
+    phentsize: 32,
+    phnum: 3,
+    shentsize: 40,
+    sym_entsize: 16,
+    rela_entsize: 12,
+};
+
 /// 把编译产物组装为 ELF 字节流。
-pub fn assemble_elf(unit: &CompilationUnit) -> io::Result<Vec<u8>> {
+pub fn assemble_elf(target: &Target, unit: &CompilationUnit) -> io::Result<Vec<u8>> {
     let mut buf = Vec::new();
+
+    let is_64 = target.pointer_size() == 8;
+    let elf = if is_64 { &ELF64 } else { &ELF32 };
 
     let text = &unit.code;
     let data = &unit.data;
     let rodata = &unit.rodata;
 
-    // 构建符号表与字符串表（必须在计算偏移前完成）。
-    let (strtab, symtab) = build_symbol_tables(unit);
+    // 构建节名表、符号表与字符串表（必须在计算偏移前完成）。
+    let shstrtab = Shstrtab::build();
+    let (strtab, symtab) = build_symbol_tables(unit, is_64);
 
     // 可执行文件用虚拟地址布局；可重定位目标文件没有加载地址概念。
-    let is_exec = unit.kind == crate::codegen::OutputKind::Executable;
+    let is_exec = unit.kind == OutputKind::Executable;
+    // 裸机镜像没有加载器，不需要 Program Header。
+    let has_segments = is_exec && target.os() != Os::Bare;
+
+    // 目标文件需要 `.rela.text` 交给链接器应用重定位。
+    let rela = if is_exec { Vec::new() } else { build_rela(target, unit, is_64) };
 
     // ---------- 文件偏移布局 ----------
-    let e_phoff: u64 = 64; // ELF header 紧接 Program Header
-    let ph_size: u64 = if is_exec { 56 * 3 } else { 0 }; // text / rodata / data 三个 PT_LOAD
+    // 顺序：ELF 头 → Program Header → Section Header 表 → 各节数据。
+    // Section Header 表必须整块落在 .shstrtab 之前，否则会与节数据重叠。
+    let e_phoff: u64 = elf.ehsize; // ELF header 紧接 Program Header
+    let ph_size: u64 = if has_segments { elf.phentsize * elf.phnum as u64 } else { 0 };
+    let sh_off = align_up(e_phoff + ph_size, SECT_ALIGN);
 
     // 各段文件偏移
-    let shstrtab_off = align_up(64 + ph_size, SECT_ALIGN);
-    let text_off = align_up(shstrtab_off + shstrtab_len(), SECT_ALIGN);
+    let shstrtab_off = align_up(sh_off + (SECTION_COUNT as u64 * elf.shentsize), SECT_ALIGN);
+    let text_off = align_up(shstrtab_off + shstrtab.len(), SECT_ALIGN);
     let rodata_off = align_up(text_off + text.len() as u64, SECT_ALIGN);
     let data_off = align_up(rodata_off + rodata.len() as u64, SECT_ALIGN);
-    let symtab_off = align_up(data_off + data.len() as u64, SECT_ALIGN);
+    let rela_off = align_up(data_off + data.len() as u64, SECT_ALIGN);
+    let symtab_off = align_up(rela_off + rela.len() as u64, SECT_ALIGN);
     let strtab_off = align_up(symtab_off + symtab.len() as u64, SECT_ALIGN);
-    let sh_off = align_up(strtab_off + strtab.len() as u64, SECT_ALIGN);
 
     // ---------- 虚拟地址布局 ----------
     // 三个 PT_LOAD 段共享同一个虚拟基址起点（按页对齐）。
-    let text_vaddr = align_up(VIRT_BASE, PAGE_ALIGN);
+    let text_vaddr = align_up(target.image_base(), PAGE_ALIGN);
     let rodata_vaddr = align_up(text_vaddr + text.len() as u64, PAGE_ALIGN);
     let data_vaddr = align_up(rodata_vaddr + rodata.len() as u64, PAGE_ALIGN);
 
     // === ELF Header ===
-    buf.extend_from_slice(&[0x7f, b'E', b'L', b'F', 2, 1, 1, 0]); // ident
+    // ident: magic + 32/64 位标记 + 小端 + 版本
+    buf.extend_from_slice(&[0x7f, b'E', b'L', b'F', if is_64 { 2 } else { 1 }, 1, 1, 0]);
     buf.extend_from_slice(&[0; 8]); // padding
     let e_type: u16 = if is_exec { 2 } else { 1 };
     buf.extend_from_slice(&e_type.to_le_bytes());
-    buf.extend_from_slice(&[0x3e, 0]); // e_machine: EM_X86_64
+    buf.extend_from_slice(&target.arch().elf_machine().to_le_bytes());
     buf.extend_from_slice(&1u32.to_le_bytes()); // e_version
     let e_entry: u64 = if is_exec {
         text_vaddr + find_entry_offset(unit) as u64
     } else {
         0
     };
-    buf.extend_from_slice(&e_entry.to_le_bytes()); // e_entry
-    buf.extend_from_slice(&e_phoff.to_le_bytes()); // e_phoff
-    buf.extend_from_slice(&sh_off.to_le_bytes()); // e_shoff
-    buf.extend_from_slice(&0u32.to_le_bytes()); // e_flags
-    buf.extend_from_slice(&64u16.to_le_bytes()); // e_ehsize
-    buf.extend_from_slice(&56u16.to_le_bytes()); // e_phentsize
-    let phnum: u16 = if is_exec { 3 } else { 0 };
-    buf.extend_from_slice(&phnum.to_le_bytes()); // e_phnum
-    buf.extend_from_slice(&64u16.to_le_bytes()); // e_shentsize
+    let e_flags = target.arch().elf_flags();
+    // e_entry / e_phoff / e_shoff / e_flags：64 位用 8 字节，32 位用 4 字节
+    if is_64 {
+        buf.extend_from_slice(&e_entry.to_le_bytes());
+        buf.extend_from_slice(&e_phoff.to_le_bytes());
+        buf.extend_from_slice(&sh_off.to_le_bytes());
+        buf.extend_from_slice(&e_flags.to_le_bytes());
+    } else {
+        buf.extend_from_slice(&(e_entry as u32).to_le_bytes());
+        buf.extend_from_slice(&(e_phoff as u32).to_le_bytes());
+        buf.extend_from_slice(&(sh_off as u32).to_le_bytes());
+        buf.extend_from_slice(&e_flags.to_le_bytes());
+    }
+    // 两种 ELF 类的这 6 个字段都是 2 字节
+    buf.extend_from_slice(&(elf.ehsize as u16).to_le_bytes()); // e_ehsize
+    buf.extend_from_slice(&(elf.phentsize as u16).to_le_bytes()); // e_phentsize
+    buf.extend_from_slice(&phnum_of(elf, has_segments).to_le_bytes()); // e_phnum
+    buf.extend_from_slice(&(elf.shentsize as u16).to_le_bytes()); // e_shentsize
     buf.extend_from_slice(&(SECTION_COUNT as u16).to_le_bytes()); // e_shnum
     buf.extend_from_slice(&(SHN_SHSTRTAB as u16).to_le_bytes()); // e_shstrndx
 
-    // === Program Headers（仅可执行文件）===
-    if is_exec {
+    // === Program Headers（仅宿主平台的可执行文件）===
+    if has_segments {
         // PT_LOAD: .text (R-X, PF_R | PF_X = 0x5)
         write_program_header(
-            &mut buf, 1, 0x5, text_off, text_vaddr, text_vaddr,
+            &mut buf, is_64, 1, 0x5, text_off, text_vaddr, text_vaddr,
             text.len() as u64, text.len() as u64, PAGE_ALIGN,
         )?;
         // PT_LOAD: .rodata (R--, PF_R = 0x4)
         write_program_header(
-            &mut buf, 1, 0x4, rodata_off, rodata_vaddr, rodata_vaddr,
+            &mut buf, is_64, 1, 0x4, rodata_off, rodata_vaddr, rodata_vaddr,
             rodata.len() as u64, rodata.len() as u64, PAGE_ALIGN,
         )?;
         // PT_LOAD: .data (RW-, PF_R | PF_W = 0x6)
         write_program_header(
-            &mut buf, 1, 0x6, data_off, data_vaddr, data_vaddr,
+            &mut buf, is_64, 1, 0x6, data_off, data_vaddr, data_vaddr,
             data.len() as u64, data.len() as u64, PAGE_ALIGN,
         )?;
     }
 
     // === Section Headers ===
+    // 表整体落在 sh_off 处（必须先补齐到 16 字节边界）。
+    pad_to(&mut buf, sh_off as usize)?;
     // idx 0: NULL
-    write_section_header(&mut buf, 0, 0, 0, 0, 0, 0, 0, 0, 0)?;
+    write_section_header(&mut buf, is_64, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0)?;
+    let n_text = shstrtab.offset_of(".text");
+    let n_rodata = shstrtab.offset_of(".rodata");
+    let n_data = shstrtab.offset_of(".data");
+    let n_rela = shstrtab.offset_of(".rela.text");
+    let n_symtab = shstrtab.offset_of(".symtab");
+    let n_strtab = shstrtab.offset_of(".strtab");
+    let n_shstrtab = shstrtab.offset_of(".shstrtab");
+
     // idx 1: .text
     write_section_header(
-        &mut buf, SHN_TEXT, 1, 0x6, text_vaddr, text_off,
-        text.len() as u64, 0, 0, SECT_ALIGN,
+        &mut buf, is_64, n_text, 1, 0x6, text_vaddr, text_off,
+        text.len() as u64, 0, 0, SECT_ALIGN, 0,
     )?;
     // idx 2: .rodata
     write_section_header(
-        &mut buf, SHN_RODATA, 1, 0x2, rodata_vaddr, rodata_off,
-        rodata.len() as u64, 0, 0, SECT_ALIGN,
+        &mut buf, is_64, n_rodata, 1, 0x2, rodata_vaddr, rodata_off,
+        rodata.len() as u64, 0, 0, SECT_ALIGN, 0,
     )?;
     // idx 3: .data
     write_section_header(
-        &mut buf, SHN_DATA, 1, 0x3, data_vaddr, data_off,
-        data.len() as u64, 0, 0, SECT_ALIGN,
+        &mut buf, is_64, n_data, 1, 0x3, data_vaddr, data_off,
+        data.len() as u64, 0, 0, SECT_ALIGN, 0,
     )?;
-    // idx 4: .symtab
+    // idx 4: .rela.text
     write_section_header(
-        &mut buf, SHN_SYMTAB, 2, 0, 0, symtab_off,
-        symtab.len() as u64, SHN_STRTAB, 1, 8,
+        &mut buf, is_64, n_rela, SHT_RELA, 0, 0, rela_off,
+        rela.len() as u64, SHN_SYMTAB, SHN_TEXT, SECT_ALIGN, elf.rela_entsize,
     )?;
-    // idx 5: .strtab
+    // idx 5: .symtab
     write_section_header(
-        &mut buf, SHN_STRTAB, 3, 0, 0, strtab_off,
-        strtab.len() as u64, 0, 0, 1,
+        &mut buf, is_64, n_symtab, SHT_SYMTAB, 0, 0, symtab_off,
+        symtab.len() as u64, SHN_STRTAB, 1, 8, elf.sym_entsize,
     )?;
-    // idx 6: .shstrtab
+    // idx 6: .strtab
     write_section_header(
-        &mut buf, SHN_SHSTRTAB, 3, 0, 0, shstrtab_off,
-        shstrtab_len(), 0, 0, 1,
+        &mut buf, is_64, n_strtab, SHT_STRTAB, 0, 0, strtab_off,
+        strtab.len() as u64, 0, 0, 1, 0,
+    )?;
+    // idx 7: .shstrtab
+    write_section_header(
+        &mut buf, is_64, n_shstrtab, SHT_STRTAB, 0, 0, shstrtab_off,
+        shstrtab.len(), 0, 0, 1, 0,
     )?;
 
     // === 段数据 ===
     pad_to(&mut buf, shstrtab_off as usize)?;
-    buf.extend_from_slice(&shstrtab());
+    buf.extend_from_slice(&shstrtab.bytes);
     pad_to(&mut buf, text_off as usize)?;
     buf.extend_from_slice(text);
     pad_to(&mut buf, rodata_off as usize)?;
     buf.extend_from_slice(rodata);
     pad_to(&mut buf, data_off as usize)?;
     buf.extend_from_slice(data);
+    pad_to(&mut buf, rela_off as usize)?;
+    buf.extend_from_slice(&rela);
     pad_to(&mut buf, symtab_off as usize)?;
     buf.extend_from_slice(&symtab);
     pad_to(&mut buf, strtab_off as usize)?;
@@ -162,52 +235,25 @@ pub fn assemble_elf(unit: &CompilationUnit) -> io::Result<Vec<u8>> {
     Ok(buf)
 }
 
-/// 应用重定位后组装并写出 ELF。
+/// 应用重定位后组装并写出 ELF 可执行文件。
 ///
 /// 这是对外入口：先回填所有重定位（此时知道各符号的虚拟地址），
-/// 再写出文件。调用方负责打开文件。
-pub fn emit_elf(unit: &CompilationUnit, path: &std::path::Path) -> io::Result<()> {
-    // 先做一个可变的拷贝来应用重定位。重定位作用于 code 段，
-    // 且必须基于虚拟地址计算 PC 相对偏移。
+/// 再写出文件。
+pub fn emit_elf(target: &Target, unit: &CompilationUnit, path: &std::path::Path) -> io::Result<()> {
+    // 重定位作用于 code 段，且必须基于虚拟地址计算 PC 相对偏移。
     let mut unit = unit.clone();
-    apply_relocations(&mut unit);
-    let bytes = assemble_elf(&unit)?;
+    let text_base = align_up(target.image_base(), PAGE_ALIGN);
+    crate::codegen::objfile::apply_relocations(&mut unit, text_base);
+    let bytes = assemble_elf(target, &unit)?;
     std::fs::write(path, &bytes)
 }
 
-/// 对可重定位单元应用重定位（虚拟地址语义）。
-fn apply_relocations(unit: &mut CompilationUnit) {
-    use crate::codegen::RelocationKind;
-
-    // 符号名 → 虚拟地址（函数入口用 text_vaddr + offset；外部符号保留）。
-    let text_vaddr = if unit.kind == crate::codegen::OutputKind::Executable {
-        align_up(VIRT_BASE, PAGE_ALIGN)
+/// Program Header 的个数（无加载器的裸机镜像为 0）。
+fn phnum_of(elf: &ElfClass, has_segments: bool) -> u16 {
+    if has_segments {
+        elf.phnum
     } else {
         0
-    };
-
-    let sym_map: std::collections::HashMap<&str, u64> = unit
-        .symbols
-        .iter()
-        .filter(|s| s.section != crate::codegen::SymbolSection::Undefined)
-        .map(|s| (s.name.as_str(), text_vaddr + s.offset as u64))
-        .collect();
-
-    for reloc in &unit.relocations {
-        let Some(&target_va) = sym_map.get(reloc.symbol.as_str()) else {
-            // 外部符号：保留重定位条目交给链接器处理。
-            continue;
-        };
-        match reloc.kind {
-            RelocationKind::PcRel32 => {
-                // PC 相对：target - (instr_addr + instr_len)。
-                // reloc.offset 指向立即数字段的第一个字节，call 的 instr_addr = offset - 1。
-                let instr_addr = reloc.offset as i64 - 1;
-                let delta = (target_va as i64) - (instr_addr + 5);
-                let imm = (delta as i32).to_le_bytes();
-                unit.code[reloc.offset..reloc.offset + 4].copy_from_slice(&imm);
-            }
-        }
     }
 }
 
@@ -220,9 +266,11 @@ fn find_entry_offset(unit: &CompilationUnit) -> usize {
         .unwrap_or(0)
 }
 
-/// 写入一个 Program Header（56 字节）。
+/// 写入一个 Program Header（ELF64: 56 字节 / ELF32: 32 字节）。
+#[allow(clippy::too_many_arguments)]
 fn write_program_header<W: Write>(
     w: &mut W,
+    is_64: bool,
     p_type: u32,
     p_flags: u32,
     p_offset: u64,
@@ -234,18 +282,30 @@ fn write_program_header<W: Write>(
 ) -> io::Result<()> {
     w.write_all(&p_type.to_le_bytes())?;
     w.write_all(&p_flags.to_le_bytes())?;
-    w.write_all(&p_offset.to_le_bytes())?;
-    w.write_all(&p_vaddr.to_le_bytes())?;
-    w.write_all(&p_paddr.to_le_bytes())?;
-    w.write_all(&p_filesz.to_le_bytes())?;
-    w.write_all(&p_memsz.to_le_bytes())?;
-    w.write_all(&p_align.to_le_bytes())?;
+    if is_64 {
+        w.write_all(&p_offset.to_le_bytes())?;
+        w.write_all(&p_vaddr.to_le_bytes())?;
+        w.write_all(&p_paddr.to_le_bytes())?;
+        w.write_all(&p_filesz.to_le_bytes())?;
+        w.write_all(&p_memsz.to_le_bytes())?;
+        w.write_all(&p_align.to_le_bytes())?;
+    } else {
+        // ELF32 的地址与大小都是 4 字节，p_flags 也是 4 字节
+        w.write_all(&(p_offset as u32).to_le_bytes())?;
+        w.write_all(&(p_vaddr as u32).to_le_bytes())?;
+        w.write_all(&(p_paddr as u32).to_le_bytes())?;
+        w.write_all(&(p_filesz as u32).to_le_bytes())?;
+        w.write_all(&(p_memsz as u32).to_le_bytes())?;
+        w.write_all(&(p_align as u32).to_le_bytes())?;
+    }
     Ok(())
 }
 
-/// 写入一个 Section Header（64 字节）。
+/// 写入一个 Section Header（ELF64: 64 字节 / ELF32: 40 字节）。
+#[allow(clippy::too_many_arguments)]
 fn write_section_header<W: Write>(
     w: &mut W,
+    is_64: bool,
     sh_name: u32,
     sh_type: u32,
     sh_flags: u64,
@@ -255,42 +315,86 @@ fn write_section_header<W: Write>(
     sh_link: u32,
     sh_info: u32,
     sh_addralign: u64,
+    sh_entsize: u64,
 ) -> io::Result<()> {
     w.write_all(&sh_name.to_le_bytes())?;
     w.write_all(&sh_type.to_le_bytes())?;
-    w.write_all(&sh_flags.to_le_bytes())?;
-    w.write_all(&sh_addr.to_le_bytes())?;   // 虚拟地址，非文件偏移
-    w.write_all(&sh_offset.to_le_bytes())?; // 文件偏移
-    w.write_all(&sh_size.to_le_bytes())?;
-    w.write_all(&sh_link.to_le_bytes())?;
-    w.write_all(&sh_info.to_le_bytes())?;
-    w.write_all(&sh_addralign.to_le_bytes())?;
-    w.write_all(&0u64.to_le_bytes())?; // sh_entsize
+    if is_64 {
+        w.write_all(&sh_flags.to_le_bytes())?;
+        w.write_all(&sh_addr.to_le_bytes())?;   // 虚拟地址，非文件偏移
+        w.write_all(&sh_offset.to_le_bytes())?; // 文件偏移
+        w.write_all(&sh_size.to_le_bytes())?;
+        w.write_all(&sh_link.to_le_bytes())?;
+        w.write_all(&sh_info.to_le_bytes())?;
+        w.write_all(&sh_addralign.to_le_bytes())?;
+        w.write_all(&sh_entsize.to_le_bytes())?;
+    } else {
+        w.write_all(&(sh_flags as u32).to_le_bytes())?;
+        w.write_all(&(sh_addr as u32).to_le_bytes())?;
+        w.write_all(&(sh_offset as u32).to_le_bytes())?;
+        w.write_all(&(sh_size as u32).to_le_bytes())?;
+        w.write_all(&sh_link.to_le_bytes())?;
+        w.write_all(&sh_info.to_le_bytes())?;
+        w.write_all(&(sh_addralign as u32).to_le_bytes())?;
+        w.write_all(&(sh_entsize as u32).to_le_bytes())?;
+    }
     Ok(())
 }
 
-/// Section 索引常量。
+/// 节表条目数（含索引 0 的 NULL 节）。
+const SECTION_COUNT: usize = 8;
+/// 段类型：SHT_RELA / SHT_SYMTAB / SHT_STRTAB。
+const SHT_RELA: u32 = 4;
+const SHT_SYMTAB: u32 = 2;
+const SHT_STRTAB: u32 = 3;
+/// 节头 `sh_link` / `sh_info` 使用的节索引（0 为 NULL 节）。
 const SHN_TEXT: u32 = 1;
-const SHN_RODATA: u32 = 2;
-const SHN_DATA: u32 = 3;
-const SHN_SYMTAB: u32 = 4;
-const SHN_STRTAB: u32 = 5;
-const SHN_SHSTRTAB: u32 = 6;
-const SECTION_COUNT: usize = 7;
+const SHN_SYMTAB: u32 = 5;
+const SHN_STRTAB: u32 = 6;
+const SHN_SHSTRTAB: u32 = 7;
 
-/// `.shstrtab` 段内容（各段名）。
-fn shstrtab() -> Vec<u8> {
-    let mut b = vec![0]; // 首项为 NUL
-    for name in &[".text", ".rodata", ".data", ".symtab", ".strtab", ".shstrtab"] {
-        b.extend_from_slice(name.as_bytes());
-        b.push(0);
-    }
-    b
+/// 节名（节表按此顺序编号，索引 0 保留给 SHT_NULL）。
+const SECTION_NAMES: [&str; SECTION_COUNT - 1] = [
+    ".text",
+    ".rodata",
+    ".data",
+    ".rela.text",
+    ".symtab",
+    ".strtab",
+    ".shstrtab",
+];
+
+/// `.shstrtab` 段：保存节名，并记录每个名字在段内的偏移
+/// （节头的 `sh_name` 就是这个偏移，不能用节索引代替）。
+struct Shstrtab {
+    bytes: Vec<u8>,
 }
 
-/// `.shstrtab` 段长度。
-fn shstrtab_len() -> u64 {
-    shstrtab().len() as u64
+impl Shstrtab {
+    /// 构建节名表。
+    fn build() -> Self {
+        let mut bytes = vec![0]; // 首项为 NUL
+        for name in SECTION_NAMES {
+            bytes.extend_from_slice(name.as_bytes());
+            bytes.push(0);
+        }
+        Shstrtab { bytes }
+    }
+
+    /// 节名在 `.shstrtab` 中的偏移（名字不存在时返回 0）。
+    fn offset_of(&self, name: &str) -> u32 {
+        let needle: Vec<u8> = name.bytes().chain(std::iter::once(0)).collect();
+        self.bytes
+            .windows(needle.len())
+            .position(|w| w == needle.as_slice())
+            .map(|p| p as u32)
+            .unwrap_or(0)
+    }
+
+    /// `.shstrtab` 段长度。
+    fn len(&self) -> u64 {
+        self.bytes.len() as u64
+    }
 }
 
 /// 把缓冲区填充到指定长度（用零填充）。
@@ -301,15 +405,9 @@ fn pad_to(w: &mut Vec<u8>, target: usize) -> io::Result<()> {
     Ok(())
 }
 
-/// 按对齐要求向上取整（要求 `align` 为 2 的幂，否则行为未定义）。
-fn align_up(addr: u64, align: u64) -> u64 {
-    debug_assert!(align.is_power_of_two(), "align must be a power of two");
-    (addr + align - 1) & !(align - 1)
-}
-
 /// 把符号转为 ELF 符号表条目（供 `.symtab` 使用）。
 /// `name_offset` 是符号名在 `.strtab` 中的偏移。
-fn symbol_to_elf(sym: &Symbol, name_offset: u32) -> Vec<u8> {
+fn symbol_to_elf(sym: &Symbol, name_offset: u32, is_64: bool) -> Vec<u8> {
     let mut b = Vec::new();
     // st_name
     b.extend_from_slice(&name_offset.to_le_bytes());
@@ -323,27 +421,36 @@ fn symbol_to_elf(sym: &Symbol, name_offset: u32) -> Vec<u8> {
     // st_other
     b.push(0);
     // st_shndx
+    // SHN_TEXT = 1（节表索引 0 保留给 SHT_NULL）。
     let shndx = match sym.section {
-        SymbolSection::Text => SHN_TEXT as u16,
+        SymbolSection::Text => 1u16,
         SymbolSection::Undefined => 0,
     };
     b.extend_from_slice(&shndx.to_le_bytes());
     // st_value
-    b.extend_from_slice(&(sym.offset as u64).to_le_bytes());
+    if is_64 {
+        b.extend_from_slice(&(sym.offset as u64).to_le_bytes());
+    } else {
+        b.extend_from_slice(&(sym.offset as u32).to_le_bytes());
+    }
     // st_size
-    b.extend_from_slice(&(sym.size as u64).to_le_bytes());
+    if is_64 {
+        b.extend_from_slice(&(sym.size as u64).to_le_bytes());
+    } else {
+        b.extend_from_slice(&(sym.size as u32).to_le_bytes());
+    }
     b
 }
 
 /// 构建 `.strtab`（符号名字符串表）和 `.symtab`（符号表）数据。
 ///
 /// 返回 (strtab_bytes, symtab_bytes)。
-fn build_symbol_tables(unit: &CompilationUnit) -> (Vec<u8>, Vec<u8>) {
+fn build_symbol_tables(unit: &CompilationUnit, is_64: bool) -> (Vec<u8>, Vec<u8>) {
     let mut strtab: Vec<u8> = vec![0]; // 首项为 NUL
     let mut symtab: Vec<u8> = Vec::new();
 
     // ELF 要求 symtab[0] 是一个全零的未定义符号。
-    symtab.extend_from_slice(&[0u8; 24]);
+    symtab.extend_from_slice(if is_64 { &[0u8; 24] } else { &[0u8; 16] });
 
     for sym in &unit.symbols {
         // 将符号名追加到 strtab
@@ -351,8 +458,177 @@ fn build_symbol_tables(unit: &CompilationUnit) -> (Vec<u8>, Vec<u8>) {
         strtab.extend_from_slice(sym.name.as_bytes());
         strtab.push(0);
         // 生成符号表条目
-        symtab.extend_from_slice(&symbol_to_elf(sym, name_offset));
+        symtab.extend_from_slice(&symbol_to_elf(sym, name_offset, is_64));
     }
 
     (strtab, symtab)
+}
+
+/// 构建 `.rela.text`（重定位表，仅目标文件需要）。
+///
+/// 每项 24 字节：`r_offset`（字段在 `.text` 中的偏移）、`r_info`
+/// （符号表索引 << 32 | 类型）、`r_addend`。
+fn build_rela(target: &Target, unit: &CompilationUnit, is_64: bool) -> Vec<u8> {
+    // 符号表索引 0 保留（未定义），因此第 i 个符号对应索引 i + 1。
+    let symbol_index = |name: &str| -> u64 {
+        unit.symbols
+            .iter()
+            .position(|s| s.name == name)
+            .map(|i| i as u64 + 1)
+            .unwrap_or(0)
+    };
+
+    let entry = if is_64 { 24 } else { 12 };
+    let mut out = Vec::with_capacity(unit.relocations.len() * entry);
+    for reloc in &unit.relocations {
+        let sym = symbol_index(&reloc.symbol) as u32;
+        let rtype = elf_reloc_type(target.arch(), reloc.kind);
+        if is_64 {
+            out.extend_from_slice(&(reloc.offset as u64).to_le_bytes());
+            out.extend_from_slice(&((u64::from(sym) << 32) | u64::from(rtype)).to_le_bytes());
+            out.extend_from_slice(&reloc.addend.to_le_bytes());
+        } else {
+            // ELF32 的 r_info 是 32 位：符号号占高 24 位，类型占低 8 位
+            out.extend_from_slice(&(reloc.offset as u32).to_le_bytes());
+            out.extend_from_slice(&((sym << 8) | rtype).to_le_bytes());
+            out.extend_from_slice(&(reloc.addend as i32).to_le_bytes());
+        }
+    }
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::codegen::target::{Arch, Os};
+
+    fn target() -> Target {
+        Target::new(Arch::X86_64, Os::Linux)
+    }
+
+    fn sample_unit(kind: OutputKind) -> CompilationUnit {
+        let mut unit = CompilationUnit::new();
+        unit.kind = kind;
+        unit.code = vec![0xe8, 0, 0, 0, 0]; // call rel32
+        unit.symbols.push(Symbol {
+            name: "main".to_string(),
+            section: SymbolSection::Text,
+            offset: 0,
+            size: 5,
+            global: true,
+            kind: SymbolKind::Function,
+        });
+        unit
+    }
+
+    #[test]
+    fn executable_has_elf_magic_and_entry() {
+        let unit = sample_unit(OutputKind::Executable);
+        let bytes = assemble_elf(&target(), &unit).unwrap();
+        assert_eq!(&bytes[..4], b"\x7fELF");
+        assert_eq!(bytes[4], 2, "EI_CLASS = 64 位");
+        assert_eq!(bytes[5], 1, "EI_DATA = 小端");
+        assert_eq!(u16::from_le_bytes(bytes[16..18].try_into().unwrap()), 2, "ET_EXEC");
+        assert_eq!(u16::from_le_bytes(bytes[18..20].try_into().unwrap()), 62, "EM_X86_64");
+        // e_entry 落在 .text 的虚拟地址范围内
+        let entry = u64::from_le_bytes(bytes[24..32].try_into().unwrap());
+        assert_eq!(entry, 0x400000);
+        assert_eq!(u16::from_le_bytes(bytes[56..58].try_into().unwrap()), 3, "e_phnum（text/rodata/data）");
+    }
+
+    #[test]
+    fn machine_field_matches_architecture() {
+        for (arch, expected) in [(Arch::X86_64, 62u16), (Arch::AArch64, 183u16)] {
+            let t = Target::new(arch, Os::Linux);
+            let bytes = assemble_elf(&t, &sample_unit(OutputKind::Executable)).unwrap();
+            let machine = u16::from_le_bytes(bytes[18..20].try_into().unwrap());
+            assert_eq!(machine, expected, "{arch:?}");
+        }
+    }
+
+    #[test]
+    fn relocatable_object_emits_rela_entries() {
+        let mut unit = sample_unit(OutputKind::Relocatable);
+        unit.relocations.push(crate::codegen::Relocation::new(
+            1,
+            0,
+            5,
+            "main",
+            crate::codegen::RelocationKind::PcRel32,
+        ));
+        let bytes = assemble_elf(&target(), &unit).unwrap();
+        assert_eq!(u16::from_le_bytes(bytes[16..18].try_into().unwrap()), 1, "ET_REL");
+        assert_eq!(u16::from_le_bytes(bytes[56..58].try_into().unwrap()), 0, "e_phnum");
+        assert_eq!(u16::from_le_bytes(bytes[60..62].try_into().unwrap()), 8, "e_shnum");
+
+        // .rela.text 数据里应能找到一条指向 main 的重定位
+        let rela = build_rela(&target(), &unit, true);
+        assert_eq!(rela.len(), 24);
+        assert_eq!(u64::from_le_bytes(rela[0..8].try_into().unwrap()), 1, "字段偏移");
+        let info = u64::from_le_bytes(rela[8..16].try_into().unwrap());
+        assert_eq!(info & 0xffff_ffff, 4, "R_X86_64_PLT32");
+        assert_eq!(info >> 32, 1, "symtab[1] = main");
+    }
+
+    #[test]
+    fn section_header_table_does_not_overlap_section_data() {
+        let unit = sample_unit(OutputKind::Executable);
+        let bytes = assemble_elf(&target(), &unit).unwrap();
+        let e_shoff = u64::from_le_bytes(bytes[40..48].try_into().unwrap()) as usize;
+        let e_shnum = u16::from_le_bytes(bytes[60..62].try_into().unwrap()) as usize;
+        let e_shentsize = u16::from_le_bytes(bytes[58..60].try_into().unwrap()) as usize;
+
+        // 节头表必须完整落在文件内
+        assert!(e_shoff + e_shnum * e_shentsize <= bytes.len());
+
+        // 每个节的 [sh_offset, sh_offset + sh_size) 都必须落在文件内，
+        // 且不与节头表重叠。
+        let text_off = e_shoff + e_shentsize; // idx 1 = .text
+        let (sh_offset, sh_size) = (
+            u64::from_le_bytes(bytes[text_off + 24..text_off + 32].try_into().unwrap()) as usize,
+            u64::from_le_bytes(bytes[text_off + 32..text_off + 40].try_into().unwrap()) as usize,
+        );
+        assert!(sh_offset + sh_size <= bytes.len(), ".text 超出文件末尾");
+        assert!(sh_offset >= e_shoff + e_shnum * e_shentsize, ".text 与节头表重叠");
+
+        // sh_name 必须指向 .shstrtab 中的真实名字（不能是节索引）
+        let shstrndx = u16::from_le_bytes(bytes[62..64].try_into().unwrap()) as usize;
+        let strtab_header = e_shoff + shstrndx * e_shentsize;
+        let strtab_off = u64::from_le_bytes(bytes[strtab_header + 24..strtab_header + 32].try_into().unwrap()) as usize;
+        let name_off = u32::from_le_bytes(bytes[text_off..text_off + 4].try_into().unwrap()) as usize;
+        let name_end = bytes[strtab_off + name_off..]
+            .iter()
+            .position(|b| *b == 0)
+            .expect("节名应以 NUL 结尾");
+        let name = std::str::from_utf8(&bytes[strtab_off + name_off..strtab_off + name_off + name_end]).unwrap();
+        assert_eq!(name, ".text");
+    }
+
+    #[test]
+    fn emitted_executable_applies_internal_relocations() {
+        let dir = std::env::temp_dir().join("zr-elf-test");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("a.out");
+        let mut unit = sample_unit(OutputKind::Executable);
+        unit.symbols.push(Symbol {
+            name: "_start".to_string(),
+            section: SymbolSection::Text,
+            offset: 0,
+            size: 5,
+            global: true,
+            kind: SymbolKind::Function,
+        });
+        unit.entry = "_start".to_string();
+        unit.relocations.push(crate::codegen::Relocation::new(
+            1,
+            0,
+            5,
+            "main",
+            crate::codegen::RelocationKind::PcRel32,
+        ));
+        emit_elf(&target(), &unit, &path).unwrap();
+        let bytes = std::fs::read(&path).unwrap();
+        assert_eq!(&bytes[..4], b"\x7fELF");
+        let _ = std::fs::remove_file(&path);
+    }
 }

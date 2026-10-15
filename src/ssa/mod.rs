@@ -207,7 +207,18 @@ fn convert_function(func: &mir::MirFunction) -> SsaFunction {
             }
         }
 
-        let term = convert_terminator(&block.term, &next_value);
+        // 返回值可能是一条尚未物化的常量：先补 Const 指令，再终结。
+        let term = match &block.term {
+            mir::MirTerminator::Return(Some(mir::MirValue::Int(i))) => {
+                let v = alloc();
+                instrs.push(SsaInstr::Const {
+                    result: v,
+                    value: SsaConst::Int(*i),
+                });
+                SsaTerminator::Return(Some(v))
+            }
+            other => convert_terminator(other, &next_value),
+        };
         blocks.push(SsaBasicBlock {
             id: block.id,
             instrs,
@@ -301,9 +312,14 @@ fn convert_terminator(term: &MirTerminator, next_value: &Cell<u32>) -> SsaTermin
             then_block: *then_block,
             else_block: *else_block,
         },
-        MirTerminator::Return => {
-            SsaTerminator::Return(None)
-        }
+        // 整数字面量由调用方补一条 Const 指令后直接引用；
+        // 其余值按变量名映射到稳定的 SSA 值。
+        MirTerminator::Return(value) => SsaTerminator::Return(
+            value
+                .as_ref()
+                .filter(|v| !matches!(v, mir::MirValue::Unit))
+                .map(|v| value_to_ssa(v, next_value)),
+        ),
         MirTerminator::Unreachable => SsaTerminator::Unreachable,
     }
 }

@@ -29,7 +29,7 @@ use std::env;
 use std::path::Path;
 use std::process::ExitCode;
 
-use crate::codegen::CompilationUnit;
+use crate::codegen::target::{Arch, ObjectFormat, Os, Target};
 use crate::opt::OptLevel;
 
 fn main() -> ExitCode {
@@ -45,8 +45,10 @@ fn main() -> ExitCode {
     };
 
     if cmd.version {
+        let host = Target::host();
         println!("zr {}", env!("CARGO_PKG_VERSION"));
-        println!("host: x86_64-unknown-linux-gnu");
+        println!("host: {} ({})", host.triple(), host.format().name());
+        println!("targets: {}", Target::supported_triples().join(", "));
         return ExitCode::SUCCESS;
     }
 
@@ -95,6 +97,8 @@ struct Cli {
     emit_llvm: bool,
     no_link: bool,
     target: String,
+    /// 输出 WebAssembly 文本（WAT）而不是二进制模块。
+    wat: bool,
     /// 生成 DWARF 调试信息。
     debug_info: bool,
     help: bool,
@@ -124,6 +128,7 @@ impl Cli {
                 "--dump-ssa" => cli.dump_ssa = true,
                 "--dump-asm" => cli.dump_asm = true,
                 "--emit-llvm" => cli.emit_llvm = true,
+                "--wat" => cli.wat = true,
                 "-c" => cli.no_link = true,
                 "--target" => {
                     i += 1;
@@ -167,6 +172,7 @@ fn print_usage(prog: &str) {
     println!("    -O0..-O3, -Oz       Optimization level");
     println!("    -c                  Compile only, do not link");
     println!("    --target <triple>   Target triple (default: host)");
+    println!("    --wat               Emit WebAssembly text (wasm32 only)");
     println!("    --dump-tokens      Dump lexer output");
     println!("    --dump-ast          Dump AST");
     println!("    --dump-hir          Dump HIR");
@@ -180,6 +186,16 @@ fn print_usage(prog: &str) {
 
 /// 编译单个文件。
 fn compile(input: &str, cmd: &Cli) -> Result<(), String> {
+    // 0. 解析目标三元组（缺省为宿主平台）
+    let target = resolve_target(&cmd.target)?;
+    if !target.is_supported() {
+        return Err(format!(
+            "unsupported target '{}'; supported targets are: {}",
+            cmd.target,
+            Target::supported_triples().join(", ")
+        ));
+    }
+
     // 1. 读取源文件
     let source = std::fs::read_to_string(input)
         .map_err(|e| format!("cannot read '{input}': {e}"))?;
@@ -229,31 +245,36 @@ fn compile(input: &str, cmd: &Cli) -> Result<(), String> {
 
     // 7.5 发射 LLVM IR（若指定 --emit-llvm）
     if cmd.emit_llvm {
-        let ir = emit_llvm_ir(&ssa_module);
+        let ir = emit_llvm_ir(&target, &ssa_module);
         std::fs::write(&cmd.output, ir)
             .map_err(|e| format!("cannot write LLVM IR to '{}': {e}", cmd.output.display()))?;
         return Ok(());
     }
 
-    // 7.6 目标选择：wasm32 使用 wasm 后端
-    if cmd.target == "wasm32" {
+    // 7.6 目标选择：wasm32 走栈式字节码后端
+    if target.format() == ObjectFormat::Wasm {
         let wasm = codegen::wasm::WasmModule::from_ssa(&ssa_module);
-        let wat = wasm.to_wat();
-        std::fs::write(&cmd.output, wat)
-            .map_err(|e| format!("cannot write WAT to '{}': {e}", cmd.output.display()))?;
+        let bytes: Vec<u8> = if cmd.wat {
+            wasm.to_wat().into_bytes()
+        } else {
+            wasm.to_binary()
+        };
+        let out = output_with_extension(Path::new(&cmd.output), &target);
+        std::fs::write(&out, bytes)
+            .map_err(|e| format!("cannot write wasm to '{}': {e}", out.display()))?;
         return Ok(());
     }
 
-    // 8. 代码生成
-    let unit: CompilationUnit = codegen::compile(&ssa_module);
+    // 8. 代码生成（按目标架构选择指令后端）
+    let unit = codegen::compile(&target, &ssa_module)?;
 
-    // 8.5 反汇编输出（--dump-asm）
+    // 8.5 机器码转储（--dump-asm）
     if cmd.dump_asm {
-        println!("=== Assembly (x86_64 machine code) ===");
+        println!("=== Machine code ({}) ===", target.describe());
         for (i, chunk) in unit.code.chunks(16).enumerate() {
             let hex: String = chunk
                 .iter()
-                .map(|b| format!("{:02x}", b))
+                .map(|b| format!("{b:02x}"))
                 .collect::<Vec<_>>()
                 .join(" ");
             println!("  {:04x}:  {}", i * 16, hex);
@@ -262,18 +283,62 @@ fn compile(input: &str, cmd: &Cli) -> Result<(), String> {
 
     // 9. 输出目标文件 / 可执行文件
     if cmd.no_link {
-        write_obj(&unit, &cmd.output)?;
+        codegen::emit_object(&target, &unit, Path::new(&cmd.output))
+            .map_err(|e| format!("object writer: {e}"))?;
     } else {
-        codegen::emit_elf(&unit, Path::new(&cmd.output))
-            .map_err(|e| format!("linker: {e}"))?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&cmd.output, std::fs::Permissions::from_mode(0o755))
-                .ok();
-        }
+        codegen::emit_executable(&target, &unit, Path::new(&cmd.output)).map_err(|e| {
+            format!("linker: {e}\nnote: {}", codegen::runtime_diagnostic(&target))
+        })?;
+        make_executable(Path::new(&cmd.output), &target)?;
     }
 
+    Ok(())
+}
+
+/// 解析 `--target`（空串表示宿主平台）。
+fn resolve_target(triple: &str) -> Result<Target, String> {
+    if triple.is_empty() {
+        Ok(Target::host())
+    } else {
+        Target::parse(triple)
+    }
+}
+
+/// 为没有扩展名的输出路径补上平台约定（`app` → `app.exe` / `app.wasm`）。
+fn output_with_extension(path: &Path, target: &Target) -> std::path::PathBuf {
+    match path.extension() {
+        Some(_) => path.to_path_buf(),
+        None => {
+            let ext = target.exe_extension();
+            if ext.is_empty() {
+                path.to_path_buf()
+            } else {
+                let mut name = path.as_os_str().to_os_string();
+                name.push(ext);
+                std::path::PathBuf::from(name)
+            }
+        }
+    }
+}
+
+/// 标记产物可执行。
+///
+/// POSIX 需要 `+x` 位；Windows 的 PE 依赖文件扩展名，不需要权限位。
+/// 两套写法按平台条件编译，保证每个平台只引用自己存在的 API。
+fn make_executable(path: &Path, target: &Target) -> Result<(), String> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if target.os() != Os::Win && path.exists() {
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755))
+                .map_err(|e| format!("cannot mark '{}' executable: {e}", path.display()))?;
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        // 非 Unix 宿主：Windows 产物无需权限位，wasm 模块由宿主加载。
+        let _ = (path, target);
+    }
     Ok(())
 }
 
@@ -282,16 +347,18 @@ fn compile(input: &str, cmd: &Cli) -> Result<(), String> {
 /// 该发射器把 SSA 指令映射为接近 LLVM IR 的文本表示，便于调试与
 /// 对接外部 LLVM 工具链。类型信息做了保守降级（整数统一为 i64，
 /// 浮点为 double，指针为 i8*）。
-fn emit_llvm_ir(module: &ssa::SsaModule) -> String {
+fn emit_llvm_ir(target: &Target, module: &ssa::SsaModule) -> String {
     use ssa::{SsaBinaryOp, SsaInstr, SsaTerminator, SsaUnaryOp};
 
+    let ptr = target.pointer_size();
+    let datalayout = format!("e-m:e-i{ptr}:{ptr}-f80:128-n8:16:32:64-S128");
     let mut out = String::new();
     out.push_str("; Module generated by zr compiler (LLVM IR emission)\n");
-    out.push_str("target datalayout = \"e-m:e-p270:32:32-p271:32:32-p272:64:64-i64:64-f80:128-n8:16:32:64-S128\"\n");
-    out.push_str("target triple = \"x86_64-unknown-linux-gnu\"\n\n");
+    out.push_str(&format!("target datalayout = \"{datalayout}\"\n"));
+    out.push_str(&format!("target triple = \"{}\"\n\n", target.llvm_triple()));
 
     for func in &module.functions {
-        let ret_ty = "i64";
+        let ret_ty = if target.arch() == Arch::Wasm32 { "i32" } else { "i64" };
         let params: Vec<String> = func
             .params
             .iter()
@@ -403,16 +470,6 @@ fn emit_llvm_ir(module: &ssa::SsaModule) -> String {
     }
 
     out
-}
-
-#[allow(clippy::unnecessary_wraps)]
-fn write_obj(_unit: &CompilationUnit, output: &Path) -> Result<(), String> {
-    // 目标文件格式（ELF relocatable）尚未实现，暂回退为写入裸机器码。
-    Err(format!(
-        "incremental compilation not implemented yet (-c to {}); \
-         falling back to full link",
-        output.display()
-    ))
 }
 
 #[cfg(test)]
