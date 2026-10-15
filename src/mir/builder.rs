@@ -11,26 +11,43 @@ use crate::mir::{
     MirTerminator, MirUnaryOp, MirValue,
 };
 use crate::typeck::hir::{self, HirBlock, HirExpr, HirStmt, HirFunction};
+use std::collections::HashMap;
 
 /// 降级单个函数。
-pub fn lower_function(func: &HirFunction, body: &HirBlock) -> MirFunction {
-    let mut b = Builder::new(func.name.clone());
+pub fn lower_function(
+    func: &HirFunction,
+    body: &HirBlock,
+    def_names: &std::collections::HashMap<hir::DefId, String>,
+) -> MirFunction {
+    let mut b = Builder::new(func.name.clone(), def_names.clone());
 
-    // 参数
-    for _p in &func.params {
-        let name = format!("arg_{}", b.param_names.len());
-        b.param_names.push(name);
+    // 参数：先登记参数名，再分配入口块后把 `arg_N` 写进参数对应的局部
+    // 变量。类型检查阶段已经把参数绑定成了局部变量，函数体里引用的是
+    // 局部名，所以这里必须补一条显式赋值，否则参数永远读不到值。
+    for i in 0..func.params.len() {
+        b.param_names.push(format!("arg_{i}"));
     }
 
     // 分配入口块
     let entry = b.new_block();
     b.current = entry;
 
+    for (i, p) in func.params.iter().enumerate() {
+        b.current_block_mut().instrs.push(MirInstr::Assign(
+            format!("v{}", p.local.0),
+            MirValue::Var(format!("arg_{i}")),
+        ));
+    }
+
     // 降级函数体
     let tail = lower_block(&mut b, body);
 
     // 终结入口块：尾表达式的值即函数返回值。
-    b.current_block_mut().term = MirTerminator::Return(tail);
+    // 已经有终结符（函数体里写了显式的 `return`）就不要覆盖。
+    if b.current_block_mut().term.is_none() {
+        b.current_block_mut().term = Some(MirTerminator::Return(tail));
+    }
+    
 
     // 把收集到的块按分配顺序落盘
     MirFunction {
@@ -115,27 +132,28 @@ fn lower_expr(b: &mut Builder, expr: &HirExpr) -> MirValue {
         Block(block) => lower_block(b, block).unwrap_or(MirValue::Unit),
         If(cond, then_block, else_block) => {
             let c = lower_expr(b, cond);
-            let _ = c;
             let then_bb = b.new_block();
             let else_bb = b.new_block();
             let join = b.new_block();
 
-            b.current_block_mut().term = MirTerminator::Branch {
+            b.current_block_mut().term = Some(MirTerminator::Branch {
+                cond: c,
                 then_block: then_bb,
                 else_block: else_bb,
-            };
+            });
 
-            // then
+            // 分支体里可能已经用 `return` 终结了块，这时不能再补 `goto join`
+            //（否则会把 return 覆盖掉，分支体里的返回永远到不了）。
             b.current = then_bb;
             let _then_val = lower_block(b, then_block);
-            b.current_block_mut().term = MirTerminator::Goto(join);
+            b.terminate_if_open(MirTerminator::Goto(join));
 
             // else
             b.current = else_bb;
             if let Some(eb) = else_block {
                 let _ = lower_block(b, eb);
             }
-            b.current_block_mut().term = MirTerminator::Goto(join);
+            b.terminate_if_open(MirTerminator::Goto(join));
 
             b.current = join;
             MirValue::Unit
@@ -145,18 +163,18 @@ fn lower_expr(b: &mut Builder, expr: &HirExpr) -> MirValue {
             let body_bb = b.new_block();
             let exit = b.new_block();
 
-            b.current_block_mut().term = MirTerminator::Goto(header);
+            b.current_block_mut().term = Some(MirTerminator::Goto(header));
             b.current = header;
             let c = lower_expr(b, cond);
-            let _ = c;
-            b.current_block_mut().term = MirTerminator::Branch {
+            b.current_block_mut().term = Some(MirTerminator::Branch {
+                cond: c,
                 then_block: body_bb,
                 else_block: exit,
-            };
+            });
 
             b.current = body_bb;
             let _ = lower_block(b, body);
-            b.current_block_mut().term = MirTerminator::Goto(header);
+            b.terminate_if_open(MirTerminator::Goto(header));
 
             b.current = exit;
             MirValue::Unit
@@ -164,16 +182,16 @@ fn lower_expr(b: &mut Builder, expr: &HirExpr) -> MirValue {
         Loop(body) => {
             let head = b.new_block();
             let exit = b.new_block();
-            b.current_block_mut().term = MirTerminator::Goto(head);
+            b.current_block_mut().term = Some(MirTerminator::Goto(head));
             b.current = head;
             let _ = lower_block(b, body);
-            b.current_block_mut().term = MirTerminator::Goto(head);
+            b.current_block_mut().term = Some(MirTerminator::Goto(head));
             b.current = exit;
             MirValue::Unit
         }
         Return(v) => {
             let rv = v.as_ref().map(|e| lower_expr(b, e));
-            b.current_block_mut().term = MirTerminator::Return(rv.clone());
+            b.current_block_mut().term = Some(MirTerminator::Return(rv.clone()));
             rv.unwrap_or(MirValue::Unit)
         }
         Await(future) => {
@@ -183,8 +201,24 @@ fn lower_expr(b: &mut Builder, expr: &HirExpr) -> MirValue {
             b.current_block_mut().instrs.push(MirInstr::Await(name.clone(), f));
             MirValue::Var(name)
         }
+        Call { callee, args, result } => {
+            let name = format!("v{}", result.0);
+            let fn_name = b
+                .functions
+                .get(callee)
+                .cloned()
+                .unwrap_or_else(|| "<unknown>".to_string());
+            let mut mir_args = Vec::with_capacity(args.len());
+            for a in args {
+                mir_args.push(lower_expr(b, a));
+            }
+            b.current_block_mut()
+                .instrs
+                .push(MirInstr::Call(name.clone(), fn_name, mir_args));
+            MirValue::Var(name)
+        }
         _ => {
-            // 其他表达式（Call/Match/For/Struct 等）骨架阶段降级为占位
+            // 其他表达式（Match/For/Struct 等）骨架阶段降级为占位
             MirValue::Unit
         }
     }
@@ -246,16 +280,26 @@ struct Builder {
     current: usize,
     param_names: Vec<String>,
     next_temp: u32,
+    /// DefId → 函数名（由降级入口注入）。
+    functions: HashMap<hir::DefId, String>,
 }
 
 impl Builder {
-    fn new(name: String) -> Self {
+    fn new(name: String, functions: HashMap<hir::DefId, String>) -> Self {
         let _ = name;
         Self {
             blocks: Vec::new(),
             current: 0,
             param_names: Vec::new(),
             next_temp: 0,
+            functions,
+        }
+    }
+
+    /// 只在当前块还没有终结符时补一个。
+    fn terminate_if_open(&mut self, term: MirTerminator) {
+        if self.current_block_mut().term.is_none() {
+            self.current_block_mut().term = Some(term);
         }
     }
 
@@ -264,7 +308,8 @@ impl Builder {
         self.blocks.push(MirBasicBlock {
             id,
             instrs: Vec::new(),
-            term: MirTerminator::Unreachable,
+            // 新建的块还没终结；函数体收尾时会补默认 Return。
+            term: None,
         });
         id
     }

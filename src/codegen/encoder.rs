@@ -56,6 +56,9 @@ const SCRATCH_DX: Gpr = Gpr::Rdx;
 /// 可用于分配的 GPR（不含 RSP/RBP 栈指针/帧指针，也不含三个暂存器）。
 /// 注意：R12–R15 属于 callee-save，此处仅作为通用分配池，
 /// 真实实现应在函数序言/尾声中保存/恢复 callee-save 寄存器。
+/// SysV AMD64 调用约定的整数实参寄存器（前 6 个）。
+const ARG_REGS: [Gpr; 6] = [Gpr::Rdi, Gpr::Rsi, SCRATCH_DX, SCRATCH_CX, Gpr::R8, Gpr::R9];
+
 const ALLOCATABLE: [Gpr; 10] = [
     Gpr::Rsi, Gpr::Rdi, Gpr::R8, Gpr::R9, Gpr::R10, Gpr::R11, Gpr::R12, Gpr::R13, Gpr::R14, Gpr::R15,
 ];
@@ -138,9 +141,14 @@ pub fn emit_function(target: &Target, unit: &mut CompilationUnit, func: &SsaFunc
 /// 发射一条 SSA 指令。
 fn emit_instr(unit: &mut CompilationUnit, instr: &SsaInstr) {
     match instr {
-        SsaInstr::Const { result, value } => emit_const(unit, *result, *value),
+        SsaInstr::Const { result, value } => emit_const(unit, *result, value.clone()),
         SsaInstr::Binary { result, op, lhs, rhs } => emit_binary(unit, *result, *op, *lhs, *rhs),
         SsaInstr::Unary { result, op, operand } => emit_unary(unit, *result, *op, *operand),
+        SsaInstr::Call { result, callee, args } => {
+            emit_call_args(unit, args);
+            emit_call(unit, callee);
+            emit_mov_rr(unit, alloc_reg(*result), SCRATCH_AX);
+        }
         SsaInstr::Var { .. } => {
             // Var 是 φ 合并前的引用，运行时无需动作
         }
@@ -158,7 +166,29 @@ fn emit_const(unit: &mut CompilationUnit, result: SsaValue, value: SsaConst) {
             emit1(unit, 0xb8 + dst.bits());
             emit8(unit, i as u64);
         }
+        // bool / unit 在通用寄存器里就是 0/1；浮点与字符串后端暂未实现
+        SsaConst::Bool(b) => emit_const_bool(unit, dst.bits(), b),
+        SsaConst::Unit => emit_const_int(unit, dst.bits(), 0),
+        SsaConst::Float(_) | SsaConst::Str(_) => emit_const_int(unit, dst.bits(), 0),
     }
+}
+
+/// 用 mov 立即数加载一个小整数（0/1 之类）。
+fn emit_const_int(unit: &mut CompilationUnit, dst: u8, value: u64) {
+    if value == 0 {
+        // xor reg, reg —— 比 mov 短，且不破坏标志位
+        emit1(unit, 0x31);
+        emit1(unit, 0xc0 | (dst << 3) | dst);
+    } else {
+        emit1(unit, 0x48 | if dst >= 8 { 0x04 } else { 0x00 });
+        emit1(unit, 0xb8 + (dst & 7));
+        emit8(unit, value);
+    }
+}
+
+/// 加载布尔常量。
+fn emit_const_bool(unit: &mut CompilationUnit, dst: u8, value: bool) {
+    emit_const_int(unit, dst, u64::from(value));
 }
 
 /// 发射二元运算。
@@ -317,19 +347,31 @@ fn emit_test_rr(unit: &mut CompilationUnit, a: Gpr, b: Gpr) {
 }
 
 /// `cmp r64, r64`：REX.W + 0x39 /r  (39 = MR, reg=src, r/m=dst; 计算 dst - src)
+/// `cmp a, b`（比较 `a - b`，结果只体现在标志位里）。
+///
+/// 0x39 是 Intel 的 `cmp r/m64, r64`，算的是 `r/m - reg`；AT&T 又把
+/// 操作数反过来打印。所以要让 `a` 作被减数，ModRM 的 **rm 字段必须放 a、
+/// reg 字段放 b**——写反就变成 `b - a`，`>` / `<` 会整体反掉。
 fn emit_cmp_rr(unit: &mut CompilationUnit, a: Gpr, b: Gpr) {
     let mut rex = 0x48u8;
-    if a.rex_bit() { rex |= 0x04; }
-    if b.rex_bit() { rex |= 0x01; }
+    if b.rex_bit() { rex |= 0x04; } // REX.R <- reg 字段（b）
+    if a.rex_bit() { rex |= 0x01; } // REX.B <- rm  字段（a）
     emit1(unit, rex);
     emit1(unit, 0x39);
-    modrm(unit, 3, a.bits(), b.bits());
+    modrm(unit, 3, b.bits(), a.bits());
 }
 
 /// `setcc r8`：0x0F 0x9x + ModR/M(r/m=reg, mod=3)
 /// `cc` 是 0x90 + 条件码。
 fn emit_setcc(unit: &mut CompilationUnit, cc: u8, dst: Gpr) {
     // 0x0F 0x90+cc; ModR/M: mod=3, reg=0, r/m=dst
+    //
+    // REX 前缀是**必须**的：没有 REX 时 0F 90-9F 这一段被解释成
+    // `xchg` / `nop` / `pause` 等等，根本不是 setcc。加上 REX.B 才能
+    // 正确扩展到 r8-r15。
+    let mut rex = 0x40u8;
+    if dst.rex_bit() { rex |= 0x01; }
+    emit1(unit, rex);
     emit2(unit, 0x0f, cc);
     modrm(unit, 3, 0, dst.bits());
 }
@@ -337,12 +379,58 @@ fn emit_setcc(unit: &mut CompilationUnit, cc: u8, dst: Gpr) {
 /// `movzx r64, r8`：REX.W + 0x0F 0xB6 /r
 /// 把源寄存器的 8 位结果零扩展到 64 位。
 fn emit_movzx(unit: &mut CompilationUnit, dst: Gpr, src: Gpr) {
+    // Intel `movzx r32, r/m8`（0F B6 /r）：**reg 字段是 32 位目的，
+    // r/m 字段是 8 位源**。写反会变成把 dst 的低字节搬进 src。
     let mut rex = 0x48u8;
-    if src.rex_bit() { rex |= 0x04; }
-    if dst.rex_bit() { rex |= 0x01; }
+    if dst.rex_bit() { rex |= 0x04; } // REX.R <- reg 字段（dst）
+    if src.rex_bit() { rex |= 0x01; } // REX.B <- rm  字段（src）
     emit1(unit, rex);
     emit2(unit, 0x0f, 0xb6);
-    modrm(unit, 3, src.bits(), dst.bits());
+    modrm(unit, 3, dst.bits(), src.bits());
+}
+
+/// 按 SysV AMD64 约定把实参搬进 rdi/rsi/rdx/rcx/r8/r9。
+///
+/// 这是一次**并行搬运**：目标集合和源集合可能重叠，顺序执行会互相
+/// 覆盖（先 `mov rdi, rsi` 再 `mov rsi, rdi`，两步读到的都是已被改写
+/// 的值，调用方会拿到 `add(20, 20)` 而不是 `add(20, 22)`）。
+///
+/// 做法是标准的平行搬运消环：反复挑一个"目标不再被任何人读取"的
+/// 搬运先执行；如果一个都挑不出来（说明存在环），就把某个环上的源
+/// 暂存到 rax（rax 不是实参寄存器），把环打开后继续。
+fn emit_call_args(unit: &mut CompilationUnit, args: &[SsaValue]) {
+    let n = args.len().min(ARG_REGS.len());
+    let mut moves: Vec<(Gpr, Gpr)> = Vec::new();
+    for i in 0..n {
+        let src = alloc_reg(args[i]);
+        if src != ARG_REGS[i] {
+            moves.push((ARG_REGS[i], src));
+        }
+    }
+    // 超过 6 个的实参走栈上传参区，本后端尚未实现。
+
+    while !moves.is_empty() {
+        // 目标不再被任何待执行的搬运读取 -> 可以安全执行
+        let safe = moves.iter().position(|(dst, _)| {
+            !moves.iter().any(|(_, src)| src == dst)
+        });
+        match safe {
+            Some(at) => {
+                let (dst, src) = moves.remove(at);
+                emit_mov_rr(unit, dst, src);
+            }
+            None => {
+                // 存在环：把第一个搬运的源暂存到 rax，把环打开
+                let src = moves[0].1;
+                emit_mov_rr(unit, SCRATCH_AX, src);
+                for m in moves.iter_mut() {
+                    if m.1 == src {
+                        m.1 = SCRATCH_AX;
+                    }
+                }
+            }
+        }
+    }
 }
 
 /// `call rel32`：0xE8 + imm32（需重定位）。
@@ -451,11 +539,14 @@ fn emit_mul(unit: &mut CompilationUnit, dst: Gpr, l: Gpr, r: Gpr) {
         emit_mov_rr(unit, dst, l);
     }
     let mut rex = 0x48u8;
-    if r.rex_bit() { rex |= 0x04; }
-    if dst.rex_bit() { rex |= 0x01; }
+    // `imul r/m64, reg64`（REX.W 0F AF /r）的 reg 字段是**目的**、
+    // r/m 字段是源，所以 REX.R 取自 dst、REX.B 取自 r——和 `mov r64,r64`
+    // （89 /r，reg=源）的 REX 归属正好相反，弄反会读到错误的寄存器。
+    if dst.rex_bit() { rex |= 0x04; }
+    if r.rex_bit() { rex |= 0x01; }
     emit1(unit, rex);
     emit2(unit, 0x0f, 0xaf);
-    modrm(unit, 3, r.bits(), dst.bits());
+    modrm(unit, 3, dst.bits(), r.bits());
 }
 
 /// 有符号除法 / 取模：`idiv r/m64`（REX.W + 0xF7 /7）。

@@ -46,12 +46,21 @@ use crate::lexer::{Token, TokenKind, Span};
 pub struct Parser {
     tokens: Vec<Token>,
     pos: usize,
+    /// 正在解析 `if` / `while` 的条件：此时禁用结构体字面量。
+    ///
+    /// `if x { ... }` 里的 `{` 必须是条件体块，不能被当成结构体字面量
+    /// 的起始（Rust 的 "no struct literal in condition position" 规则）。
+    no_struct_literal: bool,
 }
 
 impl Parser {
     /// 创建解析器。
     pub fn new(tokens: Vec<Token>) -> Self {
-        Self { tokens, pos: 0 }
+        Self {
+            tokens,
+            pos: 0,
+            no_struct_literal: false,
+        }
     }
 
     /// 解析整个编译单元。
@@ -312,6 +321,12 @@ impl Parser {
             } else if self.check(&TokenKind::RBrace) {
                 tail = Some(Box::new(expr));
                 break;
+            } else if is_block_like(&expr) {
+                // `if` / `match` / `while` / `for` / `loop` / `{ ... }` 这些
+                // 自带块的表达式在语句位置不需要分号（和 Rust 一致）。
+                // 必须继续解析本块的后续语句，否则 `if c { .. } 下一句;`
+                // 会把后面的语句当成"块外"的垃圾，报 "expected '}'"。
+                stmts.push(Statement::Expr(expr, Span::unknown()));
             } else {
                 // 裸表达式当作尾表达式
                 tail = Some(Box::new(expr));
@@ -392,6 +407,23 @@ impl Parser {
         }
     }
 
+    /// 路径段：标识符，**或者**被当作标识符的关键字。
+    ///
+    /// 模块名可以撞上关键字（标准库里的 `async` 就是一例），所以
+    /// `use async::{spawn}` 必须能解析——关键字在路径位置退化成标识符。
+    fn consume_path_segment(&mut self, msg: &str) -> Result<String> {
+        if let TokenKind::Ident(name) = &self.peek().kind {
+            let n = name.clone();
+            self.advance();
+            return Ok(n);
+        }
+        if let Some(kw) = self.peek().kind.keyword_text() {
+            self.advance();
+            return Ok(kw.to_string());
+        }
+        Err(self.expected(msg, &TokenKind::Ident(String::new())))
+    }
+
     fn is_at_end(&self) -> bool {
         self.pos >= self.tokens.len() || self.peek().kind == TokenKind::Eof
     }
@@ -416,6 +448,19 @@ impl Parser {
         .with_kind(ErrorKind::Parse)
         .with_span(span)
     }
+}
+
+/// 判断表达式是否"自带块"——这类表达式在语句位置可以省略分号。
+fn is_block_like(expr: &Expression) -> bool {
+    matches!(
+        expr,
+        Expression::If(..)
+            | Expression::Match(..)
+            | Expression::While(..)
+            | Expression::For(..)
+            | Expression::Loop(..)
+            | Expression::Block(..)
+    )
 }
 
 #[cfg(test)]

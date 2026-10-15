@@ -234,7 +234,17 @@ impl<'a> Lexer<'a> {
 
             // ===== 字符串 / 字符 =====
             '"' => return self.read_string(start + 1, line, col),
-            '\'' => return self.read_char(start + 1, line, col),
+            '\'' => {
+                // `'` 后面跟标识符且不是紧跟的 `'` -> 生命周期（`&'static str`）
+                if self.pos < self.src.len()
+                    && (self.src[self.pos].is_alphabetic() || self.src[self.pos] == '_')
+                {
+                    if let Some(tok) = self.read_lifetime(start, line, col) {
+                        return tok;
+                    }
+                }
+                return self.read_char(start + 1, line, col);
+            }
 
             // ===== 数字 =====
             '0'..='9' => return self.read_number(start, line, col),
@@ -444,6 +454,32 @@ impl<'a> Lexer<'a> {
         }
         self.advance(); // 消费闭合 "
         Token::new(TokenKind::StringLiteral(value), Span::new(start, self.pos, line, col))
+    }
+
+    /// 尝试把 `'xxx` 读成生命周期。
+    ///
+    /// 形态是 `'` + 标识符 + **不是** `'`。`'a'` 是字符字面量，
+    /// `'static` 是生命周期——靠标识符后面跟的是逗号/空格/尖括号等来区分。
+    fn read_lifetime(&mut self, start: usize, line: usize, col: usize) -> Option<Token> {
+        let mut end = self.pos;
+        while end < self.src.len()
+            && (self.src[end].is_alphanumeric() || self.src[end] == '_')
+        {
+            end += 1;
+        }
+        if end == self.pos {
+            return None; // `'3'` 之类：标识符没开始，仍按字符字面量处理
+        }
+        // `'a'` 是字符字面量：标识符后面紧跟闭合引号就放弃生命周期的解释
+        if end < self.src.len() && self.src[end] == '\'' {
+            return None;
+        }
+        let name: String = self.src[self.pos..end].iter().collect();
+        self.pos = end;
+        Some(Token::new(
+            TokenKind::Lifetime(name),
+            Span::new(start, self.pos, line, col),
+        ))
     }
 
     /// 读取字符字面量。

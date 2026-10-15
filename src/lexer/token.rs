@@ -73,6 +73,8 @@ pub enum TokenKind {
     KwAwait,
     /// `yield`
     KwYield,
+    /// 生命周期：`'static`、`'a`。与字符字面量靠词法形态区分。
+    Lifetime(String),
     /// `spawn`
     KwSpawn,
     /// `comptime`
@@ -282,5 +284,69 @@ impl Token {
 impl fmt::Display for Token {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(&format!("{:?}", self.kind))
+    }
+}
+
+impl TokenKind {
+    /// 关键字变体对应的源码文本。
+    ///
+    /// 词法器把关键字收成独立变体后，源码原文就丢了；但 `use async::{…}`
+    /// 这类路径段需要把关键字还原成标识符拼进模块名，所以这里按
+    /// 词法器的关键字表逐条列出来。
+    pub fn keyword_text(&self) -> Option<&'static str> {
+        match self {
+            TokenKind::KwFn => Some("fn"),
+            TokenKind::KwLet => Some("let"),
+            TokenKind::KwConst => Some("const"),
+            TokenKind::KwVar => Some("var"),
+            TokenKind::KwMut => Some("mut"),
+            TokenKind::KwIf => Some("if"),
+            TokenKind::KwElse => Some("else"),
+            TokenKind::KwMatch => Some("match"),
+            TokenKind::KwWhile => Some("while"),
+            TokenKind::KwFor => Some("for"),
+            TokenKind::KwLoop => Some("loop"),
+            TokenKind::KwBreak => Some("break"),
+            TokenKind::KwContinue => Some("continue"),
+            TokenKind::KwReturn => Some("return"),
+            TokenKind::KwDefer => Some("defer"),
+            TokenKind::KwTry => Some("try"),
+            TokenKind::KwCatch => Some("catch"),
+            TokenKind::KwThrow => Some("throw"),
+            TokenKind::KwAsync => Some("async"),
+            TokenKind::KwAwait => Some("await"),
+            TokenKind::KwYield => Some("yield"),
+            TokenKind::KwSpawn => Some("spawn"),
+            TokenKind::KwComptime => Some("comptime"),
+            TokenKind::KwDefault => Some("default"),
+            TokenKind::KwGoto => Some("goto"),
+            TokenKind::KwStruct => Some("struct"),
+            TokenKind::KwEnum => Some("enum"),
+            TokenKind::KwUnion => Some("union"),
+            TokenKind::KwTrait => Some("trait"),
+            TokenKind::KwImpl => Some("impl"),
+            TokenKind::KwType => Some("type"),
+            TokenKind::KwWhere => Some("where"),
+            TokenKind::KwPub => Some("pub"),
+            TokenKind::KwMod => Some("mod"),
+            TokenKind::KwUse => Some("use"),
+            TokenKind::KwAs => Some("as"),
+            TokenKind::KwSelf => Some("self"),
+            TokenKind::KwUpperSelf => Some("Self"),
+            TokenKind::KwSuper => Some("super"),
+            TokenKind::KwTrue => Some("true"),
+            TokenKind::KwFalse => Some("false"),
+            TokenKind::KwVoid => Some("void"),
+            TokenKind::KwAnytype => Some("anytype"),
+            TokenKind::KwAuto => Some("auto"),
+            TokenKind::KwIn => Some("in"),
+            TokenKind::KwIs => Some("is"),
+            TokenKind::KwRef => Some("ref"),
+            TokenKind::KwStatic => Some("static"),
+            TokenKind::KwExtern => Some("extern"),
+            TokenKind::KwCrate => Some("crate"),
+            TokenKind::KwAnyerror => Some("anyerror"),
+            _ => None,
+        }
     }
 }

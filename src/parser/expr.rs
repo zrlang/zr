@@ -374,13 +374,26 @@ impl Parser {
                 }
                 return Ok(Expression::Path(path, span));
             }
-            // 结构体字面量：`Point { x: 1, y: 2 }`
-            // 仅当 `{` 后紧跟「标识符 :」时才视为结构体字面量，
-            // 避免与 `if cond { ... }` 的块语法冲突。
-            if self.check(&TokenKind::LBrace)
-                && self.peek_n(1).map(|t| matches!(t.kind, TokenKind::Ident(_))).unwrap_or(false)
-                && self.peek_n(2).map(|t| t.kind == TokenKind::Colon).unwrap_or(false)
-            {
+            // 结构体字面量：`Point { x: 1, y: 2 }` 或简写 `Point { x, y }`。
+            // `{` 后紧跟「标识符」且其后是 `:` 或 `,`/`}` 时才认定，
+            // 避免和块语法冲突；`if` / `while` 条件位置由
+            // `no_struct_literal` 额外禁用。
+            let looks_like_struct = !self.no_struct_literal
+                && self.check(&TokenKind::LBrace)
+                && self
+                    .peek_n(1)
+                    .map(|t| matches!(t.kind, TokenKind::Ident(_)))
+                    .unwrap_or(false)
+                && self
+                    .peek_n(2)
+                    .map(|t| {
+                        matches!(
+                            t.kind,
+                            TokenKind::Colon | TokenKind::Comma | TokenKind::RBrace
+                        )
+                    })
+                    .unwrap_or(false);
+            if looks_like_struct {
                 self.advance(); // {
                 return self.parse_struct_literal(vec![n], span);
             }
@@ -434,7 +447,7 @@ impl Parser {
         &mut self,
     ) -> Result<(Box<Expression>, Block, Option<Box<Expression>>, Span), CompileError> {
         let span = self.previous().span;
-        let cond = Box::new(self.parse_expression()?);
+        let cond = Box::new(self.parse_condition()?);
         let then = self.parse_block()?;
         let else_branch = if self.match_kind(&TokenKind::KwElse) {
             if self.check(&TokenKind::KwIf) {
@@ -493,7 +506,7 @@ impl Parser {
         &mut self,
     ) -> Result<(Box<Expression>, Block, Option<Block>, Span), CompileError> {
         let span = self.previous().span;
-        let cond = Box::new(self.parse_expression()?);
+        let cond = Box::new(self.parse_condition()?);
         let body = self.parse_block()?;
         let else_body = if self.match_kind(&TokenKind::KwElse) {
             Some(self.parse_block()?)
@@ -557,21 +570,27 @@ impl Parser {
         Ok(Expression::Array(elems, repeat, span))
     }
 
+    /// 解析 `if` / `while` 的条件表达式：禁用结构体字面量。
+    fn parse_condition(&mut self) -> Result<Expression, CompileError> {
+        let saved = self.no_struct_literal;
+        self.no_struct_literal = true;
+        let cond = self.parse_expression();
+        self.no_struct_literal = saved;
+        cond
+    }
     fn parse_struct_literal(&mut self, path: Vec<String>, span: Span) -> Result<Expression, CompileError> {
         let mut fields = Vec::new();
-        if !self.check(&TokenKind::RBrace) {
+        while !self.check(&TokenKind::RBrace) && !self.is_at_end() {
             let name = self.consume_ident("expected field name")?;
-            self.consume(&TokenKind::Colon, "expected ':' after field name")?;
-            let value = self.parse_expression()?;
+            // 字段简写：`Point { x, y }` 等价于 `Point { x: x, y: y }`
+            let value = if self.match_kind(&TokenKind::Colon) {
+                self.parse_expression()?
+            } else {
+                Expression::Variable(name.clone(), span)
+            };
             fields.push((name, value));
-            while self.match_kind(&TokenKind::Comma) {
-                if self.check(&TokenKind::RBrace) {
-                    break;
-                }
-                let n = self.consume_ident("expected field name")?;
-                self.consume(&TokenKind::Colon, "expected ':' after field name")?;
-                let v = self.parse_expression()?;
-                fields.push((n, v));
+            if !self.match_kind(&TokenKind::Comma) {
+                break;
             }
         }
         self.consume(&TokenKind::RBrace, "expected '}'")?;
@@ -748,7 +767,6 @@ impl Parser {
         self.tokens[self.pos - 2].kind == TokenKind::Comma
     }
 }
-
 #[cfg(test)]
 mod tests {
     use super::*;

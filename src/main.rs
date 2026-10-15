@@ -378,6 +378,12 @@ fn emit_llvm_ir(target: &Target, module: &ssa::SsaModule) -> String {
                     SsaInstr::Const { result, value } => {
                         let v = match value {
                             ssa::SsaConst::Int(i) => i.to_string(),
+                            ssa::SsaConst::Bool(b) => (i64::from(*b)).to_string(),
+                            ssa::SsaConst::Unit => "0".to_string(),
+                            ssa::SsaConst::Float(bits) => format!("0x{bits:016x}"),
+                            ssa::SsaConst::Str(text) => {
+                                format!("c\"{}\"", text.replace('\\', "\\\\").replace('"', "\\\""))
+                            }
                         };
                         out.push_str(&format!("  %{} = add i64 0, {}\n", result.id(), v));
                     }
@@ -434,6 +440,17 @@ fn emit_llvm_ir(target: &Target, module: &ssa::SsaModule) -> String {
                             op_str,
                             lhs.id(),
                             rhs.id()
+                        ));
+                    }
+                    ssa::SsaInstr::Call { result, callee, args } => {
+                        let a: Vec<String> =
+                            args.iter().map(|v| format!("%{}", v.id())).collect();
+                        out.push_str(&format!(
+                            "  %{} = call {} {}({})\n",
+                            result.id(),
+                            callee,
+                            "i64",
+                            a.join(", ")
                         ));
                     }
                     SsaInstr::Var { result, name } => {

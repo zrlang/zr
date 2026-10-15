@@ -9,12 +9,15 @@
 //!
 //! HIR 是后续 MIR 降级、借用检查、模式穷尽性检查、闭包转换的输入。
 
-use crate::parser::ast::{Abi, Attribute, Span};
+pub use crate::parser::ast::{Abi, Attribute, Span};
+use std::collections::HashMap;
 
 /// 一个 HIR 程序（已通过类型检查）。
 #[derive(Debug, Clone, Default)]
 pub struct HirModule {
     pub functions: Vec<HirFunction>,
+    /// DefId → 定义名（MIR 降级时用来把调用还原成符号名）。
+    pub def_names: HashMap<DefId, String>,
 }
 
 // ======================================================================
@@ -162,7 +165,12 @@ pub enum ExprKind {
     /// 赋值（含复合赋值，已脱糖为普通赋值）。
     Assign(Box<HirExpr>, Box<HirExpr>),
     /// 函数调用（含方法调用，已确定 receiver 与方法）。
-    Call,
+    /// 函数调用：`callee(args...)`，`callee` 是 `ExprKind::Def`。
+    Call {
+        callee: DefId,
+        args: Vec<HirExpr>,
+        result: LocalId,
+    },
     /// 字段访问（含元组索引）。
     Field(Box<HirExpr>),
     /// 解引用。
@@ -310,8 +318,8 @@ pub enum HirPattern {
     Wildcard,
     /// 字面量模式。
     Literal,
-    /// 绑定（绑定到局部变量）。
-    Binding,
+    /// 绑定（绑定到局部变量，携带它对应的 LocalId）。
+    Binding(LocalId),
     /// 元组模式。
     Tuple,
     /// 结构体模式。
@@ -367,11 +375,21 @@ pub struct HirFunction {
     pub params: Vec<HirParam>,
     pub return_type: Ty,
     pub body: Option<HirBlock>,
+    /// 是否 `async fn`。
+    pub is_async: bool,
+    /// 调用约定 / ABI（保留字段，后端按目标选择调用约定时使用）。
+    #[allow(dead_code)]
+    pub abi: Abi,
 }
 
 /// HIR 参数。
 #[derive(Debug, Clone)]
-pub struct HirParam;
+pub struct HirParam {
+    /// 参数对应的局部变量。
+    pub local: LocalId,
+    /// 参数类型（用于构造函数的类型）。
+    pub ty: Ty,
+}
 
 /// HIR 类型定义。
 #[derive(Debug, Clone)]

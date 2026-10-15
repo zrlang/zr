@@ -58,6 +58,13 @@ pub struct TypeChecker {
     scope_depth: usize,
     /// 作用域栈：每层记录在该层引入的局部变量。
     scope_stack: Vec<Vec<LocalId>>,
+    /// 词法作用域栈：每层是"名字 → DefId"的绑定表。
+    ///
+    /// 与 `scope_stack` 同步 push/pop，用于把源码里的标识符解析到
+    /// 对应的局部变量（shadowing 时内层遮蔽外层）。
+    local_scopes: Vec<HashMap<String, DefId>>,
+    /// DefId → LocalId：区分"这个 DefId 其实是局部变量"。
+    locals_by_def: HashMap<DefId, LocalId>,
     /// 当前函数 ID（用于 return 检查）。
     current_function: Option<DefId>,
     /// 错误集合（延迟报告，允许错误恢复）。
@@ -86,6 +93,8 @@ impl Default for TypeChecker {
             next_bb: 0,
             scope_depth: 0,
             scope_stack: Vec::new(),
+            local_scopes: Vec::new(),
+            locals_by_def: HashMap::new(),
             current_function: None,
             errors: Vec::new(),
             use_aliases: HashMap::new(),
@@ -141,7 +150,10 @@ impl TypeChecker {
             return Err(self.errors.remove(0));
         }
 
-        Ok(hir::HirModule { functions })
+        Ok(hir::HirModule {
+            functions,
+            def_names: self.def_names.clone(),
+        })
     }
 
     // ==================================================================
@@ -158,6 +170,8 @@ impl TypeChecker {
                     params: Vec::new(),
                     return_type: Ty::Infer(InferId(0)),
                     body: None,
+                    is_async: item.is_async,
+                    abi: hir::Abi::Zr,
                 },
             );
         }
@@ -554,7 +568,11 @@ impl TypeChecker {
             // 检查 receiver
             if let Some(recv) = &f.receiver {
                 let local = self.alloc_local();
-                let self_ty = Ty::Named(id, Vec::new()); // 占位：实际应是 impl 的目标类型
+                // 显式接收者类型优先（`self: &mut Self`），否则退回 impl 目标
+                let self_ty = match &recv.ty {
+                    Some(t) => self.ast_to_hir_type(t)?,
+                    None => Ty::Named(id, Vec::new()),
+                };
                 let ty = match recv.mutability {
                     ast::Mutability::Mutable => Ty::Reference(Box::new(self_ty), hir::Mutability::Mutable),
                     ast::Mutability::Immutable => Ty::Reference(Box::new(self_ty), hir::Mutability::Immutable),
@@ -567,12 +585,11 @@ impl TypeChecker {
             let mut params = Vec::new();
             for p in &f.params {
                 let ty = self.ast_to_hir_type(&p.ty)?;
-                let local = self.alloc_local();
-                self.locals.insert(local, ty.clone());
-                self.infer.locals.insert(local, ty.clone());
-                self.scope_stack.last_mut().unwrap().push(local);
-                let _ = self.lower_pattern(&p.pattern, &ty)?;
-                params.push(hir::HirParam);
+                // 参数模式本身会负责绑定名字（`n` / `mut n` / 复杂模式）
+                let pat = self.lower_pattern(&p.pattern, &ty)?;
+                let local = first_binding(&pat)
+                    .unwrap_or_else(|| self.alloc_local());
+                params.push(hir::HirParam { local, ty: ty.clone() });
             }
 
             // 检查函数体
@@ -597,11 +614,14 @@ impl TypeChecker {
         for s in &b.stmts {
             stmts.push(self.check_stmt(s)?);
         }
+        let diverges = block_diverges(b);
         let tail = if let Some(t) = &b.tail {
             let e = self.check_expr(t, expected)?;
             self.infer.subtype(&e.ty, expected, t.span())
                 .map_err(|e| self.errors.push(e)).ok();
             Some(Box::new(e))
+        } else if diverges {
+            None
         } else if !matches!(expected, Ty::Unit | Ty::Never) && !self.current_returns() {
             // 块缺少尾部表达式，但期望非空类型
             self.errors.push(CompileError::type_error(format!(
@@ -641,10 +661,10 @@ impl TypeChecker {
                 } else {
                     None
                 };
-                let local = self.alloc_local();
-                self.locals.insert(local, ty.clone());
-                self.infer.locals.insert(local, ty.clone());
-                self.scope_stack.last_mut().unwrap().push(local);
+                let hir_pat = self.lower_pattern(&_pat, &ty)?;
+                // 非绑定模式（通配 / 字面量 / 元组）没有单个可引用的名字，
+                // 用一个匿名局部占位，保证 `HirStmt::Let` 的形状不变。
+                let local = first_binding(&hir_pat).unwrap_or_else(|| self.alloc_local());
                 Ok(HirStmt::Let {
                     local,
                     init: init_hir,
@@ -699,7 +719,6 @@ impl TypeChecker {
             Expression::Variable(name, _) => {
                 let id = self.resolve_name(name, span)?;
                 if let Some(local) = self.as_local(id) {
-                    let _ty = self.locals.get(&local).cloned().unwrap_or(Ty::Infer(InferId(0)));
                     ExprKind::Local(local)
                 } else {
                     ExprKind::Def(id)
@@ -830,6 +849,16 @@ impl TypeChecker {
                     self.unify_or(&t, &e)
                 } else {
                     Ty::Unit
+                };
+                // 两个分支都是发散的（都以 `return` / `throw` 结束）时，
+                // `if` 本身的值是 never：它既不产生值也不正常返回。
+                // 没有这一条，`fn f() -> i32 { if c { return 1; } else { return 2; } }`
+                // 里的 `if` 作为尾表达式会被拿去和 i32 统一，报类型不匹配。
+                let ty = if then_hir.tail.is_none() && else_hir.as_ref().is_some_and(|b| b.tail.is_none())
+                {
+                    Ty::Never
+                } else {
+                    ty
                 };
                 return Ok(HirExpr { kind: ExprKind::If(Box::new(c), then_hir, else_hir), ty, span });
             }
@@ -1005,8 +1034,40 @@ impl TypeChecker {
                 });
             }
         };
-        let ty = self.infer.fresh_infer(span);
+        // 走到这里的表达式大多已经自己算好了类型；只有引用（局部变量 /
+        // 全局定义）需要在这里补上——之前统一发一个全新的推断变量，导致
+        // `fn f(n: i64) -> i64 { n }` 里的 `n` 退化成 `_`。
+        let ty = match &kind {
+            ExprKind::Local(local) => self
+                .locals
+                .get(local)
+                .cloned()
+                .unwrap_or(Ty::Infer(InferId(0))),
+            ExprKind::Def(id) => self.def_type(*id).unwrap_or(Ty::Infer(InferId(0))),
+            _ => self.infer.fresh_infer(span),
+        };
         Ok(HirExpr { kind, ty, span })
+    }
+
+    /// 全局定义（函数 / 常量 / 静态 / 类型别名）的类型。
+    fn def_type(&self, id: DefId) -> Option<Ty> {
+        // 函数名的类型是**函数类型**而不是返回类型——否则
+        // `add(1, 2)` 会报 "cannot call non-function type `i32`"。
+        if let Some(f) = self.functions.get(&id) {
+            return Some(Ty::Function {
+                params: f.params.iter().map(|p| p.ty.clone()).collect(),
+                ret: Box::new(f.return_type.clone()),
+                is_async: f.is_async,
+                abi: hir::Abi::Zr,
+            });
+        }
+        if let Some(c) = self.consts.get(&id) {
+            return Some(c.ty.clone());
+        }
+        if let Some(s) = self.statics.get(&id) {
+            return Some(s.ty.clone());
+        }
+        None
     }
 
     // ==================================================================
@@ -1067,6 +1128,7 @@ impl TypeChecker {
                 .with_span(span));
             }
         };
+        let mut hir_args = Vec::with_capacity(args.len());
         for (i, arg) in args.iter().enumerate() {
             let a = match arg {
                 ast::Argument::Pos(e) => e,
@@ -1077,9 +1139,27 @@ impl TypeChecker {
                 }
             };
             let param_ty = param_tys.get(i).cloned().unwrap_or_else(|| Ty::Infer(InferId(0)));
-            let _ = self.check_expr(a, &param_ty)?;
+            hir_args.push(self.check_expr(a, &param_ty)?);
         }
-        Ok(HirExpr { kind: ExprKind::Call, ty: ret_ty, span })
+        // 被调函数用一个 DefId 指明；间接调用（通过函数指针）暂不支持。
+        let callee_def = match callee_hir.kind {
+            ExprKind::Def(id) => id,
+            _ => {
+                return Err(CompileError::type_error(
+                    "only direct calls to named functions are supported",
+                )
+                .with_span(span));
+            }
+        };
+        Ok(HirExpr {
+            kind: ExprKind::Call {
+                callee: callee_def,
+                args: hir_args,
+                result: self.alloc_local(),
+            },
+            ty: ret_ty,
+            span,
+        })
     }
 
     // ==================================================================
@@ -1307,17 +1387,14 @@ impl TypeChecker {
                     _ => hir::HirPattern::Wildcard,
                 }
             }
-            AstPattern::Binding(_name, mutability, sub, _) => {
-                let local = self.alloc_local();
-                self.locals.insert(local, ty.clone());
-                self.infer.locals.insert(local, ty.clone());
-                self.scope_stack.last_mut().unwrap().push(local);
+            AstPattern::Binding(name, mutability, sub, _) => {
+                let (_, local) = self.bind_local(name, ty);
                 let _ = mutability;
                 if let Some(s) = sub {
                     let _ = self.lower_pattern(s, ty)?;
                     hir::HirPattern::Ref
                 } else {
-                    hir::HirPattern::Binding
+                    hir::HirPattern::Binding(local)
                 }
             }
             AstPattern::Tuple(pats, _) => {
@@ -1498,7 +1575,10 @@ impl TypeChecker {
     }
 
     fn resolve_name(&self, name: &str, span: ast::Span) -> Result<DefId> {
-        // 先查局部变量，再查全局符号
+        // 先查局部变量（词法作用域，内层优先），再查导入与全局符号
+        if let Some(id) = self.resolve_local(name) {
+            return Ok(id);
+        }
         if let Some(id) = self.use_aliases.get(name).copied() {
             return Ok(id);
         }
@@ -1539,9 +1619,9 @@ impl TypeChecker {
         self.resolve_path(path, ast::Span::unknown())
     }
 
-    fn as_local(&self, _id: DefId) -> Option<LocalId> {
+    fn as_local(&self, id: DefId) -> Option<LocalId> {
         // 若 id 对应某个局部变量则返回
-        None
+        self.locals_by_def.get(&id).copied()
     }
 
     // ==================================================================
@@ -1752,6 +1832,8 @@ impl TypeChecker {
             params: Vec::new(),
             return_type: Ty::Infer(InferId(0)),
             body: None,
+            is_async: f.is_async,
+            abi: hir::Abi::Zr,
         }
     }
 
@@ -1832,6 +1914,7 @@ impl TypeChecker {
     fn push_scope(&mut self) {
         self.scope_depth += 1;
         self.scope_stack.push(Vec::new());
+        self.local_scopes.push(HashMap::new());
     }
 
     fn pop_scope(&mut self) {
@@ -1841,7 +1924,41 @@ impl TypeChecker {
                 self.infer.locals.remove(&l);
             }
         }
+        self.local_scopes.pop();
         self.scope_depth = self.scope_depth.saturating_sub(1);
+    }
+
+    /// 在当前作用域里绑定一个局部变量名，返回它的 `DefId`。
+    ///
+    /// 刻意**不**写入全局 `symbols`——局部名不应该泄漏到文件作用域，
+    /// 否则不同函数里的同名变量会互相覆盖。
+    fn bind_local(&mut self, name: &str, ty: &Ty) -> (DefId, LocalId) {
+        let def = DefId(self.next_def);
+        self.next_def += 1;
+        self.def_names.insert(def, name.to_string());
+
+        let local = self.alloc_local();
+        self.locals.insert(local, ty.clone());
+        self.infer.locals.insert(local, ty.clone());
+        self.locals_by_def.insert(def, local);
+
+        if let Some(layer) = self.scope_stack.last_mut() {
+            layer.push(local);
+        }
+        if let Some(layer) = self.local_scopes.last_mut() {
+            layer.insert(name.to_string(), def);
+        }
+        (def, local)
+    }
+
+    /// 从最内层作用域向外查找局部变量名。
+    fn resolve_local(&self, name: &str) -> Option<DefId> {
+        for layer in self.local_scopes.iter().rev() {
+            if let Some(&def) = layer.get(name) {
+                return Some(def);
+            }
+        }
+        None
     }
 
     fn current_returns(&self) -> bool {
@@ -2132,5 +2249,25 @@ fn ty_name(ty: &Ty) -> String {
         Ty::Infer(_) => "_".into(),
         Ty::Opaque(id) => format!("opaque({})", id.0),
         Ty::Pin(inner) => format!("Pin<{}>", ty_name(inner)),
+    }
+}
+
+/// 取模式中第一个绑定变量的 `LocalId`。
+fn first_binding(p: &hir::HirPattern) -> Option<LocalId> {
+    match p {
+        hir::HirPattern::Binding(local) => Some(*local),
+        _ => None,
+    }
+}
+
+/// 块是否以发散语句结束（`return` / `throw`）。
+///
+/// 这类块不会把值交给调用方，所以类型检查不应要求它提供尾部表达式。
+fn block_diverges(b: &AstBlock) -> bool {
+    match (b.stmts.last(), &b.tail) {
+        (Some(Statement::Expr(e, _)), None) => {
+            matches!(e, Expression::Return(..) | Expression::Throw(..))
+        }
+        _ => false,
     }
 }

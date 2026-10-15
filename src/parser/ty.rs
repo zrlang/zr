@@ -137,10 +137,11 @@ impl Parser {
         // 数组 / 切片：`[T; N]` / `[T]`
         if self.match_kind(&TokenKind::LBracket) {
             if self.match_kind(&TokenKind::RBracket) {
-                // `[]T` —— 这里简化为错误，标准写法是 `[T]`
-                return Err(crate::error::CompileError::type_error(
-                    "expected element type after '['",
-                ));
+                // `[]const T` / `[]T` —— 右括号已经吃掉了，这里只解析元素
+                // 类型，不再消费第二个右括号。
+                let _ = self.match_kind(&TokenKind::KwConst);
+                let elem = self.parse_type()?;
+                return Ok(Type::Slice(Box::new(elem), crate::parser::ast::Mutability::Immutable));
             }
             let elem = self.parse_type()?;
             let len = if self.match_kind(&TokenKind::Semicolon) {
@@ -151,6 +152,11 @@ impl Parser {
             };
             self.consume(&TokenKind::RBracket, "expected ']' to close array type")?;
             return Ok(Type::Array(Box::new(elem), len));
+        }
+
+        // 生命周期标注：`&'a T` 里的 `'a`（类型检查阶段直接丢弃）
+        if let TokenKind::Lifetime(_) = self.peek().kind {
+            self.advance();
         }
 
         // 基础类型

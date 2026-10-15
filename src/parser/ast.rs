@@ -533,6 +533,10 @@ pub struct Param {
 #[derive(Debug, Clone)]
 pub struct Receiver {
     pub mutability: Mutability,
+    /// 显式写出的接收者类型：`self: &mut Self` 里的 `&mut Self`。
+    ///
+    /// 省略时为 `None`，按 `Self` 处理。
+    pub ty: Option<Type>,
 }
 
 // ======================================================================

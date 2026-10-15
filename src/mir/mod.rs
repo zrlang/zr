@@ -39,7 +39,10 @@ pub struct MirParam;
 pub struct MirBasicBlock {
     pub id: usize,
     pub instrs: Vec<MirInstr>,
-    pub term: MirTerminator,
+    /// 终结符。`None` 表示"还没有终结"——降级收尾时会补一个默认的
+    /// `Return`。必须能区分"未终结"和"显式的 `return`"，否则函数体里
+    /// 写 `return x;` 会被收尾逻辑覆盖成返回空值。
+    pub term: Option<MirTerminator>,
 }
 
 /// MIR 指令。
@@ -54,6 +57,8 @@ pub enum MirInstr {
     /// await 点：暂停当前协程，等待 future 就绪。
     /// `name = await future`。
     Await(String, MirValue),
+    /// 函数调用 `name = callee(args...)`。
+    Call(String, String, Vec<MirValue>),
 }
 
 /// MIR 终结器。
@@ -61,14 +66,16 @@ pub enum MirInstr {
 pub enum MirTerminator {
     /// 无条件跳转。
     Goto(usize),
-    /// 条件分支。
+    /// 条件分支（条件为真走 then，否则走 else）。
     Branch {
+        cond: MirValue,
         then_block: usize,
         else_block: usize,
     },
     /// 函数返回（携带返回值；`None` 表示返回单元值）。
     Return(Option<MirValue>),
     /// 不可达（发散调用 / `!` 类型）。
+    #[allow(dead_code)]
     Unreachable,
 }
 
@@ -118,7 +125,7 @@ pub fn lower(hir: &HirModule) -> MirModule {
 
     for func in &hir.functions {
         if let Some(body) = &func.body {
-            functions.push(builder::lower_function(func, body));
+            functions.push(builder::lower_function(func, body, &hir.def_names));
         }
     }
 

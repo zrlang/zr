@@ -14,6 +14,7 @@ pub mod print;
 
 pub use print::print_module;
 
+use std::collections::HashMap;
 use crate::mir::{self, MirInstr, MirModule, MirTerminator, MirValue};
 use std::cell::Cell;
 
@@ -60,6 +61,14 @@ pub enum SsaInstr {
         lhs: SsaValue,
         rhs: SsaValue,
     },
+    /// 函数调用：`result = callee(args...)`。
+    ///
+    /// 各后端按目标 ABI 负责把实参搬进调用约定寄存器。
+    Call {
+        result: SsaValue,
+        callee: String,
+        args: Vec<SsaValue>,
+    },
     /// 变量引用（用于 φ 函数合并前的原始变量）。
     Var {
         result: SsaValue,
@@ -96,9 +105,17 @@ impl SsaValue {
 }
 
 /// SSA 常量。
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum SsaConst {
     Int(i128),
+    /// 布尔常量。
+    Bool(bool),
+    /// 浮点常量（按位存储）。
+    Float(u64),
+    /// 单元值。
+    Unit,
+    /// 字符串字面量。
+    Str(String),
 }
 
 /// 一元运算。
@@ -128,6 +145,7 @@ impl SsaInstr {
             SsaInstr::Const { result, .. } => Some(*result),
             SsaInstr::Unary { result, .. } => Some(*result),
             SsaInstr::Binary { result, .. } => Some(*result),
+            SsaInstr::Call { result, .. } => Some(*result),
             SsaInstr::Var { result, .. } => Some(*result),
         }
     }
@@ -162,62 +180,84 @@ fn convert_function(func: &mir::MirFunction) -> SsaFunction {
         .collect();
 
     let mut blocks = Vec::with_capacity(func.blocks.len());
+    // MIR 用字符串给变量/临时值命名，这里维护"名字 → SSA 值"的环境。
+    // 之前每处引用都现�� `alloc()` 一个新值、并且把赋值的目标值直接丢掉，
+    // 导致 `let x = 42; x + 1` 里的 x 是个没有定义指令的野值。
+    let mut env: HashMap<String, SsaValue> = HashMap::new();
+    for (i, p) in params.iter().enumerate() {
+        env.insert(format!("arg_{i}"), *p);
+    }
+
     for block in &func.blocks {
         let mut instrs = Vec::new();
         for instr in &block.instrs {
             match instr {
                 MirInstr::Assign(name, val) => {
-                    let v = alloc();
-                    instrs.push(SsaInstr::Var {
-                        result: v,
-                        name: name.clone(),
-                    });
-                    // 若是字面量，补充一条 Const 指令保留值语义
-                    if let MirValue::Int(_) | MirValue::Bool(_) = val {
-                        let _ = val;
-                    }
+                    let v = materialize(val, &mut instrs, &mut env, &next_value);
+                    env.insert(name.clone(), v);
                 }
                 MirInstr::Binary(name, a, op, b) => {
+                    let l = materialize(a, &mut instrs, &mut env, &next_value);
+                    let r = materialize(b, &mut instrs, &mut env, &next_value);
                     let v = alloc();
                     instrs.push(SsaInstr::Binary {
                         result: v,
                         op: convert_binary_op(*op),
-                        lhs: value_to_ssa(a, &next_value),
-                        rhs: value_to_ssa(b, &next_value),
+                        lhs: l,
+                        rhs: r,
                     });
-                    let _ = name;
+                    env.insert(name.clone(), v);
                 }
                 MirInstr::Unary(name, op, x) => {
+                    let o = materialize(x, &mut instrs, &mut env, &next_value);
                     let v = alloc();
                     instrs.push(SsaInstr::Unary {
                         result: v,
                         op: convert_unary_op(*op),
-                        operand: value_to_ssa(x, &next_value),
+                        operand: o,
                     });
-                    let _ = name;
+                    env.insert(name.clone(), v);
                 }
                 MirInstr::Await(name, future) => {
+                    let v = materialize(future, &mut instrs, &mut env, &next_value);
+                    env.insert(name.clone(), v);
+                }
+                MirInstr::Call(name, callee, args) => {
+                    let mut ssa_args = Vec::with_capacity(args.len());
+                    for a in args {
+                        ssa_args.push(materialize(a, &mut instrs, &mut env, &next_value));
+                    }
                     let v = alloc();
-                    instrs.push(SsaInstr::Var {
+                    instrs.push(SsaInstr::Call {
                         result: v,
-                        name: name.clone(),
+                        callee: callee.clone(),
+                        args: ssa_args,
                     });
-                    let _ = future;
+                    env.insert(name.clone(), v);
                 }
             }
         }
 
         // 返回值可能是一条尚未物化的常量：先补 Const 指令，再终结。
-        let term = match &block.term {
-            mir::MirTerminator::Return(Some(mir::MirValue::Int(i))) => {
-                let v = alloc();
-                instrs.push(SsaInstr::Const {
-                    result: v,
-                    value: SsaConst::Int(*i),
-                });
-                SsaTerminator::Return(Some(v))
+        let term = match block.term.as_ref() {
+            // 未终结的块：MIR 降级阶段保证函数体收尾时补上终结符，
+            // 这里按不可达处理，避免生成悬空的基本块。
+            None => SsaTerminator::Unreachable,
+            Some(mir::MirTerminator::Return(Some(val))) => {
+                SsaTerminator::Return(Some(materialize(
+                    val,
+                    &mut instrs,
+                    &mut env,
+                    &next_value,
+                )))
             }
-            other => convert_terminator(other, &next_value),
+            // 条件分支：条件值要从环境里解析出来（不能像以前那样硬编码
+            // 成 SsaValue(0)，否则 `if` 判断的永远是第一个值）。
+            Some(mir::MirTerminator::Branch { cond, then_block, else_block }) => {
+                let c = materialize(cond, &mut instrs, &mut env, &next_value);
+                SsaTerminator::Branch { cond: c, then_block: *then_block, else_block: *else_block }
+            }
+            Some(other) => convert_terminator(other, &next_value),
         };
         blocks.push(SsaBasicBlock {
             id: block.id,
@@ -307,8 +347,11 @@ fn convert_terminator(term: &MirTerminator, next_value: &Cell<u32>) -> SsaTermin
     let _ = alloc;
     match term {
         MirTerminator::Goto(target) => SsaTerminator::Goto(*target),
-        MirTerminator::Branch { then_block, else_block } => SsaTerminator::Branch {
-            cond: SsaValue(0),
+        MirTerminator::Branch { cond, then_block, else_block } => SsaTerminator::Branch {
+            cond: SsaValue(match cond {
+                MirValue::Int(i) => *i as u32,
+                _ => 0,
+            }),
             then_block: *then_block,
             else_block: *else_block,
         },
@@ -332,4 +375,48 @@ fn hash_name(name: &str) -> u32 {
     }
     // 保留高 8 位为 0，避免与字面量分配的值碰撞
     h & 0x00ff_ffff
+}
+
+/// 把一个 MIR 操作数物化成 SSA 值，必要时发射一条定义指令。
+///
+/// 变量名先查环境；查不到说明它来自块外（形参或前驱块），此时保留一条
+/// `Var` 指令占位，由 SSA 重命名阶段补上 φ 节点。
+fn materialize(
+    val: &MirValue,
+    instrs: &mut Vec<SsaInstr>,
+    env: &mut HashMap<String, SsaValue>,
+    next: &Cell<u32>,
+) -> SsaValue {
+    let v = SsaValue(next.get());
+    next.set(next.get() + 1);
+    match val {
+        MirValue::Var(name) => {
+            if let Some(&existing) = env.get(name) {
+                return existing;
+            }
+            instrs.push(SsaInstr::Var { result: v, name: name.clone() });
+            env.insert(name.clone(), v);
+        }
+        MirValue::Int(i) => instrs.push(SsaInstr::Const {
+            result: v,
+            value: SsaConst::Int(*i),
+        }),
+        MirValue::Bool(b) => instrs.push(SsaInstr::Const {
+            result: v,
+            value: SsaConst::Bool(*b),
+        }),
+        MirValue::Float(bits) => instrs.push(SsaInstr::Const {
+            result: v,
+            value: SsaConst::Float(*bits),
+        }),
+        MirValue::Str(s) => instrs.push(SsaInstr::Const {
+            result: v,
+            value: SsaConst::Str(s.clone()),
+        }),
+        MirValue::Unit => instrs.push(SsaInstr::Const {
+            result: v,
+            value: SsaConst::Unit,
+        }),
+    }
+    v
 }

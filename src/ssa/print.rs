@@ -27,6 +27,10 @@ pub fn print_module(module: &SsaModule) {
                             rhs.id()
                         )
                     }
+                    super::SsaInstr::Call { result, callee, args } => {
+                        let a: Vec<String> = args.iter().map(|v| format!("%{}", v.id())).collect();
+                        println!("%{} = call {}({})", result.id(), callee, a.join(", "));
+                    }
                     super::SsaInstr::Var { result, name } => {
                         println!("%{} = var {}", result.id(), name)
                     }

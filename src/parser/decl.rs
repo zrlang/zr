@@ -19,15 +19,17 @@ impl Parser {
 
     fn parse_use_tree(&mut self) -> Result<UseTree, CompileError> {
         // 处理 `use a::b as c`
+        // 路径段可以是标识符，也可以是关键字（模块名 `async` 等）。
         if self.check(&TokenKind::KwSelf)
             || matches!(self.peek().kind, TokenKind::Ident(_))
+            || self.peek().kind.keyword_text().is_some()
             || self.check(&TokenKind::Star)
         {
             let mut path = Vec::new();
             if self.match_kind(&TokenKind::KwSelf) {
                 path.push("self".into());
             } else {
-                path.push(self.consume_ident("expected name in use tree")?);
+                path.push(self.consume_path_segment("expected name in use tree")?);
             }
             while self.match_kind(&TokenKind::ColonColon) {
                 if self.match_kind(&TokenKind::Star) {
@@ -53,7 +55,7 @@ impl Parser {
                     }
                     return Ok(UseTree::Group(vec![tree, group]));
                 }
-                path.push(self.consume_ident("expected name")?);
+                path.push(self.consume_path_segment("expected name")?);
             }
             // 构造嵌套 Name 树
             let mut tree = UseTree::Name(path[0].clone());
@@ -276,7 +278,13 @@ impl Parser {
             crate::parser::ast::Mutability::Immutable
         };
         self.consume(&TokenKind::KwSelf, "expected 'self'")?;
-        Ok(Receiver { mutability })
+        // 显式接收者类型：`self: &mut Self`
+        let ty = if self.match_kind(&TokenKind::Colon) {
+            Some(self.parse_type()?)
+        } else {
+            None
+        };
+        Ok(Receiver { mutability, ty })
     }
 
     fn parse_where_clause(&mut self) -> Result<Vec<WherePred>, CompileError> {
@@ -412,7 +420,10 @@ impl Parser {
                 name: fname,
                 ty: fty,
             });
-            self.consume(&TokenKind::Comma, "expected ',' after field")?;
+            // 最后一个字段后面允许省略逗号
+            if !self.match_kind(&TokenKind::Comma) {
+                break;
+            }
         }
         self.consume(&TokenKind::RBrace, "expected '}' to close struct")?;
         Ok(TypeDef::Struct(StructDef {
@@ -531,7 +542,10 @@ impl Parser {
                 name: fname,
                 ty: fty,
             });
-            self.consume(&TokenKind::Comma, "expected ',' after field")?;
+            // 最后一个字段后面允许省略逗号
+            if !self.match_kind(&TokenKind::Comma) {
+                break;
+            }
         }
         self.consume(&TokenKind::RBrace, "expected '}'")?;
         Ok(TypeDef::Union(UnionDef { name, fields }))
@@ -591,6 +605,8 @@ impl Parser {
             if self.match_kind(&TokenKind::KwType) {
                 assoc_types.push(self.parse_assoc_type()?);
             } else {
+                // impl 里的方法可以带可见性修饰（`pub fn new`）
+                let _pub = self.match_kind(&TokenKind::KwPub);
                 let is_async = self.match_kind(&TokenKind::KwAsync);
                 self.consume(&TokenKind::KwFn, "expected 'fn'")?;
                 methods.push(self.parse_function(Visibility::Private, vec![], is_async, false)?);
@@ -656,9 +672,14 @@ impl Parser {
             if self.match_kind(&TokenKind::KwType) {
                 _assoc_types.push(self.parse_assoc_type()?);
             } else {
+                let visibility = if self.match_kind(&TokenKind::KwPub) {
+                    Visibility::Public
+                } else {
+                    Visibility::Private
+                };
                 let is_async = self.match_kind(&TokenKind::KwAsync);
                 self.consume(&TokenKind::KwFn, "expected 'fn'")?;
-                _items.push(self.parse_function(Visibility::Private, vec![], is_async, false)?);
+                _items.push(self.parse_function(visibility, vec![], is_async, false)?);
             }
         }
         self.consume(&TokenKind::RBrace, "expected '}'")?;

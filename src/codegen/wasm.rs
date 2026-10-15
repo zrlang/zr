@@ -58,6 +58,8 @@ pub enum WasmInstr {
     I32Eqz,
     /// 二元运算，参数为值类型。
     Binary(WasmType, WasmBinaryOp),
+    /// `call funcidx`。
+    Call(u32),
     Return,
 }
 
@@ -139,6 +141,11 @@ impl WasmBinaryOp {
 #[derive(Debug, Clone)]
 pub struct WasmFunction {
     pub name: String,
+    /// 尚未解析函数下标的调用：`(指令下标, 被调函数名)`。
+    ///
+    /// 函数下标要等所有函数都登记进模块后才能确定（`_start` 克隆还会
+    /// 额外占用一个下标），所以先记名字，最后统一回填。
+    pub pending_calls: Vec<(usize, String)>,
     pub params: Vec<WasmType>,
     pub results: Vec<WasmType>,
     pub locals: Vec<WasmType>,
@@ -188,6 +195,24 @@ impl WasmModule {
                 wasm.functions.push(start);
             }
             wasm.functions.push(compiled);
+        }
+
+        // 所有函数下标确定后，把按名字记录的调用回填成实际下标。
+        let import_count = wasm.imports.len() as u32;
+        let indices: std::collections::HashMap<String, u32> = wasm
+            .functions
+            .iter()
+            .enumerate()
+            .map(|(i, f)| (f.name.clone(), import_count + i as u32))
+            .collect();
+        for func in &mut wasm.functions {
+            for (at, callee) in std::mem::take(&mut func.pending_calls) {
+                if let Some(&idx) = indices.get(&callee) {
+                    func.body[at] = WasmInstr::Call(idx);
+                } else {
+                    func.body[at] = WasmInstr::Call(import_count);
+                }
+            }
         }
         wasm
     }
@@ -332,6 +357,7 @@ impl WasmInstr {
             WasmInstr::I64Const(v) => format!("i64.const {v}"),
             WasmInstr::I32Eqz => "i32.eqz".to_string(),
             WasmInstr::Binary(ty, op) => op.wat(*ty),
+            WasmInstr::Call(idx) => format!("call {idx}"),
             WasmInstr::Return => "return".to_string(),
         }
     }
@@ -353,6 +379,7 @@ impl WasmFunction {
         }
 
         let mut body = Vec::new();
+        let mut pending_calls: Vec<(usize, String)> = Vec::new();
 
         for block in &func.blocks {
             for instr in &block.instrs {
@@ -361,6 +388,13 @@ impl WasmFunction {
                         let idx = ensure_local(result, &mut local_map, &mut locals, &mut next_local);
                         match value {
                             SsaConst::Int(i) => body.push(WasmInstr::I64Const(*i as i64)),
+                            // bool / unit 在 wasm 里就是 i64 0/1；
+                            // 浮点与字符串暂未在 wasm 后端实现
+                            SsaConst::Bool(b) => body.push(WasmInstr::I64Const(i64::from(*b))),
+                            SsaConst::Unit => body.push(WasmInstr::I64Const(0)),
+                            SsaConst::Float(_) | SsaConst::Str(_) => {
+                                body.push(WasmInstr::I64Const(0));
+                            }
                         }
                         body.push(WasmInstr::LocalSet(idx));
                     }
@@ -387,6 +421,16 @@ impl WasmFunction {
                         body.push(WasmInstr::Binary(WasmType::I64, wasm_binop(*op)));
                         body.push(WasmInstr::LocalSet(idx));
                     }
+                    SsaInstr::Call { result, callee, args } => {
+                        for a in args {
+                            emit_value_ref(*a, &local_map, &mut body);
+                        }
+                        // 先占位，函数下标要等所有函数登记完才能确定
+                        pending_calls.push((body.len(), callee.clone()));
+                        body.push(WasmInstr::Call(0));
+                        let idx = ensure_local(result, &mut local_map, &mut locals, &mut next_local);
+                        body.push(WasmInstr::LocalSet(idx));
+                    }
                     SsaInstr::Var { result, .. } => {
                         ensure_local(result, &mut local_map, &mut locals, &mut next_local);
                     }
@@ -404,6 +448,7 @@ impl WasmFunction {
 
         WasmFunction {
             name: func.name.clone(),
+            pending_calls,
             params,
             results,
             locals,
@@ -698,6 +743,10 @@ fn encode_instr(instr: &WasmInstr, out: &mut Vec<u8>) {
             out.push(op.code());
             let _ = ty; // 操作码本身已隐含类型
         }
+        WasmInstr::Call(idx) => {
+            out.push(0x10);
+            uleb(u64::from(*idx), out);
+        }
         WasmInstr::Return => out.push(0x0f),
     }
 }
@@ -713,6 +762,7 @@ mod tests {
         wasm.memory_max_pages = 2;
         wasm.functions.push(WasmFunction {
             name: "main".to_string(),
+            pending_calls: vec![],
             params: vec![],
             results: vec![WasmType::I64],
             locals: vec![WasmType::I64],
