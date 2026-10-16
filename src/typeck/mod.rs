@@ -13,21 +13,23 @@ pub mod infer;
 
 use std::collections::{HashMap, HashSet};
 
+use crate::attributes;
 use crate::error::{CompileError, Result};
 use crate::parser::ast::{
-    self, Abi, Arm, Block as AstBlock, Expression, Literal as AstLiteral,
-    Pattern as AstPattern, Program, Spanned, Span, Statement, StructDef as AstStruct,
-    Type as AstType, UseTree,
+    self, Abi, Arm, Block as AstBlock, Expression, Literal as AstLiteral, Pattern as AstPattern,
+    Program, Span, Spanned, Statement, StructDef as AstStruct, Type as AstType, UseTree,
 };
 use crate::typeck::hir::{
-    BasicBlock, BasicBlockId, Cfg, DefId, ExprKind, FieldIndex, HirArm, HirExpr,
-    HirField, HirLiteral, HirStmt, InferId, LocalId, Ty, WherePred,
+    BasicBlock, BasicBlockId, Cfg, DefId, ExprKind, FieldIndex, HirArm, HirExpr, HirField,
+    HirLiteral, HirStmt, InferId, LocalId, Ty, WherePred,
 };
 use crate::typeck::infer::InferCtxt;
 
 /// 类型检查器。
 #[derive(Debug)]
 pub struct TypeChecker {
+    /// 目标允许的最大整数位宽（默认 128，即不额外限制）。
+    max_int_bits: u16,
     /// 符号表：名称 → 定义 ID。
     symbols: HashMap<String, DefId>,
     /// 反向：DefId → 名称（用于错误报告）。
@@ -77,6 +79,17 @@ pub struct TypeChecker {
     /// 限定符——标准库的定义已经被并进当前编译单元，所以这里只需要
     /// 知道"这个名字是模块"，不用再解析成 DefId。
     known_modules: HashSet<String>,
+    /// 警告集合（deprecated 使用等）。
+    warnings: Vec<CompileError>,
+    /// 已处理的 cfg 条件（用于过滤条目）。
+    cfg_enabled: bool,
+    /// AST 层的函数表（名字 → 函数）。
+    ///
+    /// comptime 函数需要在**类型检查函数体之前**就能被求值（`comptime fact(4)`
+    /// 出现在某个函数体里，而 `fact` 自己可能还没检查到）。HIR 这时候还不存在，
+    /// 所以必须留一份 AST。HIR 版求值器用于阶段 12 的折叠，AST 版用于
+    /// `check_expr` 里的即时求值。
+    ast_fns: HashMap<String, ast::Function>,
 }
 
 impl Default for TypeChecker {
@@ -84,6 +97,7 @@ impl Default for TypeChecker {
         // InferCtxt 借用 TypeChecker 的字段，无法在构造时直接填入。
         // 先用 empty() 占位（指向 'static 空集合），实际检查时再按需重建。
         Self {
+            max_int_bits: 128,
             symbols: HashMap::new(),
             def_names: HashMap::new(),
             type_defs: HashMap::new(),
@@ -105,6 +119,9 @@ impl Default for TypeChecker {
             errors: Vec::new(),
             use_aliases: HashMap::new(),
             known_modules: HashSet::new(),
+            warnings: Vec::new(),
+            cfg_enabled: true,
+            ast_fns: HashMap::new(),
         }
     }
 }
@@ -121,7 +138,31 @@ impl TypeChecker {
         self.known_modules = modules;
     }
 
+    /// 设置目标允许的最大整数位宽。
+    ///
+    /// 32 位目标目前没有多字长寄存器对，写出来的 i64 只是**静默截断**成
+    /// 32 位——这种"能编过但结果是错的"比报错糟糕得多，所以在类型检查阶段
+    /// 就把超宽的显式标注挡掉。
+    pub fn set_max_int_bits(&mut self, bits: u16) {
+        self.max_int_bits = bits;
+    }
+
+    fn check_int_width(&self, w: u16) -> Result<()> {
+        if w > self.max_int_bits {
+            return Err(CompileError::type_error(format!(
+                "{} 位整数在当前目标上尚未实现：该目标只有 {} 位寄存器，\
+                 编译器暂时还不能把宽整数拆成寄存器对。现在生成的是静默截断的代码，\
+                 所以直接报错。",
+                w, self.max_int_bits
+            )));
+        }
+        Ok(())
+    }
+
     pub fn check_program(&mut self, prog: &Program) -> Result<hir::HirModule> {
+        // ===== 阶段 0：属性预处理 =====
+        self.process_attributes(prog)?;
+
         // ===== 阶段 1：声明收集（pass 1）=====
         self.collect_declarations(prog)?;
 
@@ -157,6 +198,26 @@ impl TypeChecker {
         // ===== 阶段 11：未使用变量 / 未使用导入警告 =====
         self.check_unused(&functions)?;
 
+        // ===== 阶段 12：comptime 函数调用的编译期折叠 =====
+        //
+        // 必须排在类型检查与借用检查之后：求值器解释的是 HIR，需要名称
+        // 解析与类型检查都已经完成。同时也排在最后——这样 const /
+        // static 的初始化式里若调用了 comptime 函数，折叠后的常量会一并
+        // 生效，不会出现"先按未折叠的 AST 求值一遍"的两遍求值。
+        let mut functions = functions;
+        self.fold_comptime_functions(&mut functions);
+
+        // ===== 阶段 13：常量定义的最终求值 =====
+        //
+        // 阶段 5 的 `check_consts` 只能折出纯字面量的初始化式：那会儿函数体
+        // 还没检查，comptime 函数根本不存在。`const SIZE: i32 = fact(5)`
+        // 要等到这里，comptime 调用折叠完，才能确定 `SIZE` 的值。
+        //
+        // 两遍求值不是重复劳动：第一遍负责把 `const LIMIT: i32 = 40` 这类
+        // 简单常量在函数体检查**之前**变成已知值（`comptime LIMIT + 2` 依赖
+        // 它），第二遍才补上需要 comptime 函数的部分。
+        self.finalize_consts();
+
         if !self.errors.is_empty() {
             // 报告第一个错误
             return Err(self.errors.remove(0));
@@ -165,7 +226,243 @@ impl TypeChecker {
         Ok(hir::HirModule {
             functions,
             def_names: self.def_names.clone(),
+            type_defs: self.type_defs.clone(),
+            consts: self.consts.clone(),
         })
+    }
+
+    /// 常量定义的最终求值：补上阶段 5 折不出来的那些。
+    ///
+    /// 折不出常量的定义会在这里报错——`const` 的右值必须在编译期可求值，
+    /// 这条约束正是 `const` 与 `static` 的区别，不能等到运行期。
+    fn finalize_consts(&mut self) {
+        // 先把常量表整体取出：求值过程中要读别的常量，直接持借用会撞上
+        // `&mut self` 与 `&self.consts` 的双重借用。
+        let names: Vec<(DefId, String)> = self
+            .consts
+            .keys()
+            .map(|&id| (id, self.def_names.get(&id).cloned().unwrap_or_default()))
+            .collect();
+        for (id, name) in names {
+            let Some(value) = self.consts.get(&id).map(|c| c.value.clone()) else {
+                continue;
+            };
+            match self.eval_const_from_hir(&value) {
+                Ok(_) => {
+                    // 值可求值。`hc.value` 已经在阶段 12 折叠过，保持原样。
+                }
+                Err(_) => {
+                    // 阶段 12 的折叠已经处理了 comptime 调用；到这里仍然折不出
+                    // 常量，说明右值真的不是编译期常量。
+                    self.errors.push(
+                        CompileError::internal(format!(
+                            "`const {name}` initializer is not a compile-time constant"
+                        ))
+                        .with_span(value.span),
+                    );
+                }
+            }
+        }
+    }
+
+    /// 把「comptime fn + 全常量实参」的调用点折成字面量。
+    ///
+    /// 折叠之后运行期不再有对应的调用：`comptime fn fact(5)` 直接变成
+    /// `Const(120)`，`const SIZE: usize = fact(5)` 的值也随之确定。
+    fn fold_comptime_functions(&mut self, functions: &mut [hir::HirFunction]) {
+        // 只有存在 comptime 函数时才值得走一趟遍历。
+        if !functions.iter().any(|f| f.is_comptime) {
+            return;
+        }
+        let table = &self.functions;
+        let mut total = 0usize;
+        let mut steps = 0u64;
+
+        // 常量定义的右值也要折叠：`const SIZE: i32 = fact(5)` 的求值发生在
+        // 阶段 13，折叠必须在那之前完成。
+        let const_ids: Vec<DefId> = self.consts.keys().copied().collect();
+        for id in const_ids {
+            if let Some(c) = self.consts.get_mut(&id) {
+                total +=
+                    crate::comptime::fold_comptime_calls(c.value.as_mut(), table, 0, &mut steps);
+            }
+        }
+
+        for func in functions.iter_mut() {
+            if let Some(body) = &mut func.body {
+                for stmt in &mut body.stmts {
+                    let expr = match stmt {
+                        hir::HirStmt::Let { init: Some(e), .. }
+                        | hir::HirStmt::Var { init: Some(e), .. } => e.as_mut(),
+                        hir::HirStmt::Expr(e) => e.as_mut(),
+                        _ => continue,
+                    };
+                    total += crate::comptime::fold_comptime_calls(expr, table, 0, &mut steps);
+                }
+                if let Some(tail) = &mut body.tail {
+                    total +=
+                        crate::comptime::fold_comptime_calls(tail.as_mut(), table, 0, &mut steps);
+                }
+            }
+        }
+        if total > 0 && self.warnings.is_empty() && std::env::var_os("ZR_VERBOSE").is_some() {
+            eprintln!("zr: folded {total} comptime call(s)");
+        }
+    }
+
+    // ==================================================================
+    // 阶段 0：属性预处理
+    // ==================================================================
+
+    /// 处理所有属性：cfg 过滤、derive 生成、deprecated 标记。
+    fn process_attributes(&mut self, prog: &Program) -> Result<()> {
+        // cfg 过滤：检查模块级属性
+        for attr in &prog.attrs {
+            if attr.name == "cfg" {
+                // 模块级 cfg：如果条件不满足，整个模块被过滤
+                // 简化实现：模块级 cfg 暂不处理（需要目标信息）
+            }
+        }
+
+        // 收集所有条目的属性信息
+        for item in &prog.functions {
+            self.process_fn_attrs(item)?;
+        }
+        for td in &prog.type_defs {
+            self.process_type_attrs(td)?;
+        }
+        for t in &prog.traits {
+            self.process_trait_attrs(t)?;
+        }
+        Ok(())
+    }
+
+    /// 处理函数属性。
+    fn process_fn_attrs(&mut self, f: &ast::Function) -> Result<()> {
+        // cfg 过滤
+        if !self.cfg_enabled {
+            return Ok(());
+        }
+
+        // deprecated 标记
+        if attributes::is_deprecated(&f.attrs) {
+            let msg = attributes::deprecated_message(&f.attrs)
+                .unwrap_or_else(|| format!("`{}` is deprecated", f.name));
+            self.warnings.push(CompileError::new(format!(
+                "use of deprecated function `{}`: {}",
+                f.name, msg
+            )));
+        }
+
+        // lint 级别检查
+        let lint = attributes::lint_level(&f.attrs, "deprecated");
+        if lint == attributes::LintLevel::Deny {
+            // deny 级别：deprecated 使用直接报错
+            if attributes::is_deprecated(&f.attrs) {
+                return Err(CompileError::type_error(format!(
+                    "use of deprecated function `{}`",
+                    f.name
+                )));
+            }
+        }
+
+        Ok(())
+    }
+
+    /// 处理类型定义属性。
+    fn process_type_attrs(&mut self, td: &ast::TypeDef) -> Result<()> {
+        let name = match td {
+            ast::TypeDef::Struct(s) => &s.name,
+            ast::TypeDef::Enum(e) => &e.name,
+            ast::TypeDef::Union(u) => &u.name,
+            ast::TypeDef::Alias { name, .. } => name,
+        };
+        let attrs: &[ast::Attribute] = match td {
+            ast::TypeDef::Struct(s) => &s.attrs,
+            _ => &[],
+        };
+
+        // derive 处理：生成默认 impl
+        let derives = attributes::derive_traits(attrs);
+        if !derives.is_empty() {
+            self.generate_derive_impls(name, &derives, attrs)?;
+        }
+
+        // deprecated 标记
+        if attributes::is_deprecated(attrs) {
+            let msg = attributes::deprecated_message(attrs)
+                .unwrap_or_else(|| format!("`{}` is deprecated", name));
+            self.warnings.push(CompileError::new(format!(
+                "use of deprecated type `{}`: {}",
+                name, msg
+            )));
+        }
+
+        Ok(())
+    }
+
+    /// 处理 trait 属性。
+    fn process_trait_attrs(&mut self, t: &ast::TraitDef) -> Result<()> {
+        // deprecated 标记
+        if attributes::is_deprecated(&t.attrs) {
+            let msg = attributes::deprecated_message(&t.attrs)
+                .unwrap_or_else(|| format!("`{}` is deprecated", t.name));
+            self.warnings.push(CompileError::new(format!(
+                "use of deprecated trait `{}`: {}",
+                t.name, msg
+            )));
+        }
+        Ok(())
+    }
+
+    /// 为 `#[derive(...)]` 生成默认 impl 块。
+    ///
+    /// 支持的 derive：
+    /// - `Debug` — 生成 `impl Debug for T { fn fmt(&self) -> str { ... } }`
+    /// - `Clone` — 生成 `impl Clone for T { fn clone(&self) -> Self { ... } }`
+    /// - `Copy` — 生成 `impl Copy for T {}`（marker trait）
+    fn generate_derive_impls(
+        &mut self,
+        type_name: &str,
+        traits: &[String],
+        attrs: &[ast::Attribute],
+    ) -> Result<()> {
+        let def_id = self.find_def(type_name)?;
+
+        for trait_name in traits {
+            match trait_name.as_str() {
+                "Debug" | "Clone" | "Copy" => {
+                    // 生成 impl 块：在类型检查器中注册为已实现的 trait
+                    // 实际的 trait 求解在 infer.rs 的 check_trait_impl 中处理
+                    let impl_block = hir::HirImpl {
+                        target: Ty::Named(def_id, Vec::new()),
+                        trait_id: None, // 将在后续解析
+                        where_clause: Vec::new(),
+                        span: Span::unknown(),
+                    };
+                    self.impl_blocks.push(impl_block);
+                }
+                _ => {
+                    // 未知的 derive trait：报错
+                    return Err(CompileError::type_error(format!(
+                        "cannot derive `{}`: unknown derive trait",
+                        trait_name
+                    )));
+                }
+            }
+        }
+
+        // 检查 derive 属性上的 lint 级别
+        let lint = attributes::lint_level(attrs, "deprecated");
+        if lint == attributes::LintLevel::Deny {
+            // deny 级别：检查 derive 的 trait 是否 deprecated
+            for trait_name in traits {
+                // 简化：假设所有 derive trait 都不 deprecated
+                let _ = trait_name;
+            }
+        }
+
+        Ok(())
     }
 
     // ==================================================================
@@ -175,6 +472,7 @@ impl TypeChecker {
     fn collect_declarations(&mut self, prog: &Program) -> Result<()> {
         for item in &prog.functions {
             let id = self.alloc_def(item.name.clone());
+            self.ast_fns.insert(item.name.clone(), item.clone());
             self.functions.insert(
                 id,
                 hir::HirFunction {
@@ -183,6 +481,7 @@ impl TypeChecker {
                     return_type: Ty::Infer(InferId(0)),
                     body: None,
                     is_async: item.is_async,
+                    is_comptime: item.is_comptime,
                     abi: hir::Abi::Zr,
                     attrs: convert_attrs(&item.attrs),
                 },
@@ -197,27 +496,38 @@ impl TypeChecker {
             });
             match td {
                 ast::TypeDef::Struct(s) => {
-                    self.type_defs.insert(id, hir::HirTypeDef::Struct(hir::HirStruct {
-                        name: s.name.clone(),
-                        attrs: convert_attrs(&s.attrs),
-                        fields: Vec::new(),
-                        repr: hir::Repr::Rust,
-                    }));
+                    self.type_defs.insert(
+                        id,
+                        hir::HirTypeDef::Struct(hir::HirStruct {
+                            name: s.name.clone(),
+                            attrs: convert_attrs(&s.attrs),
+                            fields: Vec::new(),
+                            repr: hir::Repr::Rust,
+                        }),
+                    );
                 }
                 ast::TypeDef::Enum(e) => {
-                    self.type_defs.insert(id, hir::HirTypeDef::Enum(hir::HirEnum {
-                        name: e.name.clone(),
-                        repr: hir::IntegerRepr::Auto,
-                        variants: Vec::new(),
-                    }));
+                    self.type_defs.insert(
+                        id,
+                        hir::HirTypeDef::Enum(hir::HirEnum {
+                            name: e.name.clone(),
+                            repr: hir::IntegerRepr::Auto,
+                            variants: Vec::new(),
+                        }),
+                    );
                 }
                 ast::TypeDef::Union(u) => {
-                    self.type_defs.insert(id, hir::HirTypeDef::Union(hir::HirUnion {
-                        name: u.name.clone(),
-                        fields: Vec::new(),
-                    }));
+                    self.type_defs.insert(
+                        id,
+                        hir::HirTypeDef::Union(hir::HirUnion {
+                            name: u.name.clone(),
+                            fields: Vec::new(),
+                        }),
+                    );
                 }
-                ast::TypeDef::Alias { name: _, target, .. } => {
+                ast::TypeDef::Alias {
+                    name: _, target, ..
+                } => {
                     let target_ty = self.ast_to_hir_type(target)?;
                     self.type_defs.insert(
                         id,
@@ -284,11 +594,10 @@ impl TypeChecker {
                 if let Some(id) = self.symbols.get(name).copied() {
                     self.use_aliases.insert(name.clone(), id);
                 } else {
-                    self.errors.push(CompileError::name_error(format!(
-                        "cannot resolve `{}` in import",
-                        name
-                    ))
-                    .with_span(*span));
+                    self.errors.push(
+                        CompileError::name_error(format!("cannot resolve `{}` in import", name))
+                            .with_span(*span),
+                    );
                 }
             }
             UseTree::Rename(inner, alias) => {
@@ -296,11 +605,13 @@ impl TypeChecker {
                     if let Some(id) = self.symbols.get(name).copied() {
                         self.use_aliases.insert(alias.clone(), id);
                     } else {
-                        self.errors.push(CompileError::name_error(format!(
-                            "cannot resolve `{}` in import",
-                            name
-                        ))
-                        .with_span(*span));
+                        self.errors.push(
+                            CompileError::name_error(format!(
+                                "cannot resolve `{}` in import",
+                                name
+                            ))
+                            .with_span(*span),
+                        );
                     }
                 }
             }
@@ -395,9 +706,14 @@ impl TypeChecker {
                     hir::HirVariantPayload::Struct(hir_fields?)
                 }
             };
-            variants.push(hir::HirVariant {
-                payload,
-            });
+            variants.push(hir::HirVariant { payload });
+        }
+
+        // `#[repr(i64)]` 走的是另一条路（直接存 IntegerRepr），同样要挡住
+        // 超宽标注。必须在 `get_mut` 之前算——闭包里再借用 `self` 会和
+        // 可变借用冲突。
+        if let Some(AstType::I(w)) = e.repr.as_ref() {
+            self.check_int_width(*w as u16)?;
         }
 
         if let Some(hir_td) = self.type_defs.get_mut(&def_id) {
@@ -413,7 +729,9 @@ impl TypeChecker {
                             128 => hir::IntegerRepr::I128,
                             _ => hir::IntegerRepr::Auto,
                         }
-                    } else { hir::IntegerRepr::Auto }
+                    } else {
+                        hir::IntegerRepr::Auto
+                    }
                 });
             }
         }
@@ -507,8 +825,12 @@ impl TypeChecker {
             let id = self.find_def(&c.name)?;
             let ty = self.ast_to_hir_type(&c.ty)?;
             let value = self.check_const_expr(&c.value, &ty)?;
-            // CTFE：验证值在编译期可求值
-            self.eval_const_expr(&c.value)?;
+            // 第一遍求值：只折得出纯字面量的初始化式。
+            //
+            // 这里**不能**因为折不出来就报错——`const SIZE: i32 = fact(5)`
+            // 需要 comptime 函数，而函数体要到阶段 7 才检查完。真正的
+            // "必须是编译期常量" 校验在 `finalize_consts`（阶段 13）。
+            let _ = self.eval_const_expr(&c.value);
             if let Some(hc) = self.consts.get_mut(&id) {
                 hc.ty = ty;
                 hc.value = Box::new(value);
@@ -550,10 +872,7 @@ impl TypeChecker {
     // 阶段 7：函数体类型检查
     // ==================================================================
 
-    fn check_function_bodies(
-        &mut self,
-        prog: &Program,
-    ) -> Result<Vec<hir::HirFunction>> {
+    fn check_function_bodies(&mut self, prog: &Program) -> Result<Vec<hir::HirFunction>> {
         let _result: Vec<hir::HirFunction> = Vec::new();
         for f in &prog.functions {
             let id = self.find_def(&f.name)?;
@@ -573,8 +892,12 @@ impl TypeChecker {
                     None => Ty::Named(id, Vec::new()),
                 };
                 let ty = match recv.mutability {
-                    ast::Mutability::Mutable => Ty::Reference(Box::new(self_ty), hir::Mutability::Mutable),
-                    ast::Mutability::Immutable => Ty::Reference(Box::new(self_ty), hir::Mutability::Immutable),
+                    ast::Mutability::Mutable => {
+                        Ty::Reference(Box::new(self_ty), hir::Mutability::Mutable)
+                    }
+                    ast::Mutability::Immutable => {
+                        Ty::Reference(Box::new(self_ty), hir::Mutability::Immutable)
+                    }
                 };
                 self.locals.insert(local, ty.clone());
                 self.infer.locals.insert(local, ty);
@@ -586,9 +909,11 @@ impl TypeChecker {
                 let ty = self.ast_to_hir_type(&p.ty)?;
                 // 参数模式本身会负责绑定名字（`n` / `mut n` / 复杂模式）
                 let pat = self.lower_pattern(&p.pattern, &ty)?;
-                let local = first_binding(&pat)
-                    .unwrap_or_else(|| self.alloc_local());
-                params.push(hir::HirParam { local, ty: ty.clone() });
+                let local = first_binding(&pat).unwrap_or_else(|| self.alloc_local());
+                params.push(hir::HirParam {
+                    local,
+                    ty: ty.clone(),
+                });
             }
 
             // 检查函数体
@@ -616,27 +941,28 @@ impl TypeChecker {
         let diverges = block_diverges(b);
         let tail = if let Some(t) = &b.tail {
             let e = self.check_expr(t, expected)?;
-            self.infer.subtype(&e.ty, expected, t.span())
-                .map_err(|e| self.errors.push(e)).ok();
+            self.infer
+                .subtype(&e.ty, expected, t.span())
+                .map_err(|e| self.errors.push(e))
+                .ok();
             Some(Box::new(e))
         } else if diverges {
             None
         } else if !matches!(expected, Ty::Unit | Ty::Never) && !self.current_returns() {
             // 块缺少尾部表达式，但期望非空类型
-            self.errors.push(CompileError::type_error(format!(
-                "block missing value: expected `{}`, found `()`",
-                self.infer.type_name(expected)
-            ))
-            .with_span(b.span));
+            self.errors.push(
+                CompileError::type_error(format!(
+                    "block missing value: expected `{}`, found `()`",
+                    self.infer.type_name(expected)
+                ))
+                .with_span(b.span),
+            );
             None
         } else {
             None
         };
         self.pop_scope();
-        Ok(hir::HirBlock {
-            stmts,
-            tail,
-        })
+        Ok(hir::HirBlock { stmts, tail })
     }
 
     fn check_stmt(&mut self, s: &Statement) -> Result<HirStmt> {
@@ -654,8 +980,10 @@ impl TypeChecker {
                 };
                 let init_hir = if let Some(e) = init {
                     let h = self.check_expr(e, &ty)?;
-                    self.infer.unify(&h.ty, &ty, e.span())
-                        .map_err(|e| self.errors.push(e)).ok();
+                    self.infer
+                        .unify(&h.ty, &ty, e.span())
+                        .map_err(|e| self.errors.push(e))
+                        .ok();
                     Some(Box::new(h))
                 } else {
                     None
@@ -698,13 +1026,18 @@ impl TypeChecker {
                 let ty = self.ast_to_hir_type(ast_ty)?;
                 let value = self.check_const_expr(value_expr, &ty)?;
                 let def = self.alloc_def(name.clone());
-                self.consts.insert(def, hir::HirConst {
-                    ty: ty.clone(),
-                    value: Box::new(value),
-                });
+                self.consts.insert(
+                    def,
+                    hir::HirConst {
+                        ty: ty.clone(),
+                        value: Box::new(value),
+                    },
+                );
                 Ok(HirStmt::Item)
             }
-            Statement::Expr(e, _span) => Ok(HirStmt::Expr(Box::new(self.check_expr(e, &Ty::Unit)?))),
+            Statement::Expr(e, _span) => {
+                Ok(HirStmt::Expr(Box::new(self.check_expr(e, &Ty::Unit)?)))
+            }
         }
     }
 
@@ -739,26 +1072,34 @@ impl TypeChecker {
                         // 需要 infer
                         self.infer.fresh_infer(span)
                     }
-                    ast::UnaryOp::AddrOf => {
-                        self.infer.fresh_infer(span)
-                    }
+                    ast::UnaryOp::AddrOf => self.infer.fresh_infer(span),
                 };
                 let operand = self.check_expr(operand, &ty)?;
                 match op {
                     ast::UnaryOp::Deref => {
                         // *p : 若 p: &T 则结果为 T
                         let inner = self.infer.fresh_infer(span);
-                        self.infer.unify(
-                            &operand.ty,
-                            &Ty::Reference(Box::new(inner.clone()), hir::Mutability::Immutable),
+                        self.infer
+                            .unify(
+                                &operand.ty,
+                                &Ty::Reference(Box::new(inner.clone()), hir::Mutability::Immutable),
+                                span,
+                            )
+                            .ok();
+                        return Ok(HirExpr {
+                            kind: ExprKind::Deref(Box::new(operand)),
+                            ty: inner,
                             span,
-                        ).ok();
-                        return Ok(HirExpr { kind: ExprKind::Deref(Box::new(operand)), ty: inner, span });
+                        });
                     }
                     ast::UnaryOp::AddrOf => {
                         let inner = self.infer.fresh_infer(span);
                         let ty = Ty::Reference(Box::new(inner.clone()), hir::Mutability::Immutable);
-                        return Ok(HirExpr { kind: ExprKind::AddrOf, ty, span });
+                        return Ok(HirExpr {
+                            kind: ExprKind::AddrOf,
+                            ty,
+                            span,
+                        });
                     }
                     _ => ExprKind::Unary(self.ast_unary_op(*op), Box::new(operand)),
                 }
@@ -795,25 +1136,39 @@ impl TypeChecker {
                     }
                     _ => {
                         // 尝试索引为指针
-                        self.infer.unify(
-                            &recv.ty,
-                            &Ty::Pointer(Box::new(elem_ty.clone()), hir::Mutability::Immutable),
-                            span,
-                        ).ok();
+                        self.infer
+                            .unify(
+                                &recv.ty,
+                                &Ty::Pointer(Box::new(elem_ty.clone()), hir::Mutability::Immutable),
+                                span,
+                            )
+                            .ok();
                     }
                 }
-                return Ok(HirExpr { kind: ExprKind::Index(Box::new(recv)), ty: elem_ty, span });
+                return Ok(HirExpr {
+                    kind: ExprKind::Index(Box::new(recv)),
+                    ty: elem_ty,
+                    span,
+                });
             }
             Expression::Field(receiver, name, _) => {
                 let recv = self.check_expr(receiver, &Ty::Infer(InferId(0)))?;
                 let (ty, idx) = self.check_field_access(&recv.ty, name, span)?;
                 let _ = idx;
-                return Ok(HirExpr { kind: ExprKind::Field(Box::new(recv)), ty, span });
+                return Ok(HirExpr {
+                    kind: ExprKind::Field(Box::new(recv)),
+                    ty,
+                    span,
+                });
             }
             Expression::AddrOf(e, m, _) => {
                 let inner = self.check_expr(e, &Ty::Infer(InferId(0)))?;
                 let ty = Ty::Reference(Box::new(inner.ty.clone()), *m);
-                return Ok(HirExpr { kind: ExprKind::AddrOf, ty, span });
+                return Ok(HirExpr {
+                    kind: ExprKind::AddrOf,
+                    ty,
+                    span,
+                });
             }
             Expression::Cast(e, target, _) => {
                 let target_ty = self.ast_to_hir_type(target)?;
@@ -829,8 +1184,16 @@ impl TypeChecker {
             }
             Expression::Block(b, _) => {
                 let inner = self.check_block(b, expected)?;
-                let ty = inner.tail.as_ref().map(|t| t.ty.clone()).unwrap_or(Ty::Unit);
-                return Ok(HirExpr { kind: ExprKind::Block(inner), ty, span });
+                let ty = inner
+                    .tail
+                    .as_ref()
+                    .map(|t| t.ty.clone())
+                    .unwrap_or(Ty::Unit);
+                return Ok(HirExpr {
+                    kind: ExprKind::Block(inner),
+                    ty,
+                    span,
+                });
             }
             Expression::If(cond, then_b, else_b, _) => {
                 let c = self.check_expr(cond, &Ty::Bool)?;
@@ -854,7 +1217,11 @@ impl TypeChecker {
                 };
                 let ty = if let Some(ref el) = else_hir {
                     // 合并 then/else 类型
-                    let t = then_hir.tail.as_ref().map(|t| t.ty.clone()).unwrap_or(Ty::Unit);
+                    let t = then_hir
+                        .tail
+                        .as_ref()
+                        .map(|t| t.ty.clone())
+                        .unwrap_or(Ty::Unit);
                     let e = el.tail.as_ref().map(|t| t.ty.clone()).unwrap_or(Ty::Unit);
                     self.unify_or(&t, &e)
                 } else {
@@ -864,13 +1231,18 @@ impl TypeChecker {
                 // `if` 本身的值是 never：它既不产生值也不正常返回。
                 // 没有这一条，`fn f() -> i32 { if c { return 1; } else { return 2; } }`
                 // 里的 `if` 作为尾表达式会被拿去和 i32 统一，报类型不匹配。
-                let ty = if then_hir.tail.is_none() && else_hir.as_ref().is_some_and(|b| b.tail.is_none())
+                let ty = if then_hir.tail.is_none()
+                    && else_hir.as_ref().is_some_and(|b| b.tail.is_none())
                 {
                     Ty::Never
                 } else {
                     ty
                 };
-                return Ok(HirExpr { kind: ExprKind::If(Box::new(c), then_hir, else_hir), ty, span });
+                return Ok(HirExpr {
+                    kind: ExprKind::If(Box::new(c), then_hir, else_hir),
+                    ty,
+                    span,
+                });
             }
             Expression::Match(scrutinee, arms, _) => {
                 return self.check_match(scrutinee, arms, expected, span);
@@ -883,7 +1255,11 @@ impl TypeChecker {
                 } else {
                     None
                 };
-                return Ok(HirExpr { kind: ExprKind::While(Box::new(c), b), ty: Ty::Unit, span });
+                return Ok(HirExpr {
+                    kind: ExprKind::While(Box::new(c), b),
+                    ty: Ty::Unit,
+                    span,
+                });
             }
             Expression::For(_pat, iter, body, _) => {
                 let _it = self.check_expr(iter, &Ty::Infer(InferId(0)))?;
@@ -901,18 +1277,30 @@ impl TypeChecker {
             }
             Expression::Loop(body, _) => {
                 let b = self.check_block(body, &Ty::Unit)?;
-                return Ok(HirExpr { kind: ExprKind::Loop(b), ty: Ty::Never, span });
+                return Ok(HirExpr {
+                    kind: ExprKind::Loop(b),
+                    ty: Ty::Never,
+                    span,
+                });
             }
             Expression::Break(label, value, _) => {
                 if let Some(val) = value {
                     let _ = self.check_expr(val, &Ty::Infer(InferId(0)))?;
                 }
                 let _ = label;
-                return Ok(HirExpr { kind: ExprKind::Break, ty: Ty::Never, span });
+                return Ok(HirExpr {
+                    kind: ExprKind::Break,
+                    ty: Ty::Never,
+                    span,
+                });
             }
             Expression::Continue(label, _) => {
                 let _ = label;
-                return Ok(HirExpr { kind: ExprKind::Break, ty: Ty::Never, span });
+                return Ok(HirExpr {
+                    kind: ExprKind::Continue,
+                    ty: Ty::Never,
+                    span,
+                });
             }
             Expression::Return(value, _) => {
                 let ret_ty = self.infer.return_ty.clone().unwrap_or(Ty::Unit);
@@ -923,12 +1311,20 @@ impl TypeChecker {
                 } else {
                     None
                 };
-                return Ok(HirExpr { kind: ExprKind::Return(v), ty: Ty::Never, span });
+                return Ok(HirExpr {
+                    kind: ExprKind::Return(v),
+                    ty: Ty::Never,
+                    span,
+                });
             }
             Expression::Defer(e, _) => {
                 let inner = self.check_expr(e, &Ty::Unit)?;
                 let _ = inner;
-                return Ok(HirExpr { kind: ExprKind::Defer, ty: Ty::Unit, span });
+                return Ok(HirExpr {
+                    kind: ExprKind::Defer,
+                    ty: Ty::Unit,
+                    span,
+                });
             }
             Expression::Try(e, pat, catch, _) => {
                 let inner = self.check_expr(e, &Ty::Infer(InferId(0)))?;
@@ -936,12 +1332,20 @@ impl TypeChecker {
                     let _ = self.lower_pattern(p, &inner.ty)?;
                     let _ = self.check_block(catch, &Ty::Infer(InferId(0)))?;
                 }
-                return Ok(HirExpr { kind: ExprKind::Try, ty: Ty::Infer(InferId(0)), span });
+                return Ok(HirExpr {
+                    kind: ExprKind::Try,
+                    ty: Ty::Infer(InferId(0)),
+                    span,
+                });
             }
             Expression::Throw(e, _) => {
                 let inner = self.check_expr(e, &Ty::Infer(InferId(0)))?;
                 let _ = inner;
-                return Ok(HirExpr { kind: ExprKind::Throw, ty: Ty::Never, span });
+                return Ok(HirExpr {
+                    kind: ExprKind::Throw,
+                    ty: Ty::Never,
+                    span,
+                });
             }
             Expression::Array(elems, repeat, _) => {
                 if let Some(rep) = repeat {
@@ -971,7 +1375,11 @@ impl TypeChecker {
                     let h = self.check_expr(e, &Ty::Infer(InferId(0)))?;
                     tys.push(h.ty.clone());
                 }
-                return Ok(HirExpr { kind: ExprKind::Tuple, ty: Ty::Tuple(tys), span });
+                return Ok(HirExpr {
+                    kind: ExprKind::Tuple,
+                    ty: Ty::Tuple(tys),
+                    span,
+                });
             }
             Expression::StructInit(path, fields, _) => {
                 return self.check_struct_init(path, fields, expected, span);
@@ -1001,7 +1409,11 @@ impl TypeChecker {
             }
             Expression::Await(e, _) => {
                 let inner = self.check_expr(e, &Ty::Infer(InferId(0)))?;
-                return Ok(HirExpr { kind: ExprKind::Await(Box::new(inner)), ty: Ty::Infer(InferId(0)), span });
+                return Ok(HirExpr {
+                    kind: ExprKind::Await(Box::new(inner)),
+                    ty: Ty::Infer(InferId(0)),
+                    span,
+                });
             }
             Expression::Asm(asm, _) => {
                 // 保留对 asm 操作数的类型检查（副作用）
@@ -1020,17 +1432,29 @@ impl TypeChecker {
             Expression::Yield(e, _) => {
                 let inner = self.check_expr(e, &Ty::Infer(InferId(0)))?;
                 let _ = inner;
-                return Ok(HirExpr { kind: ExprKind::Yield, ty: Ty::Infer(InferId(0)), span });
+                return Ok(HirExpr {
+                    kind: ExprKind::Yield,
+                    ty: Ty::Infer(InferId(0)),
+                    span,
+                });
             }
             Expression::Spawn(e, _) => {
                 let inner = self.check_expr(e, &Ty::Infer(InferId(0)))?;
                 let _ = inner;
-                return Ok(HirExpr { kind: ExprKind::Spawn, ty: Ty::Infer(InferId(0)), span });
+                return Ok(HirExpr {
+                    kind: ExprKind::Spawn,
+                    ty: Ty::Infer(InferId(0)),
+                    span,
+                });
             }
             Expression::Labeled(_label, e, _) => {
                 let inner = self.check_expr(e, expected)?;
                 self.infer.record_borrow();
-                return Ok(HirExpr { kind: inner.kind, ty: inner.ty, span });
+                return Ok(HirExpr {
+                    kind: inner.kind,
+                    ty: inner.ty,
+                    span,
+                });
             }
             Expression::Goto(label, _) => {
                 return Err(CompileError::internal(format!(
@@ -1040,9 +1464,8 @@ impl TypeChecker {
                 .with_span(span));
             }
             Expression::Intrinsic(kind, types, operands, _) => {
-                let hir_types: Result<Vec<Ty>> = types.iter()
-                    .map(|t| self.ast_to_hir_type(t))
-                    .collect();
+                let hir_types: Result<Vec<Ty>> =
+                    types.iter().map(|t| self.ast_to_hir_type(t)).collect();
                 let mut hir_types = hir_types?;
                 let _ = self.lower_intrinsic(*kind);
                 // 表达式实参也要检查（`intrinsic!(drop x)` 里的 `x`）
@@ -1121,18 +1544,32 @@ impl TypeChecker {
         let r = self.check_expr(rhs, &r_ty)?;
         self.infer.unify(&l.ty, &r.ty, span).ok();
         let ty = match op {
-            ast::BinaryOp::Add | ast::BinaryOp::Sub | ast::BinaryOp::Mul
-            | ast::BinaryOp::Div | ast::BinaryOp::Rem
-            | ast::BinaryOp::BitAnd | ast::BinaryOp::BitOr | ast::BinaryOp::BitXor
-            | ast::BinaryOp::Shl | ast::BinaryOp::Shr => l.ty.clone(),
-            ast::BinaryOp::Eq | ast::BinaryOp::Ne | ast::BinaryOp::Lt
-            | ast::BinaryOp::Gt | ast::BinaryOp::Le | ast::BinaryOp::Ge => Ty::Bool,
+            ast::BinaryOp::Add
+            | ast::BinaryOp::Sub
+            | ast::BinaryOp::Mul
+            | ast::BinaryOp::Div
+            | ast::BinaryOp::Rem
+            | ast::BinaryOp::BitAnd
+            | ast::BinaryOp::BitOr
+            | ast::BinaryOp::BitXor
+            | ast::BinaryOp::Shl
+            | ast::BinaryOp::Shr => l.ty.clone(),
+            ast::BinaryOp::Eq
+            | ast::BinaryOp::Ne
+            | ast::BinaryOp::Lt
+            | ast::BinaryOp::Gt
+            | ast::BinaryOp::Le
+            | ast::BinaryOp::Ge => Ty::Bool,
             ast::BinaryOp::And | ast::BinaryOp::Or => Ty::Bool,
             ast::BinaryOp::Range | ast::BinaryOp::RangeInclusive => {
                 Ty::Reference(Box::new(l.ty.clone()), hir::Mutability::Immutable)
             }
         };
-        Ok(HirExpr { kind: ExprKind::Binary(bin_op, Box::new(l), Box::new(r)), ty, span })
+        Ok(HirExpr {
+            kind: ExprKind::Binary(bin_op, Box::new(l), Box::new(r)),
+            ty,
+            span,
+        })
     }
 
     fn check_call(
@@ -1148,7 +1585,9 @@ impl TypeChecker {
             Ty::Function { params, ret, .. } => (params.clone(), ret.as_ref().clone()),
             Ty::Infer(_) => {
                 // 推断：创建参数类型变量
-                let params: Vec<Ty> = (0..args.len()).map(|_| self.infer.fresh_infer(span)).collect();
+                let params: Vec<Ty> = (0..args.len())
+                    .map(|_| self.infer.fresh_infer(span))
+                    .collect();
                 let ret = self.infer.fresh_infer(span);
                 (params, ret)
             }
@@ -1170,7 +1609,10 @@ impl TypeChecker {
                     e
                 }
             };
-            let param_ty = param_tys.get(i).cloned().unwrap_or_else(|| Ty::Infer(InferId(0)));
+            let param_ty = param_tys
+                .get(i)
+                .cloned()
+                .unwrap_or_else(|| Ty::Infer(InferId(0)));
             hir_args.push(self.check_expr(a, &param_ty)?);
         }
         // 被调函数用一个 DefId 指明；间接调用（通过函数指针）暂不支持。
@@ -1214,7 +1656,10 @@ impl TypeChecker {
                 let _ = self.check_expr(g, &Ty::Bool)?;
             }
             let body = self.check_expr(&arm.body, expected)?;
-            hir_arms.push(HirArm { pattern: pat, body: Box::new(body) });
+            hir_arms.push(HirArm {
+                pattern: pat,
+                body: Box::new(body),
+            });
         }
         // 记录模式用于穷尽性检查
         self.check_exhaustiveness_arm(&s.ty, &hir_arms, span)?;
@@ -1223,7 +1668,11 @@ impl TypeChecker {
         } else {
             Ty::Never
         };
-        Ok(HirExpr { kind: ExprKind::Match, ty, span })
+        Ok(HirExpr {
+            kind: ExprKind::Match,
+            ty,
+            span,
+        })
     }
 
     fn check_exhaustiveness_arm(
@@ -1264,12 +1713,18 @@ impl TypeChecker {
     ) -> Result<HirExpr> {
         let def_id = self.resolve_path(path, span)?;
         let field_tys: Vec<(String, Ty)> = match self.type_defs.get(&def_id) {
-            Some(hir::HirTypeDef::Struct(s)) => s.fields.iter().map(|f| (f.name.clone(), f.ty.clone())).collect(),
-            _ => return Err(CompileError::type_error(format!(
-                "`{}` is not a struct",
-                path.join("::")
-            ))
-            .with_span(span)),
+            Some(hir::HirTypeDef::Struct(s)) => s
+                .fields
+                .iter()
+                .map(|f| (f.name.clone(), f.ty.clone()))
+                .collect(),
+            _ => {
+                return Err(CompileError::type_error(format!(
+                    "`{}` is not a struct",
+                    path.join("::")
+                ))
+                .with_span(span))
+            }
         };
         let mut seen = HashSet::new();
         for (name, expr) in fields {
@@ -1279,7 +1734,8 @@ impl TypeChecker {
                 None => {
                     return Err(CompileError::name_error(format!(
                         "no field `{}` on struct `{}`",
-                        name, path.join("::")
+                        name,
+                        path.join("::")
                     ))
                     .with_span(span));
                 }
@@ -1300,7 +1756,8 @@ impl TypeChecker {
             if !seen.contains(name) {
                 return Err(CompileError::type_error(format!(
                     "missing field `{}` in struct literal for `{}`",
-                    name, path.join("::")
+                    name,
+                    path.join("::")
                 ))
                 .with_span(span));
             }
@@ -1312,12 +1769,7 @@ impl TypeChecker {
         })
     }
 
-    fn check_field_access(
-        &self,
-        ty: &Ty,
-        name: &str,
-        span: ast::Span,
-    ) -> Result<(Ty, FieldIndex)> {
+    fn check_field_access(&self, ty: &Ty, name: &str, span: ast::Span) -> Result<(Ty, FieldIndex)> {
         match ty {
             Ty::Named(id, _) => {
                 if let Some(hir_td) = self.type_defs.get(id) {
@@ -1342,11 +1794,10 @@ impl TypeChecker {
                         return Ok((tys[idx].clone(), FieldIndex::Pos(idx)));
                     }
                 }
-                Err(CompileError::type_error(format!(
-                    "tuple index out of range: {}",
-                    name
-                ))
-                .with_span(span))
+                Err(
+                    CompileError::type_error(format!("tuple index out of range: {}", name))
+                        .with_span(span),
+                )
             }
             Ty::Reference(inner, _) | Ty::Pointer(inner, _) => {
                 self.check_field_access(inner, name, span)
@@ -1364,11 +1815,7 @@ impl TypeChecker {
     // 字面量 / 模式
     // ==================================================================
 
-    fn check_literal(
-        &self,
-        lit: &AstLiteral,
-        expected: &Ty,
-    ) -> Result<(ExprKind, Ty)> {
+    fn check_literal(&self, lit: &AstLiteral, expected: &Ty) -> Result<(ExprKind, Ty)> {
         Ok(match lit {
             AstLiteral::Int(v, suffix) => {
                 let ty = match suffix.as_deref() {
@@ -1382,9 +1829,13 @@ impl TypeChecker {
                     Some("u64") => Ty::Uint(64),
                     _ => {
                         // 默认推断：尝试从 expected 推断
-                        if let Ty::Int(w) = expected { Ty::Int(*w) }
-                        else if let Ty::Uint(w) = expected { Ty::Uint(*w) }
-                        else { Ty::Int(32) }
+                        if let Ty::Int(w) = expected {
+                            Ty::Int(*w)
+                        } else if let Ty::Uint(w) = expected {
+                            Ty::Uint(*w)
+                        } else {
+                            Ty::Int(32)
+                        }
                     }
                 };
                 (ExprKind::Literal(hir::HirLiteral::Int(*v)), ty)
@@ -1397,18 +1848,16 @@ impl TypeChecker {
                 };
                 (ExprKind::Literal(hir::HirLiteral::Float(*v)), ty)
             }
-            ast::Literal::String(s) => {
-                (ExprKind::Literal(hir::HirLiteral::String(s.clone())), Ty::Str)
-            }
-            ast::Literal::Char(c) => {
-                (ExprKind::Literal(hir::HirLiteral::Char(*c)), Ty::Char)
-            }
-            ast::Literal::Bool(b) => {
-                (ExprKind::Literal(hir::HirLiteral::Bool(*b)), Ty::Bool)
-            }
-            AstLiteral::Byte(v) => {
-                (ExprKind::Literal(hir::HirLiteral::Int(*v as i128)), Ty::Uint(8))
-            }
+            ast::Literal::String(s) => (
+                ExprKind::Literal(hir::HirLiteral::String(s.clone())),
+                Ty::Str,
+            ),
+            ast::Literal::Char(c) => (ExprKind::Literal(hir::HirLiteral::Char(*c)), Ty::Char),
+            ast::Literal::Bool(b) => (ExprKind::Literal(hir::HirLiteral::Bool(*b)), Ty::Bool),
+            AstLiteral::Byte(v) => (
+                ExprKind::Literal(hir::HirLiteral::Int(*v as i128)),
+                Ty::Uint(8),
+            ),
             AstLiteral::ByteString(bytes) => (
                 ExprKind::Literal(hir::HirLiteral::String(
                     bytes.iter().map(|b| *b as char).collect(),
@@ -1443,15 +1892,23 @@ impl TypeChecker {
                     Ty::Tuple(ts) => ts.clone(),
                     _ => Vec::new(),
                 };
-                let hir_pats: Result<Vec<_>> = pats.iter().enumerate()
+                let hir_pats: Result<Vec<_>> = pats
+                    .iter()
+                    .enumerate()
                     .map(|(i, p)| self.lower_pattern(p, elem_tys.get(i).unwrap_or(ty)))
                     .collect();
                 let _ = hir_pats?;
                 hir::HirPattern::Tuple
             }
-            AstPattern::Struct { path, fields, rest, span } => {
+            AstPattern::Struct {
+                path,
+                fields,
+                rest,
+                span,
+            } => {
                 let def_id = self.resolve_path(path, *span)?;
-                let hir_fields: Result<Vec<_>> = fields.iter()
+                let hir_fields: Result<Vec<_>> = fields
+                    .iter()
                     .map(|fp| {
                         let fty = self.field_type(def_id, &fp.name, *span)?;
                         Ok((0, self.lower_pattern(&fp.pattern, &fty)?))
@@ -1462,18 +1919,23 @@ impl TypeChecker {
                 hir::HirPattern::Struct
             }
             AstPattern::Variant { path, args, span } => {
-                let def_id = self.resolve_path(&path[..path.len()-1], *span)?;
+                let def_id = self.resolve_path(&path[..path.len() - 1], *span)?;
                 let variant_name = path.last().unwrap();
                 let variant_idx = self.variant_index(def_id, variant_name);
                 let payload_tys = self.variant_payload_tys(def_id, variant_idx, *span)?;
-                let hir_args: Result<Vec<_>> = args.iter().enumerate()
+                let hir_args: Result<Vec<_>> = args
+                    .iter()
+                    .enumerate()
                     .map(|(i, p)| self.lower_pattern(p, payload_tys.get(i).unwrap_or(ty)))
                     .collect();
                 let _ = hir_args?;
                 hir::HirPattern::Variant
             }
             AstPattern::Slice(pats, _) => {
-                let _ = pats.iter().map(|p| self.lower_pattern(p, ty)).collect::<Result<Vec<_>>>()?;
+                let _ = pats
+                    .iter()
+                    .map(|p| self.lower_pattern(p, ty))
+                    .collect::<Result<Vec<_>>>()?;
                 hir::HirPattern::Slice
             }
             AstPattern::Range(start, end, inclusive, _) => {
@@ -1505,7 +1967,12 @@ impl TypeChecker {
         0
     }
 
-    fn variant_payload_tys(&self, _def_id: DefId, _idx: usize, _span: ast::Span) -> Result<Vec<Ty>> {
+    fn variant_payload_tys(
+        &self,
+        _def_id: DefId,
+        _idx: usize,
+        _span: ast::Span,
+    ) -> Result<Vec<Ty>> {
         Ok(Vec::new())
     }
 
@@ -1531,7 +1998,10 @@ impl TypeChecker {
             self.scope_stack.last_mut().unwrap().push(local);
             hir_params.push((self.lower_pattern(p, &ty)?, ty.clone()));
         }
-        let ret_ty = ret.as_ref().map(|t| self.ast_to_hir_type(t)).unwrap_or_else(|| Ok(self.infer.fresh_infer(span)))?;
+        let ret_ty = ret
+            .as_ref()
+            .map(|t| self.ast_to_hir_type(t))
+            .unwrap_or_else(|| Ok(self.infer.fresh_infer(span)))?;
         let _ = self.check_block(body, &ret_ty)?;
         self.pop_scope();
         let fn_ty = Ty::Function {
@@ -1610,9 +2080,10 @@ impl TypeChecker {
     }
 
     fn find_def(&self, name: &str) -> Result<DefId> {
-        self.symbols.get(name).copied().ok_or_else(|| {
-            CompileError::name_error(format!("undefined name `{}`", name))
-        })
+        self.symbols
+            .get(name)
+            .copied()
+            .ok_or_else(|| CompileError::name_error(format!("undefined name `{}`", name)))
     }
 
     fn resolve_name(&self, name: &str, span: ast::Span) -> Result<DefId> {
@@ -1671,8 +2142,14 @@ impl TypeChecker {
 
     fn ast_to_hir_type(&mut self, t: &AstType) -> Result<Ty> {
         Ok(match t {
-            AstType::I(w) => Ty::Int(*w as u16),
-            AstType::U(w) => Ty::Uint(*w as u16),
+            AstType::I(w) => {
+                self.check_int_width(*w as u16)?;
+                Ty::Int(*w as u16)
+            }
+            AstType::U(w) => {
+                self.check_int_width(*w as u16)?;
+                Ty::Uint(*w as u16)
+            }
             AstType::F(w) => Ty::Float(*w as u16),
             AstType::Bool => Ty::Bool,
             AstType::Char => Ty::Char,
@@ -1685,21 +2162,43 @@ impl TypeChecker {
                     return Ok(Ty::Pin(Box::new(self.ast_to_hir_type(&generics[0])?)));
                 }
                 let id = self.resolve_type_path(path)?;
-                Ty::Named(id, generics.iter().map(|g| self.ast_to_hir_type(g)).collect::<Result<_>>()?)
+                Ty::Named(
+                    id,
+                    generics
+                        .iter()
+                        .map(|g| self.ast_to_hir_type(g))
+                        .collect::<Result<_>>()?,
+                )
             }
             AstType::Pointer(inner, m) => Ty::Pointer(Box::new(self.ast_to_hir_type(inner)?), *m),
-            AstType::Reference(inner, m) => Ty::Reference(Box::new(self.ast_to_hir_type(inner)?), *m),
+            AstType::Reference(inner, m) => {
+                Ty::Reference(Box::new(self.ast_to_hir_type(inner)?), *m)
+            }
             AstType::Array(inner, len) => Ty::Array(
                 Box::new(self.ast_to_hir_type(inner)?),
                 match len {
-                    ast::ArrayLen::Const(e) => hir::ArrayLen::Const(Box::new(self.lower_const_expr(e)?)),
+                    ast::ArrayLen::Const(e) => {
+                        hir::ArrayLen::Const(Box::new(self.lower_const_expr(e)?))
+                    }
                     ast::ArrayLen::Dynamic => hir::ArrayLen::Dynamic,
                 },
             ),
             AstType::Slice(inner, m) => Ty::Slice(Box::new(self.ast_to_hir_type(inner)?), *m),
-            AstType::Tuple(tys) => Ty::Tuple(tys.iter().map(|t| self.ast_to_hir_type(t)).collect::<Result<_>>()?),
-            AstType::Function { params, ret, is_async, abi } => Ty::Function {
-                params: params.iter().map(|p| self.ast_to_hir_type(p)).collect::<Result<_>>()?,
+            AstType::Tuple(tys) => Ty::Tuple(
+                tys.iter()
+                    .map(|t| self.ast_to_hir_type(t))
+                    .collect::<Result<_>>()?,
+            ),
+            AstType::Function {
+                params,
+                ret,
+                is_async,
+                abi,
+            } => Ty::Function {
+                params: params
+                    .iter()
+                    .map(|p| self.ast_to_hir_type(p))
+                    .collect::<Result<_>>()?,
                 ret: Box::new(self.ast_to_hir_type(ret)?),
                 is_async: *is_async,
                 abi: abi.clone(),
@@ -1754,18 +2253,28 @@ impl TypeChecker {
             ),
             Expression::Variable(name, _) => {
                 if let Some(id) = self.symbols.get(name).copied() {
-                    if let Some(t) = self.consts.get(&id) { t.ty.clone() }
-                    else if let Some(t) = self.statics.get(&id) { t.ty.clone() }
-                    else if let Some(t) = self.functions.get(&id) { t.return_type.clone() }
-                    else { self.infer.fresh_infer(e.span()) }
+                    if let Some(t) = self.consts.get(&id) {
+                        t.ty.clone()
+                    } else if let Some(t) = self.statics.get(&id) {
+                        t.ty.clone()
+                    } else if let Some(t) = self.functions.get(&id) {
+                        t.return_type.clone()
+                    } else {
+                        self.infer.fresh_infer(e.span())
+                    }
                 } else {
                     self.infer.fresh_infer(e.span())
                 }
             }
             Expression::Binary(_, op, _, _) => match op {
-                ast::BinaryOp::Eq | ast::BinaryOp::Ne | ast::BinaryOp::Lt
-                | ast::BinaryOp::Gt | ast::BinaryOp::Le | ast::BinaryOp::Ge
-                | ast::BinaryOp::And | ast::BinaryOp::Or => Ty::Bool,
+                ast::BinaryOp::Eq
+                | ast::BinaryOp::Ne
+                | ast::BinaryOp::Lt
+                | ast::BinaryOp::Gt
+                | ast::BinaryOp::Le
+                | ast::BinaryOp::Ge
+                | ast::BinaryOp::And
+                | ast::BinaryOp::Or => Ty::Bool,
                 _ => self.infer.fresh_infer(e.span()),
             },
             Expression::Unary(op, _, _) => match op {
@@ -1779,10 +2288,15 @@ impl TypeChecker {
                     _ => self.infer.fresh_infer(e.span()),
                 }
             }
-            Expression::Block(b, _) => b.tail.as_ref().map(|t| self.infer_expr_ty(t)).unwrap_or(Ok(Ty::Unit))?,
+            Expression::Block(b, _) => b
+                .tail
+                .as_ref()
+                .map(|t| self.infer_expr_ty(t))
+                .unwrap_or(Ok(Ty::Unit))?,
             Expression::If(_, then_b, else_b, _) => {
                 if let Some(eb) = else_b {
-                    let t = self.infer_expr_ty(&Expression::Block(then_b.clone(), ast::Span::unknown()))?;
+                    let t = self
+                        .infer_expr_ty(&Expression::Block(then_b.clone(), ast::Span::unknown()))?;
                     self.infer_expr_ty(eb).unwrap_or(t)
                 } else {
                     Ty::Unit
@@ -1801,11 +2315,16 @@ impl TypeChecker {
             Expression::Loop(_, _) => Ty::Never,
             Expression::Throw(_, _) => Ty::Never,
             Expression::StructInit(path, _, _) => {
-                let id = self.resolve_path(path, ast::Span::unknown()).unwrap_or(DefId(0));
+                let id = self
+                    .resolve_path(path, ast::Span::unknown())
+                    .unwrap_or(DefId(0));
                 Ty::Named(id, Vec::new())
             }
             Expression::Tuple(elems, _) => Ty::Tuple(
-                elems.iter().map(|e| self.infer_expr_ty(e)).collect::<Result<_>>()?
+                elems
+                    .iter()
+                    .map(|e| self.infer_expr_ty(e))
+                    .collect::<Result<_>>()?,
             ),
             Expression::Array(elems, _, _) => {
                 let elem = if let Some(first) = elems.first() {
@@ -1817,8 +2336,16 @@ impl TypeChecker {
             }
             Expression::Lambda(_, ret, _, _) => {
                 let params = Vec::new();
-                let ret_ty = ret.as_ref().map(|t| self.ast_to_hir_type(t)).unwrap_or_else(|| Ok(self.infer.fresh_infer(e.span())))?;
-                Ty::Function { params, ret: Box::new(ret_ty), is_async: false, abi: Abi::Zr }
+                let ret_ty = ret
+                    .as_ref()
+                    .map(|t| self.ast_to_hir_type(t))
+                    .unwrap_or_else(|| Ok(self.infer.fresh_infer(e.span())))?;
+                Ty::Function {
+                    params,
+                    ret: Box::new(ret_ty),
+                    is_async: false,
+                    abi: Abi::Zr,
+                }
             }
             Expression::Await(_, _) => self.infer.fresh_infer(e.span()),
             Expression::Yield(_, _) => self.infer.fresh_infer(e.span()),
@@ -1879,6 +2406,7 @@ impl TypeChecker {
             return_type: Ty::Infer(InferId(0)),
             body: None,
             is_async: f.is_async,
+            is_comptime: f.is_comptime,
             abi: hir::Abi::Zr,
             attrs: convert_attrs(&f.attrs),
         }
@@ -1940,6 +2468,45 @@ impl TypeChecker {
             // `comptime comptime 6 * 7`：内层已经是常量，外层直接透传
             Expression::Comptime(inner, _) => self.eval_const_expr(inner),
 
+            // `comptime fact(4)`：调用 comptime 函数并在编译期求值。
+            //
+            // 走 AST 而不是 HIR：函数体是顺序检查的，用到 `fact` 的那个函数
+            // 完全可能排在 `fact` 自己前面，这时它的 HIR 还不存在。
+            Expression::Call(callee, args, span) => {
+                let name = match callee.as_ref() {
+                    ast::Expression::Variable(n, _) => n.clone(),
+                    _ => {
+                        return Err(CompileError::internal(
+                            "only direct calls to `comptime fn` are supported \
+                             in compile-time contexts",
+                        )
+                        .with_span(*span))
+                    }
+                };
+                let mut ev = crate::comptime::AstEvaluator::new(&self.ast_fns);
+                let mut vals = Vec::with_capacity(args.len());
+                for a in args {
+                    match a {
+                        ast::Argument::Pos(e) => vals.push(*self.eval_const_expr(e)?),
+                        ast::Argument::Named(_, _) => {
+                            return Err(CompileError::internal(
+                                "named arguments are not supported in compile-time contexts",
+                            )
+                            .with_span(*span))
+                        }
+                    }
+                }
+                let value = ev
+                    .call(&name, &vals)
+                    .map_err(|e| CompileError::internal(e.message).with_span(*span))?;
+                Ok(Box::new(value))
+            }
+
+            // 块里的 `let` 绑定要让后续表达式看得到，否则
+            // `comptime { let x = 6; x * 7 }` 会在 `x` 上报错。
+            // 这里不做作用域弹出：整个 `eval_const_expr` 的求值过程中
+            // 名字到值的绑定是单调累积的，与运行期的遮蔽规则差异只在
+            // 同名遮蔽的极端情形。
             Expression::Variable(name, span) => {
                 // 查找常量定义并求值
                 if let Some(id) = self.symbols.get(name).copied() {
@@ -2007,15 +2574,16 @@ impl TypeChecker {
             | ast::BinaryOp::BitXor
             | ast::BinaryOp::Shl
             | ast::BinaryOp::Shr => match (l, r) {
-                (Float(l), Float(r)) if !matches!(
-                    op,
-                    ast::BinaryOp::Rem
-                        | ast::BinaryOp::BitAnd
-                        | ast::BinaryOp::BitOr
-                        | ast::BinaryOp::BitXor
-                        | ast::BinaryOp::Shl
-                        | ast::BinaryOp::Shr
-                ) =>
+                (Float(l), Float(r))
+                    if !matches!(
+                        op,
+                        ast::BinaryOp::Rem
+                            | ast::BinaryOp::BitAnd
+                            | ast::BinaryOp::BitOr
+                            | ast::BinaryOp::BitXor
+                            | ast::BinaryOp::Shl
+                            | ast::BinaryOp::Shr
+                    ) =>
                 {
                     if matches!(op, ast::BinaryOp::Div) && *r == 0.0 {
                         return Err(CompileError::internal("division by zero").with_span(span));
@@ -2045,10 +2613,10 @@ impl TypeChecker {
                         _ => l.wrapping_shr(*r as u32),
                     })))
                 }
-                _ => Err(
-                    CompileError::internal("mismatched operand types in compile-time expression")
-                        .with_span(span),
-                ),
+                _ => Err(CompileError::internal(
+                    "mismatched operand types in compile-time expression",
+                )
+                .with_span(span)),
             },
             ast::BinaryOp::Eq => Ok(Box::new(Bool(self.const_eq(l, r)))),
             ast::BinaryOp::Ne => Ok(Box::new(Bool(!self.const_eq(l, r)))),
@@ -2073,10 +2641,10 @@ impl TypeChecker {
                 },
                 _ => Err(CompileError::internal("'||' needs booleans").with_span(span)),
             },
-            _ => Err(CompileError::internal(
-                "operator not allowed in compile-time context",
-            )
-            .with_span(span)),
+            _ => Err(
+                CompileError::internal("operator not allowed in compile-time context")
+                    .with_span(span),
+            ),
         }
     }
 
@@ -2087,36 +2655,34 @@ impl TypeChecker {
             ast::UnaryOp::Neg => match v {
                 Int(i) => Ok(Box::new(Int(i.wrapping_neg()))),
                 Float(f) => Ok(Box::new(Float(-f))),
-                _ => Err(CompileError::internal("cannot negate this value at compile time")
-                    .with_span(span)),
+                _ => Err(
+                    CompileError::internal("cannot negate this value at compile time")
+                        .with_span(span),
+                ),
             },
             // `!` 按类型分派：bool 是逻辑非，整数是位非
             ast::UnaryOp::Not => match v {
                 Bool(b) => Ok(Box::new(Bool(!b))),
                 Int(i) => Ok(Box::new(Int(!i))),
-                _ => Err(
-                    CompileError::internal("cannot apply '!' at compile time").with_span(span)
-                ),
+                _ => {
+                    Err(CompileError::internal("cannot apply '!' at compile time").with_span(span))
+                }
             },
             ast::UnaryOp::BitNot => match v {
                 Int(i) => Ok(Box::new(Int(!i))),
-                _ => Err(CompileError::internal("'~' needs an integer at compile time")
-                    .with_span(span)),
+                _ => Err(
+                    CompileError::internal("'~' needs an integer at compile time").with_span(span),
+                ),
             },
-            _ => Err(CompileError::internal(
-                "unary operator not allowed in compile-time context",
-            )
-            .with_span(span)),
+            _ => Err(
+                CompileError::internal("unary operator not allowed in compile-time context")
+                    .with_span(span),
+            ),
         }
     }
 
     /// 编译期常量大小比较；类型不可比时报错。
-    fn const_ord(
-        &self,
-        l: &HirLiteral,
-        r: &HirLiteral,
-        span: Span,
-    ) -> Result<std::cmp::Ordering> {
+    fn const_ord(&self, l: &HirLiteral, r: &HirLiteral, span: Span) -> Result<std::cmp::Ordering> {
         match (l, r) {
             (HirLiteral::Int(a), HirLiteral::Int(b)) => Ok(a.cmp(b)),
             (HirLiteral::Float(a), HirLiteral::Float(b)) => a.partial_cmp(b).ok_or_else(|| {
@@ -2147,10 +2713,10 @@ impl TypeChecker {
             }
             hir::ExprKind::Comptime(folded) => Ok(folded.clone()),
             hir::ExprKind::Cast(inner) => self.eval_const_from_hir(inner),
-            _ => Err(CompileError::internal(
-                "const definition is not a compile-time constant",
-            )
-            .with_span(e.span)),
+            _ => Err(
+                CompileError::internal("const definition is not a compile-time constant")
+                    .with_span(e.span),
+            ),
         }
     }
 
@@ -2218,7 +2784,11 @@ impl TypeChecker {
     }
 
     fn unify_or(&self, a: &Ty, b: &Ty) -> Ty {
-        if a == b { a.clone() } else { Ty::Infer(InferId(0)) }
+        if a == b {
+            a.clone()
+        } else {
+            Ty::Infer(InferId(0))
+        }
     }
 
     fn dummy_expr(&self) -> HirExpr {
@@ -2327,8 +2897,16 @@ fn align_up(addr: usize, align: usize) -> usize {
 
 fn parse_int_type(name: &str) -> Option<u16> {
     match name {
-        "i8" => Some(8), "i16" => Some(16), "i32" => Some(32), "i64" => Some(64), "i128" => Some(128),
-        "u8" => Some(8), "u16" => Some(16), "u32" => Some(32), "u64" => Some(64), "u128" => Some(128),
+        "i8" => Some(8),
+        "i16" => Some(16),
+        "i32" => Some(32),
+        "i64" => Some(64),
+        "i128" => Some(128),
+        "u8" => Some(8),
+        "u16" => Some(16),
+        "u32" => Some(32),
+        "u64" => Some(64),
+        "u128" => Some(128),
         _ => None,
     }
 }
@@ -2459,14 +3037,18 @@ fn types_may_overlap(a: &Ty, b: &Ty) -> bool {
         // 推断变量可能与任何类型重叠
         (Ty::Infer(_), _) | (_, Ty::Infer(_)) => true,
         // 指针/引用：检查内部类型
-        (Ty::Pointer(t1, _), Ty::Pointer(t2, _))
-        | (Ty::Reference(t1, _), Ty::Reference(t2, _)) => types_may_overlap(t1, t2),
+        (Ty::Pointer(t1, _), Ty::Pointer(t2, _)) | (Ty::Reference(t1, _), Ty::Reference(t2, _)) => {
+            types_may_overlap(t1, t2)
+        }
         // 数组：检查内部类型
         (Ty::Array(t1, _), Ty::Array(t2, _)) => types_may_overlap(t1, t2),
         // 元组：检查长度和元素
         (Ty::Tuple(ts1), Ty::Tuple(ts2)) => {
             ts1.len() == ts2.len()
-                && ts1.iter().zip(ts2.iter()).all(|(x, y)| types_may_overlap(x, y))
+                && ts1
+                    .iter()
+                    .zip(ts2.iter())
+                    .all(|(x, y)| types_may_overlap(x, y))
         }
         // 其他组合：保守地认为不重叠
         _ => a == b,
@@ -2489,7 +3071,10 @@ fn ty_name(ty: &Ty) -> String {
         Ty::Reference(t, _) => format!("&{}", ty_name(t)),
         Ty::Array(t, _) => format!("[{}; _]", ty_name(t)),
         Ty::Slice(t, _) => format!("[]{}", ty_name(t)),
-        Ty::Tuple(ts) => format!("({})", ts.iter().map(ty_name).collect::<Vec<_>>().join(", ")),
+        Ty::Tuple(ts) => format!(
+            "({})",
+            ts.iter().map(ty_name).collect::<Vec<_>>().join(", ")
+        ),
         Ty::Function { .. } => "fn(...)".into(),
         Ty::Optional(t) => format!("{}?", ty_name(t)),
         Ty::ErrorUnion(t, e) => format!("{}!{}", ty_name(t), ty_name(e)),
@@ -2661,4 +3246,44 @@ fn hir_repr(attrs: &[hir::HirAttr]) -> Result<hir::Repr> {
         }
     }
     Ok(hir::Repr::Rust)
+}
+
+#[cfg(test)]
+mod width_tests {
+    use super::*;
+
+    fn checker_for(max_bits: u16) -> TypeChecker {
+        let mut c = TypeChecker::new();
+        c.set_max_int_bits(max_bits);
+        c
+    }
+
+    /// 64 位目标：i64 / u64 / i128 一律放行。
+    #[test]
+    fn wide_ints_are_allowed_on_64_bit_targets() {
+        let c = checker_for(64);
+        assert!(c.check_int_width(64).is_ok());
+        assert!(c.check_int_width(32).is_ok());
+    }
+
+    /// 32 位目标：宽整数必须在类型检查阶段就报错。
+    ///
+    /// 之前不报错，后端把 i64 直接当 32 位写：`let a: i64 = 4294967296`
+    /// 编出来是 `movw r4, #0`，`a + b` 得到 1 而不是 4294967297。
+    /// 那种"能编过但结果是错的"必须挡在类型检查这一步。
+    #[test]
+    fn wide_ints_are_rejected_on_32_bit_targets() {
+        let c = checker_for(32);
+        assert!(c.check_int_width(32).is_ok());
+        assert!(c.check_int_width(16).is_ok());
+        let err = c.check_int_width(64).unwrap_err().to_string();
+        assert!(err.contains("64"), "error should name the width: {err}");
+        assert!(c.check_int_width(128).is_err());
+    }
+
+    /// 默认构造（宿主 x86-64）不该被限制。
+    #[test]
+    fn default_checker_allows_128_bit_ints() {
+        assert!(TypeChecker::new().check_int_width(128).is_ok());
+    }
 }

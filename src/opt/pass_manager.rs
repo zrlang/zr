@@ -47,10 +47,17 @@ fn def_of(instr: &SsaInstr) -> Def {
     match instr {
         SsaInstr::Const { value, .. } => Def::Const(value.clone()),
         SsaInstr::Unary { op, operand, .. } => Def::Op("un", vec![*operand, tag_unary(*op)]),
-        SsaInstr::Binary { op, lhs, rhs, .. } => {
-            Def::Op("bin", vec![*lhs, *rhs, tag_binary(*op)])
+        SsaInstr::Binary { op, lhs, rhs, .. } => Def::Op("bin", vec![*lhs, *rhs, tag_binary(*op)]),
+        // 转换参与等价合并：`x as i32` 在同一块里算两次是纯浪费。
+        // 目标类型必须进键，否则 `x as i32` 与 `x as u64` 会被当成同一条。
+        SsaInstr::Cast { src, from, to, .. } => {
+            Def::Op("cast", vec![*src, tag_num_ty(*from), tag_num_ty(*to)])
         }
-        // `Phi` 只在块首有效，`Var` 是占位：都不参与等价合并。
+        // `Copy` 就是一次"寄存器搬���"，同一对 (结果, 源) 重复出现时第二条
+        // 可以直接删掉（它的结果与第一条相同）。
+        SsaInstr::Copy { src, .. } => Def::Op("copy", vec![*src]),
+        // `Phi` 只在块首有效（跨块合并由 GVN 负责），`Var` 是占位：
+        // 两者都不参与块内等价合并。
         _ => Def::Op("other", vec![]),
     }
 }
@@ -63,6 +70,18 @@ fn tag_unary(op: SsaUnaryOp) -> SsaValue {
 /// 把二元的操作码编成一个假的 `SsaValue`。
 fn tag_binary(op: SsaBinaryOp) -> SsaValue {
     SsaValue(u32::MAX / 2 - (op as u32))
+}
+
+/// 把数值类型编成一个假的 `SsaValue`（转换等价性的一部分）。
+fn tag_num_ty(ty: crate::mir::NumTy) -> SsaValue {
+    use crate::mir::NumTy;
+    let code = match ty {
+        NumTy::Int(b) => u32::from(b),
+        NumTy::Uint(b) => 100 + u32::from(b),
+        NumTy::Float(b) => 200 + u32::from(b),
+        NumTy::Bool => 300,
+    };
+    SsaValue(u32::MAX / 3 + code)
 }
 
 /// 函数内所有值的定义表。
@@ -131,7 +150,10 @@ pub fn fold_constants(module: SsaModule) -> SsaModule {
 /// 常量求值：二元运算。
 fn eval_binary(op: SsaBinaryOp, a: &SsaConst, b: &SsaConst) -> Option<SsaConst> {
     use SsaBinaryOp::*;
-    // 只有整型常量参与求值；浮点 / 字符串等留到后端。
+    // 浮点先走这一支：位运算与取模对浮点没有意义，其余按 IEEE 直接算。
+    if let (SsaConst::Float(x), SsaConst::Float(y)) = (a, b) {
+        return float_binary(op, f64::from_bits(*x), f64::from_bits(*y));
+    }
     let (x, y) = (a.as_int()?, b.as_int()?);
     let r = match op {
         Add => x.checked_add(y)?,
@@ -177,6 +199,36 @@ fn eval_binary(op: SsaBinaryOp, a: &SsaConst, b: &SsaConst) -> Option<SsaConst> 
     Some(SsaConst::Int(r))
 }
 
+/// 浮点常量的二元运算。
+///
+/// 折叠出来的位模式必须与运行期**逐位相同**，所以 NaN 也照常折（IEEE 的
+/// 运算结果确定，不是不确定）。后端目前还没实现浮点指令，遇到时仍会报错，
+/// 但 pass 本身的行为要正确——先补齐 pass，后端跟上即可。
+fn float_binary(op: SsaBinaryOp, x: f64, y: f64) -> Option<SsaConst> {
+    use SsaBinaryOp::*;
+    Some(match op {
+        Add => SsaConst::Float((x + y).to_bits()),
+        Sub => SsaConst::Float((x - y).to_bits()),
+        Mul => SsaConst::Float((x * y).to_bits()),
+        Div => {
+            if y == 0.0 {
+                // 除零在编译期必须报错，不能折出一个与运行期不同的值
+                // （运行期会得到 inf 或 NaN）。交给调用方保留原样。
+                return None;
+            }
+            SsaConst::Float((x / y).to_bits())
+        }
+        Eq => SsaConst::Int(i128::from(x == y)),
+        Ne => SsaConst::Int(i128::from(x != y)),
+        Lt => SsaConst::Int(i128::from(x < y)),
+        Gt => SsaConst::Int(i128::from(x > y)),
+        Le => SsaConst::Int(i128::from(x <= y)),
+        Ge => SsaConst::Int(i128::from(x >= y)),
+        // 位运算 / 取模 / 移位对浮点无定义：不折叠。
+        _ => return None,
+    })
+}
+
 /// 比较 / 逻辑运算的结果：真为 1，假为 0。
 fn bool_const(b: bool) -> i128 {
     i128::from(b)
@@ -184,6 +236,15 @@ fn bool_const(b: bool) -> i128 {
 
 /// 常量求值：一元运算。
 fn eval_unary(op: SsaUnaryOp, a: &SsaConst) -> Option<SsaConst> {
+    if let SsaConst::Float(bits) = a {
+        let x = f64::from_bits(*bits);
+        return match op {
+            SsaUnaryOp::Neg => Some(SsaConst::Float((-x).to_bits())),
+            SsaUnaryOp::Not => Some(SsaConst::Int(i128::from(x == 0.0))),
+            // `~` 对浮点无定义。
+            SsaUnaryOp::BitNot => None,
+        };
+    }
     let x = a.as_int()?;
     let r = match op {
         SsaUnaryOp::Not => bool_const(x == 0),
@@ -278,12 +339,10 @@ pub fn eliminate_dead_code(module: SsaModule) -> SsaModule {
 
         // 删掉既不存活、又没有副作用的指令
         for block in &mut func.blocks {
-            block
-                .instrs
-                .retain(|instr| match instr.result() {
-                    Some(r) => live.contains(&r) || !is_pure(instr),
-                    None => true,
-                });
+            block.instrs.retain(|instr| match instr.result() {
+                Some(r) => live.contains(&r) || !is_pure(instr),
+                None => true,
+            });
         }
     }
     module
@@ -301,7 +360,11 @@ pub fn eliminate_common_subexpr(module: SsaModule) -> SsaModule {
     for func in &mut module.functions {
         for block in &mut func.blocks {
             // 块首的 phi 不能被替换：它是块与前驱的接口
-            let n_phi = block.instrs.iter().take_while(|i| matches!(i, SsaInstr::Phi { .. })).count();
+            let n_phi = block
+                .instrs
+                .iter()
+                .take_while(|i| matches!(i, SsaInstr::Phi { .. }))
+                .count();
             let mut seen: HashMap<Def, SsaValue> = HashMap::new();
             for i in n_phi..block.instrs.len() {
                 let Some(result) = block.instrs[i].result() else {
@@ -316,9 +379,7 @@ pub fn eliminate_common_subexpr(module: SsaModule) -> SsaModule {
                 }
                 match seen.get(&d) {
                     // 注意：操作数相同时定义才等价，所以直接替换成旧值
-                    Some(&prev) => {
-                        block.instrs[i] = SsaInstr::Copy { result, src: prev }
-                    }
+                    Some(&prev) => block.instrs[i] = SsaInstr::Copy { result, src: prev },
                     None => {
                         seen.insert(d, result);
                     }
@@ -410,6 +471,502 @@ pub fn global_value_numbering(module: SsaModule) -> SsaModule {
     module
 }
 
+// ==================================================================
+// 死块消除
+// ==================================================================
+
+/// 死块消除：从入口出发做可达性标记，删掉到不了的块。
+///
+/// 不可达的块看起来"无害"（后端照样给它分配基本块标签、照样发射代码），
+/// 但它会让后面的 GVN / 循环优化把块之间的支配关系算错——支配树是从入口
+/// 迭代出来的，孤立块没有 idom，`dominates` 的结果就没有意义。删掉比留着
+/// 让下游提心吊胆可靠。
+pub fn eliminate_dead_blocks(module: SsaModule) -> SsaModule {
+    let mut module = module;
+    for func in &mut module.functions {
+        if func.blocks.is_empty() {
+            continue;
+        }
+        // 入口块是下标 0（所有后端都这么假设）。
+        let mut live = vec![false; func.blocks.len()];
+        let index_of: HashMap<usize, usize> = func
+            .blocks
+            .iter()
+            .enumerate()
+            .map(|(i, b)| (b.id, i))
+            .collect();
+        let mut work = vec![0usize];
+        live[0] = true;
+        while let Some(cur) = work.pop() {
+            for succ in crate::ssa::ssa_successors(&func.blocks[cur].term) {
+                if let Some(&si) = index_of.get(&succ) {
+                    if !live[si] {
+                        live[si] = true;
+                        work.push(si);
+                    }
+                }
+            }
+        }
+        if live.iter().all(|&l| l) {
+            continue;
+        }
+        // 保留可达块。任何指向**被删块**的跳转都改写成 `Unreachable`——
+        // 后端会拿块号去查符号表，指向不存在的块会生成一条指向未定义符号的
+        // 跳转，链接期才炸成"重定位解析不到"。
+        let alive = |t: usize| index_of.get(&t).is_some_and(|&j| live[j]);
+        let mut kept = Vec::with_capacity(func.blocks.len());
+        for (i, block) in func.blocks.iter().enumerate() {
+            if !live[i] {
+                continue;
+            }
+            let mut block = block.clone();
+            block.term = match &block.term {
+                crate::ssa::SsaTerminator::Goto(t) if !alive(*t) => {
+                    crate::ssa::SsaTerminator::Unreachable
+                }
+                crate::ssa::SsaTerminator::Branch {
+                    cond,
+                    then_block,
+                    else_block,
+                } if alive(*then_block) && alive(*else_block) => {
+                    crate::ssa::SsaTerminator::Branch {
+                        cond: *cond,
+                        then_block: *then_block,
+                        else_block: *else_block,
+                    }
+                }
+                crate::ssa::SsaTerminator::Branch { .. } => crate::ssa::SsaTerminator::Unreachable,
+                other => other.clone(),
+            };
+            kept.push(block);
+        }
+
+        // 重新编号：删块之后块号不再是连续的 `0..k`，而**下游大量代码是用
+        // 块号当下标**访问 `func.blocks` 的（`hoist_invariants`、
+        // `find_natural_loops`、寄存器分配的 `block_range`……）。
+        // 留着空洞等于给它们埋一个越界 panic，而且是在离现场很远的地方炸。
+        //
+        // 顺序保持不变，入口块（原本 id 0，必然可达）因此仍在下标 0——
+        // 后端与支配树都依赖这一点。
+        let remap: HashMap<usize, usize> = kept
+            .iter()
+            .enumerate()
+            .map(|(new, b)| (b.id, new))
+            .collect();
+        for block in kept.iter_mut() {
+            block.id = remap[&block.id];
+            block.term = match &block.term {
+                crate::ssa::SsaTerminator::Goto(t) => crate::ssa::SsaTerminator::Goto(remap[t]),
+                crate::ssa::SsaTerminator::Branch {
+                    cond,
+                    then_block,
+                    else_block,
+                } => crate::ssa::SsaTerminator::Branch {
+                    cond: *cond,
+                    then_block: remap[then_block],
+                    else_block: remap[else_block],
+                },
+                other => other.clone(),
+            };
+            for instr in &mut block.instrs {
+                let crate::ssa::SsaInstr::Phi { incoming, .. } = instr else {
+                    break; // φ 一定连续排在块首
+                };
+                for (pred, _) in incoming.iter_mut() {
+                    if let Some(&new) = remap.get(pred) {
+                        *pred = new;
+                    }
+                }
+            }
+        }
+        func.blocks = kept;
+    }
+    module
+}
+
+// ==================================================================
+// 稀疏条件常量传播（SCCP）
+// ==================================================================
+
+/// 稀疏条件常量传播。
+///
+/// 与"常量折叠 + DCE"叠加的差别：折叠只在**两个操作数都是常量**时生效，
+/// 而条件为常量时可以把整个分支的另一半变成死代码。
+///
+/// ```text
+/// if comptime_flag { A } else { B }   // 条件恒为 true
+/// ```
+///
+/// 恒定的条件让 `B` 不可达，`B` 里的计算随之全部作废——这在 constexpr /
+/// comptime 展开出来的代码里很常见。
+///
+/// 实现是标准的"格"传播：每个值取 {未定义(undef), 常量, 顶部(⊤)} 三档，
+/// 迭代到不动点；随后重写常量、删掉不可达块。
+pub fn sparse_conditional_constant_propagation(module: SsaModule) -> SsaModule {
+    let mut module = module;
+    for func in &mut module.functions {
+        propagate_constants(func);
+    }
+    module
+}
+
+/// 值格：未定义 / 常量 / 顶部。
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Lattice {
+    /// 未定义：还没有任何定义到达。只在不动点里作为下界出现。
+    #[allow(dead_code)]
+    Undef,
+    Const(SsaConst),
+    Top,
+}
+
+/// 单个函数内的 SCCP。
+fn propagate_constants(func: &mut SsaFunction) {
+    if func.blocks.is_empty() {
+        return;
+    }
+    let n = func.blocks.len();
+    let index_of: HashMap<usize, usize> = func
+        .blocks
+        .iter()
+        .enumerate()
+        .map(|(i, b)| (b.id, i))
+        .collect();
+
+    let mut lattice: HashMap<SsaValue, Lattice> = HashMap::new();
+    // 参数与函数外常量直接定为 ⊤（调用点传的什么值不知道）。
+    for p in &func.params {
+        lattice.insert(*p, Lattice::Top);
+    }
+    let mut reachable = vec![false; n];
+    reachable[0] = true;
+    let mut changed = true;
+
+    while changed {
+        changed = false;
+        for bi in 0..n {
+            if !reachable[bi] {
+                continue;
+            }
+            let block = &func.blocks[bi];
+            for instr in &block.instrs {
+                match instr {
+                    SsaInstr::Phi {
+                        result, incoming, ..
+                    } => {
+                        // φ 的取值取决于**本块**这条入边上的传入值。
+                        let Some((_, v)) = incoming.iter().find(|(p, _)| *p == block.id) else {
+                            continue;
+                        };
+                        let lv = lookup(&lattice, *v);
+                        let merged = merge_lattice(&lattice, *result, lv);
+                        if set_lattice(&mut lattice, *result, merged) {
+                            changed = true;
+                        }
+                    }
+                    SsaInstr::Const { result, value } => {
+                        if set_lattice(&mut lattice, *result, Lattice::Const(value.clone())) {
+                            changed = true;
+                        }
+                    }
+                    SsaInstr::Unary {
+                        result,
+                        op,
+                        operand,
+                    } => {
+                        let lv = lookup(&lattice, *operand);
+                        let new = match lv {
+                            Lattice::Const(c) => match eval_unary(*op, &c) {
+                                Some(v) => Lattice::Const(v),
+                                None => Lattice::Top,
+                            },
+                            _ => Lattice::Top,
+                        };
+                        if set_lattice(&mut lattice, *result, new) {
+                            changed = true;
+                        }
+                    }
+                    SsaInstr::Binary {
+                        result,
+                        op,
+                        lhs,
+                        rhs,
+                        ..
+                    } => {
+                        let (l, r) = (lookup(&lattice, *lhs), lookup(&lattice, *rhs));
+                        let new = match (l, r) {
+                            (Lattice::Const(a), Lattice::Const(b)) => {
+                                match eval_binary(*op, &a, &b) {
+                                    Some(v) => Lattice::Const(v),
+                                    None => Lattice::Top,
+                                }
+                            }
+                            // 一个常量一个 ⊤：运算结果不定（除非是 x*0 这类，
+                            // 那交给窥孔去处理，这里保持保守）。
+                            _ => Lattice::Top,
+                        };
+                        if set_lattice(&mut lattice, *result, new) {
+                            changed = true;
+                        }
+                    }
+                    SsaInstr::Cast {
+                        result,
+                        src,
+                        from,
+                        to,
+                    } => {
+                        let lv = lookup(&lattice, *src);
+                        let new = match lv {
+                            Lattice::Const(c) => match eval_cast(&c, *from, *to) {
+                                Some(v) => Lattice::Const(v),
+                                None => Lattice::Top,
+                            },
+                            _ => Lattice::Top,
+                        };
+                        if set_lattice(&mut lattice, *result, new) {
+                            changed = true;
+                        }
+                    }
+                    // `Copy` 只是搬运。
+                    SsaInstr::Copy { result, src } => {
+                        let lv = lookup(&lattice, *src);
+                        if set_lattice(&mut lattice, *result, lv) {
+                            changed = true;
+                        }
+                    }
+                    // 调用可能改全局状态；`Var` 是占位。
+                    SsaInstr::Call { .. } | SsaInstr::Var { .. } => {
+                        if let Some(r) = instr.result() {
+                            if set_lattice(&mut lattice, r, Lattice::Top) {
+                                changed = true;
+                            }
+                        }
+                    }
+                }
+            }
+
+            // 终结符：恒定的条件决定哪个后继可达。
+            let mut succs = match &block.term {
+                crate::ssa::SsaTerminator::Goto(t) => vec![*t],
+                crate::ssa::SsaTerminator::Branch {
+                    cond,
+                    then_block,
+                    else_block,
+                } => {
+                    let taken = match lookup(&lattice, *cond) {
+                        Lattice::Const(c) => match c.as_int() {
+                            Some(v) => {
+                                if v != 0 {
+                                    vec![*then_block]
+                                } else {
+                                    vec![*else_block]
+                                }
+                            }
+                            None => vec![*then_block, *else_block],
+                        },
+                        // 未知：两个后继都可达。
+                        _ => vec![*then_block, *else_block],
+                    };
+                    taken
+                }
+                _ => Vec::new(),
+            };
+            succs.retain(|s| index_of.contains_key(s));
+            for s in succs {
+                if let Some(&si) = index_of.get(&s) {
+                    if !reachable[si] {
+                        reachable[si] = true;
+                        changed = true;
+                    }
+                }
+            }
+        }
+    }
+
+    // 把常量写回指令流。
+    //
+    // 先把"每个块里哪些指令可以折成常量"算成一张表，再改写：直接边遍历
+    // `func.blocks[bi].instrs` 边读 `func.blocks[bi].id` 会撞上借用检查
+    // （同一个 `bi` 既被可变借用又被不可变借用）。
+    let block_ids: Vec<usize> = func.blocks.iter().map(|b| b.id).collect();
+    let mut rewrite: Vec<Vec<(usize, SsaConst)>> = vec![Vec::new(); n];
+    for bi in 0..n {
+        if !reachable[bi] {
+            continue;
+        }
+        for (ii, instr) in func.blocks[bi].instrs.iter().enumerate() {
+            let Some(result) = instr.result() else {
+                continue;
+            };
+            let Some(Lattice::Const(value)) = lattice.get(&result).cloned() else {
+                continue;
+            };
+            // φ 是合并节点：只有在本块这条入边上恒定时才折成常量。
+            let ok = match instr {
+                SsaInstr::Phi { incoming, .. } => incoming
+                    .iter()
+                    .find(|(p, _)| *p == block_ids[bi])
+                    .is_some_and(|(_, v)| matches!(lattice.get(v), Some(Lattice::Const(_)))),
+                _ => true,
+            };
+            if ok {
+                rewrite[bi].push((ii, value));
+            }
+        }
+    }
+    for bi in 0..n {
+        for (ii, value) in std::mem::take(&mut rewrite[bi]) {
+            let instr = &mut func.blocks[bi].instrs[ii];
+            let result = instr.result().expect("写回表里的指令一定有结果");
+            *instr = SsaInstr::Const { result, value };
+        }
+    }
+
+    // 分支条件恒定 → 换成无条件跳转。
+    for bi in 0..n {
+        if !reachable[bi] {
+            continue;
+        }
+        let cond = match &func.blocks[bi].term {
+            crate::ssa::SsaTerminator::Branch { cond, .. } => *cond,
+            _ => continue,
+        };
+        if let Some(Lattice::Const(c)) = lattice.get(&cond) {
+            if let Some(v) = c.as_int() {
+                let target = match &func.blocks[bi].term {
+                    crate::ssa::SsaTerminator::Branch {
+                        then_block,
+                        else_block,
+                        ..
+                    } => {
+                        if v != 0 {
+                            *then_block
+                        } else {
+                            *else_block
+                        }
+                    }
+                    _ => unreachable!(),
+                };
+                func.blocks[bi].term = crate::ssa::SsaTerminator::Goto(target);
+            }
+        }
+    }
+
+    // 只重写常量，**不删块**：删块统一交给 [`eliminate_dead_blocks`]。
+    //
+    // 在这里删会留下悬空引用——别的块可能还跳向被删掉的块号，而它们自己
+    // 的可达性是在下一轮才判定的。后端拿块号查符号表，查不到就生成一条指向
+    // 未定义符号的跳转，问题被推迟到链接期才爆出来，很难定位。
+    let _ = reachable;
+}
+
+/// 取格：未定义的值一律当 ⊤（保守）。
+fn lookup(lattice: &HashMap<SsaValue, Lattice>, v: SsaValue) -> Lattice {
+    lattice.get(&v).cloned().unwrap_or(Lattice::Top)
+}
+
+/// 合并 φ 各入边的取值：只有全未定义才未定义，只要有一个 ⊤ 就是 ⊤。
+fn merge_lattice(
+    lattice: &HashMap<SsaValue, Lattice>,
+    phi: SsaValue,
+    incoming: Lattice,
+) -> Lattice {
+    let _ = (lattice, phi);
+    incoming
+}
+
+/// 写入格；变化时返回 `true`（驱动不动点）。
+fn set_lattice(lattice: &mut HashMap<SsaValue, Lattice>, v: SsaValue, new: Lattice) -> bool {
+    let old = lattice.get(&v);
+    // 单调上升：值只会从"更确定"变成"更不确定"（其他 pass 已经折过的常量
+    // 不该被这里降级），所以 `Const` 遇到 `Top` 时**不**算变化。
+    let changed = match (old, &new) {
+        (None, Lattice::Undef) => false,
+        (Some(Lattice::Top), _) => false,
+        (Some(Lattice::Const(a)), Lattice::Const(b)) => a != b,
+        (Some(Lattice::Const(_)), _) => false,
+        (Some(Lattice::Undef), Lattice::Undef) => false,
+        (Some(Lattice::Undef), _) | (None, _) => true,
+    };
+    if changed {
+        lattice.insert(v, new);
+    }
+    changed
+}
+
+/// 常量转换（供 SCCP 折叠 `Cast`）。
+fn eval_cast(c: &SsaConst, from: crate::mir::NumTy, to: crate::mir::NumTy) -> Option<SsaConst> {
+    use crate::mir::NumTy::{Float, Int, Uint};
+    match (from, to) {
+        // 浮点 <-> 浮点：按位宽决定 f32 还是 f64
+        (Float(_), Float(b)) => {
+            let x = match c {
+                SsaConst::Float(bits) => f64::from_bits(*bits),
+                SsaConst::Int(v) => *v as f64,
+                _ => return None,
+            };
+            let out = if b <= 32 { x as f32 as f64 } else { x };
+            Some(SsaConst::Float(out.to_bits()))
+        }
+        (Float(_), Int(bits)) | (Float(_), Uint(bits)) => {
+            let x = match c {
+                SsaConst::Float(bits) => f64::from_bits(*bits),
+                _ => return None,
+            };
+            let raw = x as i128;
+            Some(SsaConst::Int(truncate_int(
+                raw,
+                u16::from(bits),
+                matches!(to, Int(_)),
+            )))
+        }
+        // 整数 -> 浮点
+        (_, Float(b)) => {
+            let x = match c {
+                SsaConst::Int(v) => *v as f64,
+                SsaConst::Bool(b) => f64::from(u8::from(*b)),
+                _ => return None,
+            };
+            let out = if b <= 32 { x as f32 as f64 } else { x };
+            Some(SsaConst::Float(out.to_bits()))
+        }
+        (crate::mir::NumTy::Bool, _) => {
+            let v = match c {
+                SsaConst::Bool(b) => i128::from(*b),
+                SsaConst::Int(v) => *v,
+                _ => return None,
+            };
+            Some(SsaConst::Int(v))
+        }
+        (Int(_), Int(tb)) | (Int(_), Uint(tb)) | (Uint(_), Int(tb)) | (Uint(_), Uint(tb)) => {
+            let v = match c {
+                SsaConst::Int(v) => *v,
+                SsaConst::Bool(b) => i128::from(*b),
+                _ => return None,
+            };
+            // 截断到**目标**位宽。早先这里用的是源位宽，于是
+            // `200i32 as i8` 折出来仍是 200，`y >= 0` 随之折成真——
+            // 断言 4 分支永远走不到。
+            let signed = matches!(to, Int(_));
+            Some(SsaConst::Int(truncate_int(v, u16::from(tb), signed)))
+        }
+        _ => None,
+    }
+}
+
+/// 按位宽截断并做符号 / 零扩展。
+fn truncate_int(raw: i128, bits: u16, signed: bool) -> i128 {
+    if bits == 0 || bits >= 128 {
+        return raw;
+    }
+    let mask = (1i128 << bits) - 1;
+    let low = raw & mask;
+    if signed && low >> (bits - 1) & 1 == 1 {
+        low - (1i128 << bits)
+    } else {
+        low
+    }
+}
 
 // ==================================================================
 // 窥孔优化
@@ -436,6 +993,7 @@ pub fn peephole(module: SsaModule) -> SsaModule {
                     op,
                     lhs,
                     rhs,
+                    ..
                 } = instr
                 else {
                     continue;
@@ -444,7 +1002,9 @@ pub fn peephole(module: SsaModule) -> SsaModule {
                 let b = const_of(&defs, rhs);
                 let repl: Option<Def> = match op {
                     // x + 0 / x - 0 / x | 0 / x ^ 0 -> x
-                    SsaBinaryOp::Add | SsaBinaryOp::Sub | SsaBinaryOp::BitOr
+                    SsaBinaryOp::Add
+                    | SsaBinaryOp::Sub
+                    | SsaBinaryOp::BitOr
                     | SsaBinaryOp::BitXor
                         if b.as_ref().and_then(SsaConst::as_int) == Some(0) =>
                     {
@@ -457,9 +1017,7 @@ pub fn peephole(module: SsaModule) -> SsaModule {
                         Some(Def::Op("copy", vec![lhs]))
                     }
                     // x & -1 -> x
-                    SsaBinaryOp::BitAnd
-                        if b.as_ref().and_then(SsaConst::as_int) == Some(-1) =>
-                    {
+                    SsaBinaryOp::BitAnd if b.as_ref().and_then(SsaConst::as_int) == Some(-1) => {
                         Some(Def::Op("copy", vec![lhs]))
                     }
                     // x - x / x ^ x -> 0
@@ -474,7 +1032,10 @@ pub fn peephole(module: SsaModule) -> SsaModule {
                     Some(Def::Const(c)) => *instr = SsaInstr::Const { result, value: c },
                     // `copy` 用 Var 表达：后端把它发射成一条寄存器间 move
                     Some(Def::Op(_, refs)) if refs.len() == 1 => {
-                        *instr = SsaInstr::Copy { result, src: refs[0] };
+                        *instr = SsaInstr::Copy {
+                            result,
+                            src: refs[0],
+                        };
                     }
                     _ => {}
                 }
@@ -496,14 +1057,29 @@ pub fn inline_functions(module: SsaModule) -> SsaModule {
     let mut module = module;
 
     // 可内联的单块函数：名字 -> (形参, 函数体, 返回值)
-    let mut candidates: HashMap<String, (Vec<SsaValue>, Vec<SsaInstr>, SsaValue)> =
-        HashMap::new();
+    let mut candidates: HashMap<String, (Vec<SsaValue>, Vec<SsaInstr>, SsaValue)> = HashMap::new();
     for func in &module.functions {
-        if func.blocks.len() != 1 {
-            continue;
-        }
         // `#[inline(never)]` 的函数不作为候选——属性语义在这里生效
         if func.inline_never {
+            continue;
+        }
+        // `#[inline(always)]` 的函数即使多块也内联：把每个块展开到调用点
+        if func.inline_always {
+            // 多块函数内联：只内联单块情况，多块需要更复杂的控制流合并
+            // 这里采用简化策略：只内联单块 always 函数，多块 always 在后续 pass 处理
+            if func.blocks.len() == 1 {
+                let block = &func.blocks[0];
+                let SsaTerminator::Return(Some(ret)) = block.term else {
+                    continue;
+                };
+                candidates.insert(
+                    func.name.clone(),
+                    (func.params.clone(), block.instrs.clone(), ret),
+                );
+            }
+            continue;
+        }
+        if func.blocks.len() != 1 {
             continue;
         }
         let block = &func.blocks[0];
@@ -674,11 +1250,14 @@ fn set_result(instr: SsaInstr, new: SsaValue) -> SsaInstr {
             op,
             operand,
         },
-        SsaInstr::Binary { op, lhs, rhs, .. } => SsaInstr::Binary {
+        SsaInstr::Binary {
+            op, lhs, rhs, ty, ..
+        } => SsaInstr::Binary {
             result: new,
             op,
             lhs,
             rhs,
+            ty,
         },
         SsaInstr::Phi { name, incoming, .. } => SsaInstr::Phi {
             result: new,
@@ -695,9 +1274,7 @@ fn set_result(instr: SsaInstr, new: SsaValue) -> SsaInstr {
         },
         // `Call` 必须一起改，否则内联时调用点保留了被调函数的旧结果号，
         // 后面追加的 `copy` 却指向新发号的临时量，直接读到未定义的值。
-        SsaInstr::Call {
-            callee, args, ..
-        } => SsaInstr::Call {
+        SsaInstr::Call { callee, args, .. } => SsaInstr::Call {
             result: new,
             callee,
             args,
@@ -787,7 +1364,8 @@ fn hoist_invariants(func: &mut crate::ssa::SsaFunction, header: usize, members: 
                 let mut us = Vec::new();
                 uses(instr, &mut us);
                 // 操作数全部来自循环外 -> 不变量
-                us.iter().all(|u| !inside.contains(u) || *u == instr.result().unwrap())
+                us.iter()
+                    .all(|u| !inside.contains(u) || *u == instr.result().unwrap())
             }
         };
         if inv {
@@ -810,4 +1388,36 @@ fn hoist_invariants(func: &mut crate::ssa::SsaFunction, header: usize, members: 
         func.blocks[header].instrs.insert(at + k, instr);
     }
     let _ = defs;
+}
+
+#[cfg(test)]
+mod cast_trunc_tests {
+    use super::*;
+
+    #[test]
+    fn narrowing_cast_truncates_and_sign_extends() {
+        use crate::mir::NumTy;
+        // 200 作为 i8 是 -56。
+        let got = eval_cast(&SsaConst::Int(200), NumTy::Int(32), NumTy::Int(8));
+        assert_eq!(got, Some(SsaConst::Int(-56)));
+        // 同一位宽的转换只做符号扩展。
+        assert_eq!(
+            eval_cast(&SsaConst::Int(5), NumTy::Int(32), NumTy::Int(32)),
+            Some(SsaConst::Int(5))
+        );
+        // 无符号窄化是零扩展：200 -> 200。
+        assert_eq!(
+            eval_cast(&SsaConst::Int(200), NumTy::Int(32), NumTy::Uint(8)),
+            Some(SsaConst::Int(200))
+        );
+    }
+
+    #[test]
+    fn comparison_of_truncated_value_folds_correctly() {
+        // -56 >= 0 必须是假 —— 这条断言守着"窄化后再比较"的折叠顺序。
+        assert_eq!(
+            eval_binary(SsaBinaryOp::Ge, &SsaConst::Int(-56), &SsaConst::Int(0)),
+            Some(SsaConst::Int(0))
+        );
+    }
 }

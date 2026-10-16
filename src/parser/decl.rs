@@ -93,7 +93,10 @@ impl Parser {
             }
             self.consume(&TokenKind::Rocket, "expected '=>' in macro arm")?;
             // 解析 rhs（展开），直到 `;` 或 `}`
-            while !self.check(&TokenKind::Semicolon) && !self.check(&TokenKind::RBrace) && !self.is_at_end() {
+            while !self.check(&TokenKind::Semicolon)
+                && !self.check(&TokenKind::RBrace)
+                && !self.is_at_end()
+            {
                 self.advance();
             }
             // 可选的分号
@@ -114,30 +117,18 @@ impl Parser {
         _attrs: Vec<Attribute>,
     ) -> Result<ModuleDecl, CompileError> {
         let _span = self.previous().span;
-        let _name = self.consume_ident("expected module name")?;
+        let name = self.consume_ident("expected module name")?;
         if self.match_kind(&TokenKind::Semicolon) {
-            Ok(ModuleDecl::Load)
+            Ok(ModuleDecl::Load(name))
         } else if self.match_kind(&TokenKind::LBrace) {
-            let mut inner = Program::default();
-            // 递归解析模块体（简化：复用顶层解析逻辑）
+            // 递归解析模块体，条目原样保留：模块系统是扁平命名空间，
+            // 内联模块里的 `fn`/`struct` 会被直接合并进顶层。
+            let mut items = Vec::new();
             while !self.check(&TokenKind::RBrace) && !self.is_at_end() {
-                let item = self.parse_module_item()?;
-                match item {
-                    ModuleItem::Function(f) => inner.functions.push(f),
-                    ModuleItem::TypeDef(t) => inner.type_defs.push(t),
-                    ModuleItem::Trait(t) => inner.traits.push(t),
-                    ModuleItem::Impl(i) => inner.impls.push(i),
-                    ModuleItem::Const(c) => inner.consts.push(c),
-                    ModuleItem::Static(s) => inner.statics.push(s),
-                    ModuleItem::Use(u) => inner.imports.push(u),
-                    ModuleItem::Module(m) => inner.modules.push(m),
-                    ModuleItem::Extern(e) => inner.externs.push(e),
-                    ModuleItem::Macro(m) => inner.macros.push(m),
-                }
+                items.push(self.parse_module_item()?);
             }
             self.consume(&TokenKind::RBrace, "expected '}' to close module")?;
-            let _ = inner;
-            Ok(ModuleDecl::Inline)
+            Ok(ModuleDecl::Inline(name, items))
         } else {
             Err(self.expected("expected ';' or '{' after module name", &TokenKind::LBrace))
         }
@@ -147,10 +138,7 @@ impl Parser {
     // extern
     // ==================================================================
 
-    pub fn parse_extern(
-        &mut self,
-        _attrs: Vec<Attribute>,
-    ) -> Result<ExternBlock, CompileError> {
+    pub fn parse_extern(&mut self, _attrs: Vec<Attribute>) -> Result<ExternBlock, CompileError> {
         let _span = self.previous().span;
         // `extern "C" { ... }` —— abi 名字是字符串，内容暂时丢弃。
         if matches!(self.peek().kind, TokenKind::StringLiteral(_)) {
@@ -182,8 +170,25 @@ impl Parser {
         is_async: bool,
         _is_default: bool,
     ) -> Result<Function, CompileError> {
+        self.parse_function_ext(_visibility, attrs, is_async, _is_default, false)
+    }
+
+    /// `parse_function` 的完整版本，多带一个 `comptime` 标志。
+    ///
+    /// `comptime fn` 的修饰符由条目分流层吃掉（和 `async fn` / `default fn`
+    /// 一样，两个修饰符共用一条解析路径），所以标志得由调用方传进来。
+    pub fn parse_function_ext(
+        &mut self,
+        _visibility: Visibility,
+        attrs: Vec<Attribute>,
+        is_async: bool,
+        _is_default: bool,
+        is_comptime: bool,
+    ) -> Result<Function, CompileError> {
         let _span = self.previous().span;
-        let _is_const = self.match_kind(&TokenKind::KwComptime);
+        // `comptime fn` 也可以在分流层没识别的情况下走到这里（例如 impl 块里），
+        // 所以这里仍然兜底吃一次 `comptime` 修饰符。
+        let is_comptime = is_comptime || self.match_kind(&TokenKind::KwComptime);
         let name = self.consume_ident("expected function name")?;
 
         // 泛型参数
@@ -216,7 +221,10 @@ impl Parser {
                     }
                     // 可变参数 `...`
                     if self.check(&TokenKind::DotDot)
-                        && self.peek_n(1).map(|t| t.kind == TokenKind::Dot).unwrap_or(false)
+                        && self
+                            .peek_n(1)
+                            .map(|t| t.kind == TokenKind::Dot)
+                            .unwrap_or(false)
                     {
                         self.advance(); // ..
                         self.advance(); // .
@@ -256,6 +264,7 @@ impl Parser {
             // 之类只能解析、完全没有语义。必须原样带到 AST 上去。
             attrs,
             is_async,
+            is_comptime,
             params,
             receiver,
             return_type,
@@ -471,7 +480,11 @@ impl Parser {
             }
         }
         self.consume(&TokenKind::RBrace, "expected '}' to close enum")?;
-        Ok(TypeDef::Enum(EnumDef { name, repr, variants }))
+        Ok(TypeDef::Enum(EnumDef {
+            name,
+            repr,
+            variants,
+        }))
     }
 
     fn parse_variant(&mut self) -> Result<Variant, CompileError> {
@@ -516,7 +529,10 @@ impl Parser {
         } else {
             None
         };
-        Ok(Variant { payload, discriminant })
+        Ok(Variant {
+            payload,
+            discriminant,
+        })
     }
 
     // ==================================================================
@@ -617,7 +633,13 @@ impl Parser {
             }
         }
         self.consume(&TokenKind::RBrace, "expected '}'")?;
-        Ok(TraitDef { name, super_traits, assoc_types, methods, attrs })
+        Ok(TraitDef {
+            name,
+            super_traits,
+            assoc_types,
+            methods,
+            attrs,
+        })
     }
 
     fn parse_assoc_type(&mut self) -> Result<AssocType, CompileError> {
@@ -643,10 +665,7 @@ impl Parser {
     // impl
     // ==================================================================
 
-    pub fn parse_impl_block(
-        &mut self,
-        _attrs: Vec<Attribute>,
-    ) -> Result<ImplBlock, CompileError> {
+    pub fn parse_impl_block(&mut self, _attrs: Vec<Attribute>) -> Result<ImplBlock, CompileError> {
         let span = self.previous().span;
         let _generics = if self.match_kind(&TokenKind::Lt) {
             self.parse_generic_params()?
@@ -687,7 +706,12 @@ impl Parser {
             }
         }
         self.consume(&TokenKind::RBrace, "expected '}'")?;
-        Ok(ImplBlock { target, trait_type, where_clause, span })
+        Ok(ImplBlock {
+            target,
+            trait_type,
+            where_clause,
+            span,
+        })
     }
 
     // ==================================================================
@@ -723,8 +747,10 @@ impl Parser {
             self.advance();
             if self.match_kind(&TokenKind::Colon) {
                 // 生命周期约束：目前直接跳过
-                while !matches!(self.peek().kind, TokenKind::Gt | TokenKind::Comma | TokenKind::Eof)
-                    && !self.is_at_end()
+                while !matches!(
+                    self.peek().kind,
+                    TokenKind::Gt | TokenKind::Comma | TokenKind::Eof
+                ) && !self.is_at_end()
                 {
                     self.advance();
                 }

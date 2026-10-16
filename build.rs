@@ -37,14 +37,38 @@ use std::process::Command;
 /// 运行时源文件：`(平台标签, 规范三元组, 文件名)`。
 const RUNTIME_TARGETS: &[(&str, &str, &str)] = &[
     ("bare_arm", "arm-none-eabi", "rt_arm_baremetal.s"),
-    ("bare_riscv32", "riscv32-unknown-none", "rt_riscv_baremetal.s"),
-    ("bare_riscv64", "riscv64-unknown-none", "rt_riscv_baremetal.s"),
-    ("linux_x86_64", "x86_64-unknown-linux-gnu", "rt_linux_x86_64.s"),
-    ("linux_aarch64", "aarch64-unknown-linux-gnu", "rt_linux_aarch64.s"),
+    (
+        "bare_riscv32",
+        "riscv32-unknown-none",
+        "rt_riscv_baremetal.s",
+    ),
+    (
+        "bare_riscv64",
+        "riscv64-unknown-none",
+        "rt_riscv_baremetal.s",
+    ),
+    (
+        "linux_x86_64",
+        "x86_64-unknown-linux-gnu",
+        "rt_linux_x86_64.s",
+    ),
+    (
+        "linux_aarch64",
+        "aarch64-unknown-linux-gnu",
+        "rt_linux_aarch64.s",
+    ),
     ("macos_x86_64", "x86_64-apple-darwin", "rt_macos_x86_64.s"),
     ("macos_arm64", "aarch64-apple-darwin", "rt_macos_arm64.s"),
-    ("windows_x86_64", "x86_64-pc-windows-msvc", "rt_windows_x86_64.s"),
-    ("windows_arm64", "aarch64-pc-windows-msvc", "rt_windows_arm64.s"),
+    (
+        "windows_x86_64",
+        "x86_64-pc-windows-msvc",
+        "rt_windows_x86_64.s",
+    ),
+    (
+        "windows_arm64",
+        "aarch64-pc-windows-msvc",
+        "rt_windows_arm64.s",
+    ),
 ];
 
 fn main() {

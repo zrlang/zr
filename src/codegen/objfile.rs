@@ -6,7 +6,9 @@
 
 use std::collections::HashMap;
 
-use crate::codegen::{CompilationUnit, Relocation, RelocationKind, SymbolKind, SymbolSection, Symbol};
+use crate::codegen::{
+    CompilationUnit, Relocation, RelocationKind, Symbol, SymbolKind, SymbolSection,
+};
 
 /// 按对齐要求向上取整（`align` 必须是 2 的幂）。
 pub fn align_up(value: u64, align: u64) -> u64 {
@@ -27,6 +29,9 @@ pub fn reloc_field_size(kind: RelocationKind) -> usize {
         | RelocationKind::Branch26
         | RelocationKind::Call26
         | RelocationKind::ArmBranch24
+        | RelocationKind::ArmCallThumb
+        | RelocationKind::ArmBranchThumb
+        | RelocationKind::ArmCbzThumb
         | RelocationKind::RiscVJal
         | RelocationKind::RiscVBranch => 4,
     }
@@ -38,8 +43,11 @@ pub fn elf_reloc_type(arch: crate::codegen::target::Arch, kind: RelocationKind) 
     match (arch, kind) {
         (Arch::X86_64, RelocationKind::PcRel32) => 4, // R_X86_64_PLT32
         (Arch::AArch64, RelocationKind::Branch26) => 282, // R_AARCH64_JUMP26
-        (Arch::AArch64, RelocationKind::Call26) => 283,   // R_AARCH64_CALL26
+        (Arch::AArch64, RelocationKind::Call26) => 283, // R_AARCH64_CALL26
         (Arch::Arm32, RelocationKind::ArmBranch24) => 29, // R_ARM_JUMP24
+        (Arch::Arm32, RelocationKind::ArmCallThumb) => 28, // R_ARM_THM_CALL
+        (Arch::Arm32, RelocationKind::ArmBranchThumb) => 30, // R_ARM_THM_JUMP24
+        (Arch::Arm32, RelocationKind::ArmCbzThumb) => 31, // R_ARM_THM_JUMP8
         (Arch::RiscV32 | Arch::RiscV64, RelocationKind::RiscVJal) => 17, // R_RISCV_JAL
         (Arch::RiscV32 | Arch::RiscV64, RelocationKind::RiscVBranch) => 16, // R_RISCV_BRANCH
         _ => 0,
@@ -130,6 +138,81 @@ pub fn apply_relocations(unit: &mut CompilationUnit, text_base: u64) {
                     unit.code[reloc.offset..end].copy_from_slice(&(delta as i32).to_le_bytes());
                 }
             }
+            RelocationKind::ArmCbzThumb => {
+                // `cbz` / `cbnz`：6 位**有符号**半字偏移，落在 [9:3]，
+                // Rn 在 [2:0]（16 位形式只支持 r0-r3）。
+                let pc = instr_va as i64 + 4;
+                let delta = target - pc;
+                let off = (delta >> 1) & 0x3f;
+                if reloc.offset + 2 <= unit.code.len() {
+                    let hw =
+                        u16::from_le_bytes([unit.code[reloc.offset], unit.code[reloc.offset + 1]]);
+                    let patched = (hw & !0x03f8) | ((off as u16 & 0x3f) << 3);
+                    unit.code[reloc.offset..reloc.offset + 2]
+                        .copy_from_slice(&patched.to_le_bytes());
+                }
+            }
+            RelocationKind::ArmCallThumb => {
+                // `bl` (T1)。imm32 = SignExtend(S:I1:I2:imm10:imm11:'0')，
+                // J1/J2 是 I1/I2 取反；hw1 是 0xF 组，hw2 是 0xD 组，
+                // **hw1 必须在低地址**（`w32` 就是这个顺序）。
+                // clang: `bl g1`(delta=8) = f000 f804
+                let pc = instr_va as i64 + 4;
+                let delta = target - pc;
+                let off = delta >> 1;
+                let s = (off < 0) as u16;
+                let i1 = ((off >> 23) & 1) as u16;
+                let i2 = ((off >> 22) & 1) as u16;
+                let imm10 = ((off >> 12) & 0x3ff) as u16;
+                let imm11 = ((off >> 1) & 0x7ff) as u16;
+                let j1 = i1 ^ 1;
+                let j2 = i2 ^ 1;
+                let hw1 = 0xf000 | (s << 10) | imm10;
+                let hw2 = 0xd000 | (j1 << 13) | 0x1000 | (j2 << 11) | imm11;
+                if reloc.offset + 4 <= unit.code.len() {
+                    unit.code[reloc.offset..reloc.offset + 2].copy_from_slice(&hw1.to_le_bytes());
+                    unit.code[reloc.offset + 2..reloc.offset + 4]
+                        .copy_from_slice(&hw2.to_le_bytes());
+                }
+            }
+            RelocationKind::ArmBranchThumb => {
+                if reloc.instr_len == 2 {
+                    // T1 条件分支：8 位半字偏移在 [10:2]
+                    let pc = instr_va as i64 + 4;
+                    let delta = target - pc;
+                    let off = (delta >> 1) & 0xff;
+                    if reloc.offset + 2 <= unit.code.len() {
+                        let hw = u16::from_le_bytes([
+                            unit.code[reloc.offset],
+                            unit.code[reloc.offset + 1],
+                        ]);
+                        let patched = (hw & !0x03fc) | ((off as u16 & 0xff) << 2);
+                        unit.code[reloc.offset..reloc.offset + 2]
+                            .copy_from_slice(&patched.to_le_bytes());
+                    }
+                } else {
+                    // `b` (T4)。与 BL 同形，只是 hw2 的 bit12 为 0。
+                    // clang: `b.w g3`(delta=4) = f000 b802
+                    let pc = instr_va as i64 + 4;
+                    let delta = target - pc;
+                    let off = delta >> 1;
+                    let s = (off < 0) as u16;
+                    let i1 = ((off >> 23) & 1) as u16;
+                    let i2 = ((off >> 22) & 1) as u16;
+                    let imm10 = ((off >> 12) & 0x3ff) as u16;
+                    let imm11 = ((off >> 1) & 0x7ff) as u16;
+                    let j1 = i1 ^ 1;
+                    let j2 = i2 ^ 1;
+                    let hw1 = 0xf000 | (s << 10) | imm10;
+                    let hw2 = 0xd000 | (j1 << 13) | (j2 << 11) | imm11;
+                    if reloc.offset + 4 <= unit.code.len() {
+                        unit.code[reloc.offset..reloc.offset + 2]
+                            .copy_from_slice(&hw1.to_le_bytes());
+                        unit.code[reloc.offset + 2..reloc.offset + 4]
+                            .copy_from_slice(&hw2.to_le_bytes());
+                    }
+                }
+            }
             RelocationKind::ArmBranch24 => {
                 // ARM：A32 执行分支时读到的 PC 是"当前指令地址 + 8"
                 // （流水线预取），因此偏移基准是 instr_va + 8。
@@ -155,7 +238,7 @@ pub fn apply_relocations(unit: &mut CompilationUnit, text_base: u64) {
                         | (imm & 0x000f_f000)             // imm[19:12] 原位
                         | ((imm & 0x0000_0800) << 9)      // imm[11]    → [20]
                         | ((imm & 0x0000_07fe) << 20)     // imm[10:1]  → [30:21]
-                        | ((imm & 0x0010_0000) << 11)     // imm[20]    → [31]
+                        | ((imm & 0x0010_0000) << 11) // imm[20]    → [31]
                 });
             }
             RelocationKind::RiscVBranch => {
@@ -169,7 +252,7 @@ pub fn apply_relocations(unit: &mut CompilationUnit, text_base: u64) {
                         | ((imm & 0x0000_1000) >> 4)     // imm[11]   → [7]
                         | ((imm & 0x0000_000f) << 7)     // imm[4:1]  → [11:8]
                         | ((imm & 0x0000_0fe0) << 20)    // imm[10:5] → [30:25]
-                        | ((imm & 0x0000_1000) << 19)    // imm[12]   → [31]
+                        | ((imm & 0x0000_1000) << 19) // imm[12]   → [31]
                 });
             }
             RelocationKind::Branch26 | RelocationKind::Call26 => {
@@ -253,13 +336,7 @@ mod tests {
             global: true,
             kind: SymbolKind::Function,
         });
-        let relocs = vec![Relocation::new(
-            1,
-            0,
-            5,
-            "main",
-            RelocationKind::PcRel32,
-        )];
+        let relocs = vec![Relocation::new(1, 0, 5, "main", RelocationKind::PcRel32)];
         (unit, relocs)
     }
 
@@ -277,7 +354,9 @@ mod tests {
     fn branch26_counts_four_byte_units() {
         let mut unit = CompilationUnit::new();
         // 前 8 字节是 main 本身，偏移 8 处是待修正的 bl
-        unit.code = vec![0x20, 0x00, 0x80, 0xd2, 0x20, 0x00, 0x80, 0xd2, 0x00, 0x00, 0x00, 0x94];
+        unit.code = vec![
+            0x20, 0x00, 0x80, 0xd2, 0x20, 0x00, 0x80, 0xd2, 0x00, 0x00, 0x00, 0x94,
+        ];
         unit.symbols.push(Symbol {
             name: "main".to_string(),
             section: SymbolSection::Text,
@@ -286,19 +365,18 @@ mod tests {
             global: true,
             kind: SymbolKind::Function,
         });
-        unit.relocations.push(Relocation::new(
-            8,
-            8,
-            4,
-            "main",
-            RelocationKind::Branch26,
-        ));
+        unit.relocations
+            .push(Relocation::new(8, 8, 4, "main", RelocationKind::Branch26));
         apply_relocations(&mut unit, 0x1000);
         let word = u32::from_le_bytes(unit.code[8..12].try_into().unwrap());
         assert_eq!(word >> 26, 0b100101, "bl 操作码应保留");
         // 向后跳 8 字节 = -2 条指令，按 26 位补码编码。
         assert_eq!(word & 0x03ff_ffff, 0x03ff_fffe, "imm26 = -2");
-        assert_eq!(unit.code[..8], [0x20, 0x00, 0x80, 0xd2, 0x20, 0x00, 0x80, 0xd2], "main 未被改动");
+        assert_eq!(
+            unit.code[..8],
+            [0x20, 0x00, 0x80, 0xd2, 0x20, 0x00, 0x80, 0xd2],
+            "main 未被改动"
+        );
     }
 
     #[test]
@@ -322,10 +400,19 @@ mod tests {
         assert_eq!(reloc_field_size(RelocationKind::PcRel32), 4);
         assert_eq!(reloc_field_size(RelocationKind::Branch26), 4);
         assert_eq!(
-            coff_reloc_type(crate::codegen::target::Arch::AArch64, RelocationKind::Branch26),
+            coff_reloc_type(
+                crate::codegen::target::Arch::AArch64,
+                RelocationKind::Branch26
+            ),
             0x0003
         );
-        assert_eq!(elf_reloc_type(crate::codegen::target::Arch::AArch64, RelocationKind::Call26), 283);
+        assert_eq!(
+            elf_reloc_type(
+                crate::codegen::target::Arch::AArch64,
+                RelocationKind::Call26
+            ),
+            283
+        );
     }
 
     #[test]
@@ -343,7 +430,8 @@ mod tests {
             global: true,
             kind: SymbolKind::Function,
         });
-        unit.relocations.push(Relocation::new(12, 12, 4, "main", RelocationKind::RiscVJal));
+        unit.relocations
+            .push(Relocation::new(12, 12, 4, "main", RelocationKind::RiscVJal));
         apply_relocations(&mut unit, 0x1000);
         let word = u32::from_le_bytes(unit.code[12..16].try_into().unwrap());
         // imm = -6（0x1FFFFA）→ imm[20]=1, imm[10:1]=0x3FD, imm[11]=1,
@@ -367,7 +455,8 @@ mod tests {
             global: false,
             kind: SymbolKind::Function,
         });
-        unit.relocations.push(Relocation::new(8, 8, 4, "bb1", RelocationKind::RiscVBranch));
+        unit.relocations
+            .push(Relocation::new(8, 8, 4, "bb1", RelocationKind::RiscVBranch));
         apply_relocations(&mut unit, 0x2000);
         let word = u32::from_le_bytes(unit.code[8..12].try_into().unwrap());
         // imm = 4 个半字 → imm[4:1] = 2 → 指令的 [11:8] = 2
@@ -379,8 +468,10 @@ mod tests {
     #[test]
     fn extern_symbols_are_added_once() {
         let mut unit = CompilationUnit::new();
-        unit.relocations.push(Relocation::new(0, 0, 4, "zr_exit", RelocationKind::PcRel32));
-        unit.relocations.push(Relocation::new(4, 4, 4, "zr_exit", RelocationKind::PcRel32));
+        unit.relocations
+            .push(Relocation::new(0, 0, 4, "zr_exit", RelocationKind::PcRel32));
+        unit.relocations
+            .push(Relocation::new(4, 4, 4, "zr_exit", RelocationKind::PcRel32));
         add_extern_symbols(&mut unit);
         add_extern_symbols(&mut unit);
         let externs: Vec<_> = unit

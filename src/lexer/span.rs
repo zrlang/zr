@@ -21,7 +21,12 @@ pub struct Span {
 impl Span {
     /// 构造一个新的 span。
     pub const fn new(start: usize, end: usize, line: usize, column: usize) -> Self {
-        Self { start, end, line, column }
+        Self {
+            start,
+            end,
+            line,
+            column,
+        }
     }
 
     /// 构造一个「未知位置」的 span（用于合成的节点）。

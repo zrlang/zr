@@ -24,7 +24,9 @@
 //! 机器字长（32 位）逐条发射——多字长（64 位）算术尚未实现。
 
 use crate::codegen::target::{Arch, Os, Target};
-use crate::codegen::{CompilationUnit, Relocation, RelocationKind, Symbol, SymbolKind, SymbolSection};
+use crate::codegen::{
+    CompilationUnit, Relocation, RelocationKind, Symbol, SymbolKind, SymbolSection,
+};
 use crate::mir::NumTy;
 use crate::ssa::{SsaBinaryOp, SsaConst, SsaFunction, SsaInstr, SsaTerminator, SsaValue};
 
@@ -150,7 +152,7 @@ fn emit_extend(unit: &mut CompilationUnit, rd: Reg, rm: Reg, bits: u8, signed: b
     // imm2[5:4] 与 type[1:0] 一起决定扩不扩展以及扩多少：
     // type=00 字扩展(uxth)/半字，01 字节扩展(uxtb)，10/11 符号扩展。
     let (imm2, ty) = match (bits, signed) {
-        (8, true) => (0b00u32, 0b01u32),  // sxtb
+        (8, true) => (0b00u32, 0b01u32), // sxtb
         (8, false) => (0b00, 0b00),      // uxtb
         (16, true) => (0b00, 0b10),      // sxth
         (16, false) => (0b00, 0b11),     // uxth
@@ -230,12 +232,30 @@ fn rotated_imm8_operand(value: u32) -> Option<u32> {
 
 /// `mov<cond> rd, #imm8`：条件执行用来实现"比较后选择 0/1"。
 fn emit_mov_cond(unit: &mut CompilationUnit, cond: u32, rd: Reg, imm: u8) {
-    data_processing(unit, cond, op::MOV, false, Reg(0), rd, imm8_operand(0, imm), true);
+    data_processing(
+        unit,
+        cond,
+        op::MOV,
+        false,
+        Reg(0),
+        rd,
+        imm8_operand(0, imm),
+        true,
+    );
 }
 
 /// `mov rd, rm`
 fn emit_mov_rr(unit: &mut CompilationUnit, rd: Reg, rm: Reg) {
-    data_processing(unit, cc::AL, op::MOV, false, Reg(0), rd, rm.bits() as u32, false);
+    data_processing(
+        unit,
+        cc::AL,
+        op::MOV,
+        false,
+        Reg(0),
+        rd,
+        rm.bits() as u32,
+        false,
+    );
 }
 
 /// `mov rd, #imm32`：能用旋转立即数就用一条 movw，否则 movw + movt。
@@ -275,7 +295,16 @@ fn emit_op3(unit: &mut CompilationUnit, opcode: u32, rd: Reg, rn: Reg, rm: Reg) 
 /// `cmp rn, rm`：只更新标志位（编码上等价于 `subs r0, rn, rm`，
 /// 但汇编器统一使用 CMP 这个操作码）。
 fn emit_cmp(unit: &mut CompilationUnit, rn: Reg, rm: Reg) {
-    data_processing(unit, cc::AL, op::CMP, true, rn, Reg(0), rm.bits() as u32, false);
+    data_processing(
+        unit,
+        cc::AL,
+        op::CMP,
+        true,
+        rn,
+        Reg(0),
+        rm.bits() as u32,
+        false,
+    );
 }
 
 /// `mul rd, lhs, rhs`（Rd = lhs * rhs）
@@ -293,7 +322,9 @@ fn emit_mul(unit: &mut CompilationUnit, rd: Reg, lhs: Reg, rhs: Reg) {
 fn emit_mls(unit: &mut CompilationUnit, rd: Reg, lhs: Reg, rhs: Reg, acc: Reg) {
     insn(
         unit,
-        0xe060_0090 | (rd.bits() as u32) << 16 | (acc.bits() as u32) << 12
+        0xe060_0090
+            | (rd.bits() as u32) << 16
+            | (acc.bits() as u32) << 12
             | (rhs.bits() as u32) << 8
             | lhs.bits() as u32,
     );
@@ -301,17 +332,38 @@ fn emit_mls(unit: &mut CompilationUnit, rd: Reg, lhs: Reg, rhs: Reg, acc: Reg) {
 
 /// `sdiv rd, rn, rm`
 fn emit_sdiv(unit: &mut CompilationUnit, rd: Reg, rn: Reg, rm: Reg) {
-    insn(unit, 0xe710_f010 | (rd.bits() as u32) << 16 | (rm.bits() as u32) << 8 | rn.bits() as u32);
+    insn(
+        unit,
+        0xe710_f010 | (rd.bits() as u32) << 16 | (rm.bits() as u32) << 8 | rn.bits() as u32,
+    );
 }
 
 /// `mvn rd, rm`
 fn emit_mvn(unit: &mut CompilationUnit, rd: Reg, rm: Reg) {
-    data_processing(unit, cc::AL, op::MVN, false, Reg(0), rd, rm.bits() as u32, false);
+    data_processing(
+        unit,
+        cc::AL,
+        op::MVN,
+        false,
+        Reg(0),
+        rd,
+        rm.bits() as u32,
+        false,
+    );
 }
 
 /// `rsb rd, rn, #0`（取负）
 fn emit_rsb(unit: &mut CompilationUnit, rd: Reg, rn: Reg) {
-    data_processing(unit, cc::AL, op::RSB_IMM, false, rn, rd, imm8_operand(0, 0), true);
+    data_processing(
+        unit,
+        cc::AL,
+        op::RSB_IMM,
+        false,
+        rn,
+        rd,
+        imm8_operand(0, 0),
+        true,
+    );
 }
 
 /// 移位种类（编码在 [6:5]）。
@@ -337,7 +389,9 @@ fn emit_shift_by_reg(unit: &mut CompilationUnit, rd: Reg, rm: Reg, count: Reg, s
     // 早先写成 0xe1a0_1010，等于 Rd 恒为 1，换任何别的目的寄存器都会错位。
     insn(
         unit,
-        0xe1a0_0010 | (rd.bits() as u32) << 12 | (count.bits() as u32) << 8
+        0xe1a0_0010
+            | (rd.bits() as u32) << 12
+            | (count.bits() as u32) << 8
             | shift.type_code() << 5
             | rm.bits() as u32,
     );
@@ -413,7 +467,11 @@ const PHI_TMP: Reg = Reg(9);
 fn successors(block: &crate::ssa::SsaBasicBlock) -> Vec<usize> {
     match &block.term {
         SsaTerminator::Goto(t) => vec![*t],
-        SsaTerminator::Branch { then_block, else_block, .. } => vec![*then_block, *else_block],
+        SsaTerminator::Branch {
+            then_block,
+            else_block,
+            ..
+        } => vec![*then_block, *else_block],
         _ => Vec::new(),
     }
 }
@@ -425,7 +483,10 @@ fn emit_phi_copies(unit: &mut CompilationUnit, func: &SsaFunction, succ: usize, 
     };
     let mut moves: Vec<(Reg, Reg)> = Vec::new();
     for instr in &block.instrs {
-        let SsaInstr::Phi { result, incoming, .. } = instr else {
+        let SsaInstr::Phi {
+            result, incoming, ..
+        } = instr
+        else {
             continue;
         };
         let Some((_, src)) = incoming.iter().find(|(p, _)| *p == from) else {
@@ -506,7 +567,11 @@ pub fn emit_function(target: &Target, unit: &mut CompilationUnit, func: &SsaFunc
                 emit_pop_pc(unit);
             }
             SsaTerminator::Goto(target) => emit_b(unit, &block_label(&func.name, *target)),
-            SsaTerminator::Branch { cond, then_block, else_block } => {
+            SsaTerminator::Branch {
+                cond,
+                then_block,
+                else_block,
+            } => {
                 let r = alloc_reg(*cond);
                 emit_cmp(unit, r, r);
                 // cond == 0 时跳到 else，否则顺序执行 then
@@ -544,16 +609,35 @@ fn emit_instr(unit: &mut CompilationUnit, instr: &SsaInstr) {
             SsaConst::Float(_) => crate::codegen::unsupported_const("float"),
             SsaConst::Str(_) => crate::codegen::unsupported_const("string"),
         },
-        SsaInstr::Unary { result, op, operand } => emit_unary(unit, *result, *op, *operand),
-        SsaInstr::Binary { result, op, lhs, rhs } => emit_binary(unit, *result, *op, *lhs, *rhs),
-        SsaInstr::Call { result, callee, args } => {
+        SsaInstr::Unary {
+            result,
+            op,
+            operand,
+        } => emit_unary(unit, *result, *op, *operand),
+        SsaInstr::Binary {
+            result,
+            op,
+            lhs,
+            rhs,
+            ..
+        } => emit_binary(unit, *result, *op, *lhs, *rhs),
+        SsaInstr::Call {
+            result,
+            callee,
+            args,
+        } => {
             emit_call_args(unit, args);
             emit_bl(unit, callee);
             emit_mov_rr(unit, alloc_reg(*result), Reg(0));
         }
         // φ 的实际拷贝由前驱末尾的 emit_phi_copies 发出
         SsaInstr::Phi { .. } => {}
-        SsaInstr::Cast { result, src, from, to } => {
+        SsaInstr::Cast {
+            result,
+            src,
+            from,
+            to,
+        } => {
             emit_cast(unit, alloc_reg(*result), alloc_reg(*src), *from, *to);
         }
         SsaInstr::Copy { result, src } => {
@@ -725,6 +809,7 @@ mod tests {
                         op: SsaBinaryOp::Gt,
                         lhs: SsaValue(1),
                         rhs: SsaValue(2),
+                        ..
                     }],
                     term: SsaTerminator::Branch {
                         cond: SsaValue(9),
@@ -743,18 +828,14 @@ mod tests {
                     term: SsaTerminator::Return(Some(SsaValue(2))),
                 },
             ],
-                    inline_never: false,
-};
+            inline_never: false,
+            inline_always: false,
+        };
         let mut unit = empty_unit();
-        emit_function(
-            &Target::parse("arm-none-eabi").unwrap(),
-            &mut unit,
-            &func,
-        );
+        emit_function(&Target::parse("arm-none-eabi").unwrap(), &mut unit, &func);
         crate::codegen::objfile::apply_relocations(&mut unit, 0);
 
-        let word_at =
-            |off: usize| u32::from_le_bytes(unit.code[off..off + 4].try_into().unwrap());
+        let word_at = |off: usize| u32::from_le_bytes(unit.code[off..off + 4].try_into().unwrap());
         let block_off = |n: usize| {
             unit.symbols
                 .iter()
@@ -797,8 +878,15 @@ mod tests {
 
     #[test]
     fn conditional_branch_sends_true_to_then_block() {
-        let BranchShape { words, relocs, branch, jump, branch_at, then_off, else_off } =
-            branch_shape();
+        let BranchShape {
+            words,
+            relocs,
+            branch,
+            jump,
+            branch_at,
+            then_off,
+            else_off,
+        } = branch_shape();
 
         // 条件分支必须是 `beq`（cond = 0000），不能在条件成立时跳转
         assert_eq!(branch >> 28, cc::EQ, "应为 beq，跳转即表示条件为假");
@@ -808,7 +896,11 @@ mod tests {
             "branch={branch:08x} jump={jump:08x} at={branch_at} \
              relocs={relocs:?} words={words:08x?}"
         );
-        assert_eq!(branch & 0x0e00_0000, 0x0a00_0000, "必须是 B/BL 指令族 {ctx}");
+        assert_eq!(
+            branch & 0x0e00_0000,
+            0x0a00_0000,
+            "必须是 B/BL 指令族 {ctx}"
+        );
         assert_eq!(jump & 0x0e00_0000, 0x0a00_0000, "第二条指令应是无条件 b");
         assert_eq!(jump >> 28, 0b1110, "无条件 b 的 cond 应为 AL");
 
@@ -923,7 +1015,10 @@ mod tests {
         let mut u = empty_unit();
         emit_mov_imm32(&mut u, Reg::R0, 42);
         assert_eq!(u.code.len(), 4, "42 可用 mov r0, #42 表示");
-        assert_eq!(u32::from_le_bytes(u.code[0..4].try_into().unwrap()), 0xe3a0_002a);
+        assert_eq!(
+            u32::from_le_bytes(u.code[0..4].try_into().unwrap()),
+            0xe3a0_002a
+        );
     }
 
     #[test]
@@ -932,8 +1027,14 @@ mod tests {
         emit_mov_imm32(&mut u, Reg::R0, 0x1234_5678);
         assert_eq!(u.code.len(), 8);
         // movw r0, #0x5678 / movt r0, #0x1234（imm4 在 [19:16]）
-        assert_eq!(u32::from_le_bytes(u.code[0..4].try_into().unwrap()), 0xe305_0678);
-        assert_eq!(u32::from_le_bytes(u.code[4..8].try_into().unwrap()), 0xe341_0234);
+        assert_eq!(
+            u32::from_le_bytes(u.code[0..4].try_into().unwrap()),
+            0xe305_0678
+        );
+        assert_eq!(
+            u32::from_le_bytes(u.code[4..8].try_into().unwrap()),
+            0xe341_0234
+        );
     }
 
     #[test]
@@ -964,7 +1065,10 @@ mod tests {
         let mut u = empty_unit();
         emit_bl(&mut u, "main");
         assert_eq!(u.code.len(), 4);
-        assert_eq!(u32::from_le_bytes(u.code[0..4].try_into().unwrap()) >> 24, 0xeb);
+        assert_eq!(
+            u32::from_le_bytes(u.code[0..4].try_into().unwrap()) >> 24,
+            0xeb
+        );
         assert_eq!(u.relocations.len(), 1);
         assert_eq!(u.relocations[0].kind, RelocationKind::ArmBranch24);
         assert_eq!(u.relocations[0].offset, 0, "imm24 在指令自身的 [23:0]");
@@ -975,14 +1079,27 @@ mod tests {
         let mut u = empty_unit();
         emit_push(&mut u);
         emit_pop_pc(&mut u);
-        assert_eq!(u32::from_le_bytes(u.code[0..4].try_into().unwrap()), 0xe92d_41f0);
-        assert_eq!(u32::from_le_bytes(u.code[4..8].try_into().unwrap()), 0xe8bd_81f0, "pop 寄存器列表含 pc");
+        assert_eq!(
+            u32::from_le_bytes(u.code[0..4].try_into().unwrap()),
+            0xe92d_41f0
+        );
+        assert_eq!(
+            u32::from_le_bytes(u.code[4..8].try_into().unwrap()),
+            0xe8bd_81f0,
+            "pop 寄存器列表含 pc"
+        );
     }
 
     #[test]
     fn remainder_uses_div_and_mls() {
         let mut u = empty_unit();
-        emit_binary(&mut u, SsaValue(3), SsaBinaryOp::Rem, SsaValue(0), SsaValue(1));
+        emit_binary(
+            &mut u,
+            SsaValue(3),
+            SsaBinaryOp::Rem,
+            SsaValue(0),
+            SsaValue(1),
+        );
         // r3 = r0 / r1; r3 = r0 - r3 * r1
         let sdiv = u32::from_le_bytes(u.code[0..4].try_into().unwrap());
         let mls = u32::from_le_bytes(u.code[4..8].try_into().unwrap());

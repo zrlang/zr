@@ -7,11 +7,10 @@
 //! - `break`/`continue` 转为对循环出口/头部块的 `Goto`。
 
 use crate::mir::{
-    NumTy,
-    MirBasicBlock, MirBinaryOp, MirFunction, MirInstr, MirParam,
-    MirTerminator, MirUnaryOp, MirValue,
+    MirBasicBlock, MirBinaryOp, MirFunction, MirInstr, MirParam, MirTerminator, MirUnaryOp,
+    MirValue, NumTy,
 };
-use crate::typeck::hir::{self, HirBlock, HirExpr, HirStmt, HirFunction};
+use crate::typeck::hir::{self, HirBlock, HirConst, HirExpr, HirFunction, HirStmt};
 use std::collections::HashMap;
 
 /// 降级单个函数。
@@ -19,8 +18,9 @@ pub fn lower_function(
     func: &HirFunction,
     body: &HirBlock,
     def_names: &std::collections::HashMap<hir::DefId, String>,
+    consts: &std::collections::HashMap<hir::DefId, HirConst>,
 ) -> MirFunction {
-    let mut b = Builder::new(func.name.clone(), def_names.clone());
+    let mut b = Builder::new(func.name.clone(), def_names.clone(), const_values(consts));
 
     // 参数：先登记参数名，再分配入口块后把 `arg_N` 写进参数对应的局部
     // 变量。类型检查阶段已经把参数绑定成了局部变量，函数体里引用的是
@@ -48,14 +48,12 @@ pub fn lower_function(
     if b.current_block_mut().term.is_none() {
         b.current_block_mut().term = Some(MirTerminator::Return(tail));
     }
-    
 
     // 把收集到的块按分配顺序落盘
     MirFunction {
         name: func.name.clone(),
-        inline_never: func
-            .attr("inline")
-            .is_some_and(|a| a.has_arg("never")),
+        inline_never: func.attr("inline").is_some_and(|a| a.has_arg("never")),
+        inline_always: func.attr("inline").is_some_and(|a| a.has_arg("always")),
         params: b.param_names.iter().map(|_| MirParam).collect(),
         blocks: b.blocks,
     }
@@ -80,9 +78,7 @@ fn lower_stmt(b: &mut Builder, stmt: &HirStmt) {
             let name = format!("v{}", local.0);
             if let Some(init) = init {
                 let v = lower_expr(b, init);
-                b.current_block_mut()
-                    .instrs
-                    .push(MirInstr::Assign(name, v));
+                b.current_block_mut().instrs.push(MirInstr::Assign(name, v));
             }
         }
         HirStmt::Expr(expr) => {
@@ -98,8 +94,20 @@ fn lower_expr(b: &mut Builder, expr: &HirExpr) -> MirValue {
     match &expr.kind {
         Literal(lit) => mir_literal(lit),
         Local(id) => MirValue::Var(format!("v{}", id.0)),
-        Def(_id) => MirValue::Unit, // 函数/常量引用降级为占位
+        // 全局 `const` 引用：直接把常量的值内联进来。
+        //
+        // 早先这里一律降级成 `MirValue::Unit`（"函数/常量引用降级为占位"），
+        // 于是 `const LIMIT: i32 = 40; if LIMIT != 40 { .. }` 编出来是拿
+        // unit 去比——恒不相等。`const` 是编译期已知的值，内联它是唯一正确
+        // 的处理：它没有存储，也就没有"读一个全局"这种运行时操作。
+        Def(id) => match b.const_values.get(id) {
+            Some(value) => value.clone(),
+            // 非 `const` 的全局（函数 / static）：仍无值可内联。
+            None => MirValue::Unit,
+        },
         Binary(op, lhs, rhs) => {
+            // 结果类型先记下来：HIR 上每个表达式都带类型，是唯一可靠的来源。
+            let ty = num_ty_of(&expr.ty);
             let l = lower_expr(b, lhs);
             let r = lower_expr(b, rhs);
             let name = format!("t{}", b.temp_id());
@@ -108,16 +116,19 @@ fn lower_expr(b: &mut Builder, expr: &HirExpr) -> MirValue {
                 l,
                 convert_binary(*op),
                 r,
+                ty,
             ));
             MirValue::Var(name)
         }
         Unary(op, operand) => {
+            let ty = num_ty_of(&expr.ty);
             let o = lower_expr(b, operand);
             let name = format!("t{}", b.temp_id());
             b.current_block_mut().instrs.push(MirInstr::Unary(
                 name.clone(),
                 convert_unary(*op),
                 o,
+                ty,
             ));
             MirValue::Var(name)
         }
@@ -181,17 +192,43 @@ fn lower_expr(b: &mut Builder, expr: &HirExpr) -> MirValue {
             let body_bb = b.new_block();
             let exit = b.new_block();
 
-            b.current_block_mut().term = Some(MirTerminator::Goto(header));
-            b.current = header;
-            let c = lower_expr(b, cond);
-            b.current_block_mut().term = Some(MirTerminator::Branch {
-                cond: c,
-                then_block: body_bb,
-                else_block: exit,
-            });
+            // `while true` / `while false` 的条件是常量，直接展开，不生成条件
+            // 跳转。否则那个常量会被物化进一个寄存器，而循环体里的临时值会
+            // 把它占掉——回头再测条件时测到的是临时值，`while true { .. break; }`
+            // 会提前一轮退出。
+            let const_cond = match &cond.kind {
+                hir::ExprKind::Literal(hir::HirLiteral::Bool(v)) => Some(*v),
+                _ => None,
+            };
+
+            match const_cond {
+                Some(true) => {
+                    b.current_block_mut().term = Some(MirTerminator::Goto(header));
+                    b.current = header;
+                    b.current_block_mut().term = Some(MirTerminator::Goto(body_bb));
+                }
+                Some(false) => {
+                    // 条件恒假：整个循环跳过
+                    b.current_block_mut().term = Some(MirTerminator::Goto(exit));
+                    b.current = exit;
+                    return MirValue::Unit;
+                }
+                None => {
+                    b.current_block_mut().term = Some(MirTerminator::Goto(header));
+                    b.current = header;
+                    let c = lower_expr(b, cond);
+                    b.current_block_mut().term = Some(MirTerminator::Branch {
+                        cond: c,
+                        then_block: body_bb,
+                        else_block: exit,
+                    });
+                }
+            }
 
             b.current = body_bb;
+            b.loops.push(LoopCtx { header, exit });
             let _ = lower_block(b, body);
+            b.loops.pop();
             b.terminate_if_open(MirTerminator::Goto(header));
 
             b.current = exit;
@@ -202,7 +239,9 @@ fn lower_expr(b: &mut Builder, expr: &HirExpr) -> MirValue {
             let exit = b.new_block();
             b.current_block_mut().term = Some(MirTerminator::Goto(head));
             b.current = head;
+            b.loops.push(LoopCtx { header: head, exit });
             let _ = lower_block(b, body);
+            b.loops.pop();
             b.current_block_mut().term = Some(MirTerminator::Goto(head));
             b.current = exit;
             MirValue::Unit
@@ -216,10 +255,16 @@ fn lower_expr(b: &mut Builder, expr: &HirExpr) -> MirValue {
             // await 表达式：先计算 future，然后生成 await 点
             let f = lower_expr(b, future);
             let name = format!("t{}", b.temp_id());
-            b.current_block_mut().instrs.push(MirInstr::Await(name.clone(), f));
+            b.current_block_mut()
+                .instrs
+                .push(MirInstr::Await(name.clone(), f));
             MirValue::Var(name)
         }
-        Call { callee, args, result } => {
+        Call {
+            callee,
+            args,
+            result,
+        } => {
             let name = format!("v{}", result.0);
             let fn_name = b
                 .functions
@@ -251,6 +296,22 @@ fn lower_expr(b: &mut Builder, expr: &HirExpr) -> MirValue {
             // 被折叠掉了，这里没有原始表达式可降级，`comptime 40 + 2` 到
             // 这一步已经是一个 `Int(42)`。
             mir_literal(folded)
+        }
+        Break => {
+            // `break` 终结当前块并跳到最内层循环的出口。用 `terminate_if_open`
+            // 是为了不覆盖已经终结的块（比如 `if c { break; }` 里 if 自己刚
+            // 写完跳转）。
+            if let Some(ctx) = b.loops.last() {
+                b.terminate_if_open(MirTerminator::Goto(ctx.exit));
+            }
+            MirValue::Unit
+        }
+        Continue => {
+            // `continue` 跳回循环头（回边），而不是像 `break` 那样跳出口。
+            if let Some(ctx) = b.loops.last() {
+                b.terminate_if_open(MirTerminator::Goto(ctx.header));
+            }
+            MirValue::Unit
         }
         _ => {
             // 其他表达式（Match/For/Struct 等）骨架阶段降级为占位
@@ -317,17 +378,60 @@ struct Builder {
     next_temp: u32,
     /// DefId → 函数名（由降级入口注入）。
     functions: HashMap<hir::DefId, String>,
+    /// 正在展开的循环（由内到外）：`(回边目标块, 出口块)`。
+    ///
+    /// `break` / `continue` 本身是表达式，拿不到"我在哪个循环里"，只能靠
+    /// 降级时维护的这份栈。之前它们落进 `_ => Unit` 的兜底分支，等价于
+    /// 什么都没做——`loop { ... break; }` 于是**编译通过但永远转不出来**。
+    loops: Vec<LoopCtx>,
+    /// DefId → 常量的值（MIR 值形式）。
+    ///
+    /// 引用 `const` 时把值直接内联进指令流：常量在编译期就定下来了，
+    /// 运行时既没有存储也没有读取动作。
+    const_values: HashMap<hir::DefId, MirValue>,
+}
+
+/// 把常量表折成 `DefId -> MirValue`。
+///
+/// 只收**字面量**初值：`const X: T = f(2)` 之类的复合初值在 HIR 里不是字面量，
+/// 引用它的地方降级成 unit（与"无法内联"同义），而不是猜一个值。
+fn const_values(consts: &HashMap<hir::DefId, HirConst>) -> HashMap<hir::DefId, MirValue> {
+    let mut out = HashMap::with_capacity(consts.len());
+    for (id, c) in consts {
+        if let hir::ExprKind::Literal(lit) = &c.value.kind {
+            out.insert(*id, mir_literal(lit));
+        } else if let hir::ExprKind::Comptime(folded) = &c.value.kind {
+            // comptime 求值出来的常量：同样是一条字面量。
+            out.insert(*id, mir_literal(folded));
+        }
+    }
+    out
+}
+
+/// 一个 `break` / `continue` 各自的目标块。
+#[derive(Clone, Copy)]
+struct LoopCtx {
+    /// `continue` 的落点（循环头）。
+    header: usize,
+    /// `break` 的落点（循环出口）。
+    exit: usize,
 }
 
 impl Builder {
-    fn new(name: String, functions: HashMap<hir::DefId, String>) -> Self {
+    fn new(
+        name: String,
+        functions: HashMap<hir::DefId, String>,
+        const_values: HashMap<hir::DefId, MirValue>,
+    ) -> Self {
         let _ = name;
         Self {
             blocks: Vec::new(),
             current: 0,
             param_names: Vec::new(),
             next_temp: 0,
+            loops: Vec::new(),
             functions,
+            const_values,
         }
     }
 

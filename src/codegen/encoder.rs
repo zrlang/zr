@@ -24,14 +24,26 @@ use crate::codegen::target::{Arch, Os, Target};
 use crate::codegen::{
     CompilationUnit, Relocation, RelocationKind, Symbol, SymbolKind, SymbolSection,
 };
-use std::collections::HashMap;
 use crate::mir::NumTy;
 use crate::ssa::{SsaBinaryOp, SsaConst, SsaFunction, SsaInstr, SsaTerminator, SsaValue};
+use std::collections::HashMap;
 
 /// x86-64 通用寄存器（System V ABI / Microsoft x64 ABI 共用编号）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Gpr {
-    Rax, Rcx, Rdx, Rsi, Rdi, R8, R9, R10, R11, R12, R13, R14, R15,
+    Rax,
+    Rcx,
+    Rdx,
+    Rsi,
+    Rdi,
+    R8,
+    R9,
+    R10,
+    R11,
+    R12,
+    R13,
+    R14,
+    R15,
 }
 
 impl Gpr {
@@ -39,15 +51,28 @@ impl Gpr {
     fn bits(self) -> u8 {
         use Gpr::*;
         match self {
-            Rax => 0, Rcx => 1, Rdx => 2, Rsi => 6, Rdi => 7,
-            R8 => 0, R9 => 1, R10 => 2, R11 => 3,
-            R12 => 4, R13 => 5, R14 => 6, R15 => 7,
+            Rax => 0,
+            Rcx => 1,
+            Rdx => 2,
+            Rsi => 6,
+            Rdi => 7,
+            R8 => 0,
+            R9 => 1,
+            R10 => 2,
+            R11 => 3,
+            R12 => 4,
+            R13 => 5,
+            R14 => 6,
+            R15 => 7,
         }
     }
 
     /// 是否需要 REX.B / REX.R 扩展位（R8–R15 需要）。
     fn rex_bit(self) -> bool {
-        matches!(self, Gpr::R8 | Gpr::R9 | Gpr::R10 | Gpr::R11 | Gpr::R12 | Gpr::R13 | Gpr::R14 | Gpr::R15)
+        matches!(
+            self,
+            Gpr::R8 | Gpr::R9 | Gpr::R10 | Gpr::R11 | Gpr::R12 | Gpr::R13 | Gpr::R14 | Gpr::R15
+        )
     }
 }
 
@@ -63,7 +88,16 @@ const SCRATCH_DX: Gpr = Gpr::Rdx;
 const ARG_REGS: [Gpr; 6] = [Gpr::Rdi, Gpr::Rsi, SCRATCH_DX, SCRATCH_CX, Gpr::R8, Gpr::R9];
 
 const ALLOCATABLE: [Gpr; 10] = [
-    Gpr::Rsi, Gpr::Rdi, Gpr::R8, Gpr::R9, Gpr::R10, Gpr::R11, Gpr::R12, Gpr::R13, Gpr::R14, Gpr::R15,
+    Gpr::Rsi,
+    Gpr::Rdi,
+    Gpr::R8,
+    Gpr::R9,
+    Gpr::R10,
+    Gpr::R11,
+    Gpr::R12,
+    Gpr::R13,
+    Gpr::R14,
+    Gpr::R15,
 ];
 
 /// 把 SSA value 映射到物理寄存器（虚拟分配）。
@@ -72,15 +106,6 @@ const ALLOCATABLE: [Gpr; 10] = [
 /// 早先只用 `bb<编号>`，于是**不同函数的同名块会共用一个符号**——`main`
 /// 的 `bb1` 和 `f` 的 `bb1` 撞在一起，`main` 里的分支会跳进别的函数。
 /// 加上函数名前缀后每个块的标签全局唯一。
-/// 一个块的后继。
-fn successors(block: &crate::ssa::SsaBasicBlock) -> Vec<usize> {
-    match &block.term {
-        SsaTerminator::Goto(t) => vec![*t],
-        SsaTerminator::Branch { then_block, else_block, .. } => vec![*then_block, *else_block],
-        _ => Vec::new(),
-    }
-}
-
 /// 在当前块（`from`）末尾，把本块持有的值写进后继块 `succ` 的各个 φ 寄存器。
 ///
 /// 多个 φ 的写入彼此独立但必须**同时**读源：直接按顺序 `mov` 会在存在
@@ -94,7 +119,10 @@ fn emit_phi_copies(unit: &mut CompilationUnit, func: &SsaFunction, succ: usize, 
     // 溢出结果先单独处理：它们没有固定寄存器，只能经 `rax` 中转。
     // 放在最前面做是安全的——`rax` 不参与分配，不是任何搬运的源。
     for instr in &block.instrs {
-        let SsaInstr::Phi { result, incoming, .. } = instr else {
+        let SsaInstr::Phi {
+            result, incoming, ..
+        } = instr
+        else {
             continue;
         };
         let Some((_, src)) = incoming.iter().find(|(p, _)| *p == from) else {
@@ -107,7 +135,10 @@ fn emit_phi_copies(unit: &mut CompilationUnit, func: &SsaFunction, succ: usize, 
     }
     // 剩下的都是寄存器到寄存器，统一走并行搬运处理环
     for instr in &block.instrs {
-        let SsaInstr::Phi { result, incoming, .. } = instr else {
+        let SsaInstr::Phi {
+            result, incoming, ..
+        } = instr
+        else {
             continue;
         };
         let Some((_, src)) = incoming.iter().find(|(p, _)| *p == from) else {
@@ -146,6 +177,21 @@ fn emit_pop_r(unit: &mut CompilationUnit, r: Gpr) {
 
 fn block_label(func: &str, id: usize) -> String {
     format!("{func}.bb{id}")
+}
+
+/// 登记一个只在函数内部使用的局部标签（条件分支的 `else` 副本）。
+///
+/// 与基本块标签不同：它不对应任何块，只是让 `jz` 能跳过 then 分支的代码。
+/// 放在符号表里（而不是单独一张表）是为了能复用现有的重定位解析路径。
+fn bind_local_label(unit: &mut CompilationUnit, name: &str, offset: usize) {
+    unit.symbols.push(Symbol {
+        name: name.to_string(),
+        section: SymbolSection::Text,
+        offset,
+        size: 0,
+        global: false,
+        kind: SymbolKind::Section,
+    });
 }
 
 // 当前函数的「值 id -> 寄存器下标」映射。寄存器分配要跨整个函数做
@@ -204,10 +250,19 @@ enum Src {
 
 /// `mov dst, [rsp + 8*slot]`
 fn emit_load_slot(unit: &mut CompilationUnit, dst: Gpr, slot: usize) {
-    emit1(unit, 0x48 | if dst.rex_bit() { 0x01 } else { 0 });
+    // REX 位必须分清 ModRM 的两个字段：`8B /r` 的 **reg 字段是目的**，
+    // **r/m 字段是源**——而这里的 r/m 是 SIB，所以真正被扩展的是 SIB 的
+    // **base**（`rsp`）。于是 REX.R 属于 dst，而 REX.B **必须留 0**。
+    //
+    // 把 REX.B 当成"目的寄存器需要扩展"来设（早先的写法）会在目的寄存器是
+    // R8–R15 时把 SIB 的 base 从 `rsp` 换成 `r12`：装载溢出值时读的根本不是
+    // 栈帧，而是某个被分配给活跃值的寄存器指向的内存 —— 直接段错误。
+    let rex = 0x48u8 | if dst.rex_bit() { 0x04 } else { 0 };
+    emit1(unit, rex);
     emit1(unit, 0x8B);
-    // mod=10 (disp32), reg=dst, r/m=100 (SIB) -> SIB: base=rsp(100), index=none
+    // mod=10 (disp32), reg=dst, rm=100 (SIB)
     emit1(unit, 0b10_000_100 | dst.bits() << 3);
+    // SIB: scale=00, index=100 (无索引), base=100 (rsp)
     emit1(unit, 0b00_100_100);
     emit4(unit, (slot * 8) as u32);
 }
@@ -224,13 +279,14 @@ fn emit_store_slot(unit: &mut CompilationUnit, src: Gpr, slot: usize) {
 
 /// 发射一个函数的机器码。
 pub fn emit_function(target: &Target, unit: &mut CompilationUnit, func: &SsaFunction) {
-    debug_assert_eq!(target.arch(), Arch::X86_64, "x86-64 后端只能用于 x86_64 目标");
-    // 先做活跃区间分析 + 线性扫描，确定每个值落在哪个寄存器
-    let alloc = crate::codegen::regalloc::allocate_registers(
-        func,
-        ALLOCATABLE.len(),
-        &X86_64_CALLEE_SAVE,
+    debug_assert_eq!(
+        target.arch(),
+        Arch::X86_64,
+        "x86-64 后端只能用于 x86_64 目标"
     );
+    // 先做活跃区间分析 + 线性扫描，确定每个值落在哪个寄存器
+    let alloc =
+        crate::codegen::regalloc::allocate_registers(func, ALLOCATABLE.len(), &X86_64_CALLEE_SAVE);
     // callee-save 集合要在发射尾声时再用，所以这里留一份
     let callee_saved = callee_saved_regs(&alloc.map);
     FRAME_SLOTS.with(|c| c.set(alloc.spilled));
@@ -281,14 +337,20 @@ pub fn emit_function(target: &Target, unit: &mut CompilationUnit, func: &SsaFunc
         }
         // φ 是"在每个前驱末尾"的并行拷贝：跳转之前必须把本块持有的值
         // 写进后继块各个 φ 的目标寄存器。
-        for succ in successors(block) {
-            emit_phi_copies(unit, func, succ, block.id);
-        }
+        //
+        // **条件分支块里，拷贝必须排在 `test` 之后**（见下面 Branch 分支）。
+        // 拷贝写的是后继 φ 的目标寄存器，而条件值所在的寄存器在拷贝那一刻
+        // 已经"用完"了（按活跃区间算它到这里就死了），于是两者可以分到同一个
+        // 寄存器。拷贝在前的话，`mov` 会把条件覆盖掉，分支判的是错的值——
+        // `while k < 10 { k += 1; if k == 5 { break } }` 在 k 非零时直接跳出。
         match &block.term {
             SsaTerminator::Return(ret_val) => {
-                // 若有返回值，先 mov rax, <reg>
+                // 若有返回值，先 mov rax, <reg>。
+                // 必须走 `use_reg`：返回值本身可能是溢出的值，它没有固定
+                // 寄存器，直接 `alloc_reg` 会 panic。
                 if let Some(v) = ret_val {
-                    emit_mov_rr(unit, SCRATCH_AX, alloc_reg(*v));
+                    let r = use_reg(unit, *v);
+                    emit_mov_rr(unit, SCRATCH_AX, r);
                 }
                 // 尾声：add rsp, frame; pop callee-save; mov rsp, rbp; pop rbp; ret
                 if frame > 0 {
@@ -304,14 +366,43 @@ pub fn emit_function(target: &Target, unit: &mut CompilationUnit, func: &SsaFunc
                 emit1(unit, 0x5d);
                 emit1(unit, 0xc3);
             }
-            SsaTerminator::Goto(target) => emit_jmp(unit, &block_label(&func.name, *target)),
-            SsaTerminator::Branch { cond, then_block, else_block } => {
-                // test cond, cond; jz else; jmp then
-                // 条件可能溢出在栈上，先装回 rax 再测
+            SsaTerminator::Goto(target) => {
+                emit_phi_copies(unit, func, *target, block.id);
+                emit_jmp(unit, &block_label(&func.name, *target));
+            }
+            SsaTerminator::Branch {
+                cond,
+                then_block,
+                else_block,
+            } => {
+                // 条件可能溢出在栈上，先装回 rax 再测。
                 let r = use_reg(unit, *cond);
                 emit_test_rr(unit, r, r);
-                emit_jcc_rel32(unit, 0x84, &block_label(&func.name, *else_block)); // jz
+
+                // φ 拷贝必须**按边**发射，不能在分支之前一股脑全发。
+                //
+                // 每个后继只在自己的前驱边上做拷贝：`while c { ... }` 展开成
+                // `bb1 -> bb2`（真）与 `bb1 -> bb3`（假），而只有 bb3 有 φ。
+                // 提前在分支前统一发射，拷贝会在**两条边上都执行**——包括
+                // 根本不经过 bb3 的那条。于是 bb2 读到的循环变量寄存器已经被
+                // 覆盖成别的值，累加器从某一轮起就不再正确。
+                //
+                //   test cond, cond
+                //   jz   L_else
+                //   <then 边的 φ 拷贝>      ; 条件为真
+                //   jmp  then
+                // L_else:
+                //   <else 边的 φ 拷贝>      ; 条件为假
+                //   jmp  else
+                let else_label = format!("{}.else{}", func.name, block.id);
+                emit_jcc_rel32(unit, 0x84, &else_label); // jz L_else
+                emit_phi_copies(unit, func, *then_block, block.id);
                 emit_jmp(unit, &block_label(&func.name, *then_block));
+                // `else` 副本登记成一个局部标签（不出现在符号表里）。
+                let else_start = unit.code.len();
+                emit_phi_copies(unit, func, *else_block, block.id);
+                emit_jmp(unit, &block_label(&func.name, *else_block));
+                bind_local_label(unit, &else_label, else_start);
             }
             SsaTerminator::Unreachable => emit_ud2(unit),
         }
@@ -338,9 +429,23 @@ pub fn emit_function(target: &Target, unit: &mut CompilationUnit, func: &SsaFunc
 fn emit_instr(unit: &mut CompilationUnit, instr: &SsaInstr) {
     match instr {
         SsaInstr::Const { result, value } => emit_const(unit, *result, value.clone()),
-        SsaInstr::Binary { result, op, lhs, rhs } => emit_binary(unit, *result, *op, *lhs, *rhs),
-        SsaInstr::Unary { result, op, operand } => emit_unary(unit, *result, *op, *operand),
-        SsaInstr::Call { result, callee, args } => {
+        SsaInstr::Binary {
+            result,
+            op,
+            lhs,
+            rhs,
+            ..
+        } => emit_binary(unit, *result, *op, *lhs, *rhs),
+        SsaInstr::Unary {
+            result,
+            op,
+            operand,
+        } => emit_unary(unit, *result, *op, *operand),
+        SsaInstr::Call {
+            result,
+            callee,
+            args,
+        } => {
             emit_call_args(unit, args);
             emit_call(unit, callee);
             match location_of(*result) {
@@ -357,7 +462,11 @@ fn emit_instr(unit: &mut CompilationUnit, instr: &SsaInstr) {
         SsaInstr::Phi { .. } => {}
         SsaInstr::Copy { result, src } => {
             let spilled = matches!(location_of(*result), Location::Stack(_));
-            let d = if spilled { SCRATCH_AX } else { alloc_reg(*result) };
+            let d = if spilled {
+                SCRATCH_AX
+            } else {
+                alloc_reg(*result)
+            };
             match location_of(*src) {
                 Location::Reg(i) => {
                     let s = ALLOCATABLE[i];
@@ -373,9 +482,18 @@ fn emit_instr(unit: &mut CompilationUnit, instr: &SsaInstr) {
                 }
             }
         }
-        SsaInstr::Cast { result, src, from, to } => {
+        SsaInstr::Cast {
+            result,
+            src,
+            from,
+            to,
+        } => {
             let spilled = matches!(location_of(*result), Location::Stack(_));
-            let d = if spilled { SCRATCH_AX } else { alloc_reg(*result) };
+            let d = if spilled {
+                SCRATCH_AX
+            } else {
+                alloc_reg(*result)
+            };
             let s = use_reg(unit, *src);
             emit_cast(unit, d, s, *from, *to);
             if spilled {
@@ -394,13 +512,7 @@ fn emit_instr(unit: &mut CompilationUnit, instr: &SsaInstr) {
 ///
 /// 值一律放在 64 位寄存器里，所以转换就是"取低 w 位再按目标的有无符号
 /// 重新符号/零扩展到 64 位"。宽度已经是 64 时什么都不用做。
-fn emit_cast(
-    unit: &mut CompilationUnit,
-    dst: Gpr,
-    src: Gpr,
-    from: NumTy,
-    to: NumTy,
-) {
+fn emit_cast(unit: &mut CompilationUnit, dst: Gpr, src: Gpr, from: NumTy, to: NumTy) {
     // 浮点之间的转换、浮点与整数之间的转换目前后端还没有实现。
     // 宁可报错也不能静默发出 0 —— 那比编译失败更难查。
     if from.is_float() || to.is_float() {
@@ -484,7 +596,11 @@ fn emit_extend_to64(unit: &mut CompilationUnit, dst: Gpr, src: Gpr, bits: u8, si
 fn emit_const(unit: &mut CompilationUnit, result: SsaValue, value: SsaConst) {
     // 溢出的结果没有寄存器：先装进 rax，再写回栈槽
     let spilled = matches!(location_of(result), Location::Stack(_));
-    let dst = if spilled { SCRATCH_AX } else { alloc_reg(result) };
+    let dst = if spilled {
+        SCRATCH_AX
+    } else {
+        alloc_reg(result)
+    };
     match value {
         SsaConst::Int(i) => {
             // movabs（REX.W + 0xB8 + rd + imm64）加载 64 位立即数
@@ -525,115 +641,205 @@ fn emit_const_bool(unit: &mut CompilationUnit, dst: u8, value: bool) {
 }
 
 /// 发射二元运算。
-fn emit_binary(unit: &mut CompilationUnit, result: SsaValue, op: SsaBinaryOp, lhs: SsaValue, rhs: SsaValue) {
+fn emit_binary(
+    unit: &mut CompilationUnit,
+    result: SsaValue,
+    op: SsaBinaryOp,
+    lhs: SsaValue,
+    rhs: SsaValue,
+) {
     use SsaBinaryOp::*;
 
-    // 操作数可能是溢出的值：先按需从栈槽装进临时寄存器。
-    // 分配器保证溢出值没有固定寄存器，所以这里用的是**不参与分配**的
-    // `rax` / `rdx`。
-    let lhs_loc = location_of(lhs);
-    let rhs_loc = location_of(rhs);
-    let l_temp = match lhs_loc {
-        Location::Stack(slot) => {
-            emit_load_slot(unit, SCRATCH_AX, slot);
-            Some(SCRATCH_AX)
-        }
-        Location::Reg(_) => None,
-    };
-    let r_temp = match rhs_loc {
-        Location::Stack(_) => {
-            // `div`/`rem` 内部要用 `rax:rdx` 放被除数，`cqo` 还会把 rdx
-            // 写掉，所以除数不能借用这两个寄存器——借一个分配池里的，
-            // 用 push/pop 保护它当下的内容。
-            if matches!(op, Div | Rem) {
-                let slot = match rhs_loc {
-                    Location::Stack(slot) => slot,
-                    Location::Reg(_) => unreachable!(),
-                };
-                let protect = ALLOCATABLE[X86_64_CALLEE_SAVE[0]];
-                emit_push_r(unit, protect);
-                emit_load_slot(unit, protect, slot);
-                Some(protect)
-            } else {
-                // 两个操作数都溢出时只能用第二个临时寄存器
-                let tmp = if l_temp.is_some() { SCRATCH_DX } else { SCRATCH_AX };
-                let slot = match rhs_loc {
-                    Location::Stack(slot) => slot,
-                    Location::Reg(_) => unreachable!(),
-                };
-                emit_load_slot(unit, tmp, slot);
-                Some(tmp)
-            }
-        }
-        Location::Reg(_) => None,
-    };
-
-    // 结果寄存器：溢出的结果先算进一个临时寄存器，最后再存回栈槽。
-    // 除法/取模要占用 rax:rdx，比较要用 setcc al，移位要占 cl ——
-    // 这几种运算的结果临时寄存器换用 rcx，免得和它们打架。
     let result_spilled = matches!(location_of(result), Location::Stack(_));
-    let scratch = match op {
-        Div | Rem | Eq | Ne | Lt | Gt | Le | Ge => SCRATCH_CX,
-        _ => SCRATCH_AX,
+    let dst = if result_spilled {
+        SCRATCH_AX
+    } else {
+        alloc_reg(result)
     };
-    let dst = if result_spilled { scratch } else { alloc_reg(result) };
-    let l = l_temp.unwrap_or_else(|| alloc_reg(lhs));
-    let r = r_temp.unwrap_or_else(|| alloc_reg(rhs));
 
-    // 运算体
-    let _ = &mut ();
     match op {
-        // 算术与位运算：dst = l OP r
-        Add | Sub | BitAnd | BitOr | BitXor | And | Or => {
-            if dst != l {
-                emit_mov_rr(unit, dst, l);
+        // -------------------------------------------------------------
+        // 除法 / 取模：`rax` 放被除数，`rdx` 放余数（`cqo` 写 rdx）
+        // -------------------------------------------------------------
+        Div | Rem => {
+            // 被除数 → rax
+            match location_of(lhs) {
+                Location::Reg(_) => emit_mov_rr(unit, SCRATCH_AX, alloc_reg(lhs)),
+                Location::Stack(slot) => emit_load_slot(unit, SCRATCH_AX, slot),
             }
-            if let Some(code) = alu_opcode(op) {
-                emit_full_alu(unit, code, dst, r);
-            }
-        }
-        // 乘法 / 除法 / 取模 / 移位：需要专用指令编码
-        Mul => {
-            emit_mul(unit, dst, l, r);
-            if r_temp.is_some() {
-                emit_pop_r(unit, r);
-            }
-        }
-        Div => {
-            emit_divrem(unit, dst, l, r, false);
-            if r_temp.is_some() {
-                emit_pop_r(unit, r);
-            }
-        }
-        Rem => {
-            emit_divrem(unit, dst, l, r, true);
-            if r_temp.is_some() {
-                emit_pop_r(unit, r);
+            // 除数：溢出时直接用内存操作数 `idiv [rsp+disp32]`。
+            //
+            // 不装进寄存器：rax 被除数占用，rdx 会被 `cqo` 写掉，而借一个
+            // 分配池里的寄存器就得先 push 保护——push 让 rsp 偏移 8，之后
+            // 所有 `[rsp+disp]` 形式的栈槽访问全部读错地址。
+            let divisor = match location_of(rhs) {
+                Location::Reg(_) => emit_divrem_reg(unit, dst, alloc_reg(rhs), op == Rem),
+                Location::Stack(slot) => emit_divrem_mem(unit, dst, slot, op == Rem),
+            };
+            if result_spilled {
+                if let Location::Stack(slot) = location_of(result) {
+                    emit_store_slot(unit, divisor, slot);
+                }
             }
         }
-        Shl => emit_shift(unit, 4, dst, l, r), // shl r/m64, cl
-        Shr => emit_shift(unit, 7, dst, l, r), // sar r/m64, cl（算术右移）
-        // 比较运算：cmp l, r; setcc al; movzx dst, al
+
+        // -------------------------------------------------------------
+        // 移位：计数固定走 `cl`，被移位值进 dst
+        // -------------------------------------------------------------
+        Shl | Shr => {
+            // 左操作数直接搬进 dst：`mov dst, l` 本来就要发，省一次搬运。
+            match location_of(lhs) {
+                Location::Reg(i) => {
+                    let l = ALLOCATABLE[i];
+                    if l != dst {
+                        emit_mov_rr(unit, dst, l);
+                    }
+                }
+                Location::Stack(slot) => emit_load_slot(unit, dst, slot),
+            }
+            // 计数：x86 的移位计数只取 `cl`，固定用 rcx。
+            match location_of(rhs) {
+                Location::Reg(i) => {
+                    let r = ALLOCATABLE[i];
+                    if r != SCRATCH_CX {
+                        emit_mov_rr(unit, SCRATCH_CX, r);
+                    }
+                }
+                Location::Stack(slot) => emit_load_slot(unit, SCRATCH_CX, slot),
+            }
+            // 4 = shl, 7 = sar（算术右移：IR 的 Shr 是有符号的）
+            let code = if op == Shl { 4 } else { 7 };
+            let mut rex = 0x48u8;
+            if dst.rex_bit() {
+                rex |= 0x01;
+            }
+            emit1(unit, rex);
+            emit1(unit, 0xd3);
+            modrm(unit, 3, code, dst.bits());
+            if result_spilled {
+                if let Location::Stack(slot) = location_of(result) {
+                    emit_store_slot(unit, dst, slot);
+                }
+            }
+        }
+
+        // -------------------------------------------------------------
+        // 比较：`cmp l, r; setcc al; movzx dst, al`
+        // -------------------------------------------------------------
         Eq | Ne | Lt | Gt | Le | Ge => {
+            // 两个操作数都装进暂存器。它们在 `cmp` 之后就没用了，所以结果
+            // 暂存器可以与它们重合（`setcc` 写的是 al，`movzx dst, al` 在
+            // `cmp` 之后才执行）。
+            let l = load_scratch(unit, lhs, SCRATCH_AX);
+            let r = load_scratch(unit, rhs, SCRATCH_DX);
             emit_cmp_rr(unit, l, r);
             emit_setcc(unit, condition_code(op), SCRATCH_AX);
             emit_movzx(unit, dst, SCRATCH_AX);
+            if result_spilled {
+                if let Location::Stack(slot) = location_of(result) {
+                    emit_store_slot(unit, dst, slot);
+                }
+            }
         }
-    }
 
-    // 溢出结果写回栈槽
-    if result_spilled {
-        emit_store_slot(unit, dst, match location_of(result) {
-            Location::Stack(slot) => slot,
-            Location::Reg(_) => unreachable!(),
-        });
+        // -------------------------------------------------------------
+        // 其余 ALU：add / sub / mul / and / or / xor
+        // -------------------------------------------------------------
+        Add | Sub | Mul | BitAnd | BitOr | BitXor | And | Or => {
+            // 左操作数进 dst（`mov dst, l` 本来就要发）。
+            match location_of(lhs) {
+                Location::Reg(i) => {
+                    let l = ALLOCATABLE[i];
+                    if l != dst {
+                        emit_mov_rr(unit, dst, l);
+                    }
+                }
+                Location::Stack(slot) => emit_load_slot(unit, dst, slot),
+            }
+            // 右操作数需要一个**不等于 dst** 的暂存器：等于 dst 时会发成
+            // `add rax, rax`（把左操作数加了两次），而不是加上真正的右操作数。
+            let scratch = if dst == SCRATCH_AX {
+                SCRATCH_DX
+            } else {
+                SCRATCH_AX
+            };
+            let r = load_scratch(unit, rhs, scratch);
+            if op == Mul {
+                emit_mul(unit, dst, dst, r);
+            } else if let Some(code) = alu_opcode(op) {
+                emit_full_alu(unit, code, dst, r);
+            }
+            if result_spilled {
+                if let Location::Stack(slot) = location_of(result) {
+                    emit_store_slot(unit, dst, slot);
+                }
+            }
+        }
     }
 }
 
+/// 取一个值的所在寄存器；溢出值先从栈槽装进 `scratch`。
+///
+/// `scratch` 必须与本条指令里的其它暂存器错开（见 [`emit_binary`]）。
+fn load_scratch(unit: &mut CompilationUnit, v: SsaValue, scratch: Gpr) -> Gpr {
+    match location_of(v) {
+        Location::Reg(i) => ALLOCATABLE[i],
+        Location::Stack(slot) => {
+            emit_load_slot(unit, scratch, slot);
+            scratch
+        }
+    }
+}
+
+/// `mov rax, l; cqo; idiv r`（除数在寄存器里），结果写到 `dst`。
+fn emit_divrem_reg(unit: &mut CompilationUnit, dst: Gpr, r: Gpr, want_rem: bool) -> Gpr {
+    // 必须用 `cqo`（rax 的符号扩展进 rdx），**不能**用 `xor edx, edx`：
+    // 后者只在被除数为非负时等价。负数除法会算出完全错误的商和余数。
+    emit2(unit, 0x48, 0x99); // cqo
+    let mut rex = 0x48u8;
+    if r.rex_bit() {
+        rex |= 0x01;
+    }
+    emit1(unit, rex);
+    emit1(unit, 0xf7);
+    modrm(unit, 3, 7, r.bits()); // /7 = IDIV
+    let src = if want_rem { SCRATCH_DX } else { SCRATCH_AX };
+    if dst != src {
+        emit_mov_rr(unit, dst, src);
+    }
+    dst
+}
+
+/// `mov rax, l; cqo; idiv qword ptr [rsp+disp32]`（除数溢出到栈上）。
+fn emit_divrem_mem(unit: &mut CompilationUnit, dst: Gpr, slot: usize, want_rem: bool) -> Gpr {
+    emit2(unit, 0x48, 0x99); // cqo
+    emit1(unit, 0x48); // REX.W
+    emit1(unit, 0xf7);
+    // mod=10 (disp32), reg=111 (/7 = IDIV), rm=100 (SIB)
+    modrm(unit, 2, 7, 4);
+    // SIB: scale=00, index=100 (无索引), base=100 (rsp)
+    emit1(unit, 0b00_100_100);
+    emit4(unit, (slot * 8) as u32);
+    let src = if want_rem { SCRATCH_DX } else { SCRATCH_AX };
+    if dst != src {
+        emit_mov_rr(unit, dst, src);
+    }
+    dst
+}
+
 /// 发射一元运算。
-fn emit_unary(unit: &mut CompilationUnit, result: SsaValue, op: crate::ssa::SsaUnaryOp, operand: SsaValue) {
+fn emit_unary(
+    unit: &mut CompilationUnit,
+    result: SsaValue,
+    op: crate::ssa::SsaUnaryOp,
+    operand: SsaValue,
+) {
     let spilled = matches!(location_of(result), Location::Stack(_));
-    let dst = if spilled { SCRATCH_AX } else { alloc_reg(result) };
+    let dst = if spilled {
+        SCRATCH_AX
+    } else {
+        alloc_reg(result)
+    };
     let r = match location_of(operand) {
         Location::Reg(i) => ALLOCATABLE[i],
         Location::Stack(slot) => {
@@ -687,11 +893,11 @@ fn emit_unary(unit: &mut CompilationUnit, result: SsaValue, op: crate::ssa::SsaU
 fn alu_opcode(op: SsaBinaryOp) -> Option<u8> {
     use SsaBinaryOp::*;
     Some(match op {
-        Add => 0,     // add
-        Sub => 5,     // sub
+        Add => 0,          // add
+        Sub => 5,          // sub
         BitAnd | And => 4, // and
-        BitOr | Or => 1,  // or
-        BitXor => 6,  // xor
+        BitOr | Or => 1,   // or
+        BitXor => 6,       // xor
         Mul | Div | Rem | Shl | Shr => return None,
         Eq | Ne | Lt | Gt | Le | Ge => return None,
     })
@@ -701,12 +907,12 @@ fn alu_opcode(op: SsaBinaryOp) -> Option<u8> {
 fn condition_code(op: SsaBinaryOp) -> u8 {
     use SsaBinaryOp::*;
     match op {
-        Eq => 0x94,  // sete
-        Ne => 0x95,  // setne
-        Lt => 0x9c,  // setl（有符号小于）
-        Gt => 0x9f,  // setg
-        Le => 0x9e,  // setle
-        Ge => 0x9d,  // setge
+        Eq => 0x94, // sete
+        Ne => 0x95, // setne
+        Lt => 0x9c, // setl（有符号小于）
+        Gt => 0x9f, // setg
+        Le => 0x9e, // setle
+        Ge => 0x9d, // setge
         _ => 0x94,
     }
 }
@@ -752,8 +958,12 @@ fn modrm(unit: &mut CompilationUnit, mm: u8, reg: u8, rm: u8) {
 /// 实际用 0x89 modrm(3, src, dst)：dst = src
 fn emit_mov_rr(unit: &mut CompilationUnit, dst: Gpr, src: Gpr) {
     let mut rex = 0x48u8;
-    if src.rex_bit() { rex |= 0x04; } // REX.R
-    if dst.rex_bit() { rex |= 0x01; } // REX.B
+    if src.rex_bit() {
+        rex |= 0x04;
+    } // REX.R
+    if dst.rex_bit() {
+        rex |= 0x01;
+    } // REX.B
     emit1(unit, rex);
     emit1(unit, 0x89);
     modrm(unit, 3, src.bits(), dst.bits());
@@ -762,8 +972,12 @@ fn emit_mov_rr(unit: &mut CompilationUnit, dst: Gpr, src: Gpr) {
 /// `test r64, r64`：REX.W + 0x85 /r  (85 = MR, reg=src, r/m=dst; 计算 src & dst)
 fn emit_test_rr(unit: &mut CompilationUnit, a: Gpr, b: Gpr) {
     let mut rex = 0x48u8;
-    if a.rex_bit() { rex |= 0x04; }
-    if b.rex_bit() { rex |= 0x01; }
+    if a.rex_bit() {
+        rex |= 0x04;
+    }
+    if b.rex_bit() {
+        rex |= 0x01;
+    }
     emit1(unit, rex);
     emit1(unit, 0x85);
     modrm(unit, 3, a.bits(), b.bits());
@@ -777,8 +991,12 @@ fn emit_test_rr(unit: &mut CompilationUnit, a: Gpr, b: Gpr) {
 /// reg 字段放 b**——写反就变成 `b - a`，`>` / `<` 会整体反掉。
 fn emit_cmp_rr(unit: &mut CompilationUnit, a: Gpr, b: Gpr) {
     let mut rex = 0x48u8;
-    if b.rex_bit() { rex |= 0x04; } // REX.R <- reg 字段（b）
-    if a.rex_bit() { rex |= 0x01; } // REX.B <- rm  字段（a）
+    if b.rex_bit() {
+        rex |= 0x04;
+    } // REX.R <- reg 字段（b）
+    if a.rex_bit() {
+        rex |= 0x01;
+    } // REX.B <- rm  字段（a）
     emit1(unit, rex);
     emit1(unit, 0x39);
     modrm(unit, 3, b.bits(), a.bits());
@@ -793,7 +1011,9 @@ fn emit_setcc(unit: &mut CompilationUnit, cc: u8, dst: Gpr) {
     // `xchg` / `nop` / `pause` 等等，根本不是 setcc。加上 REX.B 才能
     // 正确扩展到 r8-r15。
     let mut rex = 0x40u8;
-    if dst.rex_bit() { rex |= 0x01; }
+    if dst.rex_bit() {
+        rex |= 0x01;
+    }
     emit1(unit, rex);
     emit2(unit, 0x0f, cc);
     modrm(unit, 3, 0, dst.bits());
@@ -805,8 +1025,12 @@ fn emit_movzx(unit: &mut CompilationUnit, dst: Gpr, src: Gpr) {
     // Intel `movzx r32, r/m8`（0F B6 /r）：**reg 字段是 32 位目的，
     // r/m 字段是 8 位源**。写反会变成把 dst 的低字节搬进 src。
     let mut rex = 0x48u8;
-    if dst.rex_bit() { rex |= 0x04; } // REX.R <- reg 字段（dst）
-    if src.rex_bit() { rex |= 0x01; } // REX.B <- rm  字段（src）
+    if dst.rex_bit() {
+        rex |= 0x04;
+    } // REX.R <- reg 字段（dst）
+    if src.rex_bit() {
+        rex |= 0x01;
+    } // REX.B <- rm  字段（src）
     emit1(unit, rex);
     emit2(unit, 0x0f, 0xb6);
     modrm(unit, 3, dst.bits(), src.bits());
@@ -981,13 +1205,30 @@ pub fn emit_start_wrapper(target: &Target, unit: &mut CompilationUnit) {
         Os::Linux => {
             // mov edi, eax（main 的返回值作为退出码）
             emit2(unit, 0x89, 0xc7);
-            // mov eax, 60（__NR_exit）
+            // mov eax, __NR_exit（60）
             emit1(unit, 0xb8);
-            emit4(unit, 60);
+            emit4(unit, target.os().exit_syscall(Arch::X86_64));
             // syscall
             emit2(unit, 0x0f, 0x05);
         }
-        Os::Darwin => {
+        Os::FreeBsd => {
+            // FreeBSD 的系统调用约定与 Linux 相同（号在 rax，参数在
+            // rdi/rsi/rdx/r10/r8/r9），`SYS_exit` 也正好是 60。
+            emit2(unit, 0x89, 0xc7);
+            emit1(unit, 0xb8);
+            emit4(unit, target.os().exit_syscall(Arch::X86_64));
+            emit2(unit, 0x0f, 0x05);
+        }
+        Os::Android => {
+            // Android 走 Bionic，x86_64 上和 Linux 一样用 `syscall`，
+            // 但要用 `exit_group`（231）：只调 `exit`(60) 的话线程不会被
+            // 回收，Bionic 的运行时会在退出时挂住。
+            emit2(unit, 0x89, 0xc7);
+            emit1(unit, 0xb8);
+            emit4(unit, target.os().exit_syscall(Arch::X86_64));
+            emit2(unit, 0x0f, 0x05);
+        }
+        Os::Darwin | Os::Ios => {
             // SysV ABI：`main` 的返回值在 rdi，`zr_exit` 直接取用。
             emit_mov_rr(unit, Gpr::Rdi, Gpr::Rax);
             emit_call(unit, "zr_exit");
@@ -1028,48 +1269,15 @@ fn emit_mul(unit: &mut CompilationUnit, dst: Gpr, l: Gpr, r: Gpr) {
     // `imul r/m64, reg64`（REX.W 0F AF /r）的 reg 字段是**目的**、
     // r/m 字段是源，所以 REX.R 取自 dst、REX.B 取自 r——和 `mov r64,r64`
     // （89 /r，reg=源）的 REX 归属正好相反，弄反会读到错误的寄存器。
-    if dst.rex_bit() { rex |= 0x04; }
-    if r.rex_bit() { rex |= 0x01; }
+    if dst.rex_bit() {
+        rex |= 0x04;
+    }
+    if r.rex_bit() {
+        rex |= 0x01;
+    }
     emit1(unit, rex);
     emit2(unit, 0x0f, 0xaf);
     modrm(unit, 3, dst.bits(), r.bits());
-}
-
-/// 有符号除法 / 取模：`idiv r/m64`（REX.W + 0xF7 /7）。
-///
-/// 约定使用 rax 作为被除数、rdx 保存余数——这正是 `rax`/`rdx` 不参与
-/// 寄存器分配的原因。
-fn emit_divrem(unit: &mut CompilationUnit, dst: Gpr, l: Gpr, r: Gpr, want_rem: bool) {
-    emit_mov_rr(unit, SCRATCH_AX, l);
-    // 必须用 `cqo`（rax 的符号扩展进 rdx），**不能**用 `xor edx, edx`：
-    // 后者只在被除数为非负时等价。负数除法会算出完全错误的商和余数。
-    emit2(unit, 0x48, 0x99); // cqo
-    let mut rex = 0x48u8;
-    if r.rex_bit() { rex |= 0x01; }
-    emit1(unit, rex);
-    emit1(unit, 0xf7);
-    modrm(unit, 3, 7, r.bits()); // /7 = IDIV
-    emit_mov_rr(unit, dst, if want_rem { SCRATCH_DX } else { SCRATCH_AX });
-}
-
-/// 移位 `shl r/m64, cl` 或 `sar r/m64, cl`：REX.W + D3 /4 (shl) 或 /7 (sar)。
-/// x86 移位计数固定使用 CL——这是 `rcx` 不参与分配的原因。
-///
-/// 右移一律用**算术**右移：IR 只有一个 `Shr`，没有区分有无符号，而
-/// 整数字面量默认是 i32——对有符号数 `>>` 必须补符号位（`sar`）。
-/// 无符号右移需要 IR 里另加一个操作码。
-fn emit_shift(unit: &mut CompilationUnit, code: u8, dst: Gpr, l: Gpr, r: Gpr) {
-    if dst != l {
-        emit_mov_rr(unit, dst, l);
-    }
-    if r != SCRATCH_CX {
-        emit_mov_rr(unit, SCRATCH_CX, r);
-    }
-    let mut rex = 0x48u8;
-    if dst.rex_bit() { rex |= 0x01; }
-    emit1(unit, rex);
-    emit1(unit, 0xd3);
-    modrm(unit, 3, code, dst.bits());
 }
 
 /// ALU 编码的完整分发：op dst, src（dst OP= src）。
@@ -1084,8 +1292,12 @@ fn emit_full_alu(unit: &mut CompilationUnit, op: u8, dst: Gpr, src: Gpr) {
         _ => 0x01,
     };
     let mut rex = 0x48u8;
-    if src.rex_bit() { rex |= 0x04; }
-    if dst.rex_bit() { rex |= 0x01; }
+    if src.rex_bit() {
+        rex |= 0x04;
+    }
+    if dst.rex_bit() {
+        rex |= 0x01;
+    }
     emit1(unit, rex);
     emit1(unit, opcode);
     modrm(unit, 3, src.bits(), dst.bits());
@@ -1133,16 +1345,76 @@ mod tests {
     }
 
     #[test]
-    fn division_uses_rax_and_rdx() {
+    fn division_sign_extends_before_idiv() {
         let mut u = unit();
-        emit_divrem(&mut u, ALLOCATABLE[0], ALLOCATABLE[1], ALLOCATABLE[2], false);
-        // 被除数 rdi（ALLOCATABLE[1]）→ rax，除数 r8（ALLOCATABLE[2]）
-        assert_eq!(u.code.len(), 11);
-        assert_eq!(&u.code[0..3], &[0x48, 0x89, 0xf8], "mov rax, rdi");
+        // 除数在 r8（ALLOCATABLE[2]），被除数由调用方预先放进 rax。
+        emit_divrem_reg(&mut u, ALLOCATABLE[0], ALLOCATABLE[2], false);
         // 必须是 `cqo`（rax 的符号扩展进 rdx:rax），不能是 `xor edx, edx`——
         // 后者只在被除数非负时等价，负数除法会算错。
-        assert_eq!(&u.code[3..5], &[0x48, 0x99], "cqo");
-        assert_eq!(&u.code[5..8], &[0x49, 0xf7, 0xf8], "REX.WB + idiv r8");
+        assert_eq!(&u.code[0..2], &[0x48, 0x99], "cqo");
+        assert_eq!(&u.code[2..5], &[0x49, 0xf7, 0xf8], "REX.WB + idiv r8");
+    }
+
+    #[test]
+    fn spilled_divisor_uses_the_memory_operand() {
+        let mut u = unit();
+        emit_divrem_mem(&mut u, ALLOCATABLE[0], 3, false);
+        assert_eq!(&u.code[0..2], &[0x48, 0x99], "cqo");
+        // REX.W + idiv /7 + modrm(mod=10,reg=111,rm=SIB) + SIB(rsp) + disp32
+        assert_eq!(&u.code[2..6], &[0x48, 0xf7, 0b10_111_100, 0b00_100_100]);
+        assert_eq!(&u.code[6..10], &24u32.to_le_bytes(), "槽 3 -> rsp+24");
+        // SIB 的 base 是 rsp（没有 REX.B）：早先的版本按目的寄存器设 REX.B，
+        // 目的落在 R8–R15 时会把 base 换成 r12，装载溢出值时直接段错误。
+        assert_eq!(u.code[2] & 0x01, 0, "REX.B 必须为 0（base 是 rsp）");
+    }
+
+    #[test]
+    fn add_with_two_spilled_operands_targets_distinct_registers() {
+        // 两个操作数都溢出：左操作数装进 dst(=rax)，右操作数装进 **rdx**。
+        // 两者撞在一起会发成 `add rax, rax`（把左操作数加了两次），
+        // 程序能跑，值却是错的。
+        let mut u = unit();
+        emit_load_slot(&mut u, SCRATCH_AX, 0);
+        emit_load_slot(&mut u, SCRATCH_DX, 1);
+        emit_full_alu(&mut u, 0, SCRATCH_AX, SCRATCH_DX);
+
+        // 期望字节：两条 load 加一条 `add rdx -> rax`。
+        // `mov rax, [rsp+0]` / `mov rdx, [rsp+8]` / `add rdx, rax`
+        let modrm_reg_sib = |reg_bits: u8| (2 << 6) | (reg_bits << 3) | 4;
+        let mut expect = Vec::new();
+        for (dst, slot) in [(SCRATCH_AX, 0u32), (SCRATCH_DX, 8)] {
+            expect.extend_from_slice(&[0x48, 0x8b]);
+            expect.push(modrm_reg_sib(dst.bits()));
+            expect.extend_from_slice(&[0b00_100_100]); // SIB base=rsp
+            expect.extend_from_slice(&slot.to_le_bytes());
+        }
+        expect.extend_from_slice(&[0x48, 0x01]); // add r/m64, r64
+        expect.push((3 << 6) | (SCRATCH_DX.bits() << 3) | SCRATCH_AX.bits());
+
+        assert_eq!(u.code, expect, "溢出操作数必须落在不同的暂存器");
+    }
+
+    #[test]
+    fn load_and_store_use_rsp_as_the_base_register() {
+        // `8B /r` 的 reg 字段是**目的**，r/m 是 SIB——真正被 REX.B 扩展的是
+        // SIB 的 **base**（rsp）。早先按目的寄存器设 REX.B，目的落在 R8–R15
+        // 时会把 base 换成 r12，装载溢出值时读的根本不是栈帧。
+        let mut u = unit();
+        emit_load_slot(&mut u, Gpr::R10, 5);
+        // REX.W + REX.R（R10 的 reg 字段需要扩展），REX.B 留 0
+        assert_eq!(u.code[0], 0x48 | 0x04, "只应设 REX.R");
+        assert_eq!(u.code[1], 0x8b, "mov r64, r/m64");
+        assert_eq!(u.code[2] >> 6, 0b10, "mod=10 (disp32)");
+        assert_eq!(u.code[2] & 0b111, 0b100, "rm=100 (SIB)");
+        assert_eq!(u.code[2] >> 3 & 0b111, Gpr::R10.bits(), "reg=目的");
+        assert_eq!(u.code[3], 0b00_100_100, "SIB base=rsp, 无索引");
+        assert_eq!(&u.code[4..8], &40u32.to_le_bytes(), "槽 5 -> rsp+40");
+
+        let mut u2 = unit();
+        emit_store_slot(&mut u2, Gpr::R9, 2);
+        assert_eq!(u2.code[0], 0x48 | 0x04, "只应设 REX.R");
+        assert_eq!(u2.code[1], 0x89, "mov r/m64, r64");
+        assert_eq!(u2.code[3], 0b00_100_100, "SIB base=rsp");
     }
 
     #[test]

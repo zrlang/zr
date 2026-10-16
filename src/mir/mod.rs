@@ -31,6 +31,8 @@ pub struct MirFunction {
     pub blocks: Vec<MirBasicBlock>,
     /// `#[inline(never)]`：优化器不许把这个函数自动内联进调用点。
     pub inline_never: bool,
+    /// `#[inline(always)]`：优化器必须把这个函数内联进调用点。
+    pub inline_always: bool,
 }
 
 /// 函数参数。
@@ -40,6 +42,8 @@ pub struct MirParam;
 /// MIR 基本块。
 #[derive(Debug, Clone)]
 pub struct MirBasicBlock {
+    /// 块号（降级时分配，SSA 层用下标而非块号寻址）。
+    #[allow(dead_code)]
     pub id: usize,
     pub instrs: Vec<MirInstr>,
     /// 终结符。`None` 表示"还没有终结"——降级收尾时会补一个默认的
@@ -54,9 +58,13 @@ pub enum MirInstr {
     /// 赋值 `name = value`。
     Assign(String, MirValue),
     /// 二元运算 `name = a op b`。
-    Binary(String, MirValue, MirBinaryOp, MirValue),
-    /// 一元运算 `name = op x`。
-    Unary(String, MirUnaryOp, MirValue),
+    ///
+    /// 末位是**运算的结果类型**。它不是可有可无的元信息：后端必须靠它区分
+    /// 整数运算与浮点运算——`a + b` 在 GPR 里是 `add`，在 XMM 里是 `addsd`，
+    /// 两者编码完全不同。缺了它，浮点会被当成整数做加法（位模式直接相加）。
+    Binary(String, MirValue, MirBinaryOp, MirValue, NumTy),
+    /// 一元运算 `name = op x`（`-` 与 `~` 的结果类型与操作数一致）。
+    Unary(String, MirUnaryOp, MirValue, NumTy),
     /// await 点：暂停当前协程，等待 future 就绪。
     /// `name = await future`。
     Await(String, MirValue),
@@ -126,10 +134,24 @@ pub enum MirValue {
 /// MIR 二元运算。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MirBinaryOp {
-    Add, Sub, Mul, Div, Rem,
-    BitAnd, BitOr, BitXor, Shl, Shr,
-    Eq, Ne, Lt, Gt, Le, Ge,
-    And, Or,
+    Add,
+    Sub,
+    Mul,
+    Div,
+    Rem,
+    BitAnd,
+    BitOr,
+    BitXor,
+    Shl,
+    Shr,
+    Eq,
+    Ne,
+    Lt,
+    Gt,
+    Le,
+    Ge,
+    And,
+    Or,
 }
 
 /// MIR 一元运算。
@@ -152,7 +174,12 @@ pub fn lower(hir: &HirModule) -> MirModule {
 
     for func in &hir.functions {
         if let Some(body) = &func.body {
-            functions.push(builder::lower_function(func, body, &hir.def_names));
+            functions.push(builder::lower_function(
+                func,
+                body,
+                &hir.def_names,
+                &hir.consts,
+            ));
         }
     }
 

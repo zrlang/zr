@@ -40,7 +40,7 @@ mod ty;
 pub use ast::*;
 
 use crate::error::{CompileError, ErrorKind, Result};
-use crate::lexer::{Token, TokenKind, Span};
+use crate::lexer::{Span, Token, TokenKind};
 
 /// 解析器。
 pub struct Parser {
@@ -94,7 +94,10 @@ impl Parser {
         // 分流
         // `macro_rules! name { ... }`
         if self.check(&TokenKind::Ident("macro_rules".into()))
-            && self.peek_n(1).map(|t| t.kind == TokenKind::Bang).unwrap_or(false)
+            && self
+                .peek_n(1)
+                .map(|t| t.kind == TokenKind::Bang)
+                .unwrap_or(false)
         {
             self.advance(); // macro_rules
             self.advance(); // !
@@ -109,19 +112,59 @@ impl Parser {
         if self.match_kind(&TokenKind::KwExtern) {
             return self.parse_extern(attrs).map(ModuleItem::Extern);
         }
-        if self.check(&TokenKind::KwAsync) && self.peek_n(1).map(|t| t.kind == TokenKind::KwFn).unwrap_or(false) {
+        if self.check(&TokenKind::KwAsync)
+            && self
+                .peek_n(1)
+                .map(|t| t.kind == TokenKind::KwFn)
+                .unwrap_or(false)
+        {
             self.advance(); // async
             self.advance(); // fn
-            return self.parse_function(vis, attrs, true, false).map(ModuleItem::Function);
+            return self
+                .parse_function(vis, attrs, true, false)
+                .map(ModuleItem::Function);
         }
         // `default fn`（特化中的默认方法）
-        if self.check(&TokenKind::KwDefault) && self.peek_n(1).map(|t| t.kind == TokenKind::KwFn).unwrap_or(false) {
+        if self.check(&TokenKind::KwDefault)
+            && self
+                .peek_n(1)
+                .map(|t| t.kind == TokenKind::KwFn)
+                .unwrap_or(false)
+        {
             self.advance(); // default
             self.advance(); // fn
-            return self.parse_function(vis, attrs, false, true).map(ModuleItem::Function);
+            return self
+                .parse_function(vis, attrs, false, true)
+                .map(ModuleItem::Function);
         }
-        if self.match_kind(&TokenKind::KwFn) {
-            return self.parse_function(vis, attrs, false, false).map(ModuleItem::Function);
+        // `comptime fn`（编译期可调用）与 `comptime const`（编译期必为常量）。
+        //
+        // `parse_function` 内部本来就会吃掉 `comptime` 并设置 `is_comptime`，
+        // 但条目分流在这里就得把它认出来——早先没有这一支，于是
+        // `comptime fn` 直接撞上"期望 fn/let/const/…"的语法错误。
+        if self.check(&TokenKind::KwComptime)
+            && self
+                .peek_n(1)
+                .map(|t| t.kind == TokenKind::KwFn)
+                .unwrap_or(false)
+        {
+            self.advance(); // comptime
+            self.advance(); // fn
+            return self
+                .parse_function_ext(vis, attrs, false, false, true)
+                .map(ModuleItem::Function);
+        } else if self.check(&TokenKind::KwComptime)
+            && self
+                .peek_n(1)
+                .map(|t| t.kind == TokenKind::KwConst)
+                .unwrap_or(false)
+        {
+            self.advance(); // comptime
+            return self.parse_const(vis, attrs).map(ModuleItem::Const);
+        } else if self.match_kind(&TokenKind::KwFn) {
+            return self
+                .parse_function(vis, attrs, false, false)
+                .map(ModuleItem::Function);
         }
         if self.match_kind(&TokenKind::KwConst) {
             return self.parse_const(vis, attrs).map(ModuleItem::Const);
@@ -159,7 +202,10 @@ impl Parser {
     fn parse_inner_attrs(&mut self) -> Result<Vec<Attribute>> {
         let mut attrs = Vec::new();
         while self.check(&TokenKind::Hash)
-            && self.peek_n(1).map(|t| t.kind == TokenKind::Bang).unwrap_or(false)
+            && self
+                .peek_n(1)
+                .map(|t| t.kind == TokenKind::Bang)
+                .unwrap_or(false)
         {
             self.advance(); // #
             self.advance(); // !
@@ -192,7 +238,11 @@ impl Parser {
             TokenKind::RBracket
         };
         while !self.check(&closer) {
-            if self.peek_n(1).map(|t| t.kind == TokenKind::Eq).unwrap_or(false) {
+            if self
+                .peek_n(1)
+                .map(|t| t.kind == TokenKind::Eq)
+                .unwrap_or(false)
+            {
                 // `name = value`
                 let n = self.consume_ident("expected argument name")?;
                 self.advance(); // =
@@ -206,7 +256,10 @@ impl Parser {
             }
         }
         if paren {
-            self.consume(&TokenKind::RParen, "expected ')' to close attribute arguments")?;
+            self.consume(
+                &TokenKind::RParen,
+                "expected ')' to close attribute arguments",
+            )?;
         }
         self.consume(&TokenKind::RBracket, "expected ']' to close attribute")?;
         let _ = inner;
@@ -222,12 +275,19 @@ impl Parser {
     fn parse_attribute_arg(&mut self) -> Result<Expression> {
         let span = self.peek().span;
         if let TokenKind::Ident(_) = self.peek().kind {
-            if self.peek_n(1).map(|t| t.kind != TokenKind::Eq).unwrap_or(true) {
+            if self
+                .peek_n(1)
+                .map(|t| t.kind != TokenKind::Eq)
+                .unwrap_or(true)
+            {
                 let name = self.consume_ident("expected attribute argument")?;
                 return Ok(Expression::Variable(name, span));
             }
         } else if self.peek().kind.keyword_text().is_some()
-            && self.peek_n(1).map(|t| t.kind != TokenKind::Eq).unwrap_or(true)
+            && self
+                .peek_n(1)
+                .map(|t| t.kind != TokenKind::Eq)
+                .unwrap_or(true)
         {
             let name = self.consume_ident("expected attribute argument")?;
             return Ok(Expression::Variable(name, span));
@@ -241,9 +301,18 @@ impl Parser {
         if self.match_kind(&TokenKind::KwPub) {
             if self.match_kind(&TokenKind::LParen) {
                 let vis = match self.peek().kind {
-                    TokenKind::KwCrate => { self.advance(); Visibility::Crate }
-                    TokenKind::KwSelf => { self.advance(); Visibility::SelfOnly }
-                    TokenKind::KwSuper => { self.advance(); Visibility::Super }
+                    TokenKind::KwCrate => {
+                        self.advance();
+                        Visibility::Crate
+                    }
+                    TokenKind::KwSelf => {
+                        self.advance();
+                        Visibility::SelfOnly
+                    }
+                    TokenKind::KwSuper => {
+                        self.advance();
+                        Visibility::Super
+                    }
                     _ => Visibility::Crate,
                 };
                 self.consume(&TokenKind::RParen, "expected ')'").ok();
@@ -288,21 +357,24 @@ impl Parser {
         }
     }
 
-    fn parse_let_stmt(
-        &mut self,
-        mutable: bool,
-    ) -> Result<Statement> {
+    fn parse_let_stmt(&mut self, mutable: bool) -> Result<Statement> {
         let span = self.peek().span;
         // `mut name` 语法糖
         let (mutability, pattern) = if !mutable && self.check(&TokenKind::KwMut) {
             self.advance();
-            (crate::parser::ast::Mutability::Mutable, self.parse_pattern()?)
+            (
+                crate::parser::ast::Mutability::Mutable,
+                self.parse_pattern()?,
+            )
         } else {
-            (if mutable {
-                crate::parser::ast::Mutability::Mutable
-            } else {
-                crate::parser::ast::Mutability::Immutable
-            }, self.parse_pattern()?)
+            (
+                if mutable {
+                    crate::parser::ast::Mutability::Mutable
+                } else {
+                    crate::parser::ast::Mutability::Immutable
+                },
+                self.parse_pattern()?,
+            )
         };
         let _ = mutability;
         let ty = if self.match_kind(&TokenKind::Colon) {
@@ -320,7 +392,12 @@ impl Parser {
         if mutable
             || matches!(
                 pattern,
-                crate::parser::ast::Pattern::Binding(_, crate::parser::ast::Mutability::Mutable, _, _)
+                crate::parser::ast::Pattern::Binding(
+                    _,
+                    crate::parser::ast::Mutability::Mutable,
+                    _,
+                    _
+                )
             )
         {
             Ok(Statement::Var(pattern, ty, init, span))
@@ -361,7 +438,11 @@ impl Parser {
                 break;
             }
         }
-        Ok(Block { stmts, tail, span: Span::unknown() })
+        Ok(Block {
+            stmts,
+            tail,
+            span: Span::unknown(),
+        })
     }
 
     /// 解析完整块 `{ ... }`，消费闭合大括号。

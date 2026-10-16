@@ -26,7 +26,9 @@
 //! （32 位）逐条发射——多字长算术尚未实现。
 
 use crate::codegen::target::{Arch, Os, Target};
-use crate::codegen::{CompilationUnit, Relocation, RelocationKind, Symbol, SymbolKind, SymbolSection};
+use crate::codegen::{
+    CompilationUnit, Relocation, RelocationKind, Symbol, SymbolKind, SymbolSection,
+};
 use crate::mir::NumTy;
 use crate::ssa::{SsaBinaryOp, SsaConst, SsaFunction, SsaInstr, SsaTerminator, SsaValue};
 
@@ -70,7 +72,14 @@ const ALLOCATABLE: [Reg; 11] = [
 
 /// psABI 的整数实参寄存器 a0-a7（x10-x17）。
 const ARG_REGS: [Reg; 8] = [
-    Reg(10), Reg(11), Reg(12), Reg(13), Reg(14), Reg(15), Reg(16), Reg(17),
+    Reg(10),
+    Reg(11),
+    Reg(12),
+    Reg(13),
+    Reg(14),
+    Reg(15),
+    Reg(16),
+    Reg(17),
 ];
 
 /// 把实参搬进 psABI 的 a0-a7。
@@ -103,18 +112,14 @@ fn insn(unit: &mut CompilationUnit, word: u32) {
 
 /// `lui rd, imm20`
 fn emit_lui(unit: &mut CompilationUnit, rd: Reg, imm: u32) {
-    insn(unit, ((imm & 0xf_ffff) << 12) | (rd.bits() as u32) << 7 | 0x37);
+    insn(
+        unit,
+        ((imm & 0xf_ffff) << 12) | (rd.bits() as u32) << 7 | 0x37,
+    );
 }
 
 /// I 型：`opcode | rd | funct3 | rs1 | imm12`
-fn emit_i(
-    unit: &mut CompilationUnit,
-    opcode: u32,
-    rd: Reg,
-    funct3: u32,
-    rs1: Reg,
-    imm: i32,
-) {
+fn emit_i(unit: &mut CompilationUnit, opcode: u32, rd: Reg, funct3: u32, rs1: Reg, imm: i32) {
     let word = opcode
         | (rd.bits() as u32) << 7
         | (funct3 & 7) << 12
@@ -146,7 +151,14 @@ fn emit_r(
 ///
 /// 立即数字段 [31:20] 的布局是 `{arith, shamt[4:0]}`——`arith = 0x20`
 /// 表示算术右移（RISC-V 规范 Volume I，I 型移位表格）。
-fn emit_shift_imm(unit: &mut CompilationUnit, funct3: u32, arith: u32, rd: Reg, rs1: Reg, shamt: u32) {
+fn emit_shift_imm(
+    unit: &mut CompilationUnit,
+    funct3: u32,
+    arith: u32,
+    rd: Reg,
+    rs1: Reg,
+    shamt: u32,
+) {
     let word = ((arith & 0x3f) << 25)
         | (shamt & 0x1f) << 20
         | (rs1.bits() as u32) << 15
@@ -252,7 +264,6 @@ fn signed_12bit(value: u32) -> Option<i32> {
     }
 }
 
-
 /// `ret`：`jalr x0, ra, 0`
 fn emit_ret(unit: &mut CompilationUnit) {
     emit_i(unit, 0x67, Reg::ZERO, 0, Reg::RA, 0);
@@ -334,7 +345,11 @@ fn emit_load(unit: &mut CompilationUnit, wide: bool, rd: Reg, base: Reg, off: i3
 fn successors(block: &crate::ssa::SsaBasicBlock) -> Vec<usize> {
     match &block.term {
         SsaTerminator::Goto(t) => vec![*t],
-        SsaTerminator::Branch { then_block, else_block, .. } => vec![*then_block, *else_block],
+        SsaTerminator::Branch {
+            then_block,
+            else_block,
+            ..
+        } => vec![*then_block, *else_block],
         _ => Vec::new(),
     }
 }
@@ -355,7 +370,10 @@ fn emit_phi_copies(
     };
     let mut moves: Vec<(Reg, Reg)> = Vec::new();
     for instr in &block.instrs {
-        let SsaInstr::Phi { result, incoming, .. } = instr else {
+        let SsaInstr::Phi {
+            result, incoming, ..
+        } = instr
+        else {
             continue;
         };
         let Some((_, src)) = incoming.iter().find(|(p, _)| *p == from) else {
@@ -460,13 +478,23 @@ pub fn emit_function(target: &Target, unit: &mut CompilationUnit, func: &SsaFunc
                 emit_ret(unit);
             }
             SsaTerminator::Goto(target) => emit_j(unit, &block_label(&func.name, *target)),
-            SsaTerminator::Branch { cond, then_block, else_block } => {
+            SsaTerminator::Branch {
+                cond,
+                then_block,
+                else_block,
+            } => {
                 // RISC-V 没有条件执行，用"跳过一条跳转"来表达二选一：
                 //   beq cond, zero, else   // cond == 0 时直接走 else
                 //   jal zero, then         // 否则顺序落到 then
                 // 注意判断方向：cond != 0（真）必须落到 then_block。
                 let r = alloc_reg(*cond);
-                emit_branch(unit, 0b000, r, Reg::ZERO, &block_label(&func.name, *else_block)); // beq
+                emit_branch(
+                    unit,
+                    0b000,
+                    r,
+                    Reg::ZERO,
+                    &block_label(&func.name, *else_block),
+                ); // beq
                 emit_j(unit, &block_label(&func.name, *then_block));
             }
             SsaTerminator::Unreachable => emit_spin(unit),
@@ -500,18 +528,37 @@ fn emit_instr(unit: &mut CompilationUnit, instr: &SsaInstr) {
             SsaConst::Float(_) => crate::codegen::unsupported_const("float"),
             SsaConst::Str(_) => crate::codegen::unsupported_const("string"),
         },
-        SsaInstr::Unary { result, op, operand } => {
+        SsaInstr::Unary {
+            result,
+            op,
+            operand,
+        } => {
             emit_unary(unit, *result, *op, *operand);
         }
-        SsaInstr::Binary { result, op, lhs, rhs } => emit_binary(unit, *result, *op, *lhs, *rhs),
-        SsaInstr::Call { result, callee, args } => {
+        SsaInstr::Binary {
+            result,
+            op,
+            lhs,
+            rhs,
+            ..
+        } => emit_binary(unit, *result, *op, *lhs, *rhs),
+        SsaInstr::Call {
+            result,
+            callee,
+            args,
+        } => {
             emit_call_args(unit, args);
             emit_jal(unit, Reg::RA, callee);
             emit_mv(unit, alloc_reg(*result), Reg::A0);
         }
         // φ 的实际拷贝由前驱末尾的 emit_phi_copies 发出
         SsaInstr::Phi { .. } => {}
-        SsaInstr::Cast { result, src, from, to } => {
+        SsaInstr::Cast {
+            result,
+            src,
+            from,
+            to,
+        } => {
             emit_cast(unit, alloc_reg(*result), alloc_reg(*src), *from, *to);
         }
         SsaInstr::Copy { result, src } => {
@@ -671,7 +718,14 @@ fn emit_var_shift(unit: &mut CompilationUnit, left: bool, dst: Reg, rs1: Reg, rs
 
     // 循环体：每轮移 1 位并递减计数
     // slli 是 funct3=1/arith=0x00；srai 是 funct3=5/arith=0x20
-    emit_shift_imm(unit, if left { 1 } else { 5 }, if left { 0x00 } else { 0x20 }, dst, dst, 1);
+    emit_shift_imm(
+        unit,
+        if left { 1 } else { 5 },
+        if left { 0x00 } else { 0x20 },
+        dst,
+        dst,
+        1,
+    );
     emit_addi(unit, cnt, cnt, -1);
     emit_branch(unit, 0b001, cnt, Reg::ZERO, &end);
 
@@ -748,6 +802,7 @@ mod tests {
                         op: SsaBinaryOp::Gt,
                         lhs: SsaValue(1),
                         rhs: SsaValue(2),
+                        ..
                     }],
                     term: SsaTerminator::Branch {
                         cond: SsaValue(9),
@@ -766,8 +821,9 @@ mod tests {
                     term: SsaTerminator::Return(Some(SsaValue(2))),
                 },
             ],
-                    inline_never: false,
-};
+            inline_never: false,
+            inline_always: false,
+        };
         let mut unit = empty_unit();
         emit_function(
             &Target::parse("riscv64-unknown-none").unwrap(),
@@ -776,8 +832,7 @@ mod tests {
         );
         crate::codegen::objfile::apply_relocations(&mut unit, 0);
 
-        let word_at =
-            |off: usize| u32::from_le_bytes(unit.code[off..off + 4].try_into().unwrap());
+        let word_at = |off: usize| u32::from_le_bytes(unit.code[off..off + 4].try_into().unwrap());
         let block_off = |n: usize| {
             unit.symbols
                 .iter()
@@ -822,7 +877,11 @@ mod tests {
     fn conditional_branch_sends_true_to_then_block() {
         let (branch, jump, branch_at, then_off, else_off) = branch_shape();
         // funct3 = 000（beq）：条件为"真"时**不**跳转，顺序落到后面的 j → then 块
-        assert_eq!((branch >> 12) & 7, 0b000, "应为 beq，跳过跳转即表示条件为真");
+        assert_eq!(
+            (branch >> 12) & 7,
+            0b000,
+            "应为 beq，跳过跳转即表示条件为真"
+        );
         assert_eq!(branch & 0x7f, 0x63, "opcode 必须是 BRANCH");
         // 紧跟的 J 型跳转用 rd = x0（无条件），跳到 then 块
         assert_eq!(jump & 0x7f, 0x6f, "第二条指令必须是 jal");
@@ -830,7 +889,11 @@ mod tests {
 
         // 语义核验：beq 落在 else 块，jal 落在 then 块
         let branch_pc = branch_at as i64;
-        assert_eq!(branch_pc + b_imm(branch) as i64 * 2, else_off as i64, "beq 必须跳到 else 块");
+        assert_eq!(
+            branch_pc + b_imm(branch) as i64 * 2,
+            else_off as i64,
+            "beq 必须跳到 else 块"
+        );
         assert_eq!(
             branch_pc + 4 + j_imm(jump) as i64 * 2,
             then_off as i64,
@@ -846,13 +909,7 @@ mod tests {
         let lhs = SsaValue(1);
         let rhs = SsaValue(7);
         let dst = SsaValue(8);
-        emit_binary(
-            &mut unit,
-            dst,
-            SsaBinaryOp::Shl,
-            lhs,
-            rhs,
-        );
+        emit_binary(&mut unit, dst, SsaBinaryOp::Shl, lhs, rhs);
         crate::codegen::objfile::apply_relocations(&mut unit, 0);
 
         let words: Vec<u32> = unit
@@ -872,9 +929,9 @@ mod tests {
         assert_eq!((slli >> 20) & 0x3f, 1, "slli 的 shamt 应为 1，实际：{desc}");
         // 移位量必须先经过 mv 到临时寄存器，再与 63 做 andi（OP-IMM, funct3 = 111）
         assert!(
-            words
-                .iter()
-                .any(|w| w & 0x7f == 0x13 && ((*w >> 12) & 7) == 0b111 && ((*w >> 20) & 0x3f) == 63),
+            words.iter().any(|w| w & 0x7f == 0x13
+                && ((*w >> 12) & 7) == 0b111
+                && ((*w >> 20) & 0x3f) == 63),
             "缺少 `andi cnt, cnt, 63` 的移位量截断，实际：{desc}"
         );
         // 循环必须有回边（至少两条 B 型分支）
@@ -891,7 +948,13 @@ mod tests {
     #[test]
     fn right_shift_is_arithmetic() {
         let mut unit = empty_unit();
-        emit_binary(&mut unit, SsaValue(8), SsaBinaryOp::Shr, SsaValue(1), SsaValue(2));
+        emit_binary(
+            &mut unit,
+            SsaValue(8),
+            SsaBinaryOp::Shr,
+            SsaValue(1),
+            SsaValue(2),
+        );
         let words: Vec<u32> = unit
             .code
             .chunks(4)
@@ -905,7 +968,11 @@ mod tests {
             .find(|w| **w & 0x7f == 0x13 && ((**w >> 12) & 7) == 0b101)
             .copied()
             .unwrap_or_else(|| panic!("缺少右移指令，实际发射：{words:08x?}"));
-        assert_eq!((shift >> 25) & 0x3f, 0x20, "应为 srai（算术右移），不是 srli");
+        assert_eq!(
+            (shift >> 25) & 0x3f,
+            0x20,
+            "应为 srai（算术右移），不是 srli"
+        );
     }
 
     #[test]
@@ -987,7 +1054,10 @@ mod tests {
         let mut u = empty_unit();
         emit_li(&mut u, Reg::A0, 42);
         assert_eq!(u.code.len(), 4);
-        assert_eq!(u32::from_le_bytes(u.code[0..4].try_into().unwrap()), 0x02A0_0513);
+        assert_eq!(
+            u32::from_le_bytes(u.code[0..4].try_into().unwrap()),
+            0x02A0_0513
+        );
     }
 
     #[test]
@@ -1000,7 +1070,10 @@ mod tests {
         assert_eq!(lui & 0x7f, 0x37, "lui 操作码");
         assert_eq!(addi & 0x7f, 0x13, "addi 操作码");
         // lui 写 t0 的高 20 位，addi 补上 0x678
-        assert_eq!(((lui >> 12) & 0xf_ffff) << 12 | ((addi >> 20) & 0xfff), 0x1234_5678);
+        assert_eq!(
+            ((lui >> 12) & 0xf_ffff) << 12 | ((addi >> 20) & 0xfff),
+            0x1234_5678
+        );
     }
 
     #[test]
@@ -1008,7 +1081,10 @@ mod tests {
         let mut u = empty_unit();
         emit_li(&mut u, Reg::A0, -1);
         assert_eq!(u.code.len(), 4, "-1 可用单条 addi 表示");
-        assert_eq!(u32::from_le_bytes(u.code[0..4].try_into().unwrap()), 0xFFF0_0513);
+        assert_eq!(
+            u32::from_le_bytes(u.code[0..4].try_into().unwrap()),
+            0xFFF0_0513
+        );
     }
 
     #[test]
@@ -1016,7 +1092,10 @@ mod tests {
         // addi sp, sp, -32 = 0xFE010113
         let mut u = empty_unit();
         emit_addi(&mut u, Reg(2), Reg(2), -32);
-        assert_eq!(u32::from_le_bytes(u.code[0..4].try_into().unwrap()), 0xfe01_0113);
+        assert_eq!(
+            u32::from_le_bytes(u.code[0..4].try_into().unwrap()),
+            0xfe01_0113
+        );
     }
 
     #[test]
@@ -1028,7 +1107,11 @@ mod tests {
         assert_eq!(u.relocations[0].kind, RelocationKind::RiscVJal);
         assert_eq!(u.relocations[1].kind, RelocationKind::RiscVBranch);
         assert_eq!(u.relocations[1].instr_len, 4);
-        assert_eq!(u32::from_le_bytes(u.code[0..4].try_into().unwrap()), 0x0000_00ef, "jal ra, 0");
+        assert_eq!(
+            u32::from_le_bytes(u.code[0..4].try_into().unwrap()),
+            0x0000_00ef,
+            "jal ra, 0"
+        );
         assert_eq!(
             u32::from_le_bytes(u.code[4..8].try_into().unwrap()),
             0x0002_9063,
@@ -1040,7 +1123,10 @@ mod tests {
     fn spin_loop_is_self_jump() {
         let mut u = empty_unit();
         emit_spin(&mut u);
-        assert_eq!(u32::from_le_bytes(u.code[0..4].try_into().unwrap()), 0x0000_006f);
+        assert_eq!(
+            u32::from_le_bytes(u.code[0..4].try_into().unwrap()),
+            0x0000_006f
+        );
     }
 
     #[test]
@@ -1048,15 +1134,24 @@ mod tests {
         // slli a0, a1, 3 = 0x00359513
         let mut u = empty_unit();
         emit_shift_imm(&mut u, 1, 0x00, Reg(10), Reg(11), 3);
-        assert_eq!(u32::from_le_bytes(u.code[0..4].try_into().unwrap()), 0x0035_9513);
+        assert_eq!(
+            u32::from_le_bytes(u.code[0..4].try_into().unwrap()),
+            0x0035_9513
+        );
         // srli a0, a1, 3 = 0x0035D513
         let mut u = empty_unit();
         emit_shift_imm(&mut u, 5, 0x00, Reg(10), Reg(11), 3);
-        assert_eq!(u32::from_le_bytes(u.code[0..4].try_into().unwrap()), 0x0035_D513);
+        assert_eq!(
+            u32::from_le_bytes(u.code[0..4].try_into().unwrap()),
+            0x0035_D513
+        );
         // srai a0, a1, 3 = 0x4035D513
         let mut u = empty_unit();
         emit_shift_imm(&mut u, 5, 0x20, Reg(10), Reg(11), 3);
-        assert_eq!(u32::from_le_bytes(u.code[0..4].try_into().unwrap()), 0x4035_D513);
+        assert_eq!(
+            u32::from_le_bytes(u.code[0..4].try_into().unwrap()),
+            0x4035_D513
+        );
     }
 
     #[test]
@@ -1064,18 +1159,30 @@ mod tests {
         // seqz a0, a0 = sltiu a0, a0, 1 = 0x00153513
         let mut u = empty_unit();
         emit_seqz(&mut u, Reg(10), Reg(10));
-        assert_eq!(u32::from_le_bytes(u.code[0..4].try_into().unwrap()), 0x0015_3513);
+        assert_eq!(
+            u32::from_le_bytes(u.code[0..4].try_into().unwrap()),
+            0x0015_3513
+        );
         // snez a0, a0 = sltu a0, zero, a0 = 0x00A03533
         let mut u = empty_unit();
         emit_snez(&mut u, Reg(10), Reg(10));
-        assert_eq!(u32::from_le_bytes(u.code[0..4].try_into().unwrap()), 0x00a0_3533);
+        assert_eq!(
+            u32::from_le_bytes(u.code[0..4].try_into().unwrap()),
+            0x00a0_3533
+        );
     }
 
     #[test]
     fn remainder_moves_result_out_of_a0() {
         let mut u = empty_unit();
         // result 落在 a0 之外时才需要搬运；检查至少生成了 rem
-        emit_binary(&mut u, SsaValue(0), SsaBinaryOp::Rem, SsaValue(1), SsaValue(2));
+        emit_binary(
+            &mut u,
+            SsaValue(0),
+            SsaBinaryOp::Rem,
+            SsaValue(1),
+            SsaValue(2),
+        );
         assert!(!u.code.is_empty());
     }
 }

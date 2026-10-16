@@ -128,11 +128,9 @@ impl Parser {
                 }
 
                 self.advance();
-                let op = self.binary_op(&op_kind)
-                    .ok_or_else(|| CompileError::internal(format!(
-                        "missing binary op handler for {:?}",
-                        op_kind
-                    )))?;
+                let op = self.binary_op(&op_kind).ok_or_else(|| {
+                    CompileError::internal(format!("missing binary op handler for {:?}", op_kind))
+                })?;
                 let right = self.parse_expr_bp(right_bp)?;
                 left = Expression::Binary(Box::new(left), op, Box::new(right), op_span);
                 continue;
@@ -189,17 +187,23 @@ impl Parser {
 
         // ===== if 表达式 =====
         if self.match_kind(&TokenKind::KwIf) {
-            return self.parse_if().map(|(c, t, e, s)| Expression::If(c, t, e, s));
+            return self
+                .parse_if()
+                .map(|(c, t, e, s)| Expression::If(c, t, e, s));
         }
 
         // ===== match 表达式 =====
         if self.match_kind(&TokenKind::KwMatch) {
-            return self.parse_match().map(|(e, arms, s)| Expression::Match(e, arms, s));
+            return self
+                .parse_match()
+                .map(|(e, arms, s)| Expression::Match(e, arms, s));
         }
 
         // ===== while 表达式 =====
         if self.match_kind(&TokenKind::KwWhile) {
-            return self.parse_while().map(|(c, b, e, s)| Expression::While(c, b, e, s));
+            return self
+                .parse_while()
+                .map(|(c, b, e, s)| Expression::While(c, b, e, s));
         }
 
         // ===== for 表达式 =====
@@ -215,15 +219,24 @@ impl Parser {
 
         // ===== break / continue / return =====
         if self.match_kind(&TokenKind::KwBreak) {
-            let label = if self.peek().kind == TokenKind::Ident(String::new()) { None } else { None };
-            let value = if self.check_expr_start() { Some(Box::new(self.parse_expression()?)) } else { None };
+            let label = if self.peek().kind == TokenKind::Ident(String::new()) {
+                None
+            } else {
+                None
+            };
+            let value = if self.check_expr_start() {
+                Some(Box::new(self.parse_expression()?))
+            } else {
+                None
+            };
             return Ok(Expression::Break(label, value, span));
         }
         if self.match_kind(&TokenKind::KwContinue) {
             return Ok(Expression::Continue(None, span));
         }
         if self.match_kind(&TokenKind::KwReturn) {
-            let value = if !self.check(&TokenKind::Semicolon) && !self.check(&TokenKind::RBrace)
+            let value = if !self.check(&TokenKind::Semicolon)
+                && !self.check(&TokenKind::RBrace)
                 && !self.check(&TokenKind::Comma)
             {
                 Some(Box::new(self.parse_expression()?))
@@ -241,7 +254,10 @@ impl Parser {
 
         // ===== asm! 内联汇编 =====
         if self.check(&TokenKind::Ident("asm".into()))
-            && self.peek_n(1).map(|t| t.kind == TokenKind::Bang).unwrap_or(false)
+            && self
+                .peek_n(1)
+                .map(|t| t.kind == TokenKind::Bang)
+                .unwrap_or(false)
         {
             self.advance(); // asm
             self.advance(); // !
@@ -258,10 +274,8 @@ impl Parser {
             } else {
                 None
             };
-            let (pat, body) = catch.unwrap_or_else(|| (
-                Pattern::Wildcard(Span::unknown()),
-                Block::default(),
-            ));
+            let (pat, body) =
+                catch.unwrap_or_else(|| (Pattern::Wildcard(Span::unknown()), Block::default()));
             return Ok(Expression::Try(Box::new(expr), Some(pat), body, span));
         }
         if self.match_kind(&TokenKind::KwThrow) {
@@ -349,7 +363,11 @@ impl Parser {
 
         // ===== 有标签的块 =====
         if let TokenKind::Ident(name) = &kind {
-            if self.peek_n(1).map(|t| t.kind == TokenKind::Colon).unwrap_or(false) {
+            if self
+                .peek_n(1)
+                .map(|t| t.kind == TokenKind::Colon)
+                .unwrap_or(false)
+            {
                 let label = name.clone();
                 self.advance(); // ident
                 self.advance(); // :
@@ -557,7 +575,11 @@ impl Parser {
                 }
                 Box::new(e)
             };
-            arms.push(Arm { pattern: pat, guard, body });
+            arms.push(Arm {
+                pattern: pat,
+                guard,
+                body,
+            });
             // 允许省略最后一个逗号
             if self.match_kind(&TokenKind::Comma) {
                 if self.check(&TokenKind::RBrace) {
@@ -647,7 +669,11 @@ impl Parser {
         self.no_struct_literal = saved;
         cond
     }
-    fn parse_struct_literal(&mut self, path: Vec<String>, span: Span) -> Result<Expression, CompileError> {
+    fn parse_struct_literal(
+        &mut self,
+        path: Vec<String>,
+        span: Span,
+    ) -> Result<Expression, CompileError> {
         let mut fields = Vec::new();
         while !self.check(&TokenKind::RBrace) && !self.is_at_end() {
             let name = self.consume_ident("expected field name")?;
@@ -675,7 +701,11 @@ impl Parser {
         loop {
             // 命名参数：`name: value`
             if let TokenKind::Ident(name) = &self.peek().kind {
-                if self.peek_n(1).map(|t| t.kind == TokenKind::Colon).unwrap_or(false) {
+                if self
+                    .peek_n(1)
+                    .map(|t| t.kind == TokenKind::Colon)
+                    .unwrap_or(false)
+                {
                     let name = name.clone();
                     self.advance(); // ident
                     self.advance(); // :
@@ -704,9 +734,17 @@ impl Parser {
 
     fn infix_binding_power(&self, kind: &TokenKind) -> Option<(Prec, Prec)> {
         Some(match kind {
-            TokenKind::Eq | TokenKind::PlusEq | TokenKind::MinusEq | TokenKind::StarEq
-            | TokenKind::SlashEq | TokenKind::PercentEq | TokenKind::AmpEq | TokenKind::PipeEq
-            | TokenKind::CaretEq | TokenKind::ShlEq | TokenKind::ShrEq => (Prec::ASSIGN, Prec(0)),
+            TokenKind::Eq
+            | TokenKind::PlusEq
+            | TokenKind::MinusEq
+            | TokenKind::StarEq
+            | TokenKind::SlashEq
+            | TokenKind::PercentEq
+            | TokenKind::AmpEq
+            | TokenKind::PipeEq
+            | TokenKind::CaretEq
+            | TokenKind::ShlEq
+            | TokenKind::ShrEq => (Prec::ASSIGN, Prec(0)),
 
             TokenKind::PipePipe => (Prec::OR, Prec(Prec::OR.0 + 1)),
             TokenKind::AmpAmp => (Prec::AND, Prec(Prec::AND.0 + 1)),
@@ -719,15 +757,21 @@ impl Parser {
             TokenKind::Amp => (Prec::BIT_AND, Prec(Prec::BIT_AND.0 + 1)),
 
             TokenKind::EqEq | TokenKind::BangEq => (Prec::EQUALITY, Prec::EQUALITY),
-            TokenKind::Lt | TokenKind::Gt | TokenKind::Le | TokenKind::Ge => (Prec::COMPARE, Prec::COMPARE),
+            TokenKind::Lt | TokenKind::Gt | TokenKind::Le | TokenKind::Ge => {
+                (Prec::COMPARE, Prec::COMPARE)
+            }
 
             TokenKind::KwIn | TokenKind::KwIs => (Prec::COMPARE, Prec::COMPARE),
 
             TokenKind::Shl | TokenKind::Shr => (Prec::SHIFT, Prec(Prec::SHIFT.0 + 1)),
 
-            TokenKind::Plus | TokenKind::Minus | TokenKind::PlusPlus => (Prec::TERM, Prec(Prec::TERM.0 + 1)),
+            TokenKind::Plus | TokenKind::Minus | TokenKind::PlusPlus => {
+                (Prec::TERM, Prec(Prec::TERM.0 + 1))
+            }
 
-            TokenKind::Star | TokenKind::Slash | TokenKind::Percent => (Prec::FACTOR, Prec(Prec::FACTOR.0 + 1)),
+            TokenKind::Star | TokenKind::Slash | TokenKind::Percent => {
+                (Prec::FACTOR, Prec(Prec::FACTOR.0 + 1))
+            }
 
             TokenKind::KwAs => (Prec::CAST, Prec::UNARY),
 
@@ -988,7 +1032,8 @@ impl Parser {
             "sum" => IntrinsicKind::Sum,
             other => {
                 return Err(crate::error::CompileError::type_error(format!(
-                    "unknown intrinsic operation: `{}`", other
+                    "unknown intrinsic operation: `{}`",
+                    other
                 )));
             }
         })
@@ -1000,8 +1045,8 @@ impl Parser {
         // 通过 peek 判断是否是类型开头：标识符、基础类型关键字、'*'、'&'、'('、'[' 等。
         use crate::lexer::TokenKind::*;
         match self.peek().kind {
-            Ident(_) | TyI(_) | TyU(_) | TyF(_) | TyBool | TyStr | TyChar | TyNever
-            | KwVoid | KwAnytype | KwUpperSelf | KwFn | Star | Amp | LParen | LBracket => {
+            Ident(_) | TyI(_) | TyU(_) | TyF(_) | TyBool | TyStr | TyChar | TyNever | KwVoid
+            | KwAnytype | KwUpperSelf | KwFn | Star | Amp | LParen | LBracket => {
                 self.parse_type().ok()
             }
             _ => None,

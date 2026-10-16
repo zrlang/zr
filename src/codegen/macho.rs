@@ -26,7 +26,7 @@ use std::io::{self, Write};
 use crate::codegen::objfile::{
     align_up, fixed_name, macho_reloc_type, mangle_symbol, MACH_O_R_LEN_4,
 };
-use crate::codegen::target::Target;
+use crate::codegen::target::{Os, Target};
 use crate::codegen::{CompilationUnit, OutputKind, SymbolSection};
 
 // ---- 头常量 ----
@@ -45,7 +45,12 @@ const LC_DYSYMTAB: u32 = 0xb;
 const LC_MAIN: u32 = 0x8000_0028;
 const LC_BUILD_VERSION: u32 = 0x32;
 
+/// LC_BUILD_VERSION 的 `platform` 字段。
+///
+/// 写错的后果很隐蔽：平台号决定 dyld 能不能加载、用哪套可用性检查，
+/// macOS 映像标成 iOS 在 macOS 上通常仍能加载，但在 iOS 设备上会被拒绝。
 const PLATFORM_MACOS: u32 = 1;
+const PLATFORM_IOS: u32 = 2;
 
 /// `x.y` 形式的版本号（高 16 位为主版本）。
 const VERSION_11_0: u32 = 11 << 16;
@@ -94,7 +99,11 @@ pub fn assemble_macho(target: &Target, unit: &CompilationUnit) -> io::Result<Vec
     let symtab = Symtab::build(unit, value_base);
 
     // 目标文件才需要把重定位交给链接器；可执行文件的重定位已就地应用。
-    let relo_count = if is_exec { 0usize } else { unit.relocations.len() };
+    let relo_count = if is_exec {
+        0usize
+    } else {
+        unit.relocations.len()
+    };
 
     // ---------- Load command 组合 ----------
     let sizeofcmds: u32 = 72 + nsects * 80 // LC_SEGMENT_64
@@ -136,17 +145,54 @@ pub fn assemble_macho(target: &Target, unit: &CompilationUnit) -> io::Result<Vec
 
     // === LC_SEGMENT_64 ===
     // 目标文件的段没有加载地址（clang 同样写 0），可执行文件才需要。
-    let (seg_vmaddr, seg_vmsize) = if is_exec { (text_vmaddr, vm_size) } else { (0, payload_size) };
-    write_segment_header(&mut buf, SEG_TEXT, seg_vmaddr, seg_vmsize, text_off, payload_size, nsects)?;
+    let (seg_vmaddr, seg_vmsize) = if is_exec {
+        (text_vmaddr, vm_size)
+    } else {
+        (0, payload_size)
+    };
+    write_segment_header(
+        &mut buf,
+        SEG_TEXT,
+        seg_vmaddr,
+        seg_vmsize,
+        text_off,
+        payload_size,
+        nsects,
+    )?;
     let text_flags = S_ATTR_PURE_INSTRUCTIONS | S_ATTR_SOME_INSTRUCTIONS;
     write_section(
-        &mut buf, "__text", SEG_TEXT, text_addr, text_off, text.len() as u64,
-        reloff as u32, relo_count as u32, text_flags,
+        &mut buf,
+        "__text",
+        SEG_TEXT,
+        text_addr,
+        text_off,
+        text.len() as u64,
+        reloff as u32,
+        relo_count as u32,
+        text_flags,
     )?;
     write_section(
-        &mut buf, "__rodata", SEG_TEXT, rodata_addr, rodata_off, rodata.len() as u64, 0, 0, 0,
+        &mut buf,
+        "__rodata",
+        SEG_TEXT,
+        rodata_addr,
+        rodata_off,
+        rodata.len() as u64,
+        0,
+        0,
+        0,
     )?;
-    write_section(&mut buf, "__data", SEG_DATA, data_addr, data_off, data.len() as u64, 0, 0, 0)?;
+    write_section(
+        &mut buf,
+        "__data",
+        SEG_DATA,
+        data_addr,
+        data_off,
+        data.len() as u64,
+        0,
+        0,
+        0,
+    )?;
 
     if is_exec {
         // === LC_MAIN：入口点的文件偏移 ===
@@ -159,7 +205,13 @@ pub fn assemble_macho(target: &Target, unit: &CompilationUnit) -> io::Result<Vec
     // === LC_BUILD_VERSION ===
     buf.extend_from_slice(&LC_BUILD_VERSION.to_le_bytes());
     buf.extend_from_slice(&24u32.to_le_bytes());
-    buf.extend_from_slice(&PLATFORM_MACOS.to_le_bytes());
+    // iOS 与 macOS 共用 Darwin ABI，但平台号必须如实写。
+    let platform = if target.os() == Os::Ios {
+        PLATFORM_IOS
+    } else {
+        PLATFORM_MACOS
+    };
+    buf.extend_from_slice(&platform.to_le_bytes());
     buf.extend_from_slice(&VERSION_11_0.to_le_bytes()); // minos
     buf.extend_from_slice(&VERSION_14_0.to_le_bytes()); // sdk
     buf.extend_from_slice(&0u32.to_le_bytes()); // ntools
@@ -177,8 +229,15 @@ pub fn assemble_macho(target: &Target, unit: &CompilationUnit) -> io::Result<Vec
     // 目标文件的重定位由各 section 的 reloff/nreloc 描述，
     // 全局 extrel 表必须留空，否则与 section 重定位区重叠。
     let (ilocalsym, nlocalsym, iextdefsym, nextdefsym, iundefsym, nundefsym) = symtab.ranges;
-    let (extreloff, nextrel) = if is_exec { (reloff as u32, relo_count as u32) } else { (0, 0) };
-    write_dysymtab(&mut buf, ilocalsym, nlocalsym, iextdefsym, nextdefsym, iundefsym, nundefsym, extreloff, nextrel)?;
+    let (extreloff, nextrel) = if is_exec {
+        (reloff as u32, relo_count as u32)
+    } else {
+        (0, 0)
+    };
+    write_dysymtab(
+        &mut buf, ilocalsym, nlocalsym, iextdefsym, nextdefsym, iundefsym, nundefsym, extreloff,
+        nextrel,
+    )?;
 
     // === 段数据 ===
     pad_to(&mut buf, text_off as usize)?;
@@ -459,16 +518,28 @@ mod tests {
     fn header_reports_macho64_and_arm64() {
         let unit = sample_unit(OutputKind::Executable);
         let bytes = assemble_macho(&target(Arch::AArch64), &unit).unwrap();
-        assert_eq!(u32::from_le_bytes(bytes[0..4].try_into().unwrap()), 0xfeed_facf);
-        assert_eq!(u32::from_le_bytes(bytes[4..8].try_into().unwrap()), 0x0100_000c);
-        assert_eq!(u32::from_le_bytes(bytes[12..16].try_into().unwrap()), MH_EXECUTE);
+        assert_eq!(
+            u32::from_le_bytes(bytes[0..4].try_into().unwrap()),
+            0xfeed_facf
+        );
+        assert_eq!(
+            u32::from_le_bytes(bytes[4..8].try_into().unwrap()),
+            0x0100_000c
+        );
+        assert_eq!(
+            u32::from_le_bytes(bytes[12..16].try_into().unwrap()),
+            MH_EXECUTE
+        );
     }
 
     #[test]
     fn x86_64_target_uses_x86_cpu_type() {
         let unit = sample_unit(OutputKind::Executable);
         let bytes = assemble_macho(&target(Arch::X86_64), &unit).unwrap();
-        assert_eq!(u32::from_le_bytes(bytes[4..8].try_into().unwrap()), 0x0100_0007);
+        assert_eq!(
+            u32::from_le_bytes(bytes[4..8].try_into().unwrap()),
+            0x0100_0007
+        );
     }
 
     #[test]
@@ -484,12 +555,21 @@ mod tests {
     #[test]
     fn object_declares_sections_and_undefined_symbols() {
         let mut unit = sample_unit(OutputKind::Relocatable);
-        unit.relocations.push(Relocation::new(0, 0, 4, "zr_exit", RelocationKind::Branch26));
+        unit.relocations.push(Relocation::new(
+            0,
+            0,
+            4,
+            "zr_exit",
+            RelocationKind::Branch26,
+        ));
         crate::codegen::objfile::add_extern_symbols(&mut unit);
         let bytes = assemble_macho(&target(Arch::AArch64), &unit).unwrap();
         let ncmds = u32::from_le_bytes(bytes[16..20].try_into().unwrap());
         assert_eq!(ncmds, 4, "segment + build_version + symtab + dysymtab");
-        assert!(bytes.windows(7).any(|w| w == b"_zr_exi"), "应出现未定义符号名");
+        assert!(
+            bytes.windows(7).any(|w| w == b"_zr_exi"),
+            "应出现未定义符号名"
+        );
     }
 
     fn index_of(symtab: &Symtab, name: &str) -> u32 {
@@ -502,7 +582,8 @@ mod tests {
         // 重定位里的 r_symbolnum 必须指向排序后的 nlist 下标，
         // 否则链接器会把 `call main` 解析成别的符号。
         let mut unit = sample_unit(OutputKind::Relocatable);
-        unit.relocations.push(Relocation::new(0, 0, 4, "main", RelocationKind::Branch26));
+        unit.relocations
+            .push(Relocation::new(0, 0, 4, "main", RelocationKind::Branch26));
         crate::codegen::objfile::add_extern_symbols(&mut unit);
 
         let symtab = Symtab::build(&unit, 0);
@@ -521,15 +602,24 @@ mod tests {
     #[test]
     fn relocation_entries_use_branch26_type() {
         let mut unit = sample_unit(OutputKind::Relocatable);
-        unit.relocations.push(Relocation::new(0, 0, 4, "foo", RelocationKind::Branch26));
+        unit.relocations
+            .push(Relocation::new(0, 0, 4, "foo", RelocationKind::Branch26));
         crate::codegen::objfile::add_extern_symbols(&mut unit);
         let symtab = Symtab::build(&unit, 0);
         let mut out = Vec::new();
         write_relocations(&target(Arch::AArch64), &mut out, &unit, &symtab.order).unwrap();
         assert_eq!(out.len(), RELOC_SIZE);
-        assert_eq!(u32::from_le_bytes(out[0..4].try_into().unwrap()), 0, "r_address");
+        assert_eq!(
+            u32::from_le_bytes(out[0..4].try_into().unwrap()),
+            0,
+            "r_address"
+        );
         let packed = u32::from_le_bytes(out[4..8].try_into().unwrap());
-        assert_eq!(packed & 0x00ff_ffff, index_of(&symtab, "_foo"), "r_symbolnum");
+        assert_eq!(
+            packed & 0x00ff_ffff,
+            index_of(&symtab, "_foo"),
+            "r_symbolnum"
+        );
         assert_eq!((packed >> 24) & 1, 1, "r_pcrel");
         assert_eq!((packed >> 25) & 3, 2, "r_length = 4 字节");
         assert_eq!((packed >> 27) & 1, 1, "r_extern");

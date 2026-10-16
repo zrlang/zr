@@ -141,7 +141,10 @@ impl Parser {
                 // 类型，不再消费第二个右括号。
                 let _ = self.match_kind(&TokenKind::KwConst);
                 let elem = self.parse_type()?;
-                return Ok(Type::Slice(Box::new(elem), crate::parser::ast::Mutability::Immutable));
+                return Ok(Type::Slice(
+                    Box::new(elem),
+                    crate::parser::ast::Mutability::Immutable,
+                ));
             }
             let elem = self.parse_type()?;
             let len = if self.match_kind(&TokenKind::Semicolon) {
@@ -167,15 +170,42 @@ impl Parser {
         // 基础类型
         let kind = self.peek().kind.clone();
         match &kind {
-            TokenKind::TyI(w) => { self.advance(); Ok(Type::I(*w)) }
-            TokenKind::TyU(w) => { self.advance(); Ok(Type::U(*w)) }
-            TokenKind::TyF(w) => { self.advance(); Ok(Type::F(*w)) }
-            TokenKind::TyBool => { self.advance(); Ok(Type::Bool) }
-            TokenKind::TyStr => { self.advance(); Ok(Type::Str) }
-            TokenKind::TyChar => { self.advance(); Ok(Type::Char) }
-            TokenKind::TyNever => { self.advance(); Ok(Type::Never) }
-            TokenKind::KwVoid => { self.advance(); Ok(Type::Void) }
-            TokenKind::KwAnytype => { self.advance(); Ok(Type::Anytype) }
+            TokenKind::TyI(w) => {
+                self.advance();
+                Ok(Type::I(*w))
+            }
+            TokenKind::TyU(w) => {
+                self.advance();
+                Ok(Type::U(*w))
+            }
+            TokenKind::TyF(w) => {
+                self.advance();
+                Ok(Type::F(*w))
+            }
+            TokenKind::TyBool => {
+                self.advance();
+                Ok(Type::Bool)
+            }
+            TokenKind::TyStr => {
+                self.advance();
+                Ok(Type::Str)
+            }
+            TokenKind::TyChar => {
+                self.advance();
+                Ok(Type::Char)
+            }
+            TokenKind::TyNever => {
+                self.advance();
+                Ok(Type::Never)
+            }
+            TokenKind::KwVoid => {
+                self.advance();
+                Ok(Type::Void)
+            }
+            TokenKind::KwAnytype => {
+                self.advance();
+                Ok(Type::Anytype)
+            }
             TokenKind::KwUpperSelf => {
                 self.advance();
                 let mut path = vec!["Self".to_string()];
@@ -204,7 +234,8 @@ impl Parser {
                 Ok(Type::Named { path, generics })
             }
             _ => Err(crate::error::CompileError::type_error(format!(
-                "expected type, found {:?}", kind
+                "expected type, found {:?}",
+                kind
             ))),
         }
     }
@@ -230,7 +261,12 @@ impl Parser {
         } else {
             Box::new(Type::Void)
         };
-        Ok(Type::Function { params, ret, is_async, abi: Abi::Zr })
+        Ok(Type::Function {
+            params,
+            ret,
+            is_async,
+            abi: Abi::Zr,
+        })
     }
 
     /// 解析泛型实参 `<T, U, 42>`。

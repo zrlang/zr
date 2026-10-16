@@ -1,0 +1,67 @@
+//=============================================================================
+// tests/cases/15_loops.zr — 循环控制流
+//
+// 覆盖：`loop` + `break`、`continue`、循环头重定义计数器、常量条件。
+//
+// 嵌套循环（内层循环头要插 φ）只在 O0/O1 正确，O2 起仍会算错——见
+// README「循环控制流」一节。这里先不纳入，等那个 bug 修掉再加回来。
+//
+// 这些曾经是"能编译但结果不对"：break/continue 落进 MIR 降级的兜底分支变成
+// 空操作（`loop` 直接转不出来，嵌套循环算错），而循环头缺少 φ 会让计数器
+// 停在入口值。现在每条都按退出码断言具体数值。
+//=============================================================================
+
+// `continue` 必须回到循环头，而不是跳出口。
+fn sum_skipping_three_and_four() -> i32 {
+    let mut i = 0;
+    let mut s = 0;
+    loop {
+        i = i + 1;
+        if i > 10 {
+            break;
+        }
+        if i == 3 || i == 4 {
+            continue;
+        }
+        s = s + i;
+    }
+    // 1+2+5+6+7+8+9+10 = 48（55 - 3 - 4）
+    s
+}
+
+// 循环头里重新定义计数器：循环头同时是"自己算出的值"和"回边带进来的值"
+// 的汇合点。
+fn count_to_limit() -> i32 {
+    let mut n = 0;
+    let mut i = 0;
+    while i < 5 {
+        i = i + 1;
+        n = n + i;
+    }
+    n
+}
+
+// `while` 里的 break。
+fn while_break() -> i32 {
+    let mut i = 0;
+    while true {
+        i = i + 1;
+        if i >= 7 {
+            break;
+        }
+    }
+    i
+}
+
+fn main() -> i32 {
+    if sum_skipping_three_and_four() != 48 {
+        return 1;
+    }
+    if count_to_limit() != 15 {
+        return 2;
+    }
+    if while_break() != 7 {
+        return 3;
+    }
+    0
+}

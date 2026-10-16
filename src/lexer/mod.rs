@@ -24,6 +24,16 @@ pub struct Lexer<'a> {
     column: usize,
     /// 原始源码，用于错误报告。
     raw: &'a str,
+    /// 是否把注释产出为 token。
+    ///
+    /// 编译路径不需要注释，但 `zr fmt` 必须保住它们——一旦丢掉，
+    /// 格式化就等于删代码。所以做成开关而不是一律丢弃。
+    keep_comments: bool,
+    /// 已扫出但尚未返回的注释 token（`zr fmt` 用）。
+    ///
+    /// 用队列而不是 `Option`：一处空白里可能连着多个注释
+    /// （`/* a */ /* b */ x`），逐个返回才不会丢。
+    comment_queue: std::collections::VecDeque<Token>,
 }
 
 impl<'a> Lexer<'a> {
@@ -35,7 +45,32 @@ impl<'a> Lexer<'a> {
             line: 1,
             column: 1,
             raw: source,
+            keep_comments: false,
+            comment_queue: std::collections::VecDeque::new(),
         }
+    }
+
+    /// 词法分析并保留注释（供 `zr fmt` 使用）。
+    pub fn tokenize_keeping_comments(source: &str) -> Vec<Token> {
+        let mut l = Lexer {
+            src: source.chars().collect(),
+            pos: 0,
+            line: 1,
+            column: 1,
+            raw: source,
+            keep_comments: true,
+            comment_queue: std::collections::VecDeque::new(),
+        };
+        let mut tokens = Vec::new();
+        loop {
+            let t = l.next_token();
+            let done = matches!(t.kind, TokenKind::Eof);
+            tokens.push(t);
+            if done {
+                break;
+            }
+        }
+        tokens
     }
 
     /// 执行词法分析，返回 token 序列（末尾带一个 `Eof`）。
@@ -46,6 +81,8 @@ impl<'a> Lexer<'a> {
             line: 1,
             column: 1,
             raw: self.raw,
+            keep_comments: false,
+            comment_queue: std::collections::VecDeque::new(),
         };
         let mut tokens = Vec::new();
         loop {
@@ -65,9 +102,19 @@ impl<'a> Lexer<'a> {
 
     /// 读取下一个 token。
     fn next_token(&mut self) -> Token {
+        // 注释优先返回：它们是之前扫到、还没吐出来的
+        if let Some(c) = self.comment_queue.pop_front() {
+            return c;
+        }
         self.skip_whitespace_and_comments();
+        if let Some(c) = self.comment_queue.pop_front() {
+            return c;
+        }
         if self.pos >= self.src.len() {
-            return Token::new(TokenKind::Eof, Span::new(self.pos, self.pos, self.line, self.column));
+            return Token::new(
+                TokenKind::Eof,
+                Span::new(self.pos, self.pos, self.line, self.column),
+            );
         }
 
         let start = self.pos;
@@ -266,7 +313,6 @@ impl<'a> Lexer<'a> {
 
             // ===== 标签（Zig 风格：`name:` 出现在语句起始） =====
             // 普通冒号已在上方处理，标签由解析器在语句起始处特殊处理
-
             c => {
                 return Token::new(
                     TokenKind::LexError(format!("invalid character {c:?} (U+{:04X})", c as u32)),
@@ -293,7 +339,10 @@ impl<'a> Lexer<'a> {
         }
 
         // 再查带后缀的（i8..i128 / u8..u128 / f32 / f64），交给 read_number 处理
-        Token::new(TokenKind::Ident(text), Span::new(start, self.pos, line, col))
+        Token::new(
+            TokenKind::Ident(text),
+            Span::new(start, self.pos, line, col),
+        )
     }
 
     /// 读取数字字面量。
@@ -336,7 +385,12 @@ impl<'a> Lexer<'a> {
                         break;
                     }
                     // 看下一个字符是否是数字（排除 `1.` 作为方法调用）
-                    if self.src.get(self.pos + 1).map(|x| x.is_ascii_digit()).unwrap_or(false) {
+                    if self
+                        .src
+                        .get(self.pos + 1)
+                        .map(|x| x.is_ascii_digit())
+                        .unwrap_or(false)
+                    {
                         is_float = true;
                         self.advance();
                     } else {
@@ -351,14 +405,14 @@ impl<'a> Lexer<'a> {
         }
 
         // 处理科学计数法指数部分（如 `2.0e10`、`1e-5`、`3E+2`）
-        if is_float && self.pos < self.src.len()
+        if is_float
+            && self.pos < self.src.len()
             && (self.src[self.pos] == 'e' || self.src[self.pos] == 'E')
         {
             let exp_pos = self.pos;
             self.advance(); // e/E
-            // 可选的 +/- 号
-            if self.pos < self.src.len()
-                && (self.src[self.pos] == '+' || self.src[self.pos] == '-')
+                            // 可选的 +/- 号
+            if self.pos < self.src.len() && (self.src[self.pos] == '+' || self.src[self.pos] == '-')
             {
                 self.advance();
             }
@@ -389,9 +443,16 @@ impl<'a> Lexer<'a> {
             }
         } else {
             let value = match radix {
-                16 => i128::from_str_radix(clean.trim_start_matches("0x").trim_start_matches("0X"), 16),
-                2 => i128::from_str_radix(clean.trim_start_matches("0b").trim_start_matches("0B"), 2),
-                8 => i128::from_str_radix(clean.trim_start_matches("0o").trim_start_matches("0O"), 8),
+                16 => i128::from_str_radix(
+                    clean.trim_start_matches("0x").trim_start_matches("0X"),
+                    16,
+                ),
+                2 => {
+                    i128::from_str_radix(clean.trim_start_matches("0b").trim_start_matches("0B"), 2)
+                }
+                8 => {
+                    i128::from_str_radix(clean.trim_start_matches("0o").trim_start_matches("0O"), 8)
+                }
                 _ => clean.parse::<i128>(),
             };
             match value {
@@ -418,8 +479,19 @@ impl<'a> Lexer<'a> {
             // 合法后缀集合
             let valid = matches!(
                 suffix.as_str(),
-                "i8" | "i16" | "i32" | "i64" | "i128" | "u8" | "u16" | "u32" | "u64" | "u128"
-                    | "f32" | "f64" | "usize" | "isize"
+                "i8" | "i16"
+                    | "i32"
+                    | "i64"
+                    | "i128"
+                    | "u8"
+                    | "u16"
+                    | "u32"
+                    | "u64"
+                    | "u128"
+                    | "f32"
+                    | "f64"
+                    | "usize"
+                    | "isize"
             );
             if !valid {
                 return Token::new(
@@ -461,7 +533,10 @@ impl<'a> Lexer<'a> {
             );
         }
         self.advance(); // 消费闭合 "
-        Token::new(TokenKind::StringLiteral(value), Span::new(start, self.pos, line, col))
+        Token::new(
+            TokenKind::StringLiteral(value),
+            Span::new(start, self.pos, line, col),
+        )
     }
 
     /// 尝试把 `'xxx` 读成生命周期。
@@ -470,9 +545,7 @@ impl<'a> Lexer<'a> {
     /// `'static` 是生命周期——靠标识符后面跟的是逗号/空格/尖括号等来区分。
     fn read_lifetime(&mut self, start: usize, line: usize, col: usize) -> Option<Token> {
         let mut end = self.pos;
-        while end < self.src.len()
-            && (self.src[end].is_alphanumeric() || self.src[end] == '_')
-        {
+        while end < self.src.len() && (self.src[end].is_alphanumeric() || self.src[end] == '_') {
             end += 1;
         }
         if end == self.pos {
@@ -514,7 +587,10 @@ impl<'a> Lexer<'a> {
             );
         }
         self.advance(); // 消费 '
-        Token::new(TokenKind::CharLiteral(ch), Span::new(start, self.pos, line, col))
+        Token::new(
+            TokenKind::CharLiteral(ch),
+            Span::new(start, self.pos, line, col),
+        )
     }
 
     /// 读取一个转义序列。
@@ -567,42 +643,91 @@ impl<'a> Lexer<'a> {
     fn skip_whitespace_and_comments(&mut self) {
         loop {
             self.skip_whitespace();
-            if self.pos + 1 < self.src.len() && self.src[self.pos] == '/' && self.src[self.pos + 1] == '/' {
-                // 行注释
+            let is_line = self.pos + 1 < self.src.len()
+                && self.src[self.pos] == '/'
+                && self.src[self.pos + 1] == '/';
+            let is_block = self.pos + 1 < self.src.len()
+                && self.src[self.pos] == '/'
+                && self.src[self.pos + 1] == '*';
+            if !is_line && !is_block {
+                break;
+            }
+            let start = self.pos;
+            if is_line {
                 while self.pos < self.src.len() && self.src[self.pos] != '\n' {
                     self.advance();
                 }
-            } else if self.pos + 1 < self.src.len()
-                && self.src[self.pos] == '/'
-                && self.src[self.pos + 1] == '*'
-            {
-                // 块注释（支持嵌套）
-                self.advance(); // /
-                self.advance(); // *
-                let mut depth = 1usize;
-                while self.pos + 1 < self.src.len() && depth > 0 {
-                    if self.src[self.pos] == '/' && self.src[self.pos + 1] == '*' {
-                        self.advance();
-                        self.advance();
-                        depth += 1;
-                    } else if self.src[self.pos] == '*' && self.src[self.pos + 1] == '/' {
-                        self.advance();
-                        self.advance();
-                        depth -= 1;
-                    } else {
-                        self.advance();
-                    }
+                if self.keep_comments {
+                    let text: String = self.src[start..self.pos].iter().collect();
+                    let text = text.trim_end().to_string();
+                    let (l, c) = self.line_col_of(start);
+                    self.comment_queue.push_back(Token::new(
+                        TokenKind::LineComment(text),
+                        Span {
+                            start: 0,
+                            end: 0,
+                            line: l,
+                            column: c,
+                        },
+                    ));
                 }
-            } else {
-                break;
+                // 行注释后面紧跟换行，交给 skip_whitespace 记账行号
+                continue;
+            }
+            // 块注释（支持嵌套）
+            self.advance(); // /
+            self.advance(); // *
+            let mut depth = 1usize;
+            while self.pos + 1 < self.src.len() && depth > 0 {
+                if self.src[self.pos] == '/' && self.src[self.pos + 1] == '*' {
+                    self.advance();
+                    self.advance();
+                    depth += 1;
+                } else if self.src[self.pos] == '*' && self.src[self.pos + 1] == '/' {
+                    self.advance();
+                    self.advance();
+                    depth -= 1;
+                } else {
+                    self.advance();
+                }
+            }
+            if self.keep_comments {
+                let text: String = self.src[start..self.pos].iter().collect();
+                let (l, c) = self.line_col_of(start);
+                self.comment_queue.push_back(Token::new(
+                    TokenKind::BlockComment(text),
+                    Span {
+                        start: 0,
+                        end: 0,
+                        line: l,
+                        column: c,
+                    },
+                ));
             }
         }
+    }
+
+    /// 某个字符下标对应的 (行, 列)。
+    fn line_col_of(&self, at: usize) -> (usize, usize) {
+        let mut line = 1usize;
+        let mut col = 1usize;
+        for i in 0..at.min(self.src.len()) {
+            if self.src[i] == '\n' {
+                line += 1;
+                col = 1;
+            } else {
+                col += 1;
+            }
+        }
+        (line, col)
     }
 
     fn skip_whitespace(&mut self) {
         while self.pos < self.src.len() {
             match self.src[self.pos] {
-                ' ' | '\t' | '\r' => { self.advance(); }
+                ' ' | '\t' | '\r' => {
+                    self.advance();
+                }
                 '\n' => {
                     self.line += 1;
                     self.column = 1;
@@ -778,8 +903,15 @@ mod tests {
     #[test]
     fn comments() {
         let t = Lexer::new("1 /* nested /* comment */ */ 2 // line\n3").tokenize();
-        let ints: Vec<_> = t.iter()
-            .filter_map(|tok| if let TokenKind::IntLiteral(v) = tok.kind { Some(v) } else { None })
+        let ints: Vec<_> = t
+            .iter()
+            .filter_map(|tok| {
+                if let TokenKind::IntLiteral(v) = tok.kind {
+                    Some(v)
+                } else {
+                    None
+                }
+            })
             .collect();
         assert_eq!(ints, vec![1, 2, 3]);
     }

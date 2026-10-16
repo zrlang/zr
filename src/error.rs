@@ -84,7 +84,11 @@ impl CompileError {
 impl fmt::Display for CompileError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match &self.span {
-            Some(span) => write!(f, "{}:{}:{}: {}", span.line, span.column, span.start, self.message),
+            Some(span) => write!(
+                f,
+                "{}:{}:{}: {}",
+                span.line, span.column, span.start, self.message
+            ),
             None => f.write_str(&self.message),
         }
     }

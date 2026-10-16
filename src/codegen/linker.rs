@@ -82,7 +82,7 @@ pub fn assemble_elf(target: &Target, unit: &CompilationUnit) -> io::Result<Vec<u
 
     // 构建节名表、符号表与字符串表（必须在计算偏移前完成）。
     let shstrtab = Shstrtab::build();
-    let (strtab, symtab) = build_symbol_tables(unit, is_64);
+    let (strtab, symtab, local_syms) = build_symbol_tables(unit, is_64);
 
     // 可执行文件用虚拟地址布局；可重定位目标文件没有加载地址概念。
     let is_exec = unit.kind == OutputKind::Executable;
@@ -90,13 +90,21 @@ pub fn assemble_elf(target: &Target, unit: &CompilationUnit) -> io::Result<Vec<u
     let has_segments = is_exec && target.os() != Os::Bare;
 
     // 目标文件需要 `.rela.text` 交给链接器应用重定位。
-    let rela = if is_exec { Vec::new() } else { build_rela(target, unit, is_64) };
+    let rela = if is_exec {
+        Vec::new()
+    } else {
+        build_rela(target, unit, is_64)
+    };
 
     // ---------- 文件偏移布局 ----------
     // 顺序：ELF 头 → Program Header → Section Header 表 → 各节数据。
     // Section Header 表必须整块落在 .shstrtab 之前，否则会与节数据重叠。
     let e_phoff: u64 = elf.ehsize; // ELF header 紧接 Program Header
-    let ph_size: u64 = if has_segments { elf.phentsize * elf.phnum as u64 } else { 0 };
+    let ph_size: u64 = if has_segments {
+        elf.phentsize * elf.phnum as u64
+    } else {
+        0
+    };
     let sh_off = align_up(e_phoff + ph_size, SECT_ALIGN);
 
     // 各段文件偏移
@@ -123,7 +131,9 @@ pub fn assemble_elf(target: &Target, unit: &CompilationUnit) -> io::Result<Vec<u
     buf.extend_from_slice(&target.arch().elf_machine().to_le_bytes());
     buf.extend_from_slice(&1u32.to_le_bytes()); // e_version
     let e_entry: u64 = if is_exec {
-        text_vaddr + find_entry_offset(unit) as u64
+        // 同样：Thumb 入口要置 bit 0 表明指令状态
+        let bit = if unit.is_thumb { 1 } else { 0 };
+        (text_vaddr + find_entry_offset(unit) as u64) | bit
     } else {
         0
     };
@@ -152,18 +162,42 @@ pub fn assemble_elf(target: &Target, unit: &CompilationUnit) -> io::Result<Vec<u
     if has_segments {
         // PT_LOAD: .text (R-X, PF_R | PF_X = 0x5)
         write_program_header(
-            &mut buf, is_64, 1, 0x5, text_off, text_vaddr, text_vaddr,
-            text.len() as u64, text.len() as u64, PAGE_ALIGN,
+            &mut buf,
+            is_64,
+            1,
+            0x5,
+            text_off,
+            text_vaddr,
+            text_vaddr,
+            text.len() as u64,
+            text.len() as u64,
+            PAGE_ALIGN,
         )?;
         // PT_LOAD: .rodata (R--, PF_R = 0x4)
         write_program_header(
-            &mut buf, is_64, 1, 0x4, rodata_off, rodata_vaddr, rodata_vaddr,
-            rodata.len() as u64, rodata.len() as u64, PAGE_ALIGN,
+            &mut buf,
+            is_64,
+            1,
+            0x4,
+            rodata_off,
+            rodata_vaddr,
+            rodata_vaddr,
+            rodata.len() as u64,
+            rodata.len() as u64,
+            PAGE_ALIGN,
         )?;
         // PT_LOAD: .data (RW-, PF_R | PF_W = 0x6)
         write_program_header(
-            &mut buf, is_64, 1, 0x6, data_off, data_vaddr, data_vaddr,
-            data.len() as u64, data.len() as u64, PAGE_ALIGN,
+            &mut buf,
+            is_64,
+            1,
+            0x6,
+            data_off,
+            data_vaddr,
+            data_vaddr,
+            data.len() as u64,
+            data.len() as u64,
+            PAGE_ALIGN,
         )?;
     }
 
@@ -182,38 +216,111 @@ pub fn assemble_elf(target: &Target, unit: &CompilationUnit) -> io::Result<Vec<u
 
     // idx 1: .text
     write_section_header(
-        &mut buf, is_64, n_text, 1, 0x6, text_vaddr, text_off,
-        text.len() as u64, 0, 0, SECT_ALIGN, 0,
+        &mut buf,
+        is_64,
+        n_text,
+        1,
+        0x6,
+        text_vaddr,
+        text_off,
+        text.len() as u64,
+        0,
+        0,
+        SECT_ALIGN,
+        0,
     )?;
     // idx 2: .rodata
     write_section_header(
-        &mut buf, is_64, n_rodata, 1, 0x2, rodata_vaddr, rodata_off,
-        rodata.len() as u64, 0, 0, SECT_ALIGN, 0,
+        &mut buf,
+        is_64,
+        n_rodata,
+        1,
+        0x2,
+        rodata_vaddr,
+        rodata_off,
+        rodata.len() as u64,
+        0,
+        0,
+        SECT_ALIGN,
+        0,
     )?;
     // idx 3: .data
     write_section_header(
-        &mut buf, is_64, n_data, 1, 0x3, data_vaddr, data_off,
-        data.len() as u64, 0, 0, SECT_ALIGN, 0,
+        &mut buf,
+        is_64,
+        n_data,
+        1,
+        0x3,
+        data_vaddr,
+        data_off,
+        data.len() as u64,
+        0,
+        0,
+        SECT_ALIGN,
+        0,
     )?;
     // idx 4: .rela.text
+    // sh_link 必须是 `.symtab` 的**节表索引**（5），不是 `SHN_SYMTAB` 类型常量
+    // （2）——写错会让重定位的符号号指向 `.rodata`。
     write_section_header(
-        &mut buf, is_64, n_rela, SHT_RELA, 0, 0, rela_off,
-        rela.len() as u64, SHN_SYMTAB, SHN_TEXT, SECT_ALIGN, elf.rela_entsize,
+        &mut buf,
+        is_64,
+        n_rela,
+        SHT_RELA,
+        0,
+        0,
+        rela_off,
+        rela.len() as u64,
+        SHN_SYMTAB,
+        SHN_TEXT,
+        SECT_ALIGN,
+        elf.rela_entsize,
     )?;
     // idx 5: .symtab
+    // sh_link 指向 `.strtab`（6），sh_info 指向第一个全局符号（下标 local_syms+1）。
     write_section_header(
-        &mut buf, is_64, n_symtab, SHT_SYMTAB, 0, 0, symtab_off,
-        symtab.len() as u64, SHN_STRTAB, 1, 8, elf.sym_entsize,
+        &mut buf,
+        is_64,
+        n_symtab,
+        SHT_SYMTAB,
+        0,
+        0,
+        symtab_off,
+        symtab.len() as u64,
+        SHN_STRTAB,
+        local_syms as u32 + 1,
+        8,
+        elf.sym_entsize,
     )?;
     // idx 6: .strtab
     write_section_header(
-        &mut buf, is_64, n_strtab, SHT_STRTAB, 0, 0, strtab_off,
-        strtab.len() as u64, 0, 0, 1, 0,
+        &mut buf,
+        is_64,
+        n_strtab,
+        SHT_STRTAB,
+        0,
+        0,
+        strtab_off,
+        strtab.len() as u64,
+        0,
+        0,
+        1,
+        0,
     )?;
     // idx 7: .shstrtab
     write_section_header(
-        &mut buf, is_64, n_shstrtab, SHT_STRTAB, 0, 0, shstrtab_off,
-        shstrtab.len(), 0, 0, 1, 0,
+        &mut buf,
+        is_64,
+        n_shstrtab,
+        SHT_STRTAB,
+        0,
+        0,
+        shstrtab_off,
+        shstrtab.len(),
+        0,
+        0,
+        1,
+        0,
     )?;
 
     // === 段数据 ===
@@ -321,7 +428,7 @@ fn write_section_header<W: Write>(
     w.write_all(&sh_type.to_le_bytes())?;
     if is_64 {
         w.write_all(&sh_flags.to_le_bytes())?;
-        w.write_all(&sh_addr.to_le_bytes())?;   // 虚拟地址，非文件偏移
+        w.write_all(&sh_addr.to_le_bytes())?; // 虚拟地址，非文件偏移
         w.write_all(&sh_offset.to_le_bytes())?; // 文件偏移
         w.write_all(&sh_size.to_le_bytes())?;
         w.write_all(&sh_link.to_le_bytes())?;
@@ -343,11 +450,13 @@ fn write_section_header<W: Write>(
 
 /// 节表条目数（含索引 0 的 NULL 节）。
 const SECTION_COUNT: usize = 8;
+
 /// 段类型：SHT_RELA / SHT_SYMTAB / SHT_STRTAB。
 const SHT_RELA: u32 = 4;
 const SHT_SYMTAB: u32 = 2;
 const SHT_STRTAB: u32 = 3;
 /// 节头 `sh_link` / `sh_info` 使用的节索引（0 为 NULL 节）。
+/// 这些是**节表索引**，和上面的 `SHT_*` 段类型常量完全是两回事。
 const SHN_TEXT: u32 = 1;
 const SHN_SYMTAB: u32 = 5;
 const SHN_STRTAB: u32 = 6;
@@ -407,61 +516,85 @@ fn pad_to(w: &mut Vec<u8>, target: usize) -> io::Result<()> {
 
 /// 把符号转为 ELF 符号表条目（供 `.symtab` 使用）。
 /// `name_offset` 是符号名在 `.strtab` 中的偏移。
-fn symbol_to_elf(sym: &Symbol, name_offset: u32, is_64: bool) -> Vec<u8> {
+fn symbol_to_elf(sym: &Symbol, name_offset: u32, is_64: bool, thumb: bool) -> Vec<u8> {
     let mut b = Vec::new();
-    // st_name
-    b.extend_from_slice(&name_offset.to_le_bytes());
     // st_info: bind(高4) + type(低4)
     let bind = if sym.global { 1u8 } else { 0u8 }; // STB_GLOBAL or STB_LOCAL
     let ty = match sym.kind {
         SymbolKind::Function => 2u8, // STT_FUNC
         SymbolKind::Section => 3u8,  // STT_SECTION
     };
-    b.push((bind << 4) | ty);
+    let info = (bind << 4) | ty;
     // st_other
-    b.push(0);
+    let other = 0u8;
     // st_shndx
     // SHN_TEXT = 1（节表索引 0 保留给 SHT_NULL）。
     let shndx = match sym.section {
         SymbolSection::Text => 1u16,
         SymbolSection::Undefined => 0,
     };
-    b.extend_from_slice(&shndx.to_le_bytes());
-    // st_value
+    // st_value。Thumb 的函数符号要带 bit 0：那是"这个地址是 Thumb 状态"
+    // 的标记，缺了它加载器/链接器会当 ARM 状态去取指，直接跑飞。
+    let value = match (thumb, sym.kind) {
+        (true, SymbolKind::Function) => sym.offset | 1,
+        _ => sym.offset,
+    };
+
+    // ELF32 和 ELF64 的 `ElfNN_Sym` 字段顺序**不一样**，且都是 16 字节（32 位）/
+    // 24 字节（64 位）——写错顺序长度照样对，只有读出来才发现是乱的：
+    //
+    //   Elf32_Sym: st_name, st_value, st_size, st_info, st_other, st_shndx
+    //   Elf64_Sym: st_name, st_info, st_other, st_shndx, st_value, st_size
+    //
+    // 之前两种都按 64 位顺序写，于是所有 32 位目标（arm / thumb / riscv32）
+    // 的符号表全是错位的：名字串到了 st_size，st_shndx 读成 0（*UND*）。
+    b.extend_from_slice(&name_offset.to_le_bytes()); // st_name
     if is_64 {
-        b.extend_from_slice(&(sym.offset as u64).to_le_bytes());
-    } else {
-        b.extend_from_slice(&(sym.offset as u32).to_le_bytes());
-    }
-    // st_size
-    if is_64 {
+        b.push(info);
+        b.push(other);
+        b.extend_from_slice(&shndx.to_le_bytes());
+        b.extend_from_slice(&(value as u64).to_le_bytes());
         b.extend_from_slice(&(sym.size as u64).to_le_bytes());
     } else {
+        b.extend_from_slice(&(value as u32).to_le_bytes());
         b.extend_from_slice(&(sym.size as u32).to_le_bytes());
+        b.push(info);
+        b.push(other);
+        b.extend_from_slice(&shndx.to_le_bytes());
     }
     b
 }
 
+/// ELF 规定 `.symtab` 里的局部符号必须全部排在全局符号之前，且
+/// `sh_info` 指向第一个全局符号。两处都得用同一个顺序，否则重定位算出来的
+/// 符号号会跟符号表对不上。
+fn symbols_in_elf_order(unit: &CompilationUnit) -> Vec<&Symbol> {
+    let (locals, globals): (Vec<_>, Vec<_>) = unit.symbols.iter().partition(|s| !s.global);
+    locals.into_iter().chain(globals).collect()
+}
+
 /// 构建 `.strtab`（符号名字符串表）和 `.symtab`（符号表）数据。
 ///
-/// 返回 (strtab_bytes, symtab_bytes)。
-fn build_symbol_tables(unit: &CompilationUnit, is_64: bool) -> (Vec<u8>, Vec<u8>) {
+/// 返回 (strtab_bytes, symtab_bytes, 局部符号数)。
+fn build_symbol_tables(unit: &CompilationUnit, is_64: bool) -> (Vec<u8>, Vec<u8>, usize) {
     let mut strtab: Vec<u8> = vec![0]; // 首项为 NUL
     let mut symtab: Vec<u8> = Vec::new();
 
     // ELF 要求 symtab[0] 是一个全零的未定义符号。
     symtab.extend_from_slice(if is_64 { &[0u8; 24] } else { &[0u8; 16] });
 
-    for sym in &unit.symbols {
+    let ordered = symbols_in_elf_order(unit);
+    let local_count = ordered.iter().filter(|s| !s.global).count();
+    for sym in ordered {
         // 将符号名追加到 strtab
         let name_offset = strtab.len() as u32;
         strtab.extend_from_slice(sym.name.as_bytes());
         strtab.push(0);
         // 生成符号表条目
-        symtab.extend_from_slice(&symbol_to_elf(sym, name_offset, is_64));
+        symtab.extend_from_slice(&symbol_to_elf(sym, name_offset, is_64, unit.is_thumb));
     }
 
-    (strtab, symtab)
+    (strtab, symtab, local_count)
 }
 
 /// 构建 `.rela.text`（重定位表，仅目标文件需要）。
@@ -470,8 +603,9 @@ fn build_symbol_tables(unit: &CompilationUnit, is_64: bool) -> (Vec<u8>, Vec<u8>
 /// （符号表索引 << 32 | 类型）、`r_addend`。
 fn build_rela(target: &Target, unit: &CompilationUnit, is_64: bool) -> Vec<u8> {
     // 符号表索引 0 保留（未定义），因此第 i 个符号对应索引 i + 1。
+    let ordered = symbols_in_elf_order(unit);
     let symbol_index = |name: &str| -> u64 {
-        unit.symbols
+        ordered
             .iter()
             .position(|s| s.name == name)
             .map(|i| i as u64 + 1)
@@ -528,12 +662,24 @@ mod tests {
         assert_eq!(&bytes[..4], b"\x7fELF");
         assert_eq!(bytes[4], 2, "EI_CLASS = 64 位");
         assert_eq!(bytes[5], 1, "EI_DATA = 小端");
-        assert_eq!(u16::from_le_bytes(bytes[16..18].try_into().unwrap()), 2, "ET_EXEC");
-        assert_eq!(u16::from_le_bytes(bytes[18..20].try_into().unwrap()), 62, "EM_X86_64");
+        assert_eq!(
+            u16::from_le_bytes(bytes[16..18].try_into().unwrap()),
+            2,
+            "ET_EXEC"
+        );
+        assert_eq!(
+            u16::from_le_bytes(bytes[18..20].try_into().unwrap()),
+            62,
+            "EM_X86_64"
+        );
         // e_entry 落在 .text 的虚拟地址范围内
         let entry = u64::from_le_bytes(bytes[24..32].try_into().unwrap());
         assert_eq!(entry, 0x400000);
-        assert_eq!(u16::from_le_bytes(bytes[56..58].try_into().unwrap()), 3, "e_phnum（text/rodata/data）");
+        assert_eq!(
+            u16::from_le_bytes(bytes[56..58].try_into().unwrap()),
+            3,
+            "e_phnum（text/rodata/data）"
+        );
     }
 
     #[test]
@@ -557,14 +703,30 @@ mod tests {
             crate::codegen::RelocationKind::PcRel32,
         ));
         let bytes = assemble_elf(&target(), &unit).unwrap();
-        assert_eq!(u16::from_le_bytes(bytes[16..18].try_into().unwrap()), 1, "ET_REL");
-        assert_eq!(u16::from_le_bytes(bytes[56..58].try_into().unwrap()), 0, "e_phnum");
-        assert_eq!(u16::from_le_bytes(bytes[60..62].try_into().unwrap()), 8, "e_shnum");
+        assert_eq!(
+            u16::from_le_bytes(bytes[16..18].try_into().unwrap()),
+            1,
+            "ET_REL"
+        );
+        assert_eq!(
+            u16::from_le_bytes(bytes[56..58].try_into().unwrap()),
+            0,
+            "e_phnum"
+        );
+        assert_eq!(
+            u16::from_le_bytes(bytes[60..62].try_into().unwrap()),
+            8,
+            "e_shnum"
+        );
 
         // .rela.text 数据里应能找到一条指向 main 的重定位
         let rela = build_rela(&target(), &unit, true);
         assert_eq!(rela.len(), 24);
-        assert_eq!(u64::from_le_bytes(rela[0..8].try_into().unwrap()), 1, "字段偏移");
+        assert_eq!(
+            u64::from_le_bytes(rela[0..8].try_into().unwrap()),
+            1,
+            "字段偏移"
+        );
         let info = u64::from_le_bytes(rela[8..16].try_into().unwrap());
         assert_eq!(info & 0xffff_ffff, 4, "R_X86_64_PLT32");
         assert_eq!(info >> 32, 1, "symtab[1] = main");
@@ -589,18 +751,28 @@ mod tests {
             u64::from_le_bytes(bytes[text_off + 32..text_off + 40].try_into().unwrap()) as usize,
         );
         assert!(sh_offset + sh_size <= bytes.len(), ".text 超出文件末尾");
-        assert!(sh_offset >= e_shoff + e_shnum * e_shentsize, ".text 与节头表重叠");
+        assert!(
+            sh_offset >= e_shoff + e_shnum * e_shentsize,
+            ".text 与节头表重叠"
+        );
 
         // sh_name 必须指向 .shstrtab 中的真实名字（不能是节索引）
         let shstrndx = u16::from_le_bytes(bytes[62..64].try_into().unwrap()) as usize;
         let strtab_header = e_shoff + shstrndx * e_shentsize;
-        let strtab_off = u64::from_le_bytes(bytes[strtab_header + 24..strtab_header + 32].try_into().unwrap()) as usize;
-        let name_off = u32::from_le_bytes(bytes[text_off..text_off + 4].try_into().unwrap()) as usize;
+        let strtab_off = u64::from_le_bytes(
+            bytes[strtab_header + 24..strtab_header + 32]
+                .try_into()
+                .unwrap(),
+        ) as usize;
+        let name_off =
+            u32::from_le_bytes(bytes[text_off..text_off + 4].try_into().unwrap()) as usize;
         let name_end = bytes[strtab_off + name_off..]
             .iter()
             .position(|b| *b == 0)
             .expect("节名应以 NUL 结尾");
-        let name = std::str::from_utf8(&bytes[strtab_off + name_off..strtab_off + name_off + name_end]).unwrap();
+        let name =
+            std::str::from_utf8(&bytes[strtab_off + name_off..strtab_off + name_off + name_end])
+                .unwrap();
         assert_eq!(name, ".text");
     }
 
@@ -630,5 +802,83 @@ mod tests {
         let bytes = std::fs::read(&path).unwrap();
         assert_eq!(&bytes[..4], b"\x7fELF");
         let _ = std::fs::remove_file(&path);
+    }
+
+    /// ELF32 与 ELF64 的 `ElfNN_Sym` 字段顺序不同，而且两种长度都"看着对"
+    /// （16 / 24 字节），写错了 objdump 也照样能读，只是内容全错位。
+    /// 这里按字节逐字段断言，把顺序钉死。
+    #[test]
+    fn symbol_layout_is_correct_for_both_elf_classes() {
+        let sym = Symbol {
+            name: "f".to_string(),
+            section: SymbolSection::Text,
+            offset: 0x40,
+            size: 0x12,
+            global: true,
+            kind: SymbolKind::Function,
+        };
+
+        // ELF64: st_name, st_info, st_other, st_shndx, st_value(8), st_size(8)
+        let e = symbol_to_elf(&sym, 7, true, false);
+        assert_eq!(e.len(), 24);
+        assert_eq!(&e[0..4], &7u32.to_le_bytes(), "st_name");
+        assert_eq!(e[4], 0x12, "st_info = GLOBAL|FUNC");
+        assert_eq!(e[5], 0, "st_other");
+        assert_eq!(&e[6..8], &1u16.to_le_bytes(), "st_shndx = .text");
+        assert_eq!(&e[8..16], &0x40u64.to_le_bytes(), "st_value");
+        assert_eq!(&e[16..24], &0x12u64.to_le_bytes(), "st_size");
+
+        // ELF32: st_name, st_value(4), st_size(4), st_info, st_other, st_shndx
+        let e = symbol_to_elf(&sym, 7, false, false);
+        assert_eq!(e.len(), 16);
+        assert_eq!(&e[0..4], &7u32.to_le_bytes(), "st_name");
+        assert_eq!(&e[4..8], &0x40u32.to_le_bytes(), "st_value");
+        assert_eq!(&e[8..12], &0x12u32.to_le_bytes(), "st_size");
+        assert_eq!(e[12], 0x12, "st_info = GLOBAL|FUNC");
+        assert_eq!(e[13], 0, "st_other");
+        assert_eq!(&e[14..16], &1u16.to_le_bytes(), "st_shndx = .text");
+    }
+
+    /// Thumb 函数符号的值要带 bit 0（指令状态标记），否则链接器/加载器
+    /// 会按 A32 去取指。A32 目标不受影响。
+    #[test]
+    fn thumb_function_symbols_carry_the_thumb_bit() {
+        let sym = Symbol {
+            name: "f".to_string(),
+            section: SymbolSection::Text,
+            offset: 0x40,
+            size: 0x12,
+            global: true,
+            kind: SymbolKind::Function,
+        };
+        // ELF32 下 st_value 在 [4..8]
+        let e = symbol_to_elf(&sym, 1, false, true);
+        assert_eq!(&e[4..8], &0x41u32.to_le_bytes(), "0x40 | 1");
+        // 非 Thumb 目标不加位
+        let e = symbol_to_elf(&sym, 1, false, false);
+        assert_eq!(&e[4..8], &0x40u32.to_le_bytes());
+    }
+
+    /// 局部符号必须排在全局符号之前，且 `sh_info` 指向第一个全局符号；
+    /// 不满足时重定位算出来的符号号会跟符号表错位。
+    #[test]
+    fn locals_precede_globals_and_sh_info_points_at_the_first_global() {
+        let mut unit = CompilationUnit::new();
+        for (name, global) in [("g0", true), ("l0", false), ("g1", true), ("l1", false)] {
+            unit.symbols.push(Symbol {
+                name: name.to_string(),
+                section: SymbolSection::Text,
+                offset: 0,
+                size: 0,
+                global,
+                kind: SymbolKind::Section,
+            });
+        }
+        let ordered = symbols_in_elf_order(&unit);
+        let names: Vec<&str> = ordered.iter().map(|s| s.name.as_str()).collect();
+        assert_eq!(names, ["l0", "l1", "g0", "g1"]);
+
+        let (_, _, local_count) = build_symbol_tables(&unit, true);
+        assert_eq!(local_count, 2, "sh_info = local_count + 1 = 3");
     }
 }

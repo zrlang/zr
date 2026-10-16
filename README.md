@@ -166,22 +166,21 @@ async fn fastest(a: Future<String>, b: Future<String>) -> String {
 ### 5. 编译期求值（comptime）
 
 ```rust
-/// 编译期计算阶乘
+/// 编译期计算阶乘（递归、编译期循环、break 都可以用）
 comptime fn fact(n: i32) -> i32 {
     if n <= 1 { 1 } else { n * fact(n - 1) }
 }
 
-const SIZE: usize = fact(5);   // 在编译期求值为 120
+const SIZE: i32 = fact(5);      // 在编译期求值为 120
 
-/// 编译期反射：根据类型信息生成代码
-fn make_default<T>() -> T {
-    comptime match @typeInfo(T) {
-        .Struct  => T::default(),
-        .Int     => 0 as T,
-        .Pointer => null,
-        else     => unreachable(),
-    }
-}
+/// 编译期求值的终止性由递归深度与步数预算保证；
+/// 写一个不收敛的循环会让编译**报错退出**，而不是挂住。
+///
+/// 当前支持的构造：字面量、算术/位运算、比较、逻辑、`let` / `var` / `const`、
+/// 赋值与复合赋值、`if`、`while`、`loop`、`break`、`continue`、`return`、
+/// 数值转换，以及调用其它 `comptime fn`。
+/// 不支持：`match`、结构体 / 数组 / 元组字面量、闭包、指针运算
+/// （这些节点在 HIR 阶段尚未保留数据）。
 ```
 
 ### 6. C ABI 兼容
@@ -260,9 +259,24 @@ zr build program.zr --dump-ssa
 ### 运行测试
 
 ```bash
-zr test                    # 运行 tests/ 目录下所有测试
-zr test language_basics     # 运行指定测试
+cargo test                 # 全部：单元测试 + tests/cases 下的语言用例
 ```
+
+语言用例（`tests/cases/*.zr`）是**自检程序**：全部断言通过时 `main` 返回 0，
+失败时返回失败断言的编号。宿主测试驱动会把每个用例在 `-O0` / `-O1` / `-O2` /
+`-O3` / `-Oz` 下各编译并运行一遍——优化 pass 只要有一条改坏了语义，用例就会
+在某个等级上红。
+
+| 用例 | 覆盖 |
+|------|------|
+| `01_variables` … `11_if_else_chain` | 变量、标量、优先级、控制流、函数 |
+| `12_comptime` | `comptime` 表达式折叠 |
+| `13_casts` | 整数 / 浮点类型转换 |
+| `14_spill` | 寄存器溢出 |
+| `15_loops` | 循环 |
+| `16_comptime_fn` | `comptime fn`、递归、编译期循环、`const` 右值内联 |
+| `17_loop_break` | 循环出口的 φ（`break` / `continue` / 嵌套循环） |
+| `18_spill_ops` | 溢出值参与每一种运算（含 `idiv` 内存操作数） |
 
 ---
 
@@ -520,8 +534,11 @@ pub(super)  fn parent_only() {} // 仅父模块可见
 ### 属性
 
 ```rust
-#[inline(always)]               // 强制内联
+#[inline(always)]               // 强制内联（即使函数体不止一个块）
 fn hot_path() { ... }
+
+#[inline(never)]                // 禁止自动内联
+fn cold_path() { ... }
 
 #[link(name = "c", kind = "static")]  // 链接指令
 extern "C" { ... }
@@ -532,7 +549,7 @@ fn test_basic() { ... }
 #[repr(C, packed)]              // 布局控制
 struct Header { ... }
 
-#[derive(Debug, Clone, Copy)]   // 自动派生（规划中）
+#[derive(Debug, Clone, Copy)]   // 自动派生
 struct Point { x: f64, y: f64 }
 ```
 
@@ -663,10 +680,12 @@ std/
 ├── core.zr         // 基础类型：Option/Result/trait/panic/数值工具
 ├── mem.zr          // 内存管理：alloc/dealloc/memcpy/memmove/Layout
 ├── io.zr           // 格式化输出与基础 IO
-├── string.zr        // 可增长 UTF-8 字符串
+├── string.zr       // 可增长 UTF-8 字符串
 ├── slice.zr        // 切片工具、迭代器、高阶函数
 ├── collections.zr  // Vec<T> 动态数组
 ├── async.zr        // 协程、Future、Executor、通道
+├── net.zr          // TCP / UDP 套接字
+├── simd.zr         // 向量类型与内建函数
 └── error.zr        // 错误处理、回溯、断言
 ```
 
@@ -771,31 +790,33 @@ use std::error::{
 ### 命令行接口
 
 ```
-zr <COMMAND> [OPTIONS] <INPUT>
+zr [OPTIONS] <INPUT.zr>
 
-COMMANDS:
-  build <FILE>     编译并链接为可执行文件（默认）
-  check <FILE>     仅类型检查，不生成代码
-  run <FILE>       编译并立即运行
-  test [NAME]      运行测试
-  fmt [FILE]       格式化代码（规划中）
-  doc [FILE]       生成文档（规划中）
+SUBCOMMANDS:
+  lsp                    启动语言服务器（stdio）
+  pkg <SUBCOMMAND> ...   包管理器（转交给 zr pkg）
+  clean                  清空增量编译缓存
+  fmt [--check] <FILE>   格式化源码
 
 OPTIONS:
-  -o, --output <FILE>     输出文件名
-  -O0..-O3, -Oz           优化级别
-  -c                      只编译不链接
-  --target <TRIPLE>       目标三元组（默认：宿主平台）
-  --wat                   输出 WebAssembly 文本（wasm32 专用）
-  --dump-tokens           dump 词法分析结果
-  --dump-ast              dump AST
-  --dump-hir              dump HIR
-  --dump-mir              dump MIR
-  --dump-ssa              dump SSA
-  --dump-asm              dump 机器码
-  --emit-llvm             输出 LLVM IR（规划中）
-  -h, --help              显示帮助
-  -V, --version           显示版本
+  -o <FILE>              输出文件名
+  -O0..-O3, -Oz          优化级别
+  -c                     只编译不链接（产出目标文件）
+  --target <TRIPLE>      目标三元组（默认：宿主平台）
+  --wat                  输出 WebAssembly 文本（wasm32 专用）
+  --no-incremental       关闭增量编译
+  -g, --debug            生成 DWARF 调试信息
+  -v, --verbose          打印缓存命中等诊断信息
+  --dump-tokens          dump 词法分析结果
+  --dump-ast             dump AST
+  --dump-hir             dump HIR
+  --dump-mir             dump MIR
+  --dump-ssa             dump SSA
+  --dump-ssa-after       dump 优化后的 SSA
+  --dump-asm             dump 机器码
+  --emit-llvm            输出 LLVM IR 文本
+  -h, --help             显示帮助
+  -V, --version          显示版本
 ```
 
 ### 编译模型
@@ -804,7 +825,7 @@ zr 采用单态化泛型（monomorphization），与 Rust/C++ 类似：
 
 - 泛型函数在编译期为每个具体类型生成一份代码
 - 零成本抽象：trait 约束在编译期解析，无运行时开销
-- 增量编译（规划中）：仅重新编译变更的模块
+- 增量编译：默认开启，源文件与所有模块的内容指纹都未变时复用上次产物
 
 ### 链接
 
@@ -950,20 +971,48 @@ zr 编译器采用经典的多阶段架构：
 - [x] Linux / macOS / Windows × x86-64 / aarch64 + 裸机 ARM / RISC-V + wasm32
 - [x] 标准库（core / io / string / collections / async / error）
 
-### v0.6.0（计划中） 🚧
-- [ ] 完整的真实指令选择（覆盖所有 IR 操作码）
-- [ ] 真正的线性扫描寄存器分配实现
-- [ ] 所有优化 pass 的完整实现
-- [ ] `comptime` 编译期求值
-- [ ] 属性系统完善
+### v0.6.0 ✅
 
-### v0.7.0（计划中） 📋
-- [ ] 增量编译
+- [x] `comptime` 编译期求值
+  - [x] `comptime fn`：递归、编译期循环、`break`、复合赋值
+  - [x] `const` 右值内联（`const SIZE: i32 = fact(5)`）
+  - [x] 终止性双闸：递归深度上限 + 求值步数预算
+- [x] 属性系统
+  - [x] `#[inline(always)]` / `#[inline(never)]` 驱动内联决策
+  - [x] `#[repr(C)]` / `#[repr(uN)]` / `#[repr(packed)]` 布局
+  - [x] `#[link(name, kind)]` 传递给链接器
+  - [x] `#[cfg(...)]` 条件编译、`#[allow]` / `#[deny]` lint 级别
+  - [x] `#[derive(...)]` 生成默认 impl、`#[deprecated]` 使用警告
+  - [x] `#[test]` 测试桩
+- [x] SSA 构造：迭代支配边界插 φ（Braun et al.）+ DFS 重命名
+  - [x] 循环头的隐式合流、循环出口的合流（`break` 路径）
+  - [x] 关键边拆分，使 φ 的并行拷贝按边发射
+- [x] 寄存器分配：CFG 活跃性分析 + 线性扫描 + 栈溢出
+  - [x] 回边活跃区间延长；跨调用存活的值限定 callee-save
+  - [x] 溢出路径覆盖除法 / 取模 / 移位 / 比较的每一个操作数位置
+- [x] 优化 pass 完整化
+  - [x] 常量折叠（整数 + 浮点 + 类型转换）
+  - [x] SCCP 稀疏条件常量传播（含恒定分支折叠）
+  - [x] 死代码消除、死块消除（删块后重编号）
+  - [x] 块内 CSE 与全局值编号（覆盖 `Cast` / `Copy`）
+  - [x] 窥孔优化、循环不变量外提、单块函数内联
+- [x] 编译确定性：块号与 φ 编号不再依赖 `HashMap` 遍历顺序
+
+### v0.7.0（计划中） 🚧
+- [ ] 浮点指令选择（需先让 IR 携带类型信息）
+- [ ] 字符串字面量落到 `.rodata`（需重定位支持）
+- [ ] AArch64 / ARM32 / RISC-V 后端的栈溢出（目前仅 x86-64 实现了）
 - [ ] 更多架构（wasm64 / Thumb-2）与平台（FreeBSD / Android / iOS）
 - [ ] 32 位目标的多字长（i64）算术
-- [ ] 包管理器 `zr pkg`
-- [ ] 格式化器 `zr fmt`
-- [ ] 语言服务器（LSP）
+- [ ] `comptime` 的 `match` / 结构体字面量（HIR 目前丢弃这些节点的数据）
+- [ ] 增量编译、多线程编译
+
+### v0.8.0（计划中） 📋
+- [ ] 包管理器 `zr pkg` 的注册表协议与联网能力
+- [ ] 格式化器 `zr fmt` 风格定稿
+- [ ] 语言服务器（LSP）补全与跳转
+- [ ] 内联汇编
+- [ ] SIMD 指令选择
 
 ### v1.0.0（目标） 🎯
 - [ ] API 稳定
@@ -1086,20 +1135,32 @@ cargo clippy
 ```
 zr/
 ├── Cargo.toml              # Rust 项目配置
+├── build.rs                # 为每个目标构建 libzrrt-<平台>.a
 ├── README.md               # 本文件
 ├── LICENSE                 # MIT 许可证
 ├── src/                    # 编译器源码（Rust）
 │   ├── main.rs             # 入口与 CLI
 │   ├── error.rs            # 错误类型
+│   ├── attributes.rs       # 属性解析与语义
+│   ├── comptime.rs         # 编译期求值（comptime）
 │   ├── lexer/              # 词法分析
 │   ├── parser/             # 语法分析
-│   ├── typeck/             # 类型检查
+│   ├── typeck/             # 类型检查 + HIR
 │   ├── mir/                # 中级表示
-│   ├── ssa/                # SSA 构造
+│   ├── ssa/                # SSA 构造（IDF φ 插入 + 重命名）
 │   ├── opt/                # 优化 pass
-│   └── codegen/            # 代码生成
+│   ├── codegen/            # 指令选择、寄存器分配、容器格式
+│   ├── modules.rs          # 模块加载与增量编译缓存
+│   ├── fmt.rs              # 格式化器
+│   ├── lsp.rs              # 语言服务器
+│   ├── pkg.rs              # 包管理器
+│   ├── json.rs             # JSON 解析（供 LSP / pkg 使用）
+│   ├── zr0/                # 内建（bootstrap）函数
+│   └── macro_system/       # 宏
+├── runtime/                # 各平台启动代码与系统调用桩（汇编）
 ├── std/                    # 标准库（zr）
-├── tests/                  # 语言测试套件
+├── tests/                  # 语言测试套件（tests/cases/*.zr）
+├── future/                 # 尚未实现特性的设计文档
 └── examples/               # 示例程序
 ```
 

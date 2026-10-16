@@ -1,0 +1,104 @@
+//=============================================================================
+// tests/cases/17_loop_break.zr — 循环出口的 SSA 构造
+//
+// 覆盖 `while` + `break` / `continue`、嵌套循环、循环后读取被修改的变量。
+//
+// 这是回归用例。出口块有两个前驱（循环头与 `break` 落点），循环体刚算出的
+// 新值只经 break 边到达出口，而循环头的 φ 只在回边上更新——φ 插入漏掉出口
+// 时，`break` 之后读到的是**上一轮**的值：
+//
+//     var mut k = 0;
+//     while k < 10 { k += 1; if k == 5 { break; } }
+//     // k == 4，不是 5
+//
+// 而活跃区间分析若按块号顺序线性化，出口块会排在它那次读之前，导致中间值
+// 的寄存器被提前复用。
+//=============================================================================
+
+fn main() -> i32 {
+    // --- while + break：出口必须看到本轮的更新 ---
+    let mut k = 0;
+    while k < 10 {
+        k += 1;
+        if k == 5 { break; }
+    }
+    if k != 5 { return 1; }
+
+    // --- 累加器同样要看到最后一轮的值 ---
+    let mut total = 0;
+    let mut i = 0;
+    while i < 10 {
+        total += i;
+        i += 1;
+        if i == 5 { break; }
+    }
+    if total != 10 { return 2; }   // 0+1+2+3+4
+    if i != 5 { return 3; }
+
+    // --- 正常退出（不 break）---
+    let mut sum = 0;
+    let mut j = 1;
+    while j <= 100 {
+        sum += j;
+        j += 1;
+    }
+    if sum != 5050 { return 4; }
+    if j != 101 { return 5; }
+
+    // --- continue 跳到下一轮，累加器照常前进 ---
+    let mut evens = 0;
+    let mut n = 0;
+    while n < 20 {
+        n += 1;
+        if n % 2 != 0 { continue; }
+        evens += n;
+    }
+    if evens != 110 { return 6; }  // 2+4+...+20
+    if n != 20 { return 7; }
+
+    // --- 嵌套循环：内层 break 不得影响外层 ---
+    let mut pairs = 0;
+    let mut a = 0;
+    while a < 4 {
+        let mut b = 0;
+        loop {
+            b += 1;
+            if b > 3 { break; }
+            pairs += 1;
+        }
+        a += 1;
+    }
+    if pairs != 12 { return 8; }   // 4 * 3
+    if a != 4 { return 9; }
+
+    // --- 循环内定义的变量在循环后不可见（作用域）---
+    let mut outer = 0;
+    let mut x = 0;
+    while x < 3 {
+        let inner = x * 10;
+        outer += inner;
+        x += 1;
+    }
+    if outer != 30 { return 10; }  // 0+10+20
+
+    // --- 双重求和：交错的两层循环 ---
+    let mut acc = 0;
+    let mut p = 0;
+    while p < 5 {
+        let mut q = 0;
+        while q < 5 {
+            acc += 1;
+            q += 1;
+        }
+        p += 1;
+    }
+    if acc != 25 { return 11; }
+
+    // --- 循环结果参与后续算术（活跃区间跨出循环）---
+    let mut cnt = 0;
+    let mut z = 0;
+    while z < 7 { z += 1; cnt += 1; }
+    if cnt * 2 != 14 { return 12; }
+
+    return 0;
+}

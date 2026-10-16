@@ -102,7 +102,11 @@ pub fn assemble_coff(target: &Target, unit: &CompilationUnit) -> io::Result<Vec<
     let symtab_offset = cursor;
     let has_symbols = !symbols.is_empty();
     let symtab_ptr = if has_symbols { symtab_offset } else { 0 };
-    let nsyms = if has_symbols { (symbols.len() / COFF_SYMBOL_SIZE) as u32 } else { 0 };
+    let nsyms = if has_symbols {
+        (symbols.len() / COFF_SYMBOL_SIZE) as u32
+    } else {
+        0
+    };
 
     let mut buf: Vec<u8> = Vec::new();
 
@@ -208,7 +212,14 @@ fn write_coff_section_header<W: Write>(w: &mut W, s: &CoffSection, vaddr: u32) -
     w.write_all(&vaddr.to_le_bytes())?;
     w.write_all(&s.raw_size.to_le_bytes())?;
     w.write_all(&s.raw_offset.to_le_bytes())?;
-    w.write_all(&(if s.relocs.is_empty() { 0 } else { s.reloc_offset }).to_le_bytes())?;
+    w.write_all(
+        &(if s.relocs.is_empty() {
+            0
+        } else {
+            s.reloc_offset
+        })
+        .to_le_bytes(),
+    )?;
     w.write_all(&0u32.to_le_bytes())?; // PointerToLinenumbers
     w.write_all(&(s.relocs.len() as u16).to_le_bytes())?;
     w.write_all(&0u16.to_le_bytes())?; // NumberOfLinenumbers
@@ -249,7 +260,11 @@ fn build_coff_symbols(unit: &CompilationUnit) -> (Vec<u8>, Vec<u8>) {
 
         symbols.extend_from_slice(&name_field);
         symbols.extend_from_slice(&(sym.offset as u32).to_le_bytes());
-        let section_number: i16 = if sym.section == SymbolSection::Undefined { 0 } else { 1 };
+        let section_number: i16 = if sym.section == SymbolSection::Undefined {
+            0
+        } else {
+            1
+        };
         symbols.extend_from_slice(&section_number.to_le_bytes());
         let symbol_type: u16 = match sym.kind {
             SymbolKind::Function => 0x20,
@@ -305,8 +320,15 @@ mod tests {
         for (arch, expected) in [(Arch::X86_64, 0x8664u16), (Arch::AArch64, 0xaa64u16)] {
             let unit = sample_unit(OutputKind::Relocatable);
             let bytes = assemble_coff(&target(arch), &unit).unwrap();
-            assert_eq!(u16::from_le_bytes(bytes[0..2].try_into().unwrap()), expected);
-            assert_eq!(u16::from_le_bytes(bytes[2..4].try_into().unwrap()), 1, ".text");
+            assert_eq!(
+                u16::from_le_bytes(bytes[0..2].try_into().unwrap()),
+                expected
+            );
+            assert_eq!(
+                u16::from_le_bytes(bytes[2..4].try_into().unwrap()),
+                1,
+                ".text"
+            );
         }
     }
 
@@ -320,7 +342,8 @@ mod tests {
     #[test]
     fn external_references_get_relocations_and_symbols() {
         let mut unit = sample_unit(OutputKind::Relocatable);
-        unit.relocations.push(Relocation::new(1, 0, 5, "zr_exit", RelocationKind::PcRel32));
+        unit.relocations
+            .push(Relocation::new(1, 0, 5, "zr_exit", RelocationKind::PcRel32));
         crate::codegen::objfile::add_extern_symbols(&mut unit);
         let bytes = assemble_coff(&target(Arch::X86_64), &unit).unwrap();
 
@@ -333,7 +356,11 @@ mod tests {
         // 重定位数组紧跟 .text 数据，长度为 10 字节的整数倍
         let reloc_ptr = u32::from_le_bytes(bytes[20 + 24..20 + 28].try_into().unwrap());
         assert_ne!(reloc_ptr, 0);
-        let reloc_type = u16::from_le_bytes(bytes[reloc_ptr as usize + 8..reloc_ptr as usize + 10].try_into().unwrap());
+        let reloc_type = u16::from_le_bytes(
+            bytes[reloc_ptr as usize + 8..reloc_ptr as usize + 10]
+                .try_into()
+                .unwrap(),
+        );
         assert_eq!(reloc_type, 4, "IMAGE_REL_AMD64_REL32");
     }
 
@@ -345,5 +372,4 @@ mod tests {
             "IMAGE_REL_ARM64_BRANCH26"
         );
     }
-
 }

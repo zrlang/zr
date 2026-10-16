@@ -18,10 +18,7 @@ use std::sync::OnceLock;
 use crate::error::{CompileError, ErrorKind, Result};
 use crate::parser::ast::Span;
 
-use super::hir::{
-    self, Cfg, DefId, InferId, LocalId,
-    Ty,
-};
+use super::hir::{self, Cfg, DefId, InferId, LocalId, Ty};
 
 /// 类型推断上下文。
 #[derive(Debug)]
@@ -118,46 +115,49 @@ impl<'a> InferCtxt<'a> {
             Ty::Function { .. } => 8,
             Ty::Optional(inner) => self.size_of(inner) + 1,
             Ty::ErrorUnion(ok, _) => self.size_of(ok) + 1,
-            Ty::Named(def_id, _) => {
-                match self.type_defs.get(def_id) {
-                    Some(hir::HirTypeDef::Struct(s)) => {
-                        let mut sz = 0usize;
-                        for f in &s.fields {
-                            let a = self.align_of(&f.ty);
-                            sz = (sz + a - 1) / a * a;
-                            sz += self.size_of(&f.ty);
-                        }
-                        sz
+            Ty::Named(def_id, _) => match self.type_defs.get(def_id) {
+                Some(hir::HirTypeDef::Struct(s)) => {
+                    let mut sz = 0usize;
+                    for f in &s.fields {
+                        let a = self.align_of(&f.ty);
+                        sz = (sz + a - 1) / a * a;
+                        sz += self.size_of(&f.ty);
                     }
-                    Some(hir::HirTypeDef::Enum(e)) => {
-                        let tag = match e.repr {
-                            hir::IntegerRepr::I8 => 1,
-                            hir::IntegerRepr::I16 => 2,
-                            hir::IntegerRepr::I32 => 4,
-                            _ => 8,
-                        };
-                        let mut max_payload = 0usize;
-                        for v in &e.variants {
-                            let payload_size = match &v.payload {
-                                hir::HirVariantPayload::Tuple(tys) => {
-                                    tys.iter().map(|t| self.size_of(t)).max().unwrap_or(0)
-                                }
-                                hir::HirVariantPayload::Struct(fields) => {
-                                    fields.iter().map(|f| self.size_of(&f.ty)).max().unwrap_or(0)
-                                }
-                                hir::HirVariantPayload::Unit => 0,
-                            };
-                            max_payload = max_payload.max(payload_size);
-                        }
-                        tag + max_payload
-                    }
-                    Some(hir::HirTypeDef::Union(u)) => {
-                        u.fields.iter().map(|f| self.size_of(&f.ty)).max().unwrap_or(0)
-                    }
-                    Some(hir::HirTypeDef::Alias { target, .. }) => self.size_of(target),
-                    None => 0,
+                    sz
                 }
-            }
+                Some(hir::HirTypeDef::Enum(e)) => {
+                    let tag = match e.repr {
+                        hir::IntegerRepr::I8 => 1,
+                        hir::IntegerRepr::I16 => 2,
+                        hir::IntegerRepr::I32 => 4,
+                        _ => 8,
+                    };
+                    let mut max_payload = 0usize;
+                    for v in &e.variants {
+                        let payload_size = match &v.payload {
+                            hir::HirVariantPayload::Tuple(tys) => {
+                                tys.iter().map(|t| self.size_of(t)).max().unwrap_or(0)
+                            }
+                            hir::HirVariantPayload::Struct(fields) => fields
+                                .iter()
+                                .map(|f| self.size_of(&f.ty))
+                                .max()
+                                .unwrap_or(0),
+                            hir::HirVariantPayload::Unit => 0,
+                        };
+                        max_payload = max_payload.max(payload_size);
+                    }
+                    tag + max_payload
+                }
+                Some(hir::HirTypeDef::Union(u)) => u
+                    .fields
+                    .iter()
+                    .map(|f| self.size_of(&f.ty))
+                    .max()
+                    .unwrap_or(0),
+                Some(hir::HirTypeDef::Alias { target, .. }) => self.size_of(target),
+                None => 0,
+            },
             Ty::Opaque(_) => 0,
             Ty::Pin(inner) => self.size_of(inner),
             Ty::Infer(_) => 0,
@@ -181,19 +181,23 @@ impl<'a> InferCtxt<'a> {
             Ty::Array(inner, _) => self.align_of(inner),
             Ty::Tuple(tys) => tys.iter().map(|t| self.align_of(t)).max().unwrap_or(1),
             Ty::Optional(inner) | Ty::ErrorUnion(inner, _) => self.align_of(inner).max(1),
-            Ty::Named(def_id, _) => {
-                match self.type_defs.get(def_id) {
-                    Some(hir::HirTypeDef::Struct(s)) => {
-                        s.fields.iter().map(|f| self.align_of(&f.ty)).max().unwrap_or(1)
-                    }
-                    Some(hir::HirTypeDef::Enum(_)) => 8,
-                    Some(hir::HirTypeDef::Union(u)) => {
-                        u.fields.iter().map(|f| self.align_of(&f.ty)).max().unwrap_or(1)
-                    }
-                    Some(hir::HirTypeDef::Alias { target, .. }) => self.align_of(target),
-                    None => 1,
-                }
-            }
+            Ty::Named(def_id, _) => match self.type_defs.get(def_id) {
+                Some(hir::HirTypeDef::Struct(s)) => s
+                    .fields
+                    .iter()
+                    .map(|f| self.align_of(&f.ty))
+                    .max()
+                    .unwrap_or(1),
+                Some(hir::HirTypeDef::Enum(_)) => 8,
+                Some(hir::HirTypeDef::Union(u)) => u
+                    .fields
+                    .iter()
+                    .map(|f| self.align_of(&f.ty))
+                    .max()
+                    .unwrap_or(1),
+                Some(hir::HirTypeDef::Alias { target, .. }) => self.align_of(target),
+                None => 1,
+            },
             Ty::Opaque(_) => 1,
             Ty::Pin(inner) => self.align_of(inner),
             Ty::Infer(_) => 1,
@@ -218,7 +222,12 @@ impl<'a> InferCtxt<'a> {
             ),
             Ty::Slice(t, m) => Ty::Slice(Box::new(self.resolve(t)), *m),
             Ty::Tuple(ts) => Ty::Tuple(ts.iter().map(|t| self.resolve(t)).collect()),
-            Ty::Function { params, ret, is_async, abi } => Ty::Function {
+            Ty::Function {
+                params,
+                ret,
+                is_async,
+                abi,
+            } => Ty::Function {
                 params: params.iter().map(|t| self.resolve(t)).collect(),
                 ret: Box::new(self.resolve(ret)),
                 is_async: *is_async,
@@ -228,10 +237,7 @@ impl<'a> InferCtxt<'a> {
             Ty::ErrorUnion(t, e) => {
                 Ty::ErrorUnion(Box::new(self.resolve(t)), Box::new(self.resolve(e)))
             }
-            Ty::Named(id, args) => Ty::Named(
-                *id,
-                args.iter().map(|a| self.resolve(a)).collect(),
-            ),
+            Ty::Named(id, args) => Ty::Named(*id, args.iter().map(|a| self.resolve(a)).collect()),
             Ty::Pin(inner) => Ty::Pin(Box::new(self.resolve(inner))),
             _ => ty.clone(),
         }
@@ -272,10 +278,20 @@ impl<'a> InferCtxt<'a> {
                 }
                 Ok(())
             }
-            (Ty::Function { params: p1, ret: r1, is_async: a1, abi: abi1 },
-             Ty::Function { params: p2, ret: r2, is_async: a2, abi: abi2 })
-                if a1 == a2 && abi1 == abi2 && p1.len() == p2.len() =>
-            {
+            (
+                Ty::Function {
+                    params: p1,
+                    ret: r1,
+                    is_async: a1,
+                    abi: abi1,
+                },
+                Ty::Function {
+                    params: p2,
+                    ret: r2,
+                    is_async: a2,
+                    abi: abi2,
+                },
+            ) if a1 == a2 && abi1 == abi2 && p1.len() == p2.len() => {
                 for (x, y) in p1.iter().zip(p2.iter()) {
                     self.unify(x, y, span)?;
                 }
@@ -400,7 +416,8 @@ impl<'a> InferCtxt<'a> {
         // 遍历所有 impl 块，寻找匹配的
         for impl_block in self.impl_blocks {
             if let Some(t) = impl_block.trait_id {
-                if t == trait_id && self.impl_matches_type(impl_block, &Ty::Named(type_id, vec![])) {
+                if t == trait_id && self.impl_matches_type(impl_block, &Ty::Named(type_id, vec![]))
+                {
                     return Ok(());
                 }
             }
@@ -413,10 +430,7 @@ impl<'a> InferCtxt<'a> {
                     // 等于 `#[derive(Clone)]` 能满足**任何** trait。只认
                     // 列表里真正写出来的那个 trait 名。
                     if attr.name == "derive"
-                        && attr
-                            .args
-                            .iter()
-                            .any(|a| *a == self.type_id_name(trait_id))
+                        && attr.args.iter().any(|a| *a == self.type_id_name(trait_id))
                     {
                         return Ok(());
                     }
@@ -517,7 +531,12 @@ impl<'a> InferCtxt<'a> {
                         .join(", ")
                 )
             }
-            Ty::Function { params, ret, is_async, abi } => {
+            Ty::Function {
+                params,
+                ret,
+                is_async,
+                abi,
+            } => {
                 let params = params
                     .iter()
                     .map(|p| self.type_name(p))

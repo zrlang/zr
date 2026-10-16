@@ -13,6 +13,7 @@
 
 use std::collections::HashMap;
 
+use crate::codegen::target::Arch;
 use crate::ssa::{SsaBinaryOp, SsaConst, SsaFunction, SsaInstr, SsaModule, SsaUnaryOp, SsaValue};
 
 // ==================================================================
@@ -215,10 +216,10 @@ impl WasmModule {
     }
 
     /// 从 SSA 模块构建 WASM 模块。
-    pub fn from_ssa(module: &SsaModule) -> Self {
+    pub fn from_ssa(module: &SsaModule, arch: Arch) -> Self {
         let mut wasm = WasmModule::new();
-        // 运行时函数以导入形式提供，宿主负责实现。
-        wasm.imports = runtime_imports();
+        // 运行时函数以导入形式提供，宿主负责实现。签名随指针宽度变化。
+        wasm.imports = runtime_imports_for(arch);
         wasm.memory_pages = 2;
         wasm.memory_max_pages = 256;
         for func in &module.functions {
@@ -321,7 +322,10 @@ impl WasmModule {
             }
             out.push_str("  )\n");
             if func.exported {
-                out.push_str(&format!("  (export \"{}\" (func ${}))\n", func.name, func.name));
+                out.push_str(&format!(
+                    "  (export \"{}\" (func ${}))\n",
+                    func.name, func.name
+                ));
             }
         }
 
@@ -364,14 +368,21 @@ impl WasmModule {
         write_section(
             &mut out,
             5,
-            &encode_vec(&[encode_limits(self.memory_pages, Some(self.memory_max_pages))]),
+            &encode_vec(&[encode_limits(
+                self.memory_pages,
+                Some(self.memory_max_pages),
+            )]),
         );
 
         // ---- Export 段 ----
         let mut exports: Vec<Vec<u8>> = Vec::new();
         for (i, f) in self.functions.iter().enumerate() {
             if f.exported {
-                exports.push(encode_export(&f.name, 0, i as u32 + self.imports.len() as u32));
+                exports.push(encode_export(
+                    &f.name,
+                    0,
+                    i as u32 + self.imports.len() as u32,
+                ));
             }
         }
         exports.push(encode_export("memory", 0x02, 0));
@@ -421,15 +432,24 @@ impl WasmFunction {
         for block in &func.blocks {
             for instr in &block.instrs {
                 match instr {
-                    SsaInstr::Cast { result, src, from, to, .. } => {
+                    SsaInstr::Cast {
+                        result,
+                        src,
+                        from,
+                        to,
+                        ..
+                    } => {
                         let idx =
                             ensure_local(result, &mut local_map, &mut locals, &mut next_local);
                         // 值统一按 i64 局部变量存放，所以窄化转换就是
                         // "截到 32 位，再按目标的有无符号扩展回 64 位"——
                         // 和原生后端的 movsx / movzx 是同一件事。
-                        body.push(WasmInstr::LocalGet(
-                            ensure_local(src, &mut local_map, &mut locals, &mut next_local),
-                        ));
+                        body.push(WasmInstr::LocalGet(ensure_local(
+                            src,
+                            &mut local_map,
+                            &mut locals,
+                            &mut next_local,
+                        )));
                         if from.is_float() || to.is_float() {
                             crate::codegen::unsupported_cast(*from, *to);
                         } else {
@@ -450,24 +470,26 @@ impl WasmFunction {
                         body.push(WasmInstr::LocalSet(idx));
                     }
                     SsaInstr::Const { result, value } => {
-                        let idx = ensure_local(result, &mut local_map, &mut locals, &mut next_local);
+                        let idx =
+                            ensure_local(result, &mut local_map, &mut locals, &mut next_local);
                         match value {
                             SsaConst::Int(i) => body.push(WasmInstr::I64Const(*i as i64)),
                             // bool / unit 在 wasm 里就是 i64 0/1；
                             // 浮点与字符串暂未在 wasm 后端实现
                             SsaConst::Bool(b) => body.push(WasmInstr::I64Const(i64::from(*b))),
                             SsaConst::Unit => body.push(WasmInstr::I64Const(0)),
-                            SsaConst::Float(_) => {
-                                crate::codegen::unsupported_const("float")
-                            }
-                            SsaConst::Str(_) => {
-                                crate::codegen::unsupported_const("string")
-                            }
+                            SsaConst::Float(_) => crate::codegen::unsupported_const("float"),
+                            SsaConst::Str(_) => crate::codegen::unsupported_const("string"),
                         }
                         body.push(WasmInstr::LocalSet(idx));
                     }
-                    SsaInstr::Unary { result, op, operand } => {
-                        let idx = ensure_local(result, &mut local_map, &mut locals, &mut next_local);
+                    SsaInstr::Unary {
+                        result,
+                        op,
+                        operand,
+                    } => {
+                        let idx =
+                            ensure_local(result, &mut local_map, &mut locals, &mut next_local);
                         emit_value_ref(*operand, &local_map, &mut body);
                         match op {
                             SsaUnaryOp::Not => body.push(WasmInstr::I32Eqz),
@@ -482,26 +504,39 @@ impl WasmFunction {
                         }
                         body.push(WasmInstr::LocalSet(idx));
                     }
-                    SsaInstr::Binary { result, op, lhs, rhs } => {
-                        let idx = ensure_local(result, &mut local_map, &mut locals, &mut next_local);
+                    SsaInstr::Binary {
+                        result,
+                        op,
+                        lhs,
+                        rhs,
+                        ..
+                    } => {
+                        let idx =
+                            ensure_local(result, &mut local_map, &mut locals, &mut next_local);
                         emit_value_ref(*lhs, &local_map, &mut body);
                         emit_value_ref(*rhs, &local_map, &mut body);
                         body.push(WasmInstr::Binary(WasmType::I64, wasm_binop(*op)));
                         body.push(WasmInstr::LocalSet(idx));
                     }
-                    SsaInstr::Call { result, callee, args } => {
+                    SsaInstr::Call {
+                        result,
+                        callee,
+                        args,
+                    } => {
                         for a in args {
                             emit_value_ref(*a, &local_map, &mut body);
                         }
                         // 先占位，函数下标要等所有函数登记完才能确定
                         pending_calls.push((body.len(), callee.clone()));
                         body.push(WasmInstr::Call(0));
-                        let idx = ensure_local(result, &mut local_map, &mut locals, &mut next_local);
+                        let idx =
+                            ensure_local(result, &mut local_map, &mut locals, &mut next_local);
                         body.push(WasmInstr::LocalSet(idx));
                     }
                     SsaInstr::Copy { result, src } => {
                         emit_value_ref(*src, &local_map, &mut body);
-                        let idx = ensure_local(result, &mut local_map, &mut locals, &mut next_local);
+                        let idx =
+                            ensure_local(result, &mut local_map, &mut locals, &mut next_local);
                         body.push(WasmInstr::LocalSet(idx));
                     }
                     SsaInstr::Phi { result, .. } => {
@@ -566,42 +601,51 @@ fn wasm_binop(op: SsaBinaryOp) -> WasmBinaryOp {
 }
 
 /// zr 运行时的导入声明（宿主实现）。
-fn runtime_imports() -> Vec<WasmImport> {
+/// 运行时导入签名。
+///
+/// 指针宽度随架构变化：wasm32 的线性内存用 i32 下标，wasm64 用 i64。
+/// 参数类型写死成 i32 的话，wasm64 模块里所有访存都会按 32 位解释地址。
+fn runtime_imports_for(arch: Arch) -> Vec<WasmImport> {
+    let ptr = if arch == Arch::Wasm64 {
+        WasmType::I64
+    } else {
+        WasmType::I32
+    };
     vec![
         WasmImport {
             module: RUNTIME_MODULE.to_string(),
             name: "zr_write".to_string(),
-            params: vec![WasmType::I32, WasmType::I32, WasmType::I32],
-            results: vec![WasmType::I32],
+            params: vec![ptr, ptr, ptr],
+            results: vec![ptr],
         },
         WasmImport {
             module: RUNTIME_MODULE.to_string(),
             name: "zr_read".to_string(),
-            params: vec![WasmType::I32, WasmType::I32, WasmType::I32],
-            results: vec![WasmType::I32],
+            params: vec![ptr, ptr, ptr],
+            results: vec![ptr],
         },
         WasmImport {
             module: RUNTIME_MODULE.to_string(),
             name: "zr_exit".to_string(),
-            params: vec![WasmType::I32],
+            params: vec![ptr],
             results: vec![],
         },
         WasmImport {
             module: RUNTIME_MODULE.to_string(),
             name: "zr_panic".to_string(),
-            params: vec![WasmType::I32, WasmType::I32],
+            params: vec![ptr, ptr],
             results: vec![],
         },
         WasmImport {
             module: RUNTIME_MODULE.to_string(),
             name: "alloc".to_string(),
-            params: vec![WasmType::I32],
-            results: vec![WasmType::I32],
+            params: vec![ptr],
+            results: vec![ptr],
         },
         WasmImport {
             module: RUNTIME_MODULE.to_string(),
             name: "dealloc".to_string(),
-            params: vec![WasmType::I32],
+            params: vec![ptr],
             results: vec![],
         },
         WasmImport {
@@ -834,7 +878,7 @@ mod tests {
 
     fn minimal_module() -> WasmModule {
         let mut wasm = WasmModule::new();
-        wasm.imports = runtime_imports();
+        wasm.imports = runtime_imports_for(Arch::Wasm32);
         wasm.memory_pages = 1;
         wasm.memory_max_pages = 2;
         wasm.functions.push(WasmFunction {
@@ -903,7 +947,7 @@ mod tests {
 
     #[test]
     fn runtime_imports_cover_all_seven_symbols() {
-        let imports = runtime_imports();
+        let imports = runtime_imports_for(Arch::Wasm32);
         let names: Vec<&str> = imports.iter().map(|i| i.name.as_str()).collect();
         assert_eq!(names.len(), 7);
         assert!(names.contains(&"zr_panic"));

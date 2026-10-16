@@ -67,10 +67,16 @@ pub enum AttributeArg {
 /// 模块声明。
 #[derive(Debug, Clone)]
 pub enum ModuleDecl {
-    /// `mod foo;` —— 从 `foo.zr` 加载。
-    Load,
+    /// `mod foo;` —— 从 `foo.zr`（或 `mod/foo.zr`）加载。
+    ///
+    /// 必须带上名字：早先这个变体只记"是个 mod"，名字被丢在解析器里，
+    /// 加载阶段根本不知道要去读哪个文件，`mod foo;` 等于空声明。
+    Load(String),
     /// `mod foo { ... }` —— 内联模块。
-    Inline,
+    ///
+    /// 存的是**内部条目本身**而不是块：模块系统是扁平命名空间，内联模块的
+    /// `fn`/`struct` 会被直接合并进顶层，转成语句反而会丢掉定义。
+    Inline(String, Vec<ModuleItem>),
 }
 
 /// 可见性修饰符。
@@ -141,7 +147,10 @@ pub enum Type {
     /// `!`（never）
     Never,
     /// 命名类型：`Foo::Bar`
-    Named { path: Vec<String>, generics: Vec<Type> },
+    Named {
+        path: Vec<String>,
+        generics: Vec<Type>,
+    },
     /// 指针：`*T` / `*const T` / `*mut T`
     Pointer(Box<Type>, Mutability),
     /// 引用：`&T` / `&mut T`
@@ -183,9 +192,7 @@ impl PartialEq for ArrayLen {
     fn eq(&self, other: &Self) -> bool {
         match (self, other) {
             (ArrayLen::Dynamic, ArrayLen::Dynamic) => true,
-            (ArrayLen::Const(a), ArrayLen::Const(b)) => {
-                format!("{:?}", a) == format!("{:?}", b)
-            }
+            (ArrayLen::Const(a), ArrayLen::Const(b)) => format!("{:?}", a) == format!("{:?}", b),
             _ => false,
         }
     }
@@ -244,7 +251,7 @@ pub struct FieldPat {
 /// 字面量。
 #[derive(Debug, Clone, PartialEq)]
 pub enum Literal {
-    Int(i128, Option<String>),  // 值 + 可选后缀
+    Int(i128, Option<String>), // 值 + 可选后缀
     Float(f64, Option<String>),
     String(String),
     Char(char),
@@ -398,15 +405,30 @@ pub enum Argument {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum BinaryOp {
     // 算术
-    Add, Sub, Mul, Div, Rem,
+    Add,
+    Sub,
+    Mul,
+    Div,
+    Rem,
     // 位运算
-    BitAnd, BitOr, BitXor, Shl, Shr,
+    BitAnd,
+    BitOr,
+    BitXor,
+    Shl,
+    Shr,
     // 比较
-    Eq, Ne, Lt, Gt, Le, Ge,
+    Eq,
+    Ne,
+    Lt,
+    Gt,
+    Le,
+    Ge,
     // 逻辑
-    And, Or,
+    And,
+    Or,
     // 范围
-    Range, RangeInclusive,
+    Range,
+    RangeInclusive,
 }
 
 /// 一元运算符。
@@ -515,6 +537,8 @@ pub struct Function {
     /// 函数上的属性（`#[inline]` / `#[test]` / `#[no_mangle]` …）。
     pub attrs: Vec<Attribute>,
     pub is_async: bool,
+    /// `comptime fn`：只能在编译期调用，结果被折叠成常量。
+    pub is_comptime: bool,
     pub params: Vec<Param>,
     pub receiver: Option<Receiver>, // `self` / `&self` / `&mut self`
     pub return_type: Type,
@@ -567,10 +591,7 @@ pub enum TypeDef {
     /// `union`（仅最后一个字段活跃，unsafe）。
     Union(UnionDef),
     /// `type` 别名。
-    Alias {
-        name: String,
-        target: Type,
-    },
+    Alias { name: String, target: Type },
 }
 
 /// 结构体字段。
@@ -660,7 +681,7 @@ pub struct AssocType;
 /// impl 块。
 #[derive(Debug, Clone)]
 pub struct ImplBlock {
-    pub target: Type, // 实现的目标类型
+    pub target: Type,             // 实现的目标类型
     pub trait_type: Option<Type>, // `impl Trait for T` 中的 Trait
     pub where_clause: Vec<WherePred>,
     pub span: Span,

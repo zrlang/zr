@@ -14,9 +14,9 @@ pub mod print;
 
 pub use print::print_module;
 
-use std::collections::HashMap;
 use crate::mir::{self, MirModule, MirTerminator, MirValue};
 use std::cell::Cell;
+use std::collections::{HashMap, HashSet};
 
 /// 一个 SSA 模块，包含若干函数。
 #[derive(Debug, Clone, Default)]
@@ -32,6 +32,8 @@ pub struct SsaFunction {
     pub blocks: Vec<SsaBasicBlock>,
     /// `#[inline(never)]`：内联 pass 必须跳过它。
     pub inline_never: bool,
+    /// `#[inline(always)]`：内联 pass 必须内联它（即使多块）。
+    pub inline_always: bool,
 }
 
 /// 一个 SSA 基本块。
@@ -46,10 +48,7 @@ pub struct SsaBasicBlock {
 #[derive(Debug, Clone)]
 pub enum SsaInstr {
     /// 常量赋值 `v = c`。
-    Const {
-        result: SsaValue,
-        value: SsaConst,
-    },
+    Const { result: SsaValue, value: SsaConst },
     /// 一元运算 `v = op x`。
     Unary {
         result: SsaValue,
@@ -57,11 +56,17 @@ pub enum SsaInstr {
         operand: SsaValue,
     },
     /// 二元运算 `v = a op b`。
+    ///
+    /// `ty` 是运算的结果类型，决定后端选哪条指令：`add` vs `addsd`、
+    /// `idiv` vs `divsd`、整数比较的 `setcc` vs 浮点比较的 `ucomisd`。
+    /// 没有它就无法区分整数与浮点运算——浮点会按位模式当整数算，
+    /// 而且照样"能跑"，只是结果是错的。
     Binary {
         result: SsaValue,
         op: SsaBinaryOp,
         lhs: SsaValue,
         rhs: SsaValue,
+        ty: mir::NumTy,
     },
     /// 函数调用：`result = callee(args...)`。
     ///
@@ -88,10 +93,7 @@ pub enum SsaInstr {
     /// 优化 pass 用它表达 `x + 0 -> x`、`CSE/GVN 复用已有值` 这类
     /// 替换。**不能**用 `Var` 代替：`Var` 只是名字占位，后端不发射任何
     /// 指令，目标寄存器会保持未定义。
-    Copy {
-        result: SsaValue,
-        src: SsaValue,
-    },
+    Copy { result: SsaValue, src: SsaValue },
     /// 类型转换 `result = cast src`。
     Cast {
         result: SsaValue,
@@ -100,10 +102,7 @@ pub enum SsaInstr {
         to: mir::NumTy,
     },
     /// 变量引用（用于 φ 函数合并前的原始变量）。
-    Var {
-        result: SsaValue,
-        name: String,
-    },
+    Var { result: SsaValue, name: String },
 }
 
 /// SSA 终结器（基本块末尾的控制流指令）。
@@ -162,10 +161,24 @@ pub enum SsaUnaryOp {
 /// 二元运算。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SsaBinaryOp {
-    Add, Sub, Mul, Div, Rem,
-    BitAnd, BitOr, BitXor, Shl, Shr,
-    Eq, Ne, Lt, Gt, Le, Ge,
-    And, Or,
+    Add,
+    Sub,
+    Mul,
+    Div,
+    Rem,
+    BitAnd,
+    BitOr,
+    BitXor,
+    Shl,
+    Shr,
+    Eq,
+    Ne,
+    Lt,
+    Gt,
+    Le,
+    Ge,
+    And,
+    Or,
 }
 
 impl SsaInstr {
@@ -192,12 +205,39 @@ impl SsaInstr {
 pub fn from_mir(mir: &MirModule) -> SsaModule {
     let mut functions = Vec::with_capacity(mir.functions.len());
     for func in &mir.functions {
-        functions.push(convert_function(func));
+        // 关键边拆分在 φ 插入之后做：只有这时才知道哪些块带 φ。
+        functions.push(split_critical_edges(&convert_function(func)));
     }
     SsaModule { functions }
 }
 
 /// 把单个 MIR 函数转为 SSA。
+///
+/// φ 的插入用**迭代支配边界**（Braun et al., "Simple and Efficient
+/// Construction of Static Single Assignment Form"），而不是"块里定义过就插"
+/// 的启发式。
+///
+/// 启发式漏掉的形状非常常见：`while` + `break`。
+///
+/// ```text
+/// bb0: k=0 ─► bb1: 头 ─► bb2: 体 (k+=1) ─┬─► bb4 ─┐
+///             ▲                          │       ├─► bb3: 出口
+///             └──────── bb6 ◄── bb5 ◄────┘       │
+/// ```
+///
+/// 出口 bb3 有**两个**前驱：循环头 bb1（条件为假）与 break 落点 bb4。而循环体
+/// 刚算出的新值只经 bb4 到达 bb3——循环头的 φ 只在回边 bb6 上被更新，break
+/// 路径绕过它，于是 break 之后读到的是**上一轮**的值：
+///
+/// ```text
+/// var mut k = 0;
+/// while k < 10 { k += 1; if k == 5 { break; } }
+/// // k == 4，不是 5
+/// ```
+///
+/// 支配边界能抓到它：把「循环内有定义」的变量，其**循环头**也算进 defsite，
+/// 于是 `DF` 同时命中 bb1（回边那条）与 bb3（break 那条）；取迭代闭包就把出口
+/// 的 φ 补上了。缺了这一步，`break` 之后的每一次读取都差一轮。
 fn convert_function(func: &mir::MirFunction) -> SsaFunction {
     let next_value: Cell<u32> = Cell::new(0);
     let alloc = || {
@@ -207,140 +247,320 @@ fn convert_function(func: &mir::MirFunction) -> SsaFunction {
     };
 
     let params: Vec<SsaValue> = (0..func.params.len()).map(|_| alloc()).collect();
-
-    // ---- φ 插入计划（依赖 CFG，先于生成指令）----
-    let preds = predecessors(&func.blocks);
-    let plan = phi_plan(&func.blocks, &preds);
-    let rpo = reverse_postorder(&func.blocks);
-
-    // MIR 用字符串给变量/临时值命名。`cur` 是"当前可见的定义"，
-    // 按 RPO 前进时单调更新；φ 结果在进入合流块时就写进去，
-    // 这样块内的引用会指向 φ 而不是某一条路径上的旧定义。
-    let mut cur: HashMap<String, SsaValue> = HashMap::new();
-    for (i, p) in params.iter().enumerate() {
-        cur.insert(format!("arg_{i}"), *p);
+    let n = func.blocks.len();
+    if n == 0 {
+        return SsaFunction {
+            name: func.name.clone(),
+            params,
+            blocks: Vec::new(),
+            inline_never: func.inline_never,
+            inline_always: func.inline_always,
+        };
     }
 
-    // 预先给计划里的每个 φ 分配结果值。必须早于遍历完成：处理 bb0 时
-    // 就要能把"bb1 的 φ 在 bb0 这条路径上的 incoming"记下来，而那时还没
-    // 走到 bb1、φ 还不存在。
-    let mut phi_results: HashMap<usize, Vec<(String, SsaValue)>> = HashMap::new();
-    for (b, names) in &plan {
-        let mut made = Vec::new();
-        for name in names.clone() {
-            made.push((name, alloc()));
+    // ---- CFG ----
+    let succs: Vec<Vec<usize>> = func
+        .blocks
+        .iter()
+        .map(|b| successors_of_block(&b.term))
+        .collect();
+    let mut preds: Vec<Vec<usize>> = vec![Vec::new(); n];
+    for (i, ss) in succs.iter().enumerate() {
+        for &s in ss {
+            if s < n {
+                preds[s].push(i);
+            }
         }
-        phi_results.insert(*b, made);
     }
-    let mut out_blocks: Vec<SsaBasicBlock> = Vec::with_capacity(func.blocks.len());
-    // `(合流块, φ 结果) -> [(前驱, 传入值)]`
+
+    // ---- 每个变量的定义块 ----
+    let mut defsites: HashMap<String, HashSet<usize>> = HashMap::new();
+    for (bi, block) in func.blocks.iter().enumerate() {
+        for name in defined_names(block) {
+            defsites.entry(name).or_default().insert(bi);
+        }
+    }
+    for i in 0..params.len() {
+        defsites.entry(format!("arg_{i}")).or_default().insert(0);
+    }
+
+    // ---- 支配树与支配边界 ----
+    let idom = mir_dominator_tree(n, &preds, &succs);
+    // DF(x) = { y | y 有 >=2 个前驱，且 x ∈ preds(y) }
+    let mut df: HashMap<usize, Vec<usize>> = HashMap::new();
+    for y in 0..n {
+        if preds[y].len() < 2 {
+            continue;
+        }
+        for &x in &preds[y] {
+            df.entry(x).or_default().push(y);
+        }
+    }
+
+    // ---- 循环体成员表 ----
+    //
+    // 每条回边（latch -> header 且 header 支配 latch）确定一个自然循环。
+    let mut loops: Vec<(usize, HashSet<usize>)> = Vec::new();
+    for latch in 0..n {
+        for &h in &succs[latch] {
+            if h >= n || !mir_dominates(&idom, h, latch) {
+                continue;
+            }
+            loops.push((h, natural_loop(&preds, h, latch)));
+        }
+    }
+    // 变量在循环内有定义 => 循环头也进 defsite。回边让循环头成为合流点；
+    // 没有这一步 DF 命中不了循环头（回边的源块不是头的**直接**前驱，中间隔着
+    // latch 块），循环头的 φ 就会整个漏掉。
+    for sites in defsites.values_mut() {
+        for (header, members) in &loops {
+            if sites.iter().any(|b| members.contains(b)) {
+                sites.insert(*header);
+            }
+        }
+    }
+
+    // ---- 活跃性：只给"用得到的变量"插 φ ----
+    let live_in = mir_liveness(&func.blocks, &succs);
+
+    // ---- φ 位置：IDF(defsites) ∩ live_in ----
+    //
+    // `defsites` 是 HashMap，必须按**变量名排序**后遍历：遍历顺序决定了
+    // `phi_names` 里各块 φ 的插入顺序，进而决定 φ 结果值号的分配顺序。
+    // 顺序不定 = 同一个程序每次编译出来的值编号不同，机器码也不同——
+    // 同一个缺陷有时复现有时不���现（实测同一份源码在 -O0 挂、-O2 过）。
+    let mut defsite_names: Vec<&String> = defsites.keys().collect();
+    defsite_names.sort();
+    let mut phi_names: HashMap<usize, Vec<String>> = HashMap::new();
+    for name in defsite_names {
+        let sites = &defsites[name];
+        let mut work: Vec<usize> = sites.iter().copied().collect();
+        let mut seen: HashSet<usize> = HashSet::new();
+        let mut placed: Vec<usize> = Vec::new();
+        while let Some(x) = work.pop() {
+            let Some(frontier) = df.get(&x) else { continue };
+            for &y in frontier {
+                if !seen.insert(y) {
+                    continue;
+                }
+                // y 必须是这个变量活跃的地方，否则插出来的 φ 没人读。
+                if live_in[y].contains(name) {
+                    placed.push(y);
+                }
+                work.push(y);
+            }
+        }
+        if placed.is_empty() {
+            continue;
+        }
+        placed.sort_unstable();
+        for y in placed {
+            phi_names.entry(y).or_default().push(name.clone());
+        }
+    }
+    for names in phi_names.values_mut() {
+        names.sort();
+        names.dedup();
+    }
+
+    // ---- 预先给每个 φ 分配结果值 ----
+    //
+    // 必须早于遍历完成：处理 bb0 时就要能把"bb1 的 φ 在 bb0 这条路径上的
+    // incoming"记下来，而那时还没走到 bb1、φ 还不存在。
+    //
+    // 按**块号升序**分配：块顺序决定值号顺序，随意遍历会让同一份源码每次
+    // 编出不同的机器码（见上面 `defsites` 那段注释）。
+    let mut phi_blocks: Vec<usize> = phi_names.keys().copied().collect();
+    phi_blocks.sort_unstable();
+    let mut phi_results: HashMap<usize, Vec<(String, SsaValue)>> = HashMap::new();
+    for b in phi_blocks {
+        let names = &phi_names[&b];
+        let made: Vec<(String, SsaValue)> = names.iter().map(|n| (n.clone(), alloc())).collect();
+        phi_results.insert(b, made);
+    }
+
+    // ---- 重命名 ----
+    //
+    // `stacks` 是"名字 -> 该名字所有版本的栈"。遇到定义 push，离开块时 pop。
+    // 进入块时先压入该块的 φ 结果，块内的引用才会指向 φ 而不是某条路径上的
+    // 旧定义。
+    let mut stacks: HashMap<String, Vec<SsaValue>> = HashMap::new();
+    for (i, p) in params.iter().enumerate() {
+        stacks.insert(format!("arg_{i}"), vec![*p]);
+    }
+
+    // 遍历必须是**深度优先**的，不能用逆后序。
+    //
+    // 重命名靠"名字 -> 版本栈"：进入一个块时压入它的 φ 与定义，离开时弹回。
+    // 这样某个块被处理时，它**支配者**建立的绑定仍在栈上——合流块读到的正是
+    // 支配块的值。用逆后序就全乱了：RPO 里 bb3 排在 bb1 之后，可 bb1 早就
+    // 处理完并弹了栈，bb3 再读 `v1` 就查不到，只能生成一条 `var v1` 占位。
+    // 后端对 `Var` 不发射任何指令，目标寄存器保持未定义——循环读到的于是
+    // 上一轮的残留值（`while` + `break` 会算错，嵌套循环直接不收敛）。
+    let mut out_blocks: Vec<SsaBasicBlock> = (0..n)
+        .map(|id| SsaBasicBlock {
+            id,
+            instrs: Vec::new(),
+            term: SsaTerminator::Unreachable,
+        })
+        .collect();
     let mut phi_incoming: HashMap<(usize, SsaValue), Vec<(usize, SsaValue)>> = HashMap::new();
-    // 先占位，保证 block.id 能对上
-    for b in &func.blocks {
-        out_blocks.push(SsaBasicBlock { id: b.id, instrs: Vec::new(), term: SsaTerminator::Unreachable });
+
+    enum Step {
+        Enter(usize),
+        Exit(Vec<String>),
     }
+    let mut stack: Vec<Step> = vec![Step::Enter(0)];
+    let mut visited: HashSet<usize> = HashSet::new();
 
-    for &bid in &rpo {
-        let block = &func.blocks[bid];
-        let mut instrs: Vec<SsaInstr> = Vec::new();
+    while let Some(step) = stack.pop() {
+        let bid = match step {
+            Step::Exit(names) => {
+                // 离开块：弹回本块压入的绑定。
+                for name in names.into_iter().rev() {
+                    if let Some(st) = stacks.get_mut(&name) {
+                        st.pop();
+                    }
+                }
+                continue;
+            }
+            Step::Enter(b) => b,
+        };
+        if bid >= n || !visited.insert(bid) {
+            continue;
+        }
 
-        // 进入块：把该块的 φ 结果绑定为当前值，让块内引用指向它们。
-        // φ 指令本身**等遍历全部结束再插到块首**——回边（循环体的前驱）
-        // 在 RPO 里排在本块之后，那时它的 incoming 还拿不到。
-        if let Some(made) = phi_results.get(&bid).cloned() {
+        // 进入块：压入该块的 φ 结果，块内的引用才会指向 φ 而不是某条路径上的
+        // 旧定义。
+        let mut pushed: Vec<String> = Vec::new();
+        if let Some(made) = phi_results.get(&bid) {
             for (name, v) in made {
-                cur.insert(name, v);
+                stacks.entry(name.clone()).or_default().push(*v);
+                pushed.push(name.clone());
             }
         }
 
+        let mut instrs: Vec<SsaInstr> = Vec::new();
+        let block = &func.blocks[bid];
         for instr in &block.instrs {
+            // 每条指令算出一个新版本，并压进它所定义的名字的栈。
             match instr {
                 mir::MirInstr::Assign(name, val) => {
-                    let v = materialize(val, &mut instrs, &mut cur, &next_value);
-                    cur.insert(name.clone(), v);
+                    let v = materialize(val, &mut instrs, &mut stacks, &next_value);
+                    // `x = e` 用一条显式 `Copy` 表达：后端据此发射一条
+                    // 寄存器间搬运，而不是让 x 与 e 共用同一个值号（那样优化
+                    // pass 改写 x 的定义时会顺带改掉 e）。
+                    let r = alloc();
+                    instrs.push(SsaInstr::Copy { result: r, src: v });
+                    stacks.entry(name.clone()).or_default().push(r);
+                    pushed.push(name.clone());
                 }
                 mir::MirInstr::Cast(name, val, from, to) => {
-                    let s = materialize(val, &mut instrs, &mut cur, &next_value);
-                    let v = alloc();
+                    let s = materialize(val, &mut instrs, &mut stacks, &next_value);
+                    let r = alloc();
                     instrs.push(SsaInstr::Cast {
-                        result: v,
+                        result: r,
                         src: s,
                         from: *from,
                         to: *to,
                     });
-                    cur.insert(name.clone(), v);
+                    stacks.entry(name.clone()).or_default().push(r);
+                    pushed.push(name.clone());
                 }
-                mir::MirInstr::Binary(name, a, op, b) => {
-                    let l = materialize(a, &mut instrs, &mut cur, &next_value);
-                    let r = materialize(b, &mut instrs, &mut cur, &next_value);
-                    let v = alloc();
+                mir::MirInstr::Binary(name, a, op, b, ty) => {
+                    let l = materialize(a, &mut instrs, &mut stacks, &next_value);
+                    let r = materialize(b, &mut instrs, &mut stacks, &next_value);
+                    let res = alloc();
                     instrs.push(SsaInstr::Binary {
-                        result: v,
+                        result: res,
                         op: convert_binary_op(*op),
                         lhs: l,
                         rhs: r,
+                        ty: *ty,
                     });
-                    cur.insert(name.clone(), v);
+                    stacks.entry(name.clone()).or_default().push(res);
+                    pushed.push(name.clone());
                 }
-                mir::MirInstr::Unary(name, op, x) => {
-                    let o = materialize(x, &mut instrs, &mut cur, &next_value);
-                    let v = alloc();
+                mir::MirInstr::Unary(name, op, x, _) => {
+                    let o = materialize(x, &mut instrs, &mut stacks, &next_value);
+                    let res = alloc();
                     instrs.push(SsaInstr::Unary {
-                        result: v,
+                        result: res,
                         op: convert_unary_op(*op),
                         operand: o,
                     });
-                    cur.insert(name.clone(), v);
+                    stacks.entry(name.clone()).or_default().push(res);
+                    pushed.push(name.clone());
                 }
                 mir::MirInstr::Call(name, callee, args) => {
                     let mut ssa_args = Vec::with_capacity(args.len());
                     for a in args {
-                        ssa_args.push(materialize(a, &mut instrs, &mut cur, &next_value));
+                        ssa_args.push(materialize(a, &mut instrs, &mut stacks, &next_value));
                     }
-                    let v = alloc();
+                    let res = alloc();
                     instrs.push(SsaInstr::Call {
-                        result: v,
+                        result: res,
                         callee: callee.clone(),
                         args: ssa_args,
                     });
-                    cur.insert(name.clone(), v);
+                    stacks.entry(name.clone()).or_default().push(res);
+                    pushed.push(name.clone());
                 }
                 mir::MirInstr::Await(name, future) => {
-                    let v = materialize(future, &mut instrs, &mut cur, &next_value);
-                    cur.insert(name.clone(), v);
+                    // `await` 对后端是透明的（协程由运行时调度），所以不产生
+                    // 新值：future 本身就是结果。
+                    let res = materialize(future, &mut instrs, &mut stacks, &next_value);
+                    stacks.entry(name.clone()).or_default().push(res);
+                    pushed.push(name.clone());
                 }
             }
         }
 
-        let term = match block.term.as_ref() {
+        out_blocks[bid].term = match block.term.as_ref() {
             None => SsaTerminator::Unreachable,
-            Some(mir::MirTerminator::Return(Some(val))) => {
-                SsaTerminator::Return(Some(materialize(val, &mut instrs, &mut cur, &next_value)))
-            }
-            Some(mir::MirTerminator::Branch { cond, then_block, else_block }) => {
-                let c = materialize(cond, &mut instrs, &mut cur, &next_value);
-                SsaTerminator::Branch {
-                    cond: c,
-                    then_block: *then_block,
-                    else_block: *else_block,
-                }
-            }
+            Some(mir::MirTerminator::Return(Some(val))) => SsaTerminator::Return(Some(
+                materialize(val, &mut instrs, &mut stacks, &next_value),
+            )),
+            Some(mir::MirTerminator::Branch {
+                cond,
+                then_block,
+                else_block,
+            }) => SsaTerminator::Branch {
+                cond: materialize(cond, &mut instrs, &mut stacks, &next_value),
+                then_block: *then_block,
+                else_block: *else_block,
+            },
             Some(other) => convert_terminator(other, &next_value),
         };
-
         out_blocks[bid].instrs = instrs;
-        out_blocks[bid].term = term;
 
-        // 本块处理完，`cur` 就是"沿本条路径离开该块时"的定义环境。
-        // 把它作为后继各个 φ 的 incoming 记下来——必须在遍历过程中记，
-        // 事后再回填会丢掉分支之间的差别。
-        for succ in successors_of_term(&block.term) {
-            let Some(made) = phi_results.get(&succ).cloned() else {
+        // 本块处理完，栈顶就是"沿本条路径离开该块时"的值——记成后继各个 φ
+        // 的 incoming。
+        //
+        // 必须在递归进后继**之前**记：回边上后继往往已经访问过（φ 早就建好），
+        // 但它仍然需要本块提供的 incoming。事后回填则会丢掉分支之间的差别。
+        for &succ in &succs[bid] {
+            let Some(made) = phi_results.get(&succ) else {
                 continue;
             };
             for (name, v) in made {
-                let incoming = cur.get(&name).copied().unwrap_or(v);
-                phi_incoming.entry((succ, v)).or_default().push((bid, incoming));
+                let incoming = stacks
+                    .get(name)
+                    .and_then(|st| st.last().copied())
+                    .unwrap_or(*v);
+                phi_incoming
+                    .entry((succ, *v))
+                    .or_default()
+                    .push((bid, incoming));
+            }
+        }
+
+        // LIFO：先压 Exit，再压后继的 Enter，弹出时就是"深度优先地走完
+        // 后继、最后才离开本块"。
+        stack.push(Step::Exit(pushed));
+        for &succ in succs[bid].iter().rev() {
+            if succ < n && !visited.contains(&succ) {
+                stack.push(Step::Enter(succ));
             }
         }
     }
@@ -368,10 +588,308 @@ fn convert_function(func: &mir::MirFunction) -> SsaFunction {
         params,
         blocks: out_blocks,
         inline_never: func.inline_never,
+        inline_always: func.inline_always,
     }
 }
 
+/// 拆分关键边：让每条需要 φ 拷贝的边都拥有自己的块。
+///
+/// 后端把 φ 的并行拷贝发射在**前驱块的末尾**——也就是"跳出该块之前"。
+/// 这对单后继的块没问题，但对有多个后继的块就不成立：拷贝会在**每条出边上
+/// 都执行**，包括那些并不经过带 φ 的后继的那条。
+///
+/// ```text
+/// bb1: 循环头 ─┬─(真)─► bb2: 循环体 ──► ... ──► bb1
+///              └─(假)─► bb3: 出口（含 φ）
+/// ```
+///
+/// bb1 的末尾要为 bb3 做拷贝，于是条件为真的那条边上也会执行它；拷贝写的是
+/// bb3 的 φ 目标寄存器，与 bb2 还要读的循环变量寄存器重叠——循环体读到的
+/// 是被覆盖过的值。
+///
+/// 修法是标准的**关键边拆分**：在 P→B 这条边上插一个中转块 T（只含
+/// `Goto(B)`）。P 于是有若干个单前驱单后继的中转块作为后继，每个中转块在
+/// 自己末尾恰好做一次属于那条边的 φ 拷贝。所有后端共用这一处修复，不必
+/// 各自实现"按边发射拷贝"的发射逻辑。
+pub fn split_critical_edges(func: &SsaFunction) -> SsaFunction {
+    let n = func.blocks.len();
+    if n == 0 {
+        return func.clone();
+    }
+    // 每个块的前驱（按块号）。
+    let mut pred_count: HashMap<usize, usize> = HashMap::new();
+    for b in &func.blocks {
+        for s in successors_of_ssa_term(&b.term) {
+            *pred_count.entry(s).or_insert(0) += 1;
+        }
+    }
 
+    // 哪些块以 φ 开头（拷贝的目标）。
+    let has_phi: HashMap<usize, bool> = func
+        .blocks
+        .iter()
+        .map(|b| {
+            (
+                b.id,
+                b.instrs.iter().any(|i| matches!(i, SsaInstr::Phi { .. })),
+            )
+        })
+        .collect();
+
+    let mut blocks: Vec<SsaBasicBlock> = func.blocks.clone();
+    let mut next_id = blocks.iter().map(|b| b.id).max().unwrap_or(0) + 1;
+    // 旧块号 -> 该边对应的新中转块号
+    let mut trampoline: HashMap<(usize, usize), usize> = HashMap::new();
+
+    for i in 0..n {
+        let edges: Vec<usize> = match &blocks[i].term {
+            SsaTerminator::Goto(t) => vec![*t],
+            SsaTerminator::Branch {
+                then_block,
+                else_block,
+                ..
+            } => {
+                vec![*then_block, *else_block]
+            }
+            _ => Vec::new(),
+        };
+        for succ in edges {
+            let needs_split = pred_count.get(&succ).copied().unwrap_or(0) > 1
+                && has_phi.get(&succ).copied().unwrap_or(false)
+                && succ != blocks[i].id;
+            if !needs_split {
+                continue;
+            }
+            let id = next_id;
+            next_id += 1;
+            trampoline.insert((blocks[i].id, succ), id);
+            blocks.push(SsaBasicBlock {
+                id,
+                instrs: Vec::new(),
+                term: SsaTerminator::Goto(succ),
+            });
+        }
+    }
+
+    // 重写终结符：指向中转块。
+    for b in blocks.iter_mut() {
+        let from = b.id;
+        let redirect =
+            |target: usize| -> usize { trampoline.get(&(from, target)).copied().unwrap_or(target) };
+        b.term = match &b.term {
+            SsaTerminator::Goto(t) => SsaTerminator::Goto(redirect(*t)),
+            SsaTerminator::Branch {
+                cond,
+                then_block,
+                else_block,
+            } => SsaTerminator::Branch {
+                cond: *cond,
+                then_block: redirect(*then_block),
+                else_block: redirect(*else_block),
+            },
+            other => other.clone(),
+        };
+    }
+
+    // 重写 φ 的 incoming：前驱 P 改写成中转块 T。
+    for b in blocks.iter_mut() {
+        for instr in &mut b.instrs {
+            let SsaInstr::Phi { incoming, .. } = instr else {
+                break; // φ 一定连续排在块首
+            };
+            for (pred, _) in incoming.iter_mut() {
+                if let Some(&t) = trampoline.get(&(*pred, b.id)) {
+                    *pred = t;
+                }
+            }
+        }
+    }
+
+    SsaFunction {
+        name: func.name.clone(),
+        params: func.params.clone(),
+        blocks,
+        inline_never: func.inline_never,
+        inline_always: func.inline_always,
+    }
+}
+
+/// MIR 层的支配树（Cooper-Harvey-Kennedy 迭代算法）。
+fn mir_dominator_tree(
+    n: usize,
+    preds: &[Vec<usize>],
+    succs: &[Vec<usize>],
+) -> HashMap<usize, usize> {
+    let mut idom: HashMap<usize, usize> = HashMap::new();
+    if n == 0 {
+        return idom;
+    }
+    let order = mir_rpo(n, succs);
+    let rank: HashMap<usize, usize> = order.iter().enumerate().map(|(r, &b)| (b, r)).collect();
+    idom.insert(0, 0);
+
+    let mut changed = true;
+    while changed {
+        changed = false;
+        for &b in &order {
+            if b == 0 {
+                continue;
+            }
+            let mut new_idom: Option<usize> = None;
+            for &p in &preds[b] {
+                if !idom.contains_key(&p) {
+                    continue;
+                }
+                new_idom = Some(match new_idom {
+                    None => p,
+                    Some(cur) => mir_intersect(&idom, &rank, p, cur),
+                });
+            }
+            if let Some(ni) = new_idom {
+                if idom.get(&b) != Some(&ni) {
+                    idom.insert(b, ni);
+                    changed = true;
+                }
+            }
+        }
+    }
+    idom
+}
+
+/// `a` 是否支配 `b`。
+fn mir_dominates(idom: &HashMap<usize, usize>, a: usize, b: usize) -> bool {
+    let mut cur = b;
+    for _ in 0..=idom.len() {
+        if cur == a {
+            return true;
+        }
+        match idom.get(&cur) {
+            Some(&p) if p != cur => cur = p,
+            _ => return false,
+        }
+    }
+    false
+}
+
+/// 支配树上的最近公共祖先。
+fn mir_intersect(
+    idom: &HashMap<usize, usize>,
+    rank: &HashMap<usize, usize>,
+    mut a: usize,
+    mut b: usize,
+) -> usize {
+    let ra = |x: usize| *rank.get(&x).unwrap_or(&0);
+    while a != b {
+        if ra(a) <= ra(b) {
+            match idom.get(&b) {
+                Some(&p) if p != b => b = p,
+                _ => return a,
+            }
+        } else {
+            match idom.get(&a) {
+                Some(&p) if p != a => a = p,
+                _ => return b,
+            }
+        }
+    }
+    a
+}
+
+/// 逆后序（块号序列）。
+fn mir_rpo(n: usize, succs: &[Vec<usize>]) -> Vec<usize> {
+    let mut visited = vec![false; n];
+    let mut post = Vec::with_capacity(n);
+    if n == 0 {
+        return post;
+    }
+    let mut stack: Vec<(usize, usize)> = vec![(0, 0)];
+    visited[0] = true;
+    while let Some((node, ci)) = stack.pop() {
+        let ss = &succs[node];
+        if ci < ss.len() {
+            stack.push((node, ci + 1));
+            let next = ss[ci];
+            if next < n && !visited[next] {
+                visited[next] = true;
+                stack.push((next, 0));
+            }
+        } else {
+            post.push(node);
+        }
+    }
+    post.reverse();
+    post
+}
+
+/// 回边 `latch -> header` 确定的那个自然循环的成员（含 header 与 latch）。
+fn natural_loop(preds: &[Vec<usize>], header: usize, latch: usize) -> HashSet<usize> {
+    let mut members: HashSet<usize> = HashSet::new();
+    members.insert(header);
+    if latch == header {
+        return members;
+    }
+    members.insert(latch);
+    let mut stack = vec![latch];
+    while let Some(cur) = stack.pop() {
+        for &p in &preds[cur] {
+            if members.insert(p) {
+                stack.push(p);
+            }
+        }
+    }
+    members
+}
+
+/// MIR 层的活跃性分析：每块**入口**处活跃的变量名。
+fn mir_liveness(blocks: &[mir::MirBasicBlock], succs: &[Vec<usize>]) -> Vec<HashSet<String>> {
+    let n = blocks.len();
+    let uses: Vec<HashSet<String>> = blocks
+        .iter()
+        .map(|b| used_before_def(b).into_iter().collect())
+        .collect();
+    let defs: Vec<HashSet<String>> = blocks.iter().map(defined_name_set).collect();
+
+    let mut live_in: Vec<HashSet<String>> = vec![HashSet::new(); n];
+    let mut changed = true;
+    while changed {
+        changed = false;
+        for b in (0..n).rev() {
+            let mut out: HashSet<String> = HashSet::new();
+            for &s in &succs[b] {
+                for name in &live_in[s] {
+                    out.insert(name.clone());
+                }
+            }
+            let mut next: HashSet<String> = uses[b].clone();
+            for name in &out {
+                if !defs[b].contains(name) {
+                    next.insert(name.clone());
+                }
+            }
+            if next != live_in[b] {
+                live_in[b] = next;
+                changed = true;
+            }
+        }
+    }
+    live_in
+}
+
+/// 块内被赋过值的变量名（集合形式）。
+fn defined_name_set(block: &mir::MirBasicBlock) -> HashSet<String> {
+    block
+        .instrs
+        .iter()
+        .map(|i| match i {
+            mir::MirInstr::Assign(n, _)
+            | mir::MirInstr::Binary(n, ..)
+            | mir::MirInstr::Unary(n, ..)
+            | mir::MirInstr::Call(n, ..)
+            | mir::MirInstr::Await(n, _)
+            | mir::MirInstr::Cast(n, ..) => n.clone(),
+        })
+        .collect()
+}
 
 // ==================================================================
 // φ 插入与重命名
@@ -379,7 +897,20 @@ fn convert_function(func: &mir::MirFunction) -> SsaFunction {
 
 /// 从 MIR 的终结符推出每个块的前驱集合。
 /// 终结符指向的后继块。
-fn successors_of_term(term: &Option<mir::MirTerminator>) -> Vec<usize> {
+/// SSA 终结符的后继块。
+pub fn successors_of_ssa_term(term: &SsaTerminator) -> Vec<usize> {
+    match term {
+        SsaTerminator::Goto(t) => vec![*t],
+        SsaTerminator::Branch {
+            then_block,
+            else_block,
+            ..
+        } => vec![*then_block, *else_block],
+        SsaTerminator::Return(_) | SsaTerminator::Unreachable => Vec::new(),
+    }
+}
+
+pub fn successors_of_block(term: &Option<mir::MirTerminator>) -> Vec<usize> {
     match term {
         Some(mir::MirTerminator::Goto(t)) => vec![*t],
         Some(mir::MirTerminator::Branch {
@@ -391,56 +922,79 @@ fn successors_of_term(term: &Option<mir::MirTerminator>) -> Vec<usize> {
     }
 }
 
-fn predecessors(blocks: &[mir::MirBasicBlock]) -> Vec<Vec<usize>> {
-    let mut preds = vec![Vec::new(); blocks.len()];
-    for b in blocks {
-        for s in successors_of_term(&b.term) {
-            if s < preds.len() {
-                preds[s].push(b.id);
-            }
-        }
-    }
-    preds
-}
-
-/// 从入口做 DFS，得到逆后序（RPO）——SSA 重命名必须按 RPO 走，
-/// 否则回边会先于它所更新的定义被处理。
-fn reverse_postorder(blocks: &[mir::MirBasicBlock]) -> Vec<usize> {
-    let n = blocks.len();
-    let mut visited = vec![false; n];
-    let mut post = Vec::with_capacity(n);
-    // 迭代式 DFS，避免深图爆栈
-    let mut stack: Vec<(usize, usize)> = vec![(0, 0)];
-    if n == 0 {
-        return post;
-    }
-    visited[0] = true;
-    while let Some((node, child_idx)) = stack.pop() {
-        let succs: Vec<usize> = match &blocks[node].term {
-            Some(mir::MirTerminator::Goto(t)) => vec![*t],
-            Some(mir::MirTerminator::Branch {
-                then_block,
-                else_block,
-                ..
-            }) => vec![*then_block, *else_block],
-            _ => Vec::new(),
-        };
-        if child_idx < succs.len() {
-            stack.push((node, child_idx + 1));
-            let nxt = succs[child_idx];
-            if nxt < n && !visited[nxt] {
-                visited[nxt] = true;
-                stack.push((nxt, 0));
-            }
-        } else {
-            post.push(node);
-        }
-    }
-    post.reverse();
-    post
-}
-
 /// 某块内被赋值过的变量名（`Assign` / `Binary` / `Unary` / `Call` 的目标）。
+/// 收集块内"先读后写"（含只读不写）的变量名。
+///
+/// 只收**读到时还没在本块被定义过**的名字。块内新定义的名字不算 use：
+/// 它们由 `defs[b]` 负责，如果混进来，活跃性传播会把后继块自己产生的临时量
+/// 一路反向带成"活跃"，进而给合流点插出无意义的 φ。
+fn used_before_def(block: &mir::MirBasicBlock) -> Vec<String> {
+    let mut defined: Vec<String> = Vec::new();
+    let mut out: Vec<String> = Vec::new();
+
+    let note_read = |names: Vec<String>, defined: &Vec<String>, out: &mut Vec<String>| {
+        for r in names {
+            if !defined.contains(&r) && !out.contains(&r) {
+                out.push(r);
+            }
+        }
+    };
+
+    for i in &block.instrs {
+        // 先记本条指令读到的变量（此时它们还没被本条指令写）
+        let reads: Vec<String> = match i {
+            mir::MirInstr::Assign(_, v) => mir_value_names(v),
+            mir::MirInstr::Binary(_, a, _, b, _) => {
+                let mut v = mir_value_names(a);
+                v.extend(mir_value_names(b));
+                v
+            }
+            mir::MirInstr::Unary(_, _, a, _) => mir_value_names(a),
+            mir::MirInstr::Call(_, _, args) => args.iter().flat_map(mir_value_names).collect(),
+            mir::MirInstr::Await(_, v) => mir_value_names(v),
+            mir::MirInstr::Cast(_, v, ..) => mir_value_names(v),
+        };
+        note_read(reads, &defined, &mut out);
+
+        // 再记本条指令的定义
+        let name = match i {
+            mir::MirInstr::Assign(n, _) => Some(n),
+            mir::MirInstr::Binary(n, ..) => Some(n),
+            mir::MirInstr::Unary(n, ..) => Some(n),
+            mir::MirInstr::Call(n, ..) => Some(n),
+            mir::MirInstr::Await(n, _) => Some(n),
+            mir::MirInstr::Cast(n, ..) => Some(n),
+        };
+        if let Some(n) = name {
+            if !defined.contains(n) {
+                defined.push(n.clone());
+            }
+        }
+    }
+
+    // 终结符里的操作数同样是"读"
+    match block.term.as_ref() {
+        Some(mir::MirTerminator::Return(Some(v))) => {
+            let r = mir_value_names(v);
+            note_read(r, &defined, &mut out);
+        }
+        Some(mir::MirTerminator::Branch { cond, .. }) => {
+            let r = mir_value_names(cond);
+            note_read(r, &defined, &mut out);
+        }
+        _ => {}
+    }
+    out
+}
+
+/// 取 MIR 值里出现的所有变量名（常量没有名字）。
+fn mir_value_names(v: &mir::MirValue) -> Vec<String> {
+    match v {
+        mir::MirValue::Var(n) => vec![n.clone()],
+        _ => Vec::new(),
+    }
+}
+
 fn defined_names(block: &mir::MirBasicBlock) -> Vec<String> {
     let mut out = Vec::new();
     for i in &block.instrs {
@@ -459,36 +1013,6 @@ fn defined_names(block: &mir::MirBasicBlock) -> Vec<String> {
         }
     }
     out
-}
-
-/// 决定每个合流块上要为哪些变量插 φ。
-///
-/// 判定规则：块 `B` 有 ≥2 个前驱，且某个变量名在 B 的**两个不同前驱**里
-/// 都被定义过。循环回边（header 的前驱是入口和循环体）正好命中这条。
-fn phi_plan(blocks: &[mir::MirBasicBlock], preds: &[Vec<usize>]) -> HashMap<usize, Vec<String>> {
-    let mut plan: HashMap<usize, Vec<String>> = HashMap::new();
-    for (b, ps) in preds.iter().enumerate() {
-        if ps.len() < 2 {
-            continue;
-        }
-        // 统计每个名字出现在几个不同前驱里
-        let mut hits: HashMap<String, usize> = HashMap::new();
-        for &p in ps {
-            for name in defined_names(&blocks[p]) {
-                *hits.entry(name).or_insert(0) += 1;
-            }
-        }
-        let mut names: Vec<String> = hits
-            .into_iter()
-            .filter(|(_, c)| *c >= 2)
-            .map(|(n, _)| n)
-            .collect();
-        names.sort();
-        if !names.is_empty() {
-            plan.insert(b, names);
-        }
-    }
-    plan
 }
 
 fn convert_binary_op(op: mir::MirBinaryOp) -> SsaBinaryOp {
@@ -526,7 +1050,11 @@ fn convert_unary_op(op: mir::MirUnaryOp) -> SsaUnaryOp {
 fn convert_terminator(term: &MirTerminator, _next_value: &Cell<u32>) -> SsaTerminator {
     match term {
         MirTerminator::Goto(target) => SsaTerminator::Goto(*target),
-        MirTerminator::Branch { cond, then_block, else_block } => SsaTerminator::Branch {
+        MirTerminator::Branch {
+            cond,
+            then_block,
+            else_block,
+        } => SsaTerminator::Branch {
             cond: SsaValue(match cond {
                 MirValue::Int(i) => *i as u32,
                 _ => 0,
@@ -548,41 +1076,42 @@ fn convert_terminator(term: &MirTerminator, _next_value: &Cell<u32>) -> SsaTermi
 fn materialize(
     val: &MirValue,
     instrs: &mut Vec<SsaInstr>,
-    env: &mut HashMap<String, SsaValue>,
+    stacks: &mut HashMap<String, Vec<SsaValue>>,
     next: &Cell<u32>,
 ) -> SsaValue {
-    let v = SsaValue(next.get());
-    next.set(next.get() + 1);
     match val {
+        // 变量：取栈顶，即该名字当前可见的版本。
         MirValue::Var(name) => {
-            if let Some(&existing) = env.get(name) {
-                return existing;
+            if let Some(top) = stacks.get(name).and_then(|st| st.last().copied()) {
+                return top;
             }
-            instrs.push(SsaInstr::Var { result: v, name: name.clone() });
-            env.insert(name.clone(), v);
+            // 不在任何栈上：形参或来自块外的引用。保留一条 `Var` 占位，
+            // 由 φ 插入 / 重命名补上真正的定义。
+            let v = SsaValue(next.get());
+            next.set(next.get() + 1);
+            instrs.push(SsaInstr::Var {
+                result: v,
+                name: name.clone(),
+            });
+            stacks.entry(name.clone()).or_default().push(v);
+            v
         }
-        MirValue::Int(i) => instrs.push(SsaInstr::Const {
-            result: v,
-            value: SsaConst::Int(*i),
-        }),
-        MirValue::Bool(b) => instrs.push(SsaInstr::Const {
-            result: v,
-            value: SsaConst::Bool(*b),
-        }),
-        MirValue::Float(bits) => instrs.push(SsaInstr::Const {
-            result: v,
-            value: SsaConst::Float(*bits),
-        }),
-        MirValue::Str(s) => instrs.push(SsaInstr::Const {
-            result: v,
-            value: SsaConst::Str(s.clone()),
-        }),
-        MirValue::Unit => instrs.push(SsaInstr::Const {
-            result: v,
-            value: SsaConst::Unit,
-        }),
+        // 字面量：发一个新值并发射 Const。
+        _ => {
+            let v = SsaValue(next.get());
+            next.set(next.get() + 1);
+            let value = match val {
+                MirValue::Int(i) => SsaConst::Int(*i),
+                MirValue::Bool(b) => SsaConst::Bool(*b),
+                MirValue::Float(bits) => SsaConst::Float(*bits),
+                MirValue::Str(text) => SsaConst::Str(text.clone()),
+                MirValue::Unit => SsaConst::Unit,
+                MirValue::Var(_) => unreachable!("上面已经处理了变量"),
+            };
+            instrs.push(SsaInstr::Const { result: v, value });
+            v
+        }
     }
-    v
 }
 
 impl SsaConst {
@@ -743,4 +1272,24 @@ pub fn dominates(idom: &HashMap<usize, usize>, a: usize, b: usize) -> bool {
         }
     }
     false
+}
+
+/// 指令引用的 SSA 值（公开给寄存器分配等模块用）。
+pub fn instr_uses(instr: &SsaInstr, out: &mut Vec<SsaValue>) {
+    match instr {
+        SsaInstr::Const { .. } | SsaInstr::Var { .. } => {}
+        SsaInstr::Copy { src, .. } => out.push(*src),
+        SsaInstr::Cast { src, .. } => out.push(*src),
+        SsaInstr::Unary { operand, .. } => out.push(*operand),
+        SsaInstr::Binary { lhs, rhs, .. } => {
+            out.push(*lhs);
+            out.push(*rhs);
+        }
+        SsaInstr::Phi { incoming, .. } => {
+            for (_, v) in incoming {
+                out.push(*v);
+            }
+        }
+        SsaInstr::Call { args, .. } => out.extend(args.iter().copied()),
+    }
 }

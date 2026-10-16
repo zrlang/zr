@@ -22,8 +22,15 @@ pub enum Arch {
     AArch64,
     /// WebAssembly 32 位。
     Wasm32,
+    /// WebAssembly 64 位（wasm64 提案：指针 64 位，原生 i64）。
+    Wasm64,
     /// ARM 32 位（嵌入式，A32 编码）。
     Arm32,
+    /// ARM 32 位（Thumb-2 编码，thumbv7em 等）。
+    ///
+    /// 和 [`Arch::Arm32`] 分开而不是加个布尔标志：A32 与 Thumb-2 是两套
+    /// 不同的编码规则，混在一个后端里容易互相写错。
+    Arm32Thumb,
     /// RISC-V 32 位（RV32I + M 扩展）。
     RiscV32,
     /// RISC-V 64 位（RV64I + M 扩展）。
@@ -40,12 +47,18 @@ impl Arch {
         match s {
             "x86_64" | "amd64" | "x86-64" => Some(Arch::X86_64),
             "aarch64" | "arm64" => Some(Arch::AArch64),
-            "wasm32" | "wasm" => Some(Arch::Wasm32),
-            // ARM 32 位：Thumb（thumb / thumbv7em …）目前没有后端，
-            // 显式不识别，让上层给出"暂不支持"的提示而不是默默按 A32 生成。
+            "wasm32" => Some(Arch::Wasm32),
+            "wasm64" => Some(Arch::Wasm64),
+            // 只写 `wasm` 时按 wasm32 处理（历史默认值）
+            "wasm" => Some(Arch::Wasm32),
+            // ARM 32 位 A32 编码
             "arm" | "armv4" | "armv5" | "armv6" | "armv7" | "armv7a" | "armv7-a" | "armeb" => {
                 Some(Arch::Arm32)
             }
+            // Thumb-2：以 `thumb` 开头（thumb / thumbv7 / thumbv7em …）
+            s if s.starts_with("thumb") => Some(Arch::Arm32Thumb),
+            // `thumbv7em-none-eabi` 会被按 `-` 切成两段，第二段才是 "none"，
+            // 所以第一段就带上了 thumb 前缀，上面这条能命中。
             s if s.starts_with("riscv32") => Some(Arch::RiscV32),
             s if s.starts_with("riscv64") => Some(Arch::RiscV64),
             _ => None,
@@ -58,7 +71,9 @@ impl Arch {
             Arch::X86_64 => "x86_64",
             Arch::AArch64 => "aarch64",
             Arch::Wasm32 => "wasm32",
+            Arch::Wasm64 => "wasm64",
             Arch::Arm32 => "arm",
+            Arch::Arm32Thumb => "thumb",
             Arch::RiscV32 => "riscv32",
             Arch::RiscV64 => "riscv64",
         }
@@ -67,8 +82,8 @@ impl Arch {
     /// 指针宽度（字节）。
     pub fn pointer_size(self) -> u8 {
         match self {
-            Arch::Wasm32 | Arch::Arm32 | Arch::RiscV32 => 4,
-            Arch::X86_64 | Arch::AArch64 | Arch::RiscV64 => 8,
+            Arch::Wasm32 | Arch::Arm32 | Arch::Arm32Thumb | Arch::RiscV32 => 4,
+            Arch::X86_64 | Arch::AArch64 | Arch::RiscV64 | Arch::Wasm64 => 8,
         }
     }
 
@@ -83,10 +98,10 @@ impl Arch {
     /// ELF `e_machine` 取值。
     pub fn elf_machine(self) -> u16 {
         match self {
-            Arch::X86_64 => 62,  // EM_X86_64
-            Arch::AArch64 => 183, // EM_AARCH64
-            Arch::Wasm32 => 243,  // EM_WASM
-            Arch::Arm32 => 40,   // EM_ARM
+            Arch::X86_64 => 62,                   // EM_X86_64
+            Arch::AArch64 => 183,                 // EM_AARCH64
+            Arch::Wasm32 | Arch::Wasm64 => 243,   // EM_WASM
+            Arch::Arm32 | Arch::Arm32Thumb => 40, // EM_ARM
             Arch::RiscV32 | Arch::RiscV64 => 243, // EM_RISCV
         }
     }
@@ -97,7 +112,7 @@ impl Arch {
     pub fn elf_flags(self) -> u32 {
         match self {
             // EABI5
-            Arch::Arm32 => 0x0500_0000,
+            Arch::Arm32 | Arch::Arm32Thumb => 0x0500_0000,
             _ => 0,
         }
     }
@@ -109,18 +124,20 @@ impl Arch {
             Arch::X86_64 => (0x0100_0007, 0x0000_0003),
             // CPU_TYPE_ARM64 / CPU_SUBTYPE_ARM64_ALL
             Arch::AArch64 => (0x0100_000c, 0x0000_0000),
-            Arch::Wasm32 => (0x0100_0007, 0x0000_0003),
-            Arch::Arm32 | Arch::RiscV32 | Arch::RiscV64 => (0x0100_0007, 0x0000_0003),
+            Arch::Wasm32 | Arch::Wasm64 => (0x0100_0007, 0x0000_0003),
+            Arch::Arm32 | Arch::Arm32Thumb | Arch::RiscV32 | Arch::RiscV64 => {
+                (0x0100_0007, 0x0000_0003)
+            }
         }
     }
 
     /// COFF `Machine` 取值。
     pub fn pe_machine(self) -> u16 {
         match self {
-            Arch::X86_64 => 0x8664,   // IMAGE_FILE_MACHINE_AMD64
-            Arch::AArch64 => 0xaa64,  // IMAGE_FILE_MACHINE_ARM64
-            Arch::Wasm32 => 0x8664,
-            Arch::Arm32 => 0x01c0,    // IMAGE_FILE_MACHINE_ARM
+            Arch::X86_64 => 0x8664,  // IMAGE_FILE_MACHINE_AMD64
+            Arch::AArch64 => 0xaa64, // IMAGE_FILE_MACHINE_ARM64
+            Arch::Wasm32 | Arch::Wasm64 => 0x8664,
+            Arch::Arm32 | Arch::Arm32Thumb => 0x01c0, // IMAGE_FILE_MACHINE_ARM
             Arch::RiscV32 | Arch::RiscV64 => 0x8664,
         }
     }
@@ -139,6 +156,12 @@ pub enum Os {
     Win,
     /// WASI（wasm32 沙箱环境，通过导入函数访问宿主）。
     Wasi,
+    /// FreeBSD（类 Linux 的系统调用约定，但 ELF 头与内核接口不同）。
+    FreeBsd,
+    /// Android（Bionic libc；arm64 走 `svc #0`，与 Linux 的 syscall 指令不同）。
+    Android,
+    /// iOS（Darwin ABI，但 Mach-O 的平台号与 macOS 不同，不能直接跑）。
+    Ios,
 }
 
 impl Os {
@@ -146,10 +169,16 @@ impl Os {
     pub fn parse(s: &str) -> Option<Os> {
         match s {
             "none" | "elf" | "eabi" | "eabihf" | "none-eabi" => Some(Os::Bare),
-            "linux" | "android" | "ohos" => Some(Os::Linux),
-            "darwin" | "macos" | "ios" | "tvos" | "watchos" => Some(Os::Darwin),
+            "linux" | "ohos" => Some(Os::Linux),
+            "darwin" | "macos" => Some(Os::Darwin),
             "windows" | "win32" | "mingw" => Some(Os::Win),
             "wasi" => Some(Os::Wasi),
+            "freebsd" => Some(Os::FreeBsd),
+            "android" => Some(Os::Android),
+            "ios" => Some(Os::Ios),
+            // tvOS / watchOS 与 iOS 共用 Darwin ABI 与 Mach-O 平台号，
+            // 单独列出来只是为了让三元组能解析。
+            "tvos" | "watchos" => Some(Os::Ios),
             _ => None,
         }
     }
@@ -162,6 +191,9 @@ impl Os {
             Os::Darwin => "darwin",
             Os::Win => "windows",
             Os::Wasi => "wasi",
+            Os::FreeBsd => "freebsd",
+            Os::Android => "android",
+            Os::Ios => "ios",
         }
     }
 
@@ -173,6 +205,9 @@ impl Os {
             Os::Darwin => "macOS",
             Os::Win => "Windows",
             Os::Wasi => "WASI",
+            Os::FreeBsd => "FreeBSD",
+            Os::Android => "Android",
+            Os::Ios => "iOS",
         }
     }
 
@@ -182,7 +217,7 @@ impl Os {
     /// 不需要外部汇编文件，返回 `None`。
     pub fn runtime_source(self, arch: Arch) -> Option<&'static str> {
         match (self, arch) {
-            (Os::Bare, Arch::Arm32) => Some("rt_arm_baremetal.s"),
+            (Os::Bare, Arch::Arm32) | (Os::Bare, Arch::Arm32Thumb) => Some("rt_arm_baremetal.s"),
             (Os::Bare, Arch::RiscV32) | (Os::Bare, Arch::RiscV64) => Some("rt_riscv_baremetal.s"),
             (Os::Linux, Arch::X86_64) => Some("rt_linux_x86_64.s"),
             (Os::Linux, Arch::AArch64) => Some("rt_linux_aarch64.s"),
@@ -190,13 +225,40 @@ impl Os {
             (Os::Darwin, Arch::AArch64) => Some("rt_macos_arm64.s"),
             (Os::Win, Arch::X86_64) => Some("rt_windows_x86_64.s"),
             (Os::Win, Arch::AArch64) => Some("rt_windows_arm64.s"),
+            // FreeBSD / Android / iOS 的运行时和宿主机同族，直接复用
+            // 对应平台的汇编——它们的调用约定与系统调用约定都一致。
+            (Os::FreeBsd, Arch::X86_64) => Some("rt_linux_x86_64.s"),
+            (Os::FreeBsd, Arch::AArch64) => Some("rt_linux_aarch64.s"),
+            (Os::Android, Arch::X86_64) => Some("rt_linux_x86_64.s"),
+            (Os::Android, Arch::AArch64) => Some("rt_linux_aarch64.s"),
+            (Os::Ios, Arch::X86_64) => Some("rt_macos_x86_64.s"),
+            (Os::Ios, Arch::AArch64) => Some("rt_macos_arm64.s"),
             _ => None,
+        }
+    }
+
+    /// 退出进程所用的系统调用号。
+    ///
+    /// 各家编号**不一样**，而且 Android 出于线程回收必须用 `exit_group`
+    /// 而不是 `exit`——只调 `exit` 的话 Bionic 运行时会挂住。
+    pub fn exit_syscall(self, arch: Arch) -> u32 {
+        match (self, arch) {
+            // Linux
+            (Os::Linux, Arch::X86_64) => 60,  // __NR_exit
+            (Os::Linux, Arch::AArch64) => 93, // __NR_exit
+            // FreeBSD 的编号从 1 开始，且有独立的 exit_group
+            (Os::FreeBsd, Arch::X86_64) => 60, // SYS_exit
+            (Os::FreeBsd, Arch::AArch64) => 1, // SYS_exit
+            // Android：用 exit_group
+            (Os::Android, Arch::X86_64) => 231, // __NR_exit_group
+            (Os::Android, Arch::AArch64) => 94, // __NR_exit_group
+            _ => 0,
         }
     }
 
     /// 该平台是否使用系统调用而非宿主 API 实现运行时。
     pub fn uses_syscalls(self) -> bool {
-        matches!(self, Os::Linux)
+        matches!(self, Os::Linux | Os::FreeBsd | Os::Android)
     }
 
     /// 运行时的链接方式（用于诊断信息）。
@@ -207,6 +269,9 @@ impl Os {
             Os::Darwin => "libc: zr runtime wraps libSystem",
             Os::Win => "kernel32: zr runtime wraps Win32 API",
             Os::Wasi => "imports: zr runtime is imported from the host",
+            Os::FreeBsd => "libc: zr runtime wraps FreeBSD libc",
+            Os::Android => "bionic: zr runtime wraps Android NDK libc",
+            Os::Ios => "libSystem: zr runtime wraps the iOS SDK",
         }
     }
 }
@@ -268,27 +333,34 @@ impl Target {
         }
 
         let parts: Vec<&str> = triple.split('-').collect();
-        let arch = Arch::parse(parts[0])
-            .ok_or_else(|| format!("unsupported architecture '{}' in target '{}'", parts[0], triple))?;
+        let arch = Arch::parse(parts[0]).ok_or_else(|| {
+            format!(
+                "unsupported architecture '{}' in target '{}'",
+                parts[0], triple
+            )
+        })?;
 
         // 操作系统可能出现在第 2 段（如 `-windows-`、`-apple-darwin` 中的
         // 最后一段）或第 3 段；逐段匹配，找不到时按"裸架构"处理。
+        // 必须取**最后**一个能识别的段。`x86_64-linux-android` 里既有
+        // `linux` 又有 `android`，而平台其实是 Android（Bionic）；
+        // 遇到第一个匹配就停会把目标错认成 Linux，编出来的程序在
+        // Android 上用 `exit` 而不是 `exit_group` 退出，线程回收不了。
         let mut os: Option<Os> = None;
         let mut os_index = 0usize;
         for (i, part) in parts.iter().enumerate().skip(1) {
-            // 版本后缀（darwin23.0、androideabi 等）不参与匹配。
+            // 版本后缀（darwin23.0 等）不参与匹配。
             let base = part.trim_end_matches(|c: char| c.is_ascii_digit() || c == '.');
             if let Some(found) = Os::parse(base) {
                 os = Some(found);
                 os_index = i;
-                break;
             }
         }
 
-        // wasm32 没有操作系统：`none` 只是 LLVM 三元组里的占位，
+        // wasm 没有操作系统：`none` 只是 LLVM 三元组里的占位，
         // 其运行时由宿主导入实现（WASI 语义），而不是 semihosting 裸机。
         let os = match os {
-            Some(Os::Bare) if arch == Arch::Wasm32 => Some(Os::Wasi),
+            Some(Os::Bare) if arch == Arch::Wasm32 || arch == Arch::Wasm64 => Some(Os::Wasi),
             other => other,
         };
 
@@ -309,7 +381,7 @@ impl Target {
             None => {
                 // 裸架构简写：wasm32 落到 unknown-unknown（导入式运行时），
                 // 其他架构缺少操作系统信息，直接报错。
-                if arch == Arch::Wasm32 {
+                if arch == Arch::Wasm32 || arch == Arch::Wasm64 {
                     (Os::Wasi, default_vendor(Os::Wasi), "")
                 } else {
                     return Err(format!(
@@ -376,12 +448,17 @@ impl Target {
         &self.env
     }
 
+    /// 是否是 Thumb-2 编码的 ARM 32 位。
+    pub fn is_arm32_thumb(&self) -> bool {
+        self.arch == Arch::Arm32Thumb
+    }
+
     /// 容器格式（由 OS 决定）。
     pub fn format(&self) -> ObjectFormat {
         match self.os {
             // 裸机目标只产出 ELF 映像（32 位架构用 ELF32）
-            Os::Bare | Os::Linux => ObjectFormat::Elf,
-            Os::Darwin => ObjectFormat::MachO,
+            Os::Bare | Os::Linux | Os::FreeBsd | Os::Android => ObjectFormat::Elf,
+            Os::Darwin | Os::Ios => ObjectFormat::MachO,
             Os::Win => ObjectFormat::PeCoff,
             Os::Wasi => ObjectFormat::Wasm,
         }
@@ -418,6 +495,7 @@ impl Target {
             // 裸机目标的运行时按架构命名
             Os::Bare => match self.arch {
                 Arch::Arm32 => "arm-none-eabi".to_string(),
+                Arch::Arm32Thumb => "thumbv7em-none-eabi".to_string(),
                 Arch::RiscV32 => "riscv32-unknown-none".to_string(),
                 Arch::RiscV64 => "riscv64-unknown-none".to_string(),
                 _ => format!("{arch}-unknown-none"),
@@ -425,7 +503,11 @@ impl Target {
             Os::Linux => format!("{arch}-unknown-linux-gnu"),
             Os::Darwin => format!("{arch}-apple-darwin"),
             Os::Win => format!("{arch}-pc-windows-msvc"),
+            Os::Wasi if self.arch == Arch::Wasm64 => "wasm64-unknown-unknown".to_string(),
             Os::Wasi => "wasm32-unknown-unknown".to_string(),
+            Os::FreeBsd => format!("{arch}-unknown-freebsd"),
+            Os::Android => format!("{arch}-linux-android"),
+            Os::Ios => format!("{arch}-apple-ios"),
         }
     }
 
@@ -433,6 +515,7 @@ impl Target {
     /// `wasm32-unknown-unknown` 写法）。
     pub fn llvm_triple(&self) -> String {
         match self.os {
+            Os::Wasi if self.arch == Arch::Wasm64 => "wasm64-unknown-unknown".to_string(),
             Os::Wasi => "wasm32-unknown-unknown".to_string(),
             Os::Darwin => format!("{}-{}-darwin", self.arch.name(), self.vendor),
             _ => self.triple(),
@@ -465,8 +548,8 @@ impl Target {
             // 裸机镜像默认从 flash 起始（0x08000000，对应 Cortex-M 向量表），
             // 可被链接脚本 / 烧录工具覆盖。
             Os::Bare => 0x0800_0000,
-            Os::Linux => 0x0040_0000,
-            Os::Darwin => 0x1_0000_0000,
+            Os::Linux | Os::FreeBsd | Os::Android => 0x0040_0000,
+            Os::Darwin | Os::Ios => 0x1_0000_0000,
             Os::Win => 0x0040_0000,
             Os::Wasi => 0,
         }
@@ -476,9 +559,9 @@ impl Target {
     pub fn page_size(&self) -> u64 {
         match self.os {
             Os::Bare => 0x1000,
-            // Apple Silicon 的最小页为 16 KiB；macOS 的 __TEXT 段要求按
-            // 页（16 KiB）对齐，这里使用 16 KiB 以覆盖两种架构。
-            Os::Darwin => 0x4000,
+            // Apple Silicon 的最小页为 16 KiB；macOS / iOS 的 __TEXT 段要求
+            // 按页（16 KiB）对齐，这里使用 16 KiB 以覆盖两种架构。
+            Os::Darwin | Os::Ios => 0x4000,
             _ => 0x1000,
         }
     }
@@ -500,6 +583,7 @@ impl Target {
         matches!(
             (self.os, self.arch),
             (Os::Bare, Arch::Arm32)
+                | (Os::Bare, Arch::Arm32Thumb)
                 | (Os::Bare, Arch::RiscV32)
                 | (Os::Bare, Arch::RiscV64)
                 | (Os::Linux, Arch::X86_64)
@@ -509,6 +593,12 @@ impl Target {
                 | (Os::Win, Arch::X86_64)
                 | (Os::Win, Arch::AArch64)
                 | (Os::Wasi, Arch::Wasm32)
+                | (Os::Wasi, Arch::Wasm64)
+                | (Os::FreeBsd, Arch::X86_64)
+                | (Os::FreeBsd, Arch::AArch64)
+                | (Os::Android, Arch::X86_64)
+                | (Os::Android, Arch::AArch64)
+                | (Os::Ios, Arch::AArch64)
         )
     }
 
@@ -516,6 +606,7 @@ impl Target {
     pub fn supported_triples() -> &'static [&'static str] {
         &[
             "arm-none-eabi",
+            "thumbv7em-none-eabi",
             "riscv32-unknown-none",
             "riscv64-unknown-none",
             "x86_64-unknown-linux-gnu",
@@ -526,12 +617,23 @@ impl Target {
             "aarch64-pc-windows-msvc",
             "wasm32-unknown-unknown",
             "wasm32-wasi",
+            "wasm64-unknown-unknown",
+            "x86_64-unknown-freebsd",
+            "aarch64-unknown-freebsd",
+            "x86_64-linux-android",
+            "aarch64-linux-android",
+            "aarch64-apple-ios",
         ]
     }
 
     /// 面向用户的目标描述，例如 `aarch64-apple-darwin (Mach-O)`。
     pub fn describe(&self) -> String {
-        format!("{} ({}, {})", self.triple(), self.format().name(), self.os.display_name())
+        format!(
+            "{} ({}, {})",
+            self.triple(),
+            self.format().name(),
+            self.os.display_name()
+        )
     }
 }
 
@@ -549,6 +651,9 @@ fn default_vendor(os: Os) -> &'static str {
         Os::Darwin => "apple",
         Os::Win => "pc",
         Os::Wasi => "unknown",
+        Os::FreeBsd => "unknown",
+        Os::Android => "linux",
+        Os::Ios => "apple",
     }
 }
 
@@ -560,6 +665,9 @@ fn default_env(os: Os) -> &'static str {
         Os::Darwin => "",
         Os::Win => "msvc",
         Os::Wasi => "",
+        Os::FreeBsd => "",
+        Os::Android => "eabi",
+        Os::Ios => "",
     }
 }
 
@@ -635,14 +743,39 @@ mod tests {
 
     #[test]
     fn formats_and_extensions() {
-        assert_eq!(Target::parse("x86_64-unknown-linux-gnu").unwrap().format(), ObjectFormat::Elf);
-        assert_eq!(Target::parse("aarch64-apple-darwin").unwrap().format(), ObjectFormat::MachO);
-        assert_eq!(Target::parse("x86_64-pc-windows-msvc").unwrap().format(), ObjectFormat::PeCoff);
-        assert_eq!(Target::parse("wasm32-unknown-unknown").unwrap().format(), ObjectFormat::Wasm);
+        assert_eq!(
+            Target::parse("x86_64-unknown-linux-gnu").unwrap().format(),
+            ObjectFormat::Elf
+        );
+        assert_eq!(
+            Target::parse("aarch64-apple-darwin").unwrap().format(),
+            ObjectFormat::MachO
+        );
+        assert_eq!(
+            Target::parse("x86_64-pc-windows-msvc").unwrap().format(),
+            ObjectFormat::PeCoff
+        );
+        assert_eq!(
+            Target::parse("wasm32-unknown-unknown").unwrap().format(),
+            ObjectFormat::Wasm
+        );
 
-        assert_eq!(Target::parse("x86_64-pc-windows-msvc").unwrap().exe_extension(), ".exe");
-        assert_eq!(Target::parse("wasm32-wasi").unwrap().exe_extension(), ".wasm");
-        assert_eq!(Target::parse("x86_64-unknown-linux-gnu").unwrap().exe_extension(), "");
+        assert_eq!(
+            Target::parse("x86_64-pc-windows-msvc")
+                .unwrap()
+                .exe_extension(),
+            ".exe"
+        );
+        assert_eq!(
+            Target::parse("wasm32-wasi").unwrap().exe_extension(),
+            ".wasm"
+        );
+        assert_eq!(
+            Target::parse("x86_64-unknown-linux-gnu")
+                .unwrap()
+                .exe_extension(),
+            ""
+        );
     }
 
     #[test]
@@ -663,7 +796,11 @@ mod tests {
             ("wasm32-wasi", "wasm32-unknown-unknown"),
         ];
         for (input, expected) in cases {
-            assert_eq!(Target::parse(input).unwrap().canonical_triple(), expected, "{input}");
+            assert_eq!(
+                Target::parse(input).unwrap().canonical_triple(),
+                expected,
+                "{input}"
+            );
         }
     }
 

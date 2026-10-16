@@ -78,16 +78,25 @@ pub fn run(mut module: SsaModule, level: OptLevel) -> SsaModule {
         module = pass_manager::eliminate_common_subexpr(module);
         module = pass_manager::global_value_numbering(module);
         module = pass_manager::peephole(module);
+        // SCCP 要放在常量折叠与 GVN 之后：它依赖它们已经产出的常量，
+        // 同时又能把"条件恒定"的分支的另一半整个删掉——这是纯折叠做不到的。
+        module = pass_manager::sparse_conditional_constant_propagation(module);
+        module = pass_manager::eliminate_dead_blocks(module);
+        module = pass_manager::eliminate_dead_code(module);
     }
 
     if level >= OptLevel::O3 {
         module = pass_manager::inline_functions(module);
         module = pass_manager::optimize_loops(module);
+        // 内联会带进新的常量与死代码，再跑一轮收敛。
+        module = pass_manager::fold_constants(module);
+        module = pass_manager::eliminate_dead_code(module);
     }
 
     if level == OptLevel::Oz {
         // 体积优先：额外做简化与死代码清理
         module = pass_manager::eliminate_dead_code(module);
+        module = pass_manager::eliminate_dead_blocks(module);
     }
 
     module

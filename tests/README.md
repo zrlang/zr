@@ -41,10 +41,7 @@ Rust Book 的其余章节目前一个都测不了，因为对应特性尚未实�
 
 | Rust Book 章节 | 阻塞原因 |
 |----------------|----------|
-| 控制流：`loop` + `break` | `loop` 的回边降级还不完整，`break` 跳不出去 |
-| 控制流：嵌套循环 | 外层循环体被当成直线代码，内层变量没有独立的 φ |
 | 控制流：`for` | `for x in a..b` 的 `..` 表达式仍解析成标识符 |
-| 函数：递归 | 缺少栈帧：调用者不保存被调用者用到的 callee-save 寄存器 |
 | 所有权 / 借用 / 引用 / 切片 | 借用检查与引用语义未实现 |
 | 结构体与枚举 | `struct` 能声明，但字段读取返回错值；`enum` 未实现 |
 | 浮点 | 五个后端都没有浮点支持，遇到浮点字面量会**明确报错**（不再静默发射 0） |
@@ -58,7 +55,188 @@ Rust Book 的其余章节目前一个都测不了，因为对应特性尚未实�
 | 智能指针（`Box` / `Rc` / `RefCell`） | 未实现 |
 | 并发（线程 / 通道 / `Mutex` / `Send`） | 未实现 |
 | 面向对象 / 状态模式 | 依赖 `trait` 与 `enum` |
+
+| 32 位目标上的宽整数（`i64` / `u64` / `i128`） | 32 位寄存器放不下，多字长（寄存器对）尚未实现；**写出来会在类型检查阶段报错** |
+| Thumb-2 的 spilling | 超过 8 个活跃寄存器会（正确地）报 `unsupported_pressure`；栈上传参（≥5 个）同理 |
 | 高级特性（`unsafe` / 关联类型 / 宏） | 仅 `asm!` / `intrinsic!` 能解析，代码生成未实现 |
+
+## 循环控制流
+
+`loop` + `break`、`continue`、`while true/false`、循环头重定义计数器
+（`i = i + 1` 写在循环头里）、递归，现在在 O0/O1/O2/O3/Oz 下都正确
+（`tests/cases/15_loops.zr`）。
+
+这一块之前是"能编译但结果不对"，修掉的几个根因都值得记一笔：
+
+* `break` / `continue` 在 MIR 降级里落进 `_ => Unit` 兜底分支，等价于空操作
+  ——`loop { .. break; }` 直接**转不出来**（编译成功，运行挂死）。
+* `continue` 在类型检查里被映射成了 `break`，跳出口而不是跳回边。
+* 循环头缺 φ：`i = i + 1` 写在循环头里时，`i` 的定义点只有循环头自己 + 入口，
+  只统计前驱会漏掉，于是计数器停在入口值。
+* 内层循环的累加器 `s` 只在循环体里定义，但跨着整个内层循环活着——合流点
+  需要 φ 的判据不能只看"前驱里有几处定义"，得看活跃性。
+* φ 的 incoming 在寄存器分配里按**定义所在的前驱块末尾**延长，而不是 φ 自己
+  的位置。回边上后者在定义之前，算出来的活跃区间会被 `iv.insert` 覆盖，循环
+  体里刚算出的值立刻就"死"了、寄存器被下一条指令复用。
+
+**仍然不对：嵌套循环在 O2 及以上仍然算错**（O0/O1 正确）。SSA 层面是对的，
+差异只来自优化器把常量替换成 `copy` 之后那几条 `mov`，怀疑是 φ 并行搬运与
+常量重物化（rematerialization）的交互。没定位清楚之前没有把它塞进用例里。
+
+另外：`--dump-*` 在增量缓存命中时会跳过（直接复用产物），想看中间表示记得先
+`zr clean`。
+
+## Thumb-2 后端
+
+`thumbv7em-none-eabi` 走 `src/codegen/encoder_thumb.rs`，与 `arm-none-eabi`
+（A32）是两套独立后端。三元组首段以 `thumb` 开头即按 Thumb-2 处理。
+
+指令编码**逐条对照 clang 的汇编器**确定，测试里写的是 clang 的实际输出，
+不是照着手册猜的位模式（已经踩过两次：`.w` 变体的 hw2 高半字节、
+`mls` 的 [7:4] 常量位）。仓库里没有 ARM 模拟器，所以验证手段是：
+
+* `src/codegen/encoder_thumb.rs` 里的单测断言半字编码；
+* `objdump -d --triple=thumbv7em-none-eabi` 反汇编，检查序言、调用、返回、
+  分支重定位回填是否落在正确的半字上。
+
+已经过反汇编确认的关键约定：
+
+| 位置 | 约定 |
+| --- | --- |
+| 32 位指令顺序 | `w32` 先写 hw1（`0xF` 组），再写 hw2（`0xD` 组）；重定位回填必须同序 |
+| `bl` / `b` (T1/T4) | `hw1 = 0xF000\|S\|imm10`，`hw2 = 0xD000\|J1\|J2\|imm11`；`bl` 的 hw2 bit12 = 1，`b` 为 0 |
+| `cbnz` / `cbz` | 只支持 r0-r3；6 位有符号半字偏移在 [9:3]，Rn 在 [2:0] |
+| `push` / `pop` | 寄存器掩码里 LR 和 PC 都落在 bit 8 |
+| 返回路径 | `pop {r4-r7, pc}`，弹回 LR 会让函数从序言继续往下跑 |
+| 符号 / 入口地址 | 函数符号值和 `e_entry` 要置 bit 0，标明 Thumb 状态 |
+
+本机没有 `qemu-arm`，所以 Thumb 产物只做编码与对象格式验证，不做运行期验证。
+
+## ELF 输出上的两个坑
+
+两个都属于"长度照样对、只有读出来才发现错"的类型，已在 `linker.rs` 的
+单测里逐字段钉死：
+
+* **`Elf32_Sym` 和 `Elf64_Sym` 字段顺序不一样**。32 位是
+  `st_name, st_value, st_size, st_info, st_other, st_shndx`，64 位是
+  `st_name, st_info, st_other, st_shndx, st_value, st_size`。按 64 位顺序
+  写 32 位，条目长度一样是 16 字节，所有 32 位目标（arm / thumb /
+  riscv32）的符号表会整体错位：名字被读成 `st_size`，`st_shndx` 变 0，
+  于是符号全成 `*UND*`。
+* **增量缓存不能记用户 `-o` 的路径当产物**。产物被删掉或覆盖之后，缓存
+  仍会"命中"，把空文件拷回去并且报成功。现在缓存把产物拷进
+  `target/zr-cache/` 自留一份，且命中前校验非空；空产物一律退回全量编译。
+
+## 宽整数在 32 位目标上：为什么是报错而不是"能编过"
+
+SSA 不带类型信息，后端分不清 `i64` 和 `i32`——它只看到 `SsaConst::Int(i128)`。
+于是 32 位目标上宽整数会**静默截断**：
+
+```zr
+fn main() -> i64 {
+    let a: i64 = 4294967296;   // 2^32
+    let b: i64 = 1;
+    a + b
+}
+```
+
+`--target thumbv7em-none-eabi` 之前编出来是 `movw r4, #0`，高位直接丢掉，
+`a + b` 得到 1 而不是 4294967297。截断能编过，但结果是错的——这比编不过
+危险得多，所以在 `ast_to_hir_type` 这一层按目标指针宽度直接挡掉：
+
+```
+zr: 64 位整数在当前目标上尚未实现：该目标只有 32 位寄存器，编译器暂时还不能把
+    宽整数拆成寄存器对。现在生成的是静默截断的代码，所以直接报错。
+```
+
+64 位目标不受影响。真正实现多字长运算需要先给 SSA 补类型标注，再改寄存器
+分配（成对的活跃区间、成对的溢出/重载），最后改所有原生后端的调用 ABI。
+
+## 多文件项目与增量编译
+
+`mod foo;` 会去 `foo.zr`（或 `mod/foo.zr`）加载，并递归展开内联模块与
+`use` 到的标准库模块。
+
+增量编译**默认开启**（`--no-incremental` 关闭，`zr clean` 清空缓存）。
+缓存放在 `target/zr-cache/`，键是源文件路径，值是：
+
+- 所有参与编译的文件及其内容指纹；
+- 上次的产物路径。
+
+命中检查只**重新读取并哈希**这些文件，不解析任何源码，所以词法、语法、
+类型检查、MIR、代码生成、链接全部跳过。指纹里混入了编译器版本、目标三元组、
+优化等级、调试信息开关，所以换任何一个选项都会正确地失效。
+
+实测（20 个模块、1325 行）：
+
+| | 耗时 |
+|---|---|
+| 冷编译 | 29.3 ms |
+| 热命中 | 8.5 ms（3.5×）|
+
+### 为什么不是"按模块分别重新编译"
+
+模块系统是**扁平命名空间**：模块条目被直接并进同一个 `Program`，共享一张
+符号表。于是任何模块的改动都可能影响其它模块的名字解析，没有办法安全地
+跳过它们的类型检查。实测各阶段耗时（`ZR_TIME=1`）：
+
+```
+lex     ≈ 0.4 ms
+parse   ≈ 0.9 ms
+typeck  ≈ 2.2 ms
+mir     ≈ 2.3 ms
+```
+
+瓶颈在类型检查，所以缓存词法+语法最多只能省掉前端约 25%。要做到真正的
+按模块增量，得先把模块系统改成两层符号表，那是另一个量级的改动。
+
+## 工具链
+
+除编译器本身外，`zr` 还带了四个子命令：
+
+### `zr fmt`
+
+见上文"编写用例的注意事项"之前的章节。走词法而非 AST，保留全部注释，幂等，
+并校验格式化前后记号流不变。
+
+### `zr pkg`（包管理器）
+
+```
+zr pkg init                 新建 zr.toml
+zr pkg add <name> <path>    加路径依赖
+zr pkg remove <name>
+zr pkg list / tree
+zr pkg build                按拓扑序构建全部依赖
+zr pkg clean
+```
+
+清单是 TOML 的一个子集（`name` / `version` / `edition` / `[dependencies]`），
+自己解析：不想为了一份清单引入依赖，也不想清单语法随 TOML 规范漂移。
+**写错会报错**（未知段、未知键、值没加引号），不会静默生效。
+
+嵌套依赖按各自清单所在目录解析（不是一律按最外层解析），循环依赖会明确报错。
+
+### `zr lsp`（语言服务器）
+
+stdio 上的 JSON-RPC 2.0，实现：
+
+| 请求 | 说明 |
+|------|------|
+| `initialize` / `shutdown` / `exit` | 生命周期 |
+| `textDocument/didOpen` / `didChange` / `didClose` | 诊断 |
+| `textDocument/documentSymbol` | 文档符号（函数、类型、常量、形参） |
+| `textDocument/definition` | 跳转到定义（含形参） |
+| `textDocument/hover` | 悬停信息 |
+| `textDocument/formatting` | 格式化（复用 `zr fmt`） |
+
+诊断**只到语法级别**：类型检查需要完整模块环境，在单文件上跑会把 `mod`/`use`
+引不到的符号全报一遍，满屏假错误反而没法用。语义诊断等模块系统到位后再接。
+
+符号从**记号流**扫出（AST 目前不留标识符名字 span），顺带能容忍尚未支持的语法。
+
+### `zr clean`
+
+清空增量编译缓存（`target/zr-cache/`）。
 
 ## 属性与编译期求值
 
@@ -92,11 +270,15 @@ Rust Book 的其余章节目前一个都测不了，因为对应特性尚未实�
 的编译矩阵手动跑（集成测试里没做，因为会显著拉长测试时间）：
 
 ```sh
-for t in arm-none-eabi riscv32-unknown-none riscv64-unknown-none \
+for t in arm-none-eabi thumbv7em-none-eabi \
+         riscv32-unknown-none riscv64-unknown-none \
          x86_64-unknown-linux-gnu aarch64-unknown-linux-gnu \
          x86_64-apple-darwin aarch64-apple-darwin \
          x86_64-pc-windows-msvc aarch64-pc-windows-msvc \
-         wasm32-unknown-unknown wasm32-wasi; do
+         wasm32-unknown-unknown wasm32-wasi \
+         x86_64-unknown-freebsd aarch64-unknown-freebsd \
+         x86_64-linux-android aarch64-linux-android \
+         aarch64-apple-ios; do
   # 14_spill 只在 x86-64 上有意义：别的后端还没实现溢出，遇到高寄存器
   # 压力会（正确地）报错，所以不纳入矩阵。
   for f in $(ls tests/cases/*.zr | grep -v 14_spill); do

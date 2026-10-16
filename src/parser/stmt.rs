@@ -46,25 +46,27 @@ impl Parser {
 
     /// 判断下一个 token 是否可以作为模式的起始。
     fn next_can_start_pattern(&self) -> bool {
-        self.peek_n(1).map(|t| {
-            matches!(
-                t.kind,
-                TokenKind::Ident(_)
-                    | TokenKind::Underscore
-                    | TokenKind::IntLiteral(_)
-                    | TokenKind::FloatLiteral(_)
-                    | TokenKind::CharLiteral(_)
-                    | TokenKind::StringLiteral(_)
-                    | TokenKind::KwTrue
-                    | TokenKind::KwFalse
-                    | TokenKind::KwRef
-                    | TokenKind::KwMut
-                    | TokenKind::Tilde
-                    | TokenKind::Minus
-                    | TokenKind::LParen
-                    | TokenKind::LBracket
-            )
-        }).unwrap_or(false)
+        self.peek_n(1)
+            .map(|t| {
+                matches!(
+                    t.kind,
+                    TokenKind::Ident(_)
+                        | TokenKind::Underscore
+                        | TokenKind::IntLiteral(_)
+                        | TokenKind::FloatLiteral(_)
+                        | TokenKind::CharLiteral(_)
+                        | TokenKind::StringLiteral(_)
+                        | TokenKind::KwTrue
+                        | TokenKind::KwFalse
+                        | TokenKind::KwRef
+                        | TokenKind::KwMut
+                        | TokenKind::Tilde
+                        | TokenKind::Minus
+                        | TokenKind::LParen
+                        | TokenKind::LBracket
+                )
+            })
+            .unwrap_or(false)
     }
 
     /// 解析单个模式。
@@ -90,7 +92,12 @@ impl Parser {
         // `mut name`（可变绑定）
         if self.match_kind(&TokenKind::KwMut) {
             let name = self.consume_ident("expected name after 'mut'")?;
-            return Ok(Pattern::Binding(name, crate::parser::ast::Mutability::Mutable, None, span));
+            return Ok(Pattern::Binding(
+                name,
+                crate::parser::ast::Mutability::Mutable,
+                None,
+                span,
+            ));
         }
 
         // `ref mut? p`
@@ -118,7 +125,12 @@ impl Parser {
             if self.match_kind(&TokenKind::DotDot) || self.match_kind(&TokenKind::DotDotEq) {
                 let inclusive = self.previous().kind == TokenKind::DotDotEq;
                 let end = self.parse_pattern_literal_expr()?;
-                return Ok(Pattern::Range(Box::new(start), Box::new(end), inclusive, span));
+                return Ok(Pattern::Range(
+                    Box::new(start),
+                    Box::new(end),
+                    inclusive,
+                    span,
+                ));
             }
             // 不是范围模式，回退为字面量模式
             return if let Expression::Literal(lit, _) = start {
@@ -230,7 +242,12 @@ impl Parser {
             // `name @ pattern`（绑定 + 子模式）
             if self.match_kind(&TokenKind::At) {
                 let sub = self.parse_pattern_single()?;
-                return Ok(Pattern::Binding(ident, crate::parser::ast::Mutability::Immutable, Some(Box::new(sub)), span));
+                return Ok(Pattern::Binding(
+                    ident,
+                    crate::parser::ast::Mutability::Immutable,
+                    Some(Box::new(sub)),
+                    span,
+                ));
             }
 
             // 类型注解 `: T` 由调用方（parse_param / parse_let_stmt）处理，
@@ -239,7 +256,12 @@ impl Parser {
             // `mut name`（可变绑定）
             if ident == "mut" {
                 let real = self.consume_ident("expected name after 'mut'")?;
-                return Ok(Pattern::Binding(real, crate::parser::ast::Mutability::Mutable, None, span));
+                return Ok(Pattern::Binding(
+                    real,
+                    crate::parser::ast::Mutability::Mutable,
+                    None,
+                    span,
+                ));
             }
             let mutability = crate::parser::ast::Mutability::Immutable;
             return Ok(Pattern::Binding(ident, mutability, None, span));
@@ -252,7 +274,11 @@ impl Parser {
     }
 
     /// 解析结构体模式 `Name { f1, f2: pat, .. }`。
-    fn parse_struct_pattern(&mut self, path: Vec<String>, span: Span) -> Result<Pattern, CompileError> {
+    fn parse_struct_pattern(
+        &mut self,
+        path: Vec<String>,
+        span: Span,
+    ) -> Result<Pattern, CompileError> {
         let mut fields = Vec::new();
         let mut rest = false;
         if !self.check(&TokenKind::RBrace) {
@@ -263,7 +289,12 @@ impl Parser {
                 let pat = if self.match_kind(&TokenKind::Colon) {
                     self.parse_pattern()?
                 } else {
-                    Pattern::Binding(name.clone(), crate::parser::ast::Mutability::Immutable, None, Span::unknown())
+                    Pattern::Binding(
+                        name.clone(),
+                        crate::parser::ast::Mutability::Immutable,
+                        None,
+                        Span::unknown(),
+                    )
                 };
                 fields.push(FieldPat { name, pattern: pat });
                 while self.match_kind(&TokenKind::Comma) {
@@ -274,9 +305,17 @@ impl Parser {
                     let p = if self.match_kind(&TokenKind::Colon) {
                         self.parse_pattern()?
                     } else {
-                        Pattern::Binding(n.clone(), crate::parser::ast::Mutability::Immutable, None, Span::unknown())
+                        Pattern::Binding(
+                            n.clone(),
+                            crate::parser::ast::Mutability::Immutable,
+                            None,
+                            Span::unknown(),
+                        )
                     };
-                    fields.push(FieldPat { name: n, pattern: p });
+                    fields.push(FieldPat {
+                        name: n,
+                        pattern: p,
+                    });
                 }
                 if self.match_kind(&TokenKind::DotDot) {
                     rest = true;
@@ -284,16 +323,21 @@ impl Parser {
             }
         }
         self.consume(&TokenKind::RBrace, "expected '}'")?;
-        Ok(Pattern::Struct { path, fields, rest, span })
+        Ok(Pattern::Struct {
+            path,
+            fields,
+            rest,
+            span,
+        })
     }
 
     /// 解析模式中的字面量表达式（仅前缀，不消费 `..` / `..=` 等二元运算符）。
     fn parse_pattern_literal_expr(&mut self) -> Result<Expression, CompileError> {
         let span = self.peek().span;
         let neg = self.match_kind(&TokenKind::Minus);
-        let lit = self.parse_literal()?.ok_or_else(|| {
-            CompileError::internal("expected literal in pattern range")
-        })?;
+        let lit = self
+            .parse_literal()?
+            .ok_or_else(|| CompileError::internal("expected literal in pattern range"))?;
         let expr = Expression::Literal(lit, span);
         Ok(if neg {
             Expression::Unary(UnaryOp::Neg, Box::new(expr), span)
@@ -346,18 +390,12 @@ mod tests {
 
     #[test]
     fn struct_pattern() {
-        assert!(matches!(
-            pat("Point { x, y: 0 }"),
-            Pattern::Struct { .. }
-        ));
+        assert!(matches!(pat("Point { x, y: 0 }"), Pattern::Struct { .. }));
     }
 
     #[test]
     fn variant_pattern() {
-        assert!(matches!(
-            pat("Some(value)"),
-            Pattern::Variant { .. }
-        ));
+        assert!(matches!(pat("Some(value)"), Pattern::Variant { .. }));
     }
 
     #[test]
@@ -368,21 +406,33 @@ mod tests {
     #[test]
     fn literal_pattern() {
         assert!(matches!(pat("42"), Pattern::Literal(Literal::Int(42, _))));
-        assert!(matches!(pat("\"hello\""), Pattern::Literal(Literal::String(_))));
+        assert!(matches!(
+            pat("\"hello\""),
+            Pattern::Literal(Literal::String(_))
+        ));
     }
 
     #[test]
     fn ref_pattern() {
-        assert!(matches!(pat("ref mut x"), Pattern::Ref(_, crate::parser::ast::Mutability::Mutable, _)));
+        assert!(matches!(
+            pat("ref mut x"),
+            Pattern::Ref(_, crate::parser::ast::Mutability::Mutable, _)
+        ));
     }
 
     #[test]
     fn at_pattern() {
-        assert!(matches!(pat("x @ 1..=5"), Pattern::Binding(_, _, Some(_), _)));
+        assert!(matches!(
+            pat("x @ 1..=5"),
+            Pattern::Binding(_, _, Some(_), _)
+        ));
     }
 
     #[test]
     fn mut_binding() {
-        assert!(matches!(pat("mut count"), Pattern::Binding(_, crate::parser::ast::Mutability::Mutable, _, _)));
+        assert!(matches!(
+            pat("mut count"),
+            Pattern::Binding(_, crate::parser::ast::Mutability::Mutable, _, _)
+        ));
     }
 }

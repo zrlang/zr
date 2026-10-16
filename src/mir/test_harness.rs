@@ -9,8 +9,9 @@
 //! 把生成的代码重新过一遍类型检查，而 MIR 层已经有全部需要的信息
 //! （测试函数名、要调用的函数都已降级完成）。
 
+use crate::mir::NumTy;
 use crate::mir::{
-    MirBinaryOp, MirBasicBlock, MirFunction, MirInstr, MirModule, MirTerminator, MirValue,
+    MirBasicBlock, MirBinaryOp, MirFunction, MirInstr, MirModule, MirTerminator, MirValue,
 };
 
 /// 生成跑这些测试的 `main`。
@@ -49,12 +50,14 @@ pub fn build_harness(test_names: &[String]) -> MirFunction {
                     MirValue::Var("r".into()),
                     MirBinaryOp::Ne,
                     MirValue::Int(0),
+                    NumTy::Int(64),
                 ),
                 MirInstr::Binary(
                     "failed".into(),
                     MirValue::Var("failed".into()),
                     MirBinaryOp::Add,
                     MirValue::Var("bad".into()),
+                    NumTy::Int(64),
                 ),
             ],
             term: None,
@@ -85,10 +88,11 @@ pub fn build_harness(test_names: &[String]) -> MirFunction {
     }
 
     MirFunction {
-        name: "main".into(),
+        name: "main".to_string(),
         params: Vec::new(),
         blocks,
         inline_never: false,
+        inline_always: false,
     }
 }
 

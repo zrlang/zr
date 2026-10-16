@@ -14,9 +14,10 @@
 //!    只能退化成与被挤出的值共用寄存器——这仍然比取模安全得多，
 //!    因为交叠只发生在真正的溢出点。
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
-use crate::ssa::{SsaInstr, SsaTerminator, SsaValue, SsaFunction};
+use crate::ssa::{SsaFunction, SsaInstr, SsaTerminator, SsaValue};
+use Location as L;
 
 /// 一个值的存放位置。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -75,7 +76,8 @@ pub fn allocate_registers(
     let mut owners: Vec<Option<u32>> = vec![None; pool_size];
     let all_idx: Vec<usize> = (0..pool_size).collect();
 
-    for (val, start, end) in ordered {
+    for (val, start, end) in &ordered {
+        let (val, start, end) = (*val, *start, *end);
         // 回收所有已经结束的区间
         for i in 0..pool_size {
             if owners[i].is_some() && free_at[i] < start {
@@ -89,8 +91,7 @@ pub fn allocate_registers(
         // 正好等于调用位置的值也算进来是错的：那只是 `call` 的实参，
         // `call` 自己会读它，返回后不需要它 —— 而这样会把大量普通值挤进
         // 只有 4 个的 callee-save 集合，逼出本来不会发生的冲突。
-        let spans_call = callee_save.len() > 0
-            && calls.iter().any(|&c| start < c && c < end);
+        let spans_call = callee_save.len() > 0 && calls.iter().any(|&c| start < c && c < end);
         let allowed: &[usize] = if spans_call { callee_save } else { &all_idx };
         match allowed.iter().copied().find(|i| owners[*i].is_none()) {
             Some(i) => {
@@ -105,92 +106,342 @@ pub fn allocate_registers(
             }
         }
     }
+    if std::env::var("ZR_DEBUG_ALLOC").is_ok() {
+        eprintln!(
+            "== allocation for {} (pool {pool_size}, spilled {}) ==",
+            func.name, out.spilled
+        );
+        for (v, s, e) in &ordered {
+            let loc = match out.map.get(v) {
+                Some(L::Reg(i)) => format!("r{i}"),
+                Some(L::Stack(slot)) => format!("stack[{slot}]"),
+                None => "??".to_string(),
+            };
+            eprintln!("  v{v} = ({s},{e}) -> {loc}");
+        }
+    }
     out
 }
 
 /// 每个值的活跃区间 `[首定义, 末使用]`（线性位置）。
-fn live_intervals(func: &SsaFunction) -> (HashMap<u32, (usize, usize)>, Vec<usize>) {
-    let mut iv: HashMap<u32, (usize, usize)> = HashMap::new();
-    let mut pos = 0usize;
-    let mut calls: Vec<usize> = Vec::new();
+///
+/// 这一版走**真正的 CFG 活跃性分析**，而不是"沿块下标顺序扫一遍"。差别不是
+/// 风格问题，是正确性问题：
+///
+/// 块下标顺序不满足"前驱排在后继之前"。`while c { ... break; }` 展开出来是
+///
+/// ```text
+/// bb1: 头（含 φ）      ← v0 = 累加器在这里定义
+/// bb2: 循环体
+/// bb3: 出口检查        ← v0 在这里被读
+/// bb4: break 的落点    ← 块号 4 > 3，排在读之后
+/// ```
+///
+/// `break` 从 bb2 跳到 bb4，bb4 又跳回 bb3 读 v0。于是一条真实存在的路径是
+/// bb2 → bb4 → bb3：v0 必须从 bb2 一直活到 bb3 的那次读。扫块下标时 bb4 排在
+/// 那次读**之后**，v0 的区间就在进入 bb4 之前就结束了，中途的寄存器被复用，
+/// 读到的不是累加器的值。
+///
+/// 支配树那套"回边延长"救不了这种形状：bb4 → bb3 是**回边**（DFS 里 bb3 先被
+/// 访问），但它不是循环的回边——`dominates(idom, bb3, bb4)` 成立，于是延长逻辑
+/// 把它当成普通边处理，而普通边不需要延长（读在前、写在后，顺序恰好自洽）。
+///
+/// 正确做法是标准的反向活跃性不动点：
+///
+/// ```text
+/// live_out[B] = ⋃_{S∈succ(B)} (live_in[S] − φ_results(S)) ∪ {φ 在 B 上的传入值}
+/// live_in[B]  = use[B] ∪ (live_out[B] − def[B])
+/// ```
+///
+/// 之后把区间按"块内有活跃"来撑开：值只要在某个块的入口活跃，就必须覆盖整个块。
+fn sorted(s: &HashSet<u32>) -> Vec<u32> {
+    let mut v: Vec<u32> = s.iter().copied().collect();
+    v.sort_unstable();
+    v
+}
 
-    // 函数参数：入口处就算定义；上界由第一次使用来抬高
+fn live_intervals(func: &SsaFunction) -> (HashMap<u32, (usize, usize)>, Vec<usize>) {
+    let n = func.blocks.len();
+    if n == 0 {
+        return (HashMap::new(), Vec::new());
+    }
+
+    // ---- 线性位置：块下标 -> [起, 终) ----
+    //
+    // 位置只是**活跃区间端点的度量**，正确性完全由下面的 CFG 活跃性保证；
+    // 块之间的先后顺序不影响结果。
+    let mut block_range: Vec<(usize, usize)> = Vec::with_capacity(n);
+    let mut pos = 0usize;
+    for block in &func.blocks {
+        let len = block.instrs.len() + 1; // +1 给终结符
+        block_range.push((pos, pos + len));
+        pos += len;
+    }
+    // 块号 -> 下标（MIR 降级保证块号连续，但别依赖这一点）。
+    let index_of: HashMap<usize, usize> = func
+        .blocks
+        .iter()
+        .enumerate()
+        .map(|(i, b)| (b.id, i))
+        .collect();
+
+    // ---- 前驱表 ----
+    let succs: Vec<Vec<usize>> = func
+        .blocks
+        .iter()
+        .map(|b| crate::ssa::successors_of_ssa_term(&b.term))
+        .collect();
+    let mut preds: Vec<Vec<usize>> = vec![Vec::new(); n];
+    for (i, ss) in succs.iter().enumerate() {
+        for &s in ss {
+            if let Some(&si) = index_of.get(&s) {
+                preds[si].push(i);
+            }
+        }
+    }
+
+    // ---- 每块的 use / def ----
+    //
+    // φ 的传入值算**本块**的 use（它们在本块末尾被读），φ 的结果算**本块**的
+    // def（它在本块开头生效）。
+    let mut uses: Vec<HashSet<u32>> = vec![HashSet::new(); n];
+    let mut defs: Vec<HashSet<u32>> = vec![HashSet::new(); n];
+    //
+    // `use[B]` 的定义是"**在本块内**先读后写"的值，必须**顺序**扫描才能算对。
+    // 早先这里把所有操作数一股脑塞进 use，于是 `const v5 = 10; v6 = v1 < v5`
+    // 里的 v5 也成了 use——它明明在本块内已经定义过。后果不是多占一点寄存器：
+    // v5 ∈ use[B] ⇒ v5 ∈ live_in[B] ⇒ 一路经 `live_out[前驱]` 传回入口块，
+    // 整条链上的值都被撑成"全程活跃"，活跃区间完全失去意义（实测每个中间值
+    // 的区间都一直伸到函数末尾）。
+    for (bi, block) in func.blocks.iter().enumerate() {
+        let mut defined: HashSet<u32> = HashSet::new();
+        let take_use = |v: SsaValue, defined: &HashSet<u32>, uses: &mut HashSet<u32>| {
+            if !defined.contains(&v.id()) {
+                uses.insert(v.id());
+            }
+        };
+        for instr in &block.instrs {
+            if matches!(instr, SsaInstr::Phi { .. }) {
+                // φ 的**传入值**不是本块的 use——它们在各前驱块的末尾被读，
+                // 由下面的 `phi_inputs` 单独记账。混进 `uses` 会让
+                // `live_out[前驱]` 通过 `live_in[本块]` 把这些值一路传到入口块。
+                if let Some(r) = instr.result() {
+                    defined.insert(r.id());
+                    defs[bi].insert(r.id());
+                }
+                continue;
+            }
+            let mut us = Vec::new();
+            crate::ssa::instr_uses(instr, &mut us);
+            for u in us {
+                take_use(u, &defined, &mut uses[bi]);
+            }
+            if let Some(r) = instr.result() {
+                defined.insert(r.id());
+                defs[bi].insert(r.id());
+            }
+        }
+        let mut tus = Vec::new();
+        term_uses(&block.term, &mut tus);
+        for v in tus {
+            take_use(v, &defined, &mut uses[bi]);
+        }
+    }
+    // 函数参数在入口定义。
+    for p in &func.params {
+        defs[0].insert(p.id());
+    }
+
+    // ---- 反向不动点 ----
+    let mut live_in: Vec<HashSet<u32>> = vec![HashSet::new(); n];
+    let mut live_out: Vec<HashSet<u32>> = vec![HashSet::new(); n];
+
+    // 每个块作为前驱时，需要在末尾保持活跃的值：后继块 φ 的传入值。
+    // （等价于把 φ 节点"下沉"到前驱末尾，活跃性才看得见。）
+    let mut phi_inputs: Vec<HashSet<u32>> = vec![HashSet::new(); n];
+    for bi in 0..n {
+        for &s in &succs[bi] {
+            let Some(&si) = index_of.get(&s) else {
+                continue;
+            };
+            for instr in &func.blocks[si].instrs {
+                let SsaInstr::Phi { incoming, .. } = instr else {
+                    break; // φ 一定连续排在块首
+                };
+                for (p, v) in incoming {
+                    // 只收"本块确实是这条前驱边"的传入值。incoming 记的是块号，
+                    // 所以按块号比较而不是下标。
+                    if func.blocks[bi].id == *p {
+                        phi_inputs[bi].insert(v.id());
+                    }
+                }
+            }
+        }
+    }
+
+    loop {
+        let mut changed = false;
+        for bi in (0..n).rev() {
+            // live_out[B] = ⋃_S (live_in[S] − φ结果(S)) ∪ φ在B上的传入值
+            let mut out: HashSet<u32> = phi_inputs[bi].clone();
+            for &s in &succs[bi] {
+                let Some(&si) = index_of.get(&s) else {
+                    continue;
+                };
+                for &v in &live_in[si] {
+                    // 后继块 φ 的结果由 φ 自己算，不算"B 出口时必须活着"。
+                    let defined_by_phi = func.blocks[si]
+                        .instrs
+                        .iter()
+                        .take_while(|i| matches!(i, SsaInstr::Phi { .. }))
+                        .any(|i| i.result().is_some_and(|r| r.id() == v));
+                    if !defined_by_phi {
+                        out.insert(v);
+                    }
+                }
+            }
+            // live_in[B] = use[B] ∪ (live_out[B] − def[B])
+            let mut inn: HashSet<u32> = uses[bi].clone();
+            for &v in &out {
+                if !defs[bi].contains(&v) {
+                    inn.insert(v);
+                }
+            }
+            if out != live_out[bi] || inn != live_in[bi] {
+                live_out[bi] = out;
+                live_in[bi] = inn;
+                changed = true;
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+
+    // ---- 汇总成区间 ----
+    //
+    // 端点取三处的最大值 / 最小值：
+    // 1. 定义点（函数参数算 0）；
+    // 2. 直接使用点；
+    // 3. 活跃性分析给出的"必须撑满"的块。
+    //
+    // 第 3 项是关键：一个值只要在块 B 的入口活跃，就必须在整个 B 期间保持
+    // 有效——包括 B 末尾那些 φ 拷贝。break 路径正是靠这一项被撑开的。
+    let mut iv: HashMap<u32, (usize, usize)> = HashMap::new();
+    let bump_end = |iv: &mut HashMap<u32, (usize, usize)>, v: u32, end: usize| {
+        let e = iv.entry(v).or_insert((end, end));
+        if e.1 < end {
+            e.1 = end;
+        }
+        if e.0 > end {
+            e.0 = end;
+        }
+    };
+
     for p in &func.params {
         iv.insert(p.id(), (0, 0));
     }
 
-    for block in &func.blocks {
-        // 块内的 phi 必须在所有指令之前求值
+    let mut pos = 0usize;
+    let mut calls: Vec<usize> = Vec::new();
+    for (bi, block) in func.blocks.iter().enumerate() {
         let n_phi = block
             .instrs
             .iter()
             .take_while(|i| matches!(i, SsaInstr::Phi { .. }))
             .count();
+        // φ 的结果在本块开头定义；传入值不在这里记账（见 `phi_inputs`）。
         for instr in block.instrs.iter().take(n_phi) {
-            touch_use(instr, &mut iv, pos);
-            if let SsaInstr::Phi { result, incoming, .. } = instr {
-                // φ 的结果在**所有**传入值都算完之后才"活"，否则会与它们冲突
-                iv.insert(result.id(), (pos, pos));
-                for (_, v) in incoming {
-                    extend(*v, &mut iv, pos);
-                }
-            }
-            pos += 1;
-        }
-
-        for instr in block.instrs.iter().skip(n_phi) {
-            if matches!(instr, SsaInstr::Call { .. }) {
-                calls.push(pos);
-            }
-            touch_use(instr, &mut iv, pos);
             if let Some(r) = instr.result() {
                 iv.insert(r.id(), (pos, pos));
             }
             pos += 1;
         }
-
-        // 终结符引用也算一次使用
-        match &block.term {
-            SsaTerminator::Return(Some(v)) => extend(*v, &mut iv, pos),
-            SsaTerminator::Branch { cond, .. } => extend(*cond, &mut iv, pos),
-            _ => {}
+        for instr in block.instrs.iter().skip(n_phi) {
+            if matches!(instr, SsaInstr::Call { .. }) {
+                calls.push(pos);
+            }
+            let mut us = Vec::new();
+            crate::ssa::instr_uses(instr, &mut us);
+            for u in us {
+                bump_end(&mut iv, u.id(), pos);
+            }
+            if let Some(r) = instr.result() {
+                iv.insert(r.id(), (pos, pos));
+            }
+            pos += 1;
+        }
+        // 终结符的使用
+        let mut tus = Vec::new();
+        term_uses(&block.term, &mut tus);
+        for v in tus {
+            bump_end(&mut iv, v.id(), pos);
         }
         pos += 1;
+
+        // 活跃性撑开：入口活跃 → 覆盖整块；出口活跃 → 至少到块末。
+        let (start, end) = block_range[bi];
+        for &v in &live_in[bi] {
+            if let Some(e) = iv.get_mut(&v) {
+                if e.0 > start {
+                    e.0 = start;
+                }
+                if e.1 < end {
+                    e.1 = end;
+                }
+            } else {
+                iv.insert(v, (start, end));
+            }
+        }
+        for &v in &live_out[bi] {
+            if let Some(e) = iv.get_mut(&v) {
+                if e.1 < end {
+                    e.1 = end;
+                }
+            } else {
+                iv.insert(v, (end, end));
+            }
+        }
+        // φ 传入值必须活到本块末尾（末尾要做并行拷贝）。
+        for &v in &phi_inputs[bi] {
+            bump_end(&mut iv, v, end);
+        }
+    }
+
+    if std::env::var("ZR_DEBUG_BACKEDGE").is_ok() {
+        eprintln!("== live intervals for {} ==", func.name);
+        for bi in 0..n {
+            let mut li: Vec<_> = live_in[bi].iter().copied().collect();
+            let mut lo: Vec<_> = live_out[bi].iter().copied().collect();
+            let mut pd: Vec<_> = phi_inputs[bi].iter().copied().collect();
+            li.sort_unstable();
+            lo.sort_unstable();
+            pd.sort_unstable();
+            eprintln!(
+                "  bb{} {:?} use={:?} def={:?} in={:?} out={:?} phi_in={:?}",
+                func.blocks[bi].id,
+                block_range[bi],
+                sorted(&uses[bi]),
+                sorted(&defs[bi]),
+                li,
+                lo,
+                pd
+            );
+        }
+        let mut items: Vec<(u32, (usize, usize))> = iv.iter().map(|(k, v)| (*k, *v)).collect();
+        items.sort();
+        for (k, v) in items {
+            eprintln!("  v{k} = {:?}", v);
+        }
     }
     (iv, calls)
 }
 
-/// 记一条指令里的每个操作数为「使用」，并把它们的区间延长到 `pos`。
-fn touch_use(instr: &SsaInstr, iv: &mut HashMap<u32, (usize, usize)>, pos: usize) {
-    match instr {
-        SsaInstr::Const { .. } | SsaInstr::Var { .. } => {}
-        SsaInstr::Unary { operand, .. } => extend(*operand, iv, pos),
-        SsaInstr::Binary { lhs, rhs, .. } => {
-            extend(*lhs, iv, pos);
-            extend(*rhs, iv, pos);
-        }
-        SsaInstr::Phi { incoming, .. } => {
-            for (_, v) in incoming {
-                extend(*v, iv, pos);
-            }
-        }
-        SsaInstr::Copy { src, .. } => extend(*src, iv, pos),
-        SsaInstr::Cast { src, .. } => extend(*src, iv, pos),
-        SsaInstr::Call { args, .. } => {
-            for a in args {
-                extend(*a, iv, pos);
-            }
-        }
-    }
-}
-
-/// 把 `v` 的活跃区间下界补上（首次使用）并延长上界到 `pos`。
-fn extend(v: SsaValue, iv: &mut HashMap<u32, (usize, usize)>, pos: usize) {
-    let e = iv.entry(v.id()).or_insert((pos, pos));
-    if e.0 > pos {
-        e.0 = pos;
-    }
-    if pos > e.1 {
-        e.1 = pos;
+/// 终结符引用的值。
+fn term_uses(term: &SsaTerminator, out: &mut Vec<SsaValue>) {
+    match term {
+        SsaTerminator::Return(Some(v)) => out.push(*v),
+        SsaTerminator::Branch { cond, .. } => out.push(*cond),
+        _ => {}
     }
 }

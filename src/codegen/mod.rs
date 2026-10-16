@@ -26,6 +26,7 @@ pub mod encoder;
 pub mod encoder_aarch64;
 pub mod encoder_arm;
 pub mod encoder_riscv;
+pub mod encoder_thumb;
 pub mod linker;
 pub mod macho;
 pub mod objfile;
@@ -42,6 +43,11 @@ use target::{Arch, ObjectFormat, Os, Target};
 /// 编译产物（可重定位目标文件 / 可执行文件）。
 #[derive(Debug, Clone, Default)]
 pub struct CompilationUnit {
+    /// 目标是不是 Thumb-2 编码的 ARM 32 位。
+    ///
+    /// 链接写符号表 / 入口地址时要置 bit 0——那是"该地址是 Thumb 状态"
+    /// 的标记，缺了加载器会按 A32 取指。
+    pub is_thumb: bool,
     /// `.text` 段：机器码字节流。
     pub code: Vec<u8>,
     /// `.data` 段：已初始化数据。
@@ -56,6 +62,10 @@ pub struct CompilationUnit {
     pub entry: String,
     /// 文件类型。
     pub kind: OutputKind,
+    /// 链接指令（`#[link(name = "c", kind = "static")]`）。
+    pub link_directives: Vec<crate::attributes::LinkDirective>,
+    /// 结构体 repr 布局信息（`#[repr(C)]` / `#[repr(packed)]` 等）。
+    pub struct_reprs: Vec<(String, crate::typeck::hir::Repr)>,
 }
 
 /// 输出文件类型。
@@ -119,6 +129,15 @@ pub enum RelocationKind {
     Call26,
     /// ARM：24 位字面量字对齐偏移（`b` / `bl`，ELF `R_ARM_JUMP24`）。
     ArmBranch24,
+    /// Thumb-2 `bl`（T1）：PC 相对半字偏移 + S 位。
+    ///
+    /// 与 A32 的 `ArmBranch24` 分开：Thumb 的偏移单位是**半字**且带一个
+    /// 额外的高位符号位，用错重定位类型会把调用跳到垃圾地址。
+    ArmCallThumb,
+    /// Thumb-2 `b`（T4）/ `b<cond>`（T1）：PC 相对半字偏移。
+    ArmBranchThumb,
+    /// Thumb `cbz` / `cbnz`：8 位半字偏移，落在指令的 [9:2]，且只支持 r0-r3。
+    ArmCbzThumb,
     /// RISC-V：21 位字对齐偏移（`jal`，ELF `R_RISCV_JAL`）。
     RiscVJal,
     /// RISC-V：13 位半字对齐偏移（条件分支，ELF `R_RISCV_BRANCH`）。
@@ -166,6 +185,7 @@ impl CompilationUnit {
 /// `target` 决定指令后端（x86-64 / aarch64）与入口桩的调用约定。
 pub fn compile(target: &Target, module: &SsaModule) -> Result<CompilationUnit, String> {
     let mut unit = CompilationUnit::new();
+    unit.is_thumb = target.is_arm32_thumb();
 
     // 1. 指令选择 + 寄存器分配 + 代码发射（按目标架构分派后端）
     let arch = target.arch();
@@ -173,10 +193,16 @@ pub fn compile(target: &Target, module: &SsaModule) -> Result<CompilationUnit, S
         match arch {
             Arch::X86_64 => encoder::emit_function(target, &mut unit, func),
             Arch::AArch64 => encoder_aarch64::emit_function(target, &mut unit, func),
-            Arch::Arm32 => encoder_arm::emit_function(target, &mut unit, func),
+            Arch::Arm32 | Arch::Arm32Thumb => {
+                if target.is_arm32_thumb() {
+                    encoder_thumb::emit_function(target, &mut unit, func)
+                } else {
+                    encoder_arm::emit_function(target, &mut unit, func)
+                }
+            }
             Arch::RiscV32 | Arch::RiscV64 => encoder_riscv::emit_function(target, &mut unit, func),
-            Arch::Wasm32 => {
-                return Err("wasm32 is handled by `wasm::WasmModule`, not the native backend".into())
+            Arch::Wasm32 | Arch::Wasm64 => {
+                return Err("wasm is handled by `wasm::WasmModule`, not the native backend".into())
             }
         }
     }
@@ -187,11 +213,17 @@ pub fn compile(target: &Target, module: &SsaModule) -> Result<CompilationUnit, S
         match arch {
             Arch::X86_64 => encoder::emit_start_wrapper(target, &mut unit),
             Arch::AArch64 => encoder_aarch64::emit_start_wrapper(target, &mut unit),
-            Arch::Arm32 => encoder_arm::emit_start_wrapper(target, &mut unit),
+            Arch::Arm32 | Arch::Arm32Thumb => {
+                if target.is_arm32_thumb() {
+                    encoder_thumb::emit_start_wrapper(target, &mut unit)
+                } else {
+                    encoder_arm::emit_start_wrapper(target, &mut unit)
+                }
+            }
             Arch::RiscV32 | Arch::RiscV64 => {
                 encoder_riscv::emit_start_wrapper(target, &mut unit);
             }
-            Arch::Wasm32 => {}
+            Arch::Wasm32 | Arch::Wasm64 => {}
         }
     } else {
         // 没有 `main` 时入口落在代码段开头（后端仍会登记该符号）。
@@ -208,6 +240,33 @@ pub fn compile(target: &Target, module: &SsaModule) -> Result<CompilationUnit, S
     }
 
     Ok(unit)
+}
+
+/// 从 HIR 模块提取链接指令和 repr 布局信息。
+///
+/// 在代码生成前调用，把 `#[link(...)]` 和 `#[repr(...)]` 属性
+/// 从 AST/HIR 提取到 `CompilationUnit` 中，供链接器使用。
+pub fn extract_attributes(
+    unit: &mut CompilationUnit,
+    hir: &crate::typeck::hir::HirModule,
+    prog: &crate::parser::ast::Program,
+) {
+    // 提取链接指令
+    for item in &prog.functions {
+        if let Some(directive) = crate::attributes::link_directive(&item.attrs) {
+            unit.link_directives.push(directive);
+        }
+    }
+    for item in &prog.externs {
+        let _ = item; // extern 块暂不处理
+    }
+
+    // 提取 repr 布局
+    for (def_id, name) in &hir.def_names {
+        if let Some(crate::typeck::hir::HirTypeDef::Struct(s)) = hir.type_defs.get(def_id) {
+            unit.struct_reprs.push((name.clone(), s.repr));
+        }
+    }
 }
 
 /// 写出目标文件（`-c`：只编译不链接）。
@@ -241,7 +300,11 @@ pub fn emit_object(target: &Target, unit: &CompilationUnit, path: &Path) -> std:
 ///
 /// 若平台链接器不可用（例如缺少交叉工具链），则退回到自行构造容器
 /// （只要程序不依赖运行时的 `zr_*` 符号，产物依然可运行）。
-pub fn emit_executable(target: &Target, unit: &CompilationUnit, path: &Path) -> std::io::Result<()> {
+pub fn emit_executable(
+    target: &Target,
+    unit: &CompilationUnit,
+    path: &Path,
+) -> std::io::Result<()> {
     check_target(target)?;
     if target.os() == Os::Bare {
         // 裸机映像没有操作系统加载器：既不需要程序头，也不需要链接器，
@@ -284,7 +347,10 @@ fn check_target(target: &Target) -> std::io::Result<()> {
     if !target.is_little_endian() {
         return Err(std::io::Error::new(
             std::io::ErrorKind::Unsupported,
-            format!("big-endian targets are not supported yet: {}", target.triple()),
+            format!(
+                "big-endian targets are not supported yet: {}",
+                target.triple()
+            ),
         ));
     }
     if !target.is_supported() {
@@ -351,8 +417,10 @@ fn linker_commands(
         ObjectFormat::Elf => {
             // ld -o out -e _start -static user.o libzrrt-*.a
             let mut c = std::process::Command::new("ld");
-            c.arg("-o").arg(output.as_os_str())
-                .arg("-e").arg(target.entry_symbol())
+            c.arg("-o")
+                .arg(output.as_os_str())
+                .arg("-e")
+                .arg(target.entry_symbol())
                 .arg("-static")
                 .arg(obj.as_os_str());
             if let Some(lib) = runtime_lib {
@@ -362,8 +430,10 @@ fn linker_commands(
 
             // gcc 驱动（自带正确的 CRT 与入口约定）
             let mut c = std::process::Command::new("gcc");
-            c.arg("-nostdlib").arg("-no-pie")
-                .arg("-o").arg(output.as_os_str())
+            c.arg("-nostdlib")
+                .arg("-no-pie")
+                .arg("-o")
+                .arg(output.as_os_str())
                 .arg(obj.as_os_str())
                 .arg(format!("-Wl,-e,{}", target.entry_symbol()));
             if let Some(lib) = runtime_lib {
@@ -381,7 +451,8 @@ fn linker_commands(
                 if needs_target && driver == "clang" {
                     c.arg("-target").arg(macho_driver_triple(target));
                 }
-                c.arg("-o").arg(output.as_os_str())
+                c.arg("-o")
+                    .arg(output.as_os_str())
                     .arg(obj.as_os_str())
                     .arg(format!("-Wl,-e,{}", target.entry_symbol()));
                 if let Some(lib) = runtime_lib {
@@ -394,7 +465,8 @@ fn linker_commands(
             // clang 驱动：自动附加 kernel32.lib 等系统导入库
             let mut c = std::process::Command::new("clang");
             c.arg(format!("--target={}", target.triple()))
-                .arg("-o").arg(output.as_os_str())
+                .arg("-o")
+                .arg(output.as_os_str())
                 .arg(obj.as_os_str());
             if let Some(lib) = runtime_lib {
                 c.arg(lib);
@@ -407,7 +479,10 @@ fn linker_commands(
                 _ => "x86_64-w64-mingw32-gcc",
             };
             let mut c = std::process::Command::new(driver);
-            c.arg("-nostdlib").arg("-o").arg(output.as_os_str()).arg(obj.as_os_str());
+            c.arg("-nostdlib")
+                .arg("-o")
+                .arg(output.as_os_str())
+                .arg(obj.as_os_str());
             if let Some(lib) = runtime_lib {
                 c.arg(lib);
             }
@@ -437,8 +512,9 @@ fn macho_driver_triple(target: &Target) -> &'static str {
         Arch::X86_64 => "x86_64-apple-macos11",
         Arch::AArch64 => "arm64-apple-macos11",
         Arch::Wasm32 => "wasm32-unknown-unknown",
+        Arch::Wasm64 => "wasm64-unknown-unknown",
         // 裸机目标不经过平台链接器，这里只是让穷尽性成立。
-        Arch::Arm32 | Arch::RiscV32 | Arch::RiscV64 => "arm-none-eabi",
+        Arch::Arm32 | Arch::Arm32Thumb | Arch::RiscV32 | Arch::RiscV64 => "arm-none-eabi",
     }
 }
 
@@ -502,9 +578,7 @@ pub fn unsupported_pressure(func: &str, pool: usize) -> ! {
 /// 能跑，只是结果是错的。那种 bug 比编译失败难查得多——运行期看到的
 /// 只是一个诡异的数字，没有任何线索指向代码生成。所以这里宁可编译失败。
 pub fn unsupported_const(kind: &str) -> ! {
-    eprintln!(
-        "zr: error: `{kind}` literals are not implemented for this target"
-    );
+    eprintln!("zr: error: `{kind}` literals are not implemented for this target");
     std::process::exit(1);
 }
 

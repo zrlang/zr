@@ -18,6 +18,14 @@ pub struct HirModule {
     pub functions: Vec<HirFunction>,
     /// DefId → 定义名（MIR 降级时用来把调用还原成符号名）。
     pub def_names: HashMap<DefId, String>,
+    /// 类型定义表（结构体、枚举等）。
+    pub type_defs: HashMap<DefId, HirTypeDef>,
+    /// 全局常量表（DefId → 定义）。
+    ///
+    /// MIR 降级需要它：引用一个 `const` 时要把**值**内联进指令流
+    /// （常量没有存储，不存在"读一个全局"这种运行时操作）。少了这张表，
+    /// `const LIMIT: i32 = 40; if LIMIT != 40 { .. }` 会拿 unit 去比较。
+    pub consts: HashMap<DefId, HirConst>,
 }
 
 // ======================================================================
@@ -94,9 +102,7 @@ impl PartialEq for ArrayLen {
     fn eq(&self, other: &Self) -> bool {
         match (self, other) {
             (ArrayLen::Dynamic, ArrayLen::Dynamic) => true,
-            (ArrayLen::Const(a), ArrayLen::Const(b)) => {
-                format!("{:?}", a) == format!("{:?}", b)
-            }
+            (ArrayLen::Const(a), ArrayLen::Const(b)) => format!("{:?}", a) == format!("{:?}", b),
             _ => false,
         }
     }
@@ -191,8 +197,13 @@ pub enum ExprKind {
     For,
     /// `loop` 无限循环。
     Loop(HirBlock),
-    /// `break` / `continue`（含标签与值）。
+    /// `break`（含标签与值）：跳到最内层循环的出口。
     Break,
+    /// `continue`：跳回最内层循环的回边。
+    ///
+    /// 必须和 `Break` 分开。之前两者共用 `Break`，于是 `continue` 会跳出
+    /// 循环而不是回到循环头。
+    Continue,
     /// `return`。
     Return(Option<Box<HirExpr>>),
     /// `defer` 延迟表达式。
@@ -258,17 +269,36 @@ impl Eq for HirLiteral {}
 /// 二元运算符。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum BinaryOp {
-    Add, Sub, Mul, Div, Rem,
-    BitAnd, BitOr, BitXor, Shl, Shr,
-    Eq, Ne, Lt, Gt, Le, Ge,
-    And, Or,
-    Range, RangeInclusive,
+    Add,
+    Sub,
+    Mul,
+    Div,
+    Rem,
+    BitAnd,
+    BitOr,
+    BitXor,
+    Shl,
+    Shr,
+    Eq,
+    Ne,
+    Lt,
+    Gt,
+    Le,
+    Ge,
+    And,
+    Or,
+    Range,
+    RangeInclusive,
 }
 
 /// 一元运算符。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum UnaryOp {
-    Neg, Not, BitNot, Deref, AddrOf,
+    Neg,
+    Not,
+    BitNot,
+    Deref,
+    AddrOf,
 }
 
 /// 字段索引（已解析为定义顺序）。
@@ -404,6 +434,8 @@ pub struct HirFunction {
     pub body: Option<HirBlock>,
     /// 是否 `async fn`。
     pub is_async: bool,
+    /// `comptime fn`：只能在编译期求值（调用点折叠成常量）。
+    pub is_comptime: bool,
     /// 调用约定 / ABI（保留字段，后端按目标选择调用约定时使用）。
     #[allow(dead_code)]
     pub abi: Abi,
@@ -442,10 +474,7 @@ pub enum HirTypeDef {
     /// 联合体（仅最后一个字段活跃）。
     Union(HirUnion),
     /// 类型别名（已展开为 Target 类型）。
-    Alias {
-        def_id: DefId,
-        target: Ty,
-    },
+    Alias { def_id: DefId, target: Ty },
 }
 
 /// HIR 结构体。
@@ -496,7 +525,11 @@ pub enum HirVariantPayload {
 /// 整数表示。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum IntegerRepr {
-    I8, I16, I32, I64, I128,
+    I8,
+    I16,
+    I32,
+    I64,
+    I128,
     /// 由编译器选择最小表示（默认）。
     Auto,
 }
