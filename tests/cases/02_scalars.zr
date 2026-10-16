@@ -28,5 +28,29 @@ fn main() -> i32 {
     if 40 / 4 / 5 != 2 {
         return 6;
     }
+
+    // --- 有符号运算：负数会走到和正数完全不同的指令路径 ---
+    // 除法必须先做符号扩展（cqo）；`xor edx, edx` 只在被除数非负时等价。
+    let neg: i32 = -42;
+    let two: i32 = 2;
+    if neg / two != -21 {
+        return 5;
+    }
+    if -43 % 5 != -3 {
+        return 6;
+    }
+    // 右移是算术右移（补符号位），不是逻辑右移。
+    let minus8: i32 = -8;
+    if minus8 >> 2 != -2 {
+        return 7;
+    }
+    if minus8 >> 1 != -4 {
+        return 8;
+    }
+    // 正数右移不受影响
+    if 8 >> 2 != 2 {
+        return 9;
+    }
+
     return 0;
 }

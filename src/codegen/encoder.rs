@@ -612,7 +612,7 @@ fn emit_binary(unit: &mut CompilationUnit, result: SsaValue, op: SsaBinaryOp, lh
             }
         }
         Shl => emit_shift(unit, 4, dst, l, r), // shl r/m64, cl
-        Shr => emit_shift(unit, 5, dst, l, r), // shr r/m64, cl
+        Shr => emit_shift(unit, 7, dst, l, r), // sar r/m64, cl（算术右移）
         // 比较运算：cmp l, r; setcc al; movzx dst, al
         Eq | Ne | Lt | Gt | Le | Ge => {
             emit_cmp_rr(unit, l, r);
@@ -655,7 +655,10 @@ fn emit_unary(unit: &mut CompilationUnit, result: SsaValue, op: crate::ssa::SsaU
             if dst != r {
                 emit_mov_rr(unit, dst, r);
             }
-            emit1(unit, 0x48);
+            // REX.B 扩展的是 ModRM 的 **r/m** 字段，而这里是目的寄存器。
+            // 漏掉它的话，`not r9` 会被编码成 `not rcx`——写错寄存器，
+            // 而且不报错。
+            emit1(unit, 0x48 | if dst.rex_bit() { 0x01 } else { 0 });
             emit1(unit, 0xf7);
             modrm(unit, 3, 2, dst.bits()); // /2 = NOT
         }
@@ -664,7 +667,7 @@ fn emit_unary(unit: &mut CompilationUnit, result: SsaValue, op: crate::ssa::SsaU
             if dst != r {
                 emit_mov_rr(unit, dst, r);
             }
-            emit1(unit, 0x48);
+            emit1(unit, 0x48 | if dst.rex_bit() { 0x01 } else { 0 });
             emit1(unit, 0xf7);
             modrm(unit, 3, 3, dst.bits()); // /3 = NEG
         }
@@ -1038,7 +1041,9 @@ fn emit_mul(unit: &mut CompilationUnit, dst: Gpr, l: Gpr, r: Gpr) {
 /// 寄存器分配的原因。
 fn emit_divrem(unit: &mut CompilationUnit, dst: Gpr, l: Gpr, r: Gpr, want_rem: bool) {
     emit_mov_rr(unit, SCRATCH_AX, l);
-    emit2(unit, 0x31, 0xd2); // xor edx, edx（等价 cqo 的符号扩展）
+    // 必须用 `cqo`（rax 的符号扩展进 rdx），**不能**用 `xor edx, edx`：
+    // 后者只在被除数为非负时等价。负数除法会算出完全错误的商和余数。
+    emit2(unit, 0x48, 0x99); // cqo
     let mut rex = 0x48u8;
     if r.rex_bit() { rex |= 0x01; }
     emit1(unit, rex);
@@ -1047,8 +1052,12 @@ fn emit_divrem(unit: &mut CompilationUnit, dst: Gpr, l: Gpr, r: Gpr, want_rem: b
     emit_mov_rr(unit, dst, if want_rem { SCRATCH_DX } else { SCRATCH_AX });
 }
 
-/// 移位 `shl r/m64, cl` 或 `shr r/m64, cl`：REX.W + D3 /4 (shl) 或 /5 (shr)。
+/// 移位 `shl r/m64, cl` 或 `sar r/m64, cl`：REX.W + D3 /4 (shl) 或 /7 (sar)。
 /// x86 移位计数固定使用 CL——这是 `rcx` 不参与分配的原因。
+///
+/// 右移一律用**算术**右移：IR 只有一个 `Shr`，没有区分有无符号，而
+/// 整数字面量默认是 i32——对有符号数 `>>` 必须补符号位（`sar`）。
+/// 无符号右移需要 IR 里另加一个操作码。
 fn emit_shift(unit: &mut CompilationUnit, code: u8, dst: Gpr, l: Gpr, r: Gpr) {
     if dst != l {
         emit_mov_rr(unit, dst, l);
@@ -1130,7 +1139,9 @@ mod tests {
         // 被除数 rdi（ALLOCATABLE[1]）→ rax，除数 r8（ALLOCATABLE[2]）
         assert_eq!(u.code.len(), 11);
         assert_eq!(&u.code[0..3], &[0x48, 0x89, 0xf8], "mov rax, rdi");
-        assert_eq!(&u.code[3..5], &[0x31, 0xd2], "xor edx, edx");
+        // 必须是 `cqo`（rax 的符号扩展进 rdx:rax），不能是 `xor edx, edx`——
+        // 后者只在被除数非负时等价，负数除法会算错。
+        assert_eq!(&u.code[3..5], &[0x48, 0x99], "cqo");
         assert_eq!(&u.code[5..8], &[0x49, 0xf7, 0xf8], "REX.WB + idiv r8");
     }
 

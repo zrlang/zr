@@ -318,23 +318,26 @@ fn emit_rsb(unit: &mut CompilationUnit, rd: Reg, rn: Reg) {
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Shift {
     Lsl,
-    Lsr,
+    /// 算术右移。
+    Asr,
 }
 
 impl Shift {
     fn type_code(self) -> u32 {
         match self {
             Shift::Lsl => 0b00,
-            Shift::Lsr => 0b01,
+            Shift::Asr => 0b10,
         }
     }
 }
 
-/// 寄存器受控移位：`lsl/lsr rd, rm, rs`（rd = rm 移位 rs 位）。
+/// 寄存器受控移位：`lsl/asr rd, rm, rs`（rd = rm 移位 rs 位）。
 fn emit_shift_by_reg(unit: &mut CompilationUnit, rd: Reg, rm: Reg, count: Reg, shift: Shift) {
+    // 基址只置 bit4（寄存器受控移位标志），**不要**把 Rd 烤进基址——
+    // 早先写成 0xe1a0_1010，等于 Rd 恒为 1，换任何别的目的寄存器都会错位。
     insn(
         unit,
-        0xe1a0_1010 | (rd.bits() as u32) << 12 | (count.bits() as u32) << 8
+        0xe1a0_0010 | (rd.bits() as u32) << 12 | (count.bits() as u32) << 8
             | shift.type_code() << 5
             | rm.bits() as u32,
     );
@@ -610,7 +613,9 @@ fn emit_binary(
             emit_mls(unit, dst, rn, rm, dst);
         }
         Shl => emit_shift_by_reg(unit, dst, rn, rm, Shift::Lsl),
-        Shr => emit_shift_by_reg(unit, dst, rn, rm, Shift::Lsr),
+        // 右移一律取算术（ASR），与 x86-64 的 sar 一致：IR 只有一个 Shr，
+        // 而整数字面量默认 i32，对有符号数必须补符号位。
+        Shr => emit_shift_by_reg(unit, dst, rn, rm, Shift::Asr),
         Eq | Ne | Lt | Gt | Le | Ge => emit_compare(unit, dst, op, rn, rm),
     }
 }
@@ -823,14 +828,15 @@ mod tests {
     }
 
     /// 汇编器实测值（`clang -target armv7a-none-eabi -march=armv7ve` + objdump）。
-    const REF: [(&str, u32); 12] = [
+    const REF: [(&str, u32); 13] = [
         ("sdiv r1,r4,r7", 0xE711_F714),
         ("udiv r3,r5,r8", 0xE733_F815),
         ("mul r1,r4,r7", 0xE001_0794),
         ("mls r1,r4,r7,r2", 0xE061_2794),
         ("mov r1,r4", 0xE1A0_1004),
         ("lsl r1,r4,r7", 0xE1A0_1714),
-        ("lsr r1,r4,r7", 0xE1A0_1734),
+        ("asr r1,r4,r7", 0xE1A0_1754),
+        ("asr r2,r4,r7", 0xE1A0_2754),
         ("cmp r4,r7", 0xE154_0007),
         ("mvn r1,r4", 0xE1E0_1004),
         ("rsb r1,r4,#0", 0xE264_1000),
@@ -884,9 +890,9 @@ mod tests {
                 emit_shift_by_reg(&mut u, r(1), r(4), r(7), Shift::Lsl);
                 u.code
             }),
-            ("lsr r1,r4,r7", {
+            ("asr r1,r4,r7", {
                 let mut u = empty_unit();
-                emit_shift_by_reg(&mut u, r(1), r(4), r(7), Shift::Lsr);
+                emit_shift_by_reg(&mut u, r(1), r(4), r(7), Shift::Asr);
                 u.code
             }),
             ("cmp r4,r7", {

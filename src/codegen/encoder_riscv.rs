@@ -658,8 +658,8 @@ fn pick_scratch(dst: Reg) -> Reg {
 /// - RV32 移满 32 位后继续移位结果恒为 0，与规范中
 ///   "shamt >= XLEN 时结果为 0" 一致。
 ///
-/// 右移取**逻辑**右移（`srli`），与 x86-64 的 `shr` 和 AArch64 的
-/// `lsrv` 保持一致。
+/// 右移取**算术**右移（`srai`），与 x86-64 的 `sar` 保持一致：IR 里
+/// 只有一个 `Shr`，而整数字面量默认是 i32，对有符号数必须补符号位。
 fn emit_var_shift(unit: &mut CompilationUnit, left: bool, dst: Reg, rs1: Reg, rs2: Reg) {
     let cnt = pick_scratch(dst);
     let (end_idx, end) = reserve_label(unit);
@@ -670,7 +670,8 @@ fn emit_var_shift(unit: &mut CompilationUnit, left: bool, dst: Reg, rs1: Reg, rs
     emit_branch(unit, 0b001, cnt, Reg::ZERO, &end); // bne cnt, zero, end
 
     // 循环体：每轮移 1 位并递减计数
-    emit_shift_imm(unit, if left { 1 } else { 5 }, 0, dst, dst, 1);
+    // slli 是 funct3=1/arith=0x00；srai 是 funct3=5/arith=0x20
+    emit_shift_imm(unit, if left { 1 } else { 5 }, if left { 0x00 } else { 0x20 }, dst, dst, 1);
     emit_addi(unit, cnt, cnt, -1);
     emit_branch(unit, 0b001, cnt, Reg::ZERO, &end);
 
@@ -888,7 +889,7 @@ mod tests {
     }
 
     #[test]
-    fn logical_right_shift_matches_other_backends() {
+    fn right_shift_is_arithmetic() {
         let mut unit = empty_unit();
         emit_binary(&mut unit, SsaValue(8), SsaBinaryOp::Shr, SsaValue(1), SsaValue(2));
         let words: Vec<u32> = unit
@@ -896,14 +897,15 @@ mod tests {
             .chunks(4)
             .map(|c| u32::from_le_bytes(c.try_into().unwrap()))
             .collect();
-        // srli 的 imm[11:5] = 0（逻辑），srai 则是 0x20（算术）。
-        // x86-64 用 shr、AArch64 用 lsrv，本后端必须同样取逻辑右移。
+        // srli 的 imm[11:5] = 0（逻辑），srai 是 0x20（算术）。
+        // IR 只有一个 Shr，整数字面量默认 i32，所以取算术右移，
+        // 与 x86-64 的 sar / AArch64 的 asrv 保持一致。
         let shift = words
             .iter()
             .find(|w| **w & 0x7f == 0x13 && ((**w >> 12) & 7) == 0b101)
             .copied()
             .unwrap_or_else(|| panic!("缺少右移指令，实际发射：{words:08x?}"));
-        assert_eq!((shift >> 25) & 0x3f, 0, "应为 srli（逻辑右移），不是 srai");
+        assert_eq!((shift >> 25) & 0x3f, 0x20, "应为 srai（算术右移），不是 srli");
     }
 
     #[test]

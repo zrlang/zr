@@ -510,7 +510,9 @@ fn emit_binary(
             emit_msub(unit, dst, dst, rm, rn.bits());
         }
         Shl => emit_dp2(unit, 0x9ac2_2000, dst, rn, rm),
-        Shr => emit_dp2(unit, 0x9ac2_2400, dst, rn, rm),
+        // LSRV 是逻辑右移；右移一律取算术（ASRV），和 x86-64 的 sar 一致：
+        // IR 只有一个 Shr，而整数字面量默认 i32，对有符号数要补符号位。
+        Shr => emit_dp2(unit, 0x9ac2_2420, dst, rn, rm),
         Eq | Ne | Lt | Gt | Le | Ge => {
             emit_cmp(unit, rn, rm);
             emit_cset(unit, dst, condition_code(op));
