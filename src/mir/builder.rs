@@ -7,6 +7,7 @@
 //! - `break`/`continue` 转为对循环出口/头部块的 `Goto`。
 
 use crate::mir::{
+    NumTy,
     MirBasicBlock, MirBinaryOp, MirFunction, MirInstr, MirParam,
     MirTerminator, MirUnaryOp, MirValue,
 };
@@ -52,6 +53,9 @@ pub fn lower_function(
     // 把收集到的块按分配顺序落盘
     MirFunction {
         name: func.name.clone(),
+        inline_never: func
+            .attr("inline")
+            .is_some_and(|a| a.has_arg("never")),
         params: b.param_names.iter().map(|_| MirParam).collect(),
         blocks: b.blocks,
     }
@@ -231,6 +235,23 @@ fn lower_expr(b: &mut Builder, expr: &HirExpr) -> MirValue {
                 .push(MirInstr::Call(name.clone(), fn_name, mir_args));
             MirValue::Var(name)
         }
+        Cast(inner) => {
+            // 源类型取自内层表达式，目标类型是节点的 ty。
+            let from = num_ty_of(&inner.ty);
+            let to = num_ty_of(&expr.ty);
+            let v = lower_expr(b, inner);
+            let name = format!("t{}", b.temp_id());
+            b.current_block_mut()
+                .instrs
+                .push(MirInstr::Cast(name.clone(), v, from, to));
+            MirValue::Var(name)
+        }
+        Comptime(folded) => {
+            // 编译期求值的结果直接变成字面量常量：内层表达式在 HIR 阶段就
+            // 被折叠掉了，这里没有原始表达式可降级，`comptime 40 + 2` 到
+            // 这一步已经是一个 `Int(42)`。
+            mir_literal(folded)
+        }
         _ => {
             // 其他表达式（Match/For/Struct 等）骨架阶段降级为占位
             MirValue::Unit
@@ -345,5 +366,20 @@ impl Builder {
         let t = self.next_temp;
         self.next_temp += 1;
         t
+    }
+}
+
+/// HIR 类型 -> MIR 数值类型描述。
+///
+/// 转换指令要靠它决定符号扩展还是零扩展，拿不到宽度就只能退化成
+/// "什么都不做"——那正是 `x as i32` 变成 0 的原因。
+fn num_ty_of(ty: &hir::Ty) -> NumTy {
+    use hir::Ty;
+    match ty {
+        Ty::Int(w) => NumTy::Int(*w as u8),
+        Ty::Uint(w) => NumTy::Uint(*w as u8),
+        Ty::Float(w) => NumTy::Float(*w as u8),
+        Ty::Bool => NumTy::Bool,
+        _ => NumTy::Int(64),
     }
 }

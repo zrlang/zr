@@ -18,20 +18,48 @@ use std::collections::HashMap;
 
 use crate::ssa::{SsaInstr, SsaTerminator, SsaValue, SsaFunction};
 
-/// 线性扫描结果：`值 id -> 寄存器下标`。
-pub type RegMap = HashMap<u32, usize>;
+/// 一个值的存放位置。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Location {
+    /// 寄存器池下标。
+    Reg(usize),
+    /// 栈槽（每个槽 8 字节，相对 `rsp`）。
+    Stack(usize),
+}
+
+/// 线性扫描结果：`值 id -> 位置`。
+pub type RegMap = HashMap<u32, Location>;
+
+/// 分配结果：值位置 + 需要预留的栈槽数。
+#[derive(Debug, Default)]
+pub struct Allocation {
+    pub map: RegMap,
+    /// 溢出到内存的值个数（也就是栈槽数）。
+    pub spilled: usize,
+}
 
 /// x86-64 SysV 里由**被调用方**保存、跨调用仍然有效的寄存器下标
 /// （对应 `ALLOCATABLE` 的 R12–R15）。
-pub const CALLEE_SAVE_IDX: [usize; 4] = [6, 7, 8, 9];
+///
+/// 这是**目标相关**的：别的 ABI 的 callee-save 集合不一样，寄存器数量也
+/// 可能比这少。调用方必须按目标传进来，不能在这里写死。
+pub const X86_64_CALLEE_SAVE: [usize; 4] = [6, 7, 8, 9];
 
 /// 计算函数的寄存器分配。
 ///
-/// `pool_size` 是可分配寄存器的个数；返回值里超出该范围的都没有。
-pub fn allocate_registers(func: &SsaFunction, pool_size: usize) -> RegMap {
+/// 池子用完时**不再抢占**别人的寄存器，而是把当前值溢出到栈槽。早先的
+/// 做法是"挤掉结束最早的占用者"——可那个值往往**还活着**，寄存器被复用
+/// 之后它的内容就没了，生成的程序会安静地算错。这里宁可溢出，也不产出
+/// 错代码：调用方负责在溢出发生时报错（见 `emit_function`）。
+pub fn allocate_registers(
+    func: &SsaFunction,
+    pool_size: usize,
+    callee_save: &[usize],
+) -> Allocation {
     let (intervals, calls) = live_intervals(func);
+    let mut out = Allocation::default();
     if intervals.is_empty() || pool_size == 0 {
-        return HashMap::new();
+        return out;
     }
 
     // 按起点排序；同起点时终点短的先放（更容易共用）。
@@ -42,11 +70,9 @@ pub fn allocate_registers(func: &SsaFunction, pool_size: usize) -> RegMap {
         intervals.iter().map(|(v, (s, e))| (*v, *s, *e)).collect();
     ordered.sort_by_key(|(v, s, e)| (*s, *e, *v));
 
-    let mut map: RegMap = HashMap::new();
-    // 每个寄存器当前区间的终点；`usize::MAX` 表示空闲
+    // 每个寄存器当前区间的终点
     let mut free_at: Vec<usize> = vec![0; pool_size];
     let mut owners: Vec<Option<u32>> = vec![None; pool_size];
-
     let all_idx: Vec<usize> = (0..pool_size).collect();
 
     for (val, start, end) in ordered {
@@ -63,32 +89,23 @@ pub fn allocate_registers(func: &SsaFunction, pool_size: usize) -> RegMap {
         // 正好等于调用位置的值也算进来是错的：那只是 `call` 的实参，
         // `call` 自己会读它，返回后不需要它 —— 而这样会把大量普通值挤进
         // 只有 4 个的 callee-save 集合，逼出本来不会发生的冲突。
-        let spans_call = calls.iter().any(|&c| start < c && c < end);
-        let allowed: &[usize] = if spans_call {
-            &CALLEE_SAVE_IDX
-        } else {
-            &all_idx
-        };
-        // 找一个没人要的寄存器
-        let slot = allowed.iter().copied().find(|i| owners[*i].is_none());
-        let slot = match slot {
-            Some(i) => i,
-            None => {
-                // 池子满了：挤掉结束最早的那个
-                let victim = allowed
-                    .iter()
-                    .copied()
-                    .min_by_key(|i| free_at[*i])
-                    .expect("池非空");
-                owners[victim] = None;
-                victim
+        let spans_call = callee_save.len() > 0
+            && calls.iter().any(|&c| start < c && c < end);
+        let allowed: &[usize] = if spans_call { callee_save } else { &all_idx };
+        match allowed.iter().copied().find(|i| owners[*i].is_none()) {
+            Some(i) => {
+                owners[i] = Some(val);
+                free_at[i] = end;
+                out.map.insert(val, Location::Reg(i));
             }
-        };
-        owners[slot] = Some(val);
-        free_at[slot] = end;
-        map.insert(val, slot);
+            None => {
+                // 池子满了：溢出到栈槽。**不能**去抢一个还活着的值的寄存器。
+                out.map.insert(val, Location::Stack(out.spilled));
+                out.spilled += 1;
+            }
+        }
     }
-    map
+    out
 }
 
 /// 每个值的活跃区间 `[首定义, 末使用]`（线性位置）。
@@ -158,6 +175,7 @@ fn touch_use(instr: &SsaInstr, iv: &mut HashMap<u32, (usize, usize)>, pos: usize
             }
         }
         SsaInstr::Copy { src, .. } => extend(*src, iv, pos),
+        SsaInstr::Cast { src, .. } => extend(*src, iv, pos),
         SsaInstr::Call { args, .. } => {
             for a in args {
                 extend(*a, iv, pos);

@@ -15,13 +15,13 @@ use std::collections::{HashMap, HashSet};
 
 use crate::error::{CompileError, Result};
 use crate::parser::ast::{
-    self, Abi, Arm, AttributeArg, Block as AstBlock, Expression, Literal as AstLiteral,
+    self, Abi, Arm, Block as AstBlock, Expression, Literal as AstLiteral,
     Pattern as AstPattern, Program, Spanned, Span, Statement, StructDef as AstStruct,
     Type as AstType, UseTree,
 };
 use crate::typeck::hir::{
     BasicBlock, BasicBlockId, Cfg, DefId, ExprKind, FieldIndex, HirArm, HirExpr,
-    HirField, HirStmt, InferId, LocalId, Ty, WherePred,
+    HirField, HirLiteral, HirStmt, InferId, LocalId, Ty, WherePred,
 };
 use crate::typeck::infer::InferCtxt;
 
@@ -184,6 +184,7 @@ impl TypeChecker {
                     body: None,
                     is_async: item.is_async,
                     abi: hir::Abi::Zr,
+                    attrs: convert_attrs(&item.attrs),
                 },
             );
         }
@@ -198,7 +199,7 @@ impl TypeChecker {
                 ast::TypeDef::Struct(s) => {
                     self.type_defs.insert(id, hir::HirTypeDef::Struct(hir::HirStruct {
                         name: s.name.clone(),
-                        attrs: s.attrs.clone(),
+                        attrs: convert_attrs(&s.attrs),
                         fields: Vec::new(),
                         repr: hir::Repr::Rust,
                     }));
@@ -350,7 +351,9 @@ impl TypeChecker {
             });
         }
 
-        let repr = self.compute_repr(s);
+        // `#[repr(..)]` 写错了必须报错，不能默默回退到默认布局——
+        // 那会让 FFI 结构体的实际布局和调用方以为的不一致。
+        let repr = hir_repr(&convert_attrs(&s.attrs))?;
         if let Some(hir_td) = self.type_defs.get_mut(&def_id) {
             if let hir::HirTypeDef::Struct(hs) = hir_td {
                 hs.fields = fields;
@@ -440,26 +443,6 @@ impl TypeChecker {
             }
         }
         Ok(())
-    }
-
-    fn compute_repr(&self, s: &AstStruct) -> hir::Repr {
-        for attr in &s.attrs {
-            match attr.name.as_str() {
-                "repr" => {
-                    if let Some(AttributeArg::Pos(Expression::Variable(name, _))) = attr.args.first() {
-                        return match name.as_str() {
-                            "C" => hir::Repr::C,
-                            "packed" => hir::Repr::Packed,
-                            "transparent" => hir::Repr::Transparent,
-                            "simd" => hir::Repr::Simd,
-                            _ => hir::Repr::Rust,
-                        };
-                    }
-                }
-                _ => {}
-            }
-        }
-        hir::Repr::Rust
     }
 
     // ==================================================================
@@ -836,7 +819,13 @@ impl TypeChecker {
                 let target_ty = self.ast_to_hir_type(target)?;
                 let inner = self.check_expr(e, &Ty::Infer(InferId(0)))?;
                 self.validate_cast(&inner.ty, &target_ty, span)?;
-                return Ok(HirExpr { kind: ExprKind::Cast, ty: target_ty, span });
+                // 操作数必须保留。早先这里只做类型检查就把表达式扔了，
+                // HIR 里只剩下目标类型，`x as i32` 到 MIR 就变成了 Unit。
+                return Ok(HirExpr {
+                    kind: ExprKind::Cast(Box::new(inner)),
+                    ty: target_ty,
+                    span,
+                });
             }
             Expression::Block(b, _) => {
                 let inner = self.check_block(b, expected)?;
@@ -993,9 +982,22 @@ impl TypeChecker {
             Expression::Comptime(e, _) => {
                 // comptime 块：表达式必须在编译期可求值
                 let inner = self.check_expr(e, expected)?;
-                let inner_ty = inner.ty.clone();
-                let _ = self.eval_const_expr(e)?;
-                return Ok(HirExpr { kind: ExprKind::Comptime, ty: inner_ty, span });
+                // 求值结果必须带进 HIR：丢掉的话 MIR 侧只能拿一个占位值，
+                // `comptime 40 + 2` 会在运行期变成 Unit。
+                let folded = self.eval_const_expr(e)?;
+                // 类型优先沿用内层表达式推断出来的结果（例如 `comptime ~0`
+                // 应当是 i32）。类型检查器还没有真正的推断上下文，`Ty::Infer`
+                // 占位不会被解析掉，直接透传会让 `comptime { 40 + 2 } != 42`
+                // 报 "found `_`"，所以落回按折叠出的字面量反推。
+                let ty = match &inner.ty {
+                    Ty::Infer(_) => const_literal_ty(&folded),
+                    concrete => concrete.clone(),
+                };
+                return Ok(HirExpr {
+                    kind: ExprKind::Comptime(folded),
+                    ty,
+                    span,
+                });
             }
             Expression::Await(e, _) => {
                 let inner = self.check_expr(e, &Ty::Infer(InferId(0)))?;
@@ -1395,13 +1397,13 @@ impl TypeChecker {
                 };
                 (ExprKind::Literal(hir::HirLiteral::Float(*v)), ty)
             }
-            AstLiteral::String(s) => {
+            ast::Literal::String(s) => {
                 (ExprKind::Literal(hir::HirLiteral::String(s.clone())), Ty::Str)
             }
-            AstLiteral::Char(c) => {
+            ast::Literal::Char(c) => {
                 (ExprKind::Literal(hir::HirLiteral::Char(*c)), Ty::Char)
             }
-            AstLiteral::Bool(b) => {
+            ast::Literal::Bool(b) => {
                 (ExprKind::Literal(hir::HirLiteral::Bool(*b)), Ty::Bool)
             }
             AstLiteral::Byte(v) => {
@@ -1742,9 +1744,9 @@ impl TypeChecker {
                 Some("f32") => Ty::Float(32),
                 _ => Ty::Float(64),
             },
-            Expression::Literal(AstLiteral::String(_), _) => Ty::Str,
-            Expression::Literal(AstLiteral::Char(_), _) => Ty::Char,
-            Expression::Literal(AstLiteral::Bool(_), _) => Ty::Bool,
+            Expression::Literal(ast::Literal::String(_), _) => Ty::Str,
+            Expression::Literal(ast::Literal::Char(_), _) => Ty::Char,
+            Expression::Literal(ast::Literal::Bool(_), _) => Ty::Bool,
             Expression::Literal(AstLiteral::Byte(_), _) => Ty::Uint(8),
             Expression::Literal(AstLiteral::ByteString(_), _) => Ty::Slice(
                 Box::new(Ty::Uint(8)),
@@ -1878,6 +1880,7 @@ impl TypeChecker {
             body: None,
             is_async: f.is_async,
             abi: hir::Abi::Zr,
+            attrs: convert_attrs(&f.attrs),
         }
     }
 
@@ -1893,62 +1896,262 @@ impl TypeChecker {
     // 编译期求值（CTFE）
     // ==================================================================
 
-    fn eval_const_expr(&self, e: &Expression) -> Result<i128> {
-        // 编译期求值引擎（简化版）
+    /// 编译期求值：把表达式折成一个字面量。
+    ///
+    /// 折不出来时返回 `Err`，调用方据此报"不是编译期常量"。
+    fn eval_const_expr(&self, e: &Expression) -> Result<Box<HirLiteral>> {
         match e {
-            Expression::Literal(AstLiteral::Int(v, _), _) => Ok(*v),
-            Expression::Binary(lhs, op, rhs, _) => {
+            Expression::Literal(lit, _) => Ok(Box::new(self.ast_literal_to_hir(lit)?)),
+
+            // `comptime { 40 + 2 }` 里的 `{ ... }` 在语法上就是一个块，
+            // 值取块的最后一条表达式。不处理块的话 `comptime { .. }`
+            // 这个最自然的写法会直接被判成"不是常量"。
+            Expression::Block(b, _) => {
+                // 尾表达式优先；没有尾表达式就退而取最后一条 `let` 的初值
+                if let Some(tail) = &b.tail {
+                    return self.eval_const_expr(tail);
+                }
+                match b.stmts.last() {
+                    Some(ast::Statement::Expr(inner, _)) => self.eval_const_expr(inner),
+                    Some(ast::Statement::Let(_, _, init, _))
+                    | Some(ast::Statement::Var(_, _, init, _)) => {
+                        let init = init.as_ref().ok_or_else(|| {
+                            CompileError::internal("comptime binding without initializer")
+                        })?;
+                        self.eval_const_expr(init)
+                    }
+                    _ => Err(CompileError::internal(
+                        "comptime block has no constant tail expression",
+                    )),
+                }
+            }
+
+            Expression::Binary(lhs, op, rhs, span) => {
                 let l = self.eval_const_expr(lhs)?;
                 let r = self.eval_const_expr(rhs)?;
-                Ok(match op {
-                    ast::BinaryOp::Add => l + r,
-                    ast::BinaryOp::Sub => l - r,
-                    ast::BinaryOp::Mul => l * r,
-                    ast::BinaryOp::Div => l / r,
-                    ast::BinaryOp::Rem => l % r,
-                    ast::BinaryOp::BitAnd => l & r,
-                    ast::BinaryOp::BitOr => l | r,
-                    ast::BinaryOp::BitXor => l ^ r,
-                    ast::BinaryOp::Shl => l << (r as u32),
-                    ast::BinaryOp::Shr => l >> (r as u32),
-                    _ => return Err(CompileError::internal(
-                        "operator not allowed in compile-time context",
-                    )),
-                })
+                self.const_binary(*op, &l, &r, *span)
             }
-            Expression::Unary(op, operand, _) => {
+
+            Expression::Unary(op, operand, span) => {
                 let v = self.eval_const_expr(operand)?;
-                Ok(match op {
-                    ast::UnaryOp::Neg => -v,
-                    ast::UnaryOp::Not => (v == 0) as i128,
-                    ast::UnaryOp::BitNot => !v,
-                    _ => return Err(CompileError::internal(
-                        "unary operator not allowed in compile-time context",
-                    )),
-                })
+                self.const_unary(*op, &v, *span)
             }
+
+            // `comptime comptime 6 * 7`：内层已经是常量，外层直接透传
+            Expression::Comptime(inner, _) => self.eval_const_expr(inner),
+
             Expression::Variable(name, span) => {
                 // 查找常量定义并求值
                 if let Some(id) = self.symbols.get(name).copied() {
                     if let Some(c) = self.consts.get(&id) {
-                        return self.eval_const_expr_from_hir(&c.value);
+                        return self.eval_const_from_hir(&c.value);
                     }
                 }
                 Err(CompileError::internal(format!(
-                    "value `{}` cannot be used in compile-time context",
-                    name
+                    "value `{name}` cannot be used in compile-time context"
                 ))
                 .with_span(*span))
             }
+
             _ => Err(CompileError::internal(
                 "expression is not a compile-time constant",
             )),
         }
     }
 
-    fn eval_const_expr_from_hir(&self, _e: &HirExpr) -> Result<i128> {
-        // 从 HIR 表达式求值（需要遍历 HIR 字面量）
-        Ok(0)
+    /// AST 字面量 -> HIR 字面量。
+    fn ast_literal_to_hir(&self, lit: &ast::Literal) -> Result<HirLiteral> {
+        Ok(match lit {
+            ast::Literal::Int(v, _) => HirLiteral::Int(*v),
+            ast::Literal::Float(v, _) => HirLiteral::Float(*v),
+            ast::Literal::String(v) => HirLiteral::String(v.clone()),
+            ast::Literal::Char(c) => HirLiteral::Char(*c),
+            ast::Literal::Bool(b) => HirLiteral::Bool(*b),
+            ast::Literal::Byte(b) => HirLiteral::Int(*b as i128),
+            ast::Literal::ByteString(b) => {
+                HirLiteral::String(String::from_utf8_lossy(b).into_owned())
+            }
+        })
+    }
+
+    /// 编译期常量相等比较。
+    fn const_eq(&self, l: &HirLiteral, r: &HirLiteral) -> bool {
+        match (l, r) {
+            (HirLiteral::Int(a), HirLiteral::Int(b)) => a == b,
+            (HirLiteral::Float(a), HirLiteral::Float(b)) => a == b,
+            (HirLiteral::Bool(a), HirLiteral::Bool(b)) => a == b,
+            (HirLiteral::String(a), HirLiteral::String(b)) => a == b,
+            (HirLiteral::Char(a), HirLiteral::Char(b)) => a == b,
+            // 跨类型（`1 == 1.0`）在编译期不算常量
+            _ => false,
+        }
+    }
+
+    /// 编译期折叠一个二元运算。
+    fn const_binary(
+        &self,
+        op: ast::BinaryOp,
+        l: &HirLiteral,
+        r: &HirLiteral,
+        span: Span,
+    ) -> Result<Box<HirLiteral>> {
+        use HirLiteral::*;
+        match op {
+            ast::BinaryOp::Add
+            | ast::BinaryOp::Sub
+            | ast::BinaryOp::Mul
+            | ast::BinaryOp::Div
+            | ast::BinaryOp::Rem
+            | ast::BinaryOp::BitAnd
+            | ast::BinaryOp::BitOr
+            | ast::BinaryOp::BitXor
+            | ast::BinaryOp::Shl
+            | ast::BinaryOp::Shr => match (l, r) {
+                (Float(l), Float(r)) if !matches!(
+                    op,
+                    ast::BinaryOp::Rem
+                        | ast::BinaryOp::BitAnd
+                        | ast::BinaryOp::BitOr
+                        | ast::BinaryOp::BitXor
+                        | ast::BinaryOp::Shl
+                        | ast::BinaryOp::Shr
+                ) =>
+                {
+                    if matches!(op, ast::BinaryOp::Div) && *r == 0.0 {
+                        return Err(CompileError::internal("division by zero").with_span(span));
+                    }
+                    Ok(Box::new(Float(match op {
+                        ast::BinaryOp::Add => l + r,
+                        ast::BinaryOp::Sub => l - r,
+                        ast::BinaryOp::Mul => l * r,
+                        _ => l / r,
+                    })))
+                }
+                (Int(l), Int(r)) => {
+                    // 除以 0 必须在编译期报错，不能留到运行期
+                    if matches!(op, ast::BinaryOp::Div | ast::BinaryOp::Rem) && *r == 0 {
+                        return Err(CompileError::internal("division by zero").with_span(span));
+                    }
+                    Ok(Box::new(Int(match op {
+                        ast::BinaryOp::Add => l.wrapping_add(*r),
+                        ast::BinaryOp::Sub => l.wrapping_sub(*r),
+                        ast::BinaryOp::Mul => l.wrapping_mul(*r),
+                        ast::BinaryOp::Div => l.wrapping_div(*r),
+                        ast::BinaryOp::Rem => l.wrapping_rem(*r),
+                        ast::BinaryOp::BitAnd => l & r,
+                        ast::BinaryOp::BitOr => l | r,
+                        ast::BinaryOp::BitXor => l ^ r,
+                        ast::BinaryOp::Shl => l.wrapping_shl(*r as u32),
+                        _ => l.wrapping_shr(*r as u32),
+                    })))
+                }
+                _ => Err(
+                    CompileError::internal("mismatched operand types in compile-time expression")
+                        .with_span(span),
+                ),
+            },
+            ast::BinaryOp::Eq => Ok(Box::new(Bool(self.const_eq(l, r)))),
+            ast::BinaryOp::Ne => Ok(Box::new(Bool(!self.const_eq(l, r)))),
+            ast::BinaryOp::Lt => Ok(Box::new(Bool(self.const_ord(l, r, span)?.is_lt()))),
+            ast::BinaryOp::Le => Ok(Box::new(Bool(self.const_ord(l, r, span)?.is_le()))),
+            ast::BinaryOp::Gt => Ok(Box::new(Bool(self.const_ord(l, r, span)?.is_gt()))),
+            ast::BinaryOp::Ge => Ok(Box::new(Bool(self.const_ord(l, r, span)?.is_ge()))),
+            // 逻辑运算可短路：左边定了就不看右边，但仍要求右边能求值
+            ast::BinaryOp::And => match l {
+                Bool(false) => Ok(Box::new(Bool(false))),
+                Bool(true) => match r {
+                    Bool(b) => Ok(Box::new(Bool(*b))),
+                    _ => Err(CompileError::internal("'&&' needs booleans").with_span(span)),
+                },
+                _ => Err(CompileError::internal("'&&' needs booleans").with_span(span)),
+            },
+            ast::BinaryOp::Or => match l {
+                Bool(true) => Ok(Box::new(Bool(true))),
+                Bool(false) => match r {
+                    Bool(b) => Ok(Box::new(Bool(*b))),
+                    _ => Err(CompileError::internal("'||' needs booleans").with_span(span)),
+                },
+                _ => Err(CompileError::internal("'||' needs booleans").with_span(span)),
+            },
+            _ => Err(CompileError::internal(
+                "operator not allowed in compile-time context",
+            )
+            .with_span(span)),
+        }
+    }
+
+    /// 编译期折叠一个一元运算。
+    fn const_unary(&self, op: ast::UnaryOp, v: &HirLiteral, span: Span) -> Result<Box<HirLiteral>> {
+        use HirLiteral::*;
+        match op {
+            ast::UnaryOp::Neg => match v {
+                Int(i) => Ok(Box::new(Int(i.wrapping_neg()))),
+                Float(f) => Ok(Box::new(Float(-f))),
+                _ => Err(CompileError::internal("cannot negate this value at compile time")
+                    .with_span(span)),
+            },
+            // `!` 按类型分派：bool 是逻辑非，整数是位非
+            ast::UnaryOp::Not => match v {
+                Bool(b) => Ok(Box::new(Bool(!b))),
+                Int(i) => Ok(Box::new(Int(!i))),
+                _ => Err(
+                    CompileError::internal("cannot apply '!' at compile time").with_span(span)
+                ),
+            },
+            ast::UnaryOp::BitNot => match v {
+                Int(i) => Ok(Box::new(Int(!i))),
+                _ => Err(CompileError::internal("'~' needs an integer at compile time")
+                    .with_span(span)),
+            },
+            _ => Err(CompileError::internal(
+                "unary operator not allowed in compile-time context",
+            )
+            .with_span(span)),
+        }
+    }
+
+    /// 编译期常量大小比较；类型不可比时报错。
+    fn const_ord(
+        &self,
+        l: &HirLiteral,
+        r: &HirLiteral,
+        span: Span,
+    ) -> Result<std::cmp::Ordering> {
+        match (l, r) {
+            (HirLiteral::Int(a), HirLiteral::Int(b)) => Ok(a.cmp(b)),
+            (HirLiteral::Float(a), HirLiteral::Float(b)) => a.partial_cmp(b).ok_or_else(|| {
+                CompileError::internal("cannot compare NaN at compile time").with_span(span)
+            }),
+            (HirLiteral::Char(a), HirLiteral::Char(b)) => Ok(a.cmp(b)),
+            _ => Err(
+                CompileError::internal("mismatched operand types in compile-time comparison")
+                    .with_span(span),
+            ),
+        }
+    }
+
+    /// 从 HIR 表达式求值（常量定义的右值）。
+    ///
+    /// HIR 的运算符与 AST 同名同形，直接复用同一套折叠逻辑。
+    fn eval_const_from_hir(&self, e: &HirExpr) -> Result<Box<HirLiteral>> {
+        match &e.kind {
+            hir::ExprKind::Literal(l) => Ok(Box::new(l.clone())),
+            hir::ExprKind::Binary(op, lhs, rhs) => {
+                let l = self.eval_const_from_hir(lhs)?;
+                let r = self.eval_const_from_hir(rhs)?;
+                self.const_binary(hir_binary_to_ast(*op), &l, &r, e.span)
+            }
+            hir::ExprKind::Unary(op, operand) => {
+                let v = self.eval_const_from_hir(operand)?;
+                self.const_unary(hir_unary_to_ast(*op), &v, e.span)
+            }
+            hir::ExprKind::Comptime(folded) => Ok(folded.clone()),
+            hir::ExprKind::Cast(inner) => self.eval_const_from_hir(inner),
+            _ => Err(CompileError::internal(
+                "const definition is not a compile-time constant",
+            )
+            .with_span(e.span)),
+        }
     }
 
     // ==================================================================
@@ -2314,4 +2517,148 @@ fn block_diverges(b: &AstBlock) -> bool {
         }
         _ => false,
     }
+}
+
+/// HIR 二元运算符 -> AST 同名运算符（两者变体一一对应）。
+fn hir_binary_to_ast(op: hir::BinaryOp) -> ast::BinaryOp {
+    use hir::BinaryOp::*;
+    match op {
+        Add => ast::BinaryOp::Add,
+        Sub => ast::BinaryOp::Sub,
+        Mul => ast::BinaryOp::Mul,
+        Div => ast::BinaryOp::Div,
+        Rem => ast::BinaryOp::Rem,
+        BitAnd => ast::BinaryOp::BitAnd,
+        BitOr => ast::BinaryOp::BitOr,
+        BitXor => ast::BinaryOp::BitXor,
+        Shl => ast::BinaryOp::Shl,
+        Shr => ast::BinaryOp::Shr,
+        Eq => ast::BinaryOp::Eq,
+        Ne => ast::BinaryOp::Ne,
+        Lt => ast::BinaryOp::Lt,
+        Gt => ast::BinaryOp::Gt,
+        Le => ast::BinaryOp::Le,
+        Ge => ast::BinaryOp::Ge,
+        And => ast::BinaryOp::And,
+        Or => ast::BinaryOp::Or,
+        Range => ast::BinaryOp::Range,
+        RangeInclusive => ast::BinaryOp::RangeInclusive,
+    }
+}
+
+/// HIR 一元运算符 -> AST 同名运算符。
+fn hir_unary_to_ast(op: hir::UnaryOp) -> ast::UnaryOp {
+    use hir::UnaryOp::*;
+    match op {
+        Neg => ast::UnaryOp::Neg,
+        Not => ast::UnaryOp::Not,
+        BitNot => ast::UnaryOp::BitNot,
+        Deref => ast::UnaryOp::Deref,
+        AddrOf => ast::UnaryOp::AddrOf,
+    }
+}
+
+/// 编译期常量字面量对应的类型。
+fn const_literal_ty(lit: &HirLiteral) -> Ty {
+    match lit {
+        // 宽度必须和类型检查器给整数字面量的默认宽度一致（i32），
+        // 否则 `comptime ~0 != -1` 会拿 i64 去比 i32。
+        HirLiteral::Int(_) => Ty::Int(32),
+        HirLiteral::Float(_) => Ty::Float(64),
+        HirLiteral::Bool(_) => Ty::Bool,
+        HirLiteral::Char(_) => Ty::Char,
+        HirLiteral::String(_) => Ty::Str,
+    }
+}
+
+/// AST 属性 -> HIR 属性。
+///
+/// 参数压成字符串：下游（优化器 / MIR）只按名字和字面量参数做判断，
+/// 完整表达式留在这里没有用处。无法静态渲染的表达式记成空串，
+/// 等价于"没给这个参数"。
+fn convert_attrs(attrs: &[ast::Attribute]) -> Vec<hir::HirAttr> {
+    attrs
+        .iter()
+        .map(|a| hir::HirAttr {
+            name: a.name.clone(),
+            args: a
+                .args
+                .iter()
+                .filter_map(|arg| match arg {
+                    ast::AttributeArg::Pos(e) => render_attr_arg(e),
+                    ast::AttributeArg::NameValue(_, _) => None,
+                })
+                .collect(),
+            named: a
+                .args
+                .iter()
+                .filter_map(|arg| match arg {
+                    ast::AttributeArg::NameValue(n, v) => {
+                        render_attr_arg(v).map(|v| (n.clone(), v))
+                    }
+                    ast::AttributeArg::Pos(_) => None,
+                })
+                .collect(),
+        })
+        .collect()
+}
+
+/// 把属性参数表达式渲染成字符串。
+fn render_attr_arg(e: &ast::Expression) -> Option<String> {
+    Some(match e {
+        ast::Expression::Literal(ast::Literal::Int(v, _), _) => v.to_string(),
+        ast::Expression::Literal(ast::Literal::Float(v, _), _) => v.to_string(),
+        ast::Expression::Literal(ast::Literal::String(s), _) => s.clone(),
+        ast::Expression::Literal(ast::Literal::Char(c), _) => c.to_string(),
+        ast::Expression::Literal(ast::Literal::Bool(b), _) => b.to_string(),
+        ast::Expression::Variable(name, _) => name.clone(),
+        ast::Expression::Path(segments, _) => segments.join("::"),
+        _ => return None,
+    })
+}
+
+/// 从属性列表推出内存布局。
+///
+/// `#[repr(..)]` 显式给一个就行；`#[repr(C, align = 8)]` 这种组合里，
+/// `C` / `packed` / `transparent` / `simd` 决定布局，`align = N` 是对齐
+/// 约束——当前后端还没消费对齐，所以这里只校验它是个合法数字，
+/// 非法写法直接报错，而不是像早先那样默默回退到默认布局。
+fn hir_repr(attrs: &[hir::HirAttr]) -> Result<hir::Repr> {
+    for attr in attrs {
+        if attr.name != "repr" {
+            continue;
+        }
+        for (key, value) in &attr.named {
+            match key.as_str() {
+                "align" => {
+                    if value.parse::<u64>().is_err() {
+                        return Err(CompileError::internal(format!(
+                            "invalid #[repr(align = {value})]: expected a power-of-two integer"
+                        )));
+                    }
+                }
+                other => {
+                    return Err(CompileError::internal(format!(
+                        "unknown repr attribute argument `{other}`"
+                    )));
+                }
+            }
+        }
+        for arg in &attr.args {
+            return Ok(match arg.as_str() {
+                "C" => hir::Repr::C,
+                "packed" => hir::Repr::Packed,
+                "transparent" => hir::Repr::Transparent,
+                "simd" => hir::Repr::Simd,
+                // `align = 8` 的简写形式
+                other if other.starts_with("align") => hir::Repr::Rust,
+                other => {
+                    return Err(CompileError::internal(format!(
+                        "unknown representation `{other}`"
+                    )))
+                }
+            });
+        }
+    }
+    Ok(hir::Repr::Rust)
 }

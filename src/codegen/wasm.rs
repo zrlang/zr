@@ -58,9 +58,45 @@ pub enum WasmInstr {
     I32Eqz,
     /// 二元运算，参数为值类型。
     Binary(WasmType, WasmBinaryOp),
+    /// 一元运算：`i32.wrap_i64` / `i64.extend_i32_s` / `i64.extend_i32_u`。
+    Unary(WasmUnaryOp),
     /// `call funcidx`。
     Call(u32),
     Return,
+}
+
+/// 一元运算符。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WasmUnaryOp {
+    /// `i32.wrap_i64`：取低 32 位。
+    WrapI64ToI32,
+    /// `i64.extend_i32_s`：按 32 位符号扩展到 64 位。
+    ExtendI32S,
+    /// `i64.extend_i32_u`：按 32 位零扩展到 64 位。
+    ExtendI32U,
+}
+
+impl WasmUnaryOp {
+    /// WAT 助记符。
+    fn wat(self) -> &'static str {
+        match self {
+            WasmUnaryOp::WrapI64ToI32 => "i32.wrap_i64",
+            WasmUnaryOp::ExtendI32S => "i64.extend_i32_s",
+            WasmUnaryOp::ExtendI32U => "i64.extend_i32_u",
+        }
+    }
+
+    /// 二进制操作码。
+    fn code(self) -> u8 {
+        match self {
+            // i32.wrap_i64 = 0xA7
+            WasmUnaryOp::WrapI64ToI32 => 0xA7,
+            // i64.extend_i32_s = 0xAC
+            WasmUnaryOp::ExtendI32S => 0xAC,
+            // i64.extend_i32_u = 0xAD
+            WasmUnaryOp::ExtendI32U => 0xAD,
+        }
+    }
 }
 
 /// 二元运算符。
@@ -357,6 +393,7 @@ impl WasmInstr {
             WasmInstr::I64Const(v) => format!("i64.const {v}"),
             WasmInstr::I32Eqz => "i32.eqz".to_string(),
             WasmInstr::Binary(ty, op) => op.wat(*ty),
+            WasmInstr::Unary(op) => op.wat().to_string(),
             WasmInstr::Call(idx) => format!("call {idx}"),
             WasmInstr::Return => "return".to_string(),
         }
@@ -384,6 +421,34 @@ impl WasmFunction {
         for block in &func.blocks {
             for instr in &block.instrs {
                 match instr {
+                    SsaInstr::Cast { result, src, from, to, .. } => {
+                        let idx =
+                            ensure_local(result, &mut local_map, &mut locals, &mut next_local);
+                        // 值统一按 i64 局部变量存放，所以窄化转换就是
+                        // "截到 32 位，再按目标的有无符号扩展回 64 位"——
+                        // 和原生后端的 movsx / movzx 是同一件事。
+                        body.push(WasmInstr::LocalGet(
+                            ensure_local(src, &mut local_map, &mut locals, &mut next_local),
+                        ));
+                        if from.is_float() || to.is_float() {
+                            crate::codegen::unsupported_cast(*from, *to);
+                        } else {
+                            let (bits, signed) = match to {
+                                crate::mir::NumTy::Int(w) => (*w, true),
+                                crate::mir::NumTy::Uint(w) => (*w, false),
+                                _ => (8, false),
+                            };
+                            if bits < 64 {
+                                body.push(WasmInstr::Unary(WasmUnaryOp::WrapI64ToI32));
+                                body.push(WasmInstr::Unary(if signed {
+                                    WasmUnaryOp::ExtendI32S
+                                } else {
+                                    WasmUnaryOp::ExtendI32U
+                                }));
+                            }
+                        }
+                        body.push(WasmInstr::LocalSet(idx));
+                    }
                     SsaInstr::Const { result, value } => {
                         let idx = ensure_local(result, &mut local_map, &mut locals, &mut next_local);
                         match value {
@@ -392,8 +457,11 @@ impl WasmFunction {
                             // 浮点与字符串暂未在 wasm 后端实现
                             SsaConst::Bool(b) => body.push(WasmInstr::I64Const(i64::from(*b))),
                             SsaConst::Unit => body.push(WasmInstr::I64Const(0)),
-                            SsaConst::Float(_) | SsaConst::Str(_) => {
-                                body.push(WasmInstr::I64Const(0));
+                            SsaConst::Float(_) => {
+                                crate::codegen::unsupported_const("float")
+                            }
+                            SsaConst::Str(_) => {
+                                crate::codegen::unsupported_const("string")
                             }
                         }
                         body.push(WasmInstr::LocalSet(idx));
@@ -751,6 +819,7 @@ fn encode_instr(instr: &WasmInstr, out: &mut Vec<u8>) {
             out.push(op.code());
             let _ = ty; // 操作码本身已隐含类型
         }
+        WasmInstr::Unary(op) => out.push(op.code()),
         WasmInstr::Call(idx) => {
             out.push(0x10);
             uleb(u64::from(*idx), out);

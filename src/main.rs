@@ -427,6 +427,9 @@ fn emit_llvm_ir(target: &Target, module: &ssa::SsaModule) -> String {
             out.push_str(&format!("bb{}:\n", block.id));
             for instr in &block.instrs {
                 match instr {
+                    SsaInstr::Cast { result, src, from, to } => {
+                        out.push_str(&format!("%{} = cast %{} : {:?} -> {:?}\n", result.id(), src.id(), from, to));
+                    }
                     SsaInstr::Const { result, value } => {
                         let v = match value {
                             ssa::SsaConst::Int(i) => i.to_string(),

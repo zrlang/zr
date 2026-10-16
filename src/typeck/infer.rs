@@ -350,6 +350,14 @@ impl<'a> InferCtxt<'a> {
             return Ok(());
         }
 
+        // 推断变量：还没有真正的变量绑定机制，`Infer` 只是个占位，
+        // 语义上就是"什么都行"。不特判的话，任何拿 `&Ty::Infer(..)`
+        // 当期望类型去检查的表达式都会误报类型不匹配——例如
+        // `if { 40 + 2 } != 42`（块的尾表达式被拿 Infer 去校验）。
+        if matches!(sub, Ty::Infer(_)) || matches!(sup, Ty::Infer(_)) {
+            return Ok(());
+        }
+
         // 子类型关系：需要 trait 系统支持，这里处理内置规则
         match (&sub, &sup) {
             // 整数提升：i8 → i16 → i32 → i64 → i128（无符号同理）
@@ -397,18 +405,22 @@ impl<'a> InferCtxt<'a> {
                 }
             }
         }
-        // 检查类型定义中是否直接声明了 trait（自动 impl）
+        // 检查类型定义上是否用 `#[derive(..)]` 声明了这个 trait
         if let Some(td) = self.type_defs.get(&type_id) {
-            match td {
-                hir::HirTypeDef::Struct(s) => {
-                    for attr in &s.attrs {
-                        if attr.name == "derive" {
-                            // 派生的 trait impl
-                            return Ok(());
-                        }
+            if let hir::HirTypeDef::Struct(s) = td {
+                for attr in &s.attrs {
+                    // 早先这里只判断"有没有 derive 属性"就返回成功，
+                    // 等于 `#[derive(Clone)]` 能满足**任何** trait。只认
+                    // 列表里真正写出来的那个 trait 名。
+                    if attr.name == "derive"
+                        && attr
+                            .args
+                            .iter()
+                            .any(|a| *a == self.type_id_name(trait_id))
+                    {
+                        return Ok(());
                     }
                 }
-                _ => {}
             }
         }
         Err(CompileError::type_error(format!(

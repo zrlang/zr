@@ -29,6 +29,7 @@ use crate::codegen::target::{Arch, Target};
 use crate::codegen::{
     CompilationUnit, Relocation, RelocationKind, Symbol, SymbolKind, SymbolSection,
 };
+use crate::mir::NumTy;
 use crate::ssa::{SsaBinaryOp, SsaConst, SsaFunction, SsaInstr, SsaTerminator, SsaValue};
 
 /// AArch64 通用寄存器（编码为 5 位寄存器号）。
@@ -108,6 +109,42 @@ fn emit_mov_imm64(unit: &mut CompilationUnit, rd: Reg, imm: u64) {
 /// `mov xd, xm`（`orr xd, xzr, xm`）。
 fn emit_mov_rr(unit: &mut CompilationUnit, rd: Reg, rm: Reg) {
     insn(unit, 0xaa00_03e0 | (rm.bits() as u32) << 16 | rd.bits() as u32);
+}
+
+/// 类型转换：取低 `bits` 位并按 `signed` 扩展到 64 位。
+///
+/// AArch64 用 SBFM / UBFM 一步完成任意位宽的扩展：
+/// `sbfm xd, xn, #lsb, #width-1` / `ubfm xd, xn, #0, #width-1`。
+/// 位宽已经是 64 时退化成一次 `mov`。
+fn emit_cast(
+    unit: &mut CompilationUnit,
+    rd: Reg,
+    rm: Reg,
+    from: NumTy,
+    to: NumTy,
+) {
+    if from.is_float() || to.is_float() {
+        crate::codegen::unsupported_cast(from, to);
+    }
+    let (bits, signed) = match to {
+        NumTy::Int(w) => (w, true),
+        NumTy::Uint(w) => (w, false),
+        NumTy::Bool => (8, false),
+        NumTy::Float(_) => unreachable!(),
+    };
+    if bits >= 64 {
+        if rd != rm {
+            emit_mov_rr(unit, rd, rm);
+        }
+        return;
+    }
+    // immr = 0 表示不右移，imms = bits-1 决定取多少位
+    let imms = (bits - 1) as u32;
+    let opcode = if signed { 0x13u32 } else { 0x12u32 };
+    insn(
+        unit,
+        opcode | imms << 10 | (rm.bits() as u32) << 16 | rd.bits() as u32,
+    );
 }
 
 /// 三地址算术/逻辑：`op xd, xn, xm`。
@@ -317,6 +354,8 @@ fn block_label(func: &str, id: usize) -> String {
 /// 发射一个函数的机器码。
 pub fn emit_function(target: &Target, unit: &mut CompilationUnit, func: &SsaFunction) {
     debug_assert_eq!(target.arch(), Arch::AArch64, "AArch64 后端只能用于 aarch64 目标");
+
+    check_register_pressure(func);
     let start = unit.code.len();
     let sym_base = unit.symbols.len();
 
@@ -391,9 +430,8 @@ fn emit_instr(unit: &mut CompilationUnit, instr: &SsaInstr) {
             SsaConst::Int(i) => emit_mov_imm64(unit, alloc_reg(*result), *i as u64),
             SsaConst::Bool(b) => emit_mov_imm64(unit, alloc_reg(*result), u64::from(*b)),
             SsaConst::Unit => emit_mov_imm64(unit, alloc_reg(*result), 0),
-            SsaConst::Float(_) | SsaConst::Str(_) => {
-                emit_mov_imm64(unit, alloc_reg(*result), 0);
-            }
+            SsaConst::Float(_) => crate::codegen::unsupported_const("float"),
+            SsaConst::Str(_) => crate::codegen::unsupported_const("string"),
         },
         SsaInstr::Unary { result, op, operand } => emit_unary(unit, *result, *op, *operand),
         SsaInstr::Binary { result, op, lhs, rhs } => emit_binary(unit, *result, *op, *lhs, *rhs),
@@ -409,6 +447,9 @@ fn emit_instr(unit: &mut CompilationUnit, instr: &SsaInstr) {
             if d != s {
                 emit_mov_rr(unit, d, s);
             }
+        }
+        SsaInstr::Cast { result, src, from, to } => {
+            emit_cast(unit, alloc_reg(*result), alloc_reg(*src), *from, *to);
         }
         // `Var` 只是 SSA 值的命名引用，运行时不产生代码。
         SsaInstr::Var { .. } => {}
@@ -639,5 +680,21 @@ mod tests {
         let mut u = empty_unit();
         emit_binary(&mut u, SsaValue(3), SsaBinaryOp::Rem, SsaValue(0), SsaValue(1));
         assert!(!u.code.is_empty());
+    }
+}
+
+/// 寄存器压力检查。
+///
+/// 这些后端还没实现溢出（spilling）：活跃值超过可分配寄存器数时，
+/// `alloc_reg` 按编号取模会让同时存活的值抢同一个寄存器，生成**错的**代码。
+/// 宁可在这里明确报错，也不能安静地编出一个算错的程序。
+///
+/// x86-64 后端自己实现了溢出，见 `encoder.rs`。
+fn check_register_pressure(func: &SsaFunction) {
+    // 这些后端只用这次分配来**检测**压力，还没有按结果发射代码；
+    // 因此不传 callee-save 集合（它们本来也没建模调用破坏寄存器）。
+    let alloc = crate::codegen::regalloc::allocate_registers(func, ALLOCATABLE.len(), &[]);
+    if alloc.spilled > 0 {
+        crate::codegen::unsupported_pressure(&func.name, ALLOCATABLE.len());
     }
 }

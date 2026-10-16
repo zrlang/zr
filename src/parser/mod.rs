@@ -181,30 +181,58 @@ impl Parser {
         self.consume(&TokenKind::LBracket, "expected '[' after '#'")?;
         let name = self.consume_ident("expected attribute name")?;
         let mut args = Vec::new();
-        if !self.check(&TokenKind::RBracket) {
+        // 参数写在圆括号里：`#[repr(C)]`、`#[inline(always)]`、
+        // `#[repr(align = 8)]`。早先这里没有消费 `(`，整个 `(...)` 被
+        // 当成一个括号表达式解析，于是 `#[repr(size = 4)]` 里的 `=`
+        // 变成了一个**赋值表达式**，具名参数根本没被识别出来。
+        let paren = self.match_kind(&TokenKind::LParen);
+        let closer = if paren {
+            TokenKind::RParen
+        } else {
+            TokenKind::RBracket
+        };
+        while !self.check(&closer) {
             if self.peek_n(1).map(|t| t.kind == TokenKind::Eq).unwrap_or(false) {
-                self.advance(); // name
+                // `name = value`
+                let n = self.consume_ident("expected argument name")?;
                 self.advance(); // =
-                args.push(AttributeArg::Pos(self.parse_expression()?));
+                let v = self.parse_expression()?;
+                args.push(AttributeArg::NameValue(n, v));
             } else {
-                args.push(AttributeArg::Pos(self.parse_expression()?));
-                while self.match_kind(&TokenKind::Comma) {
-                    if self.check(&TokenKind::RBracket) {
-                        break;
-                    }
-                    if self.peek_n(1).map(|t| t.kind == TokenKind::Eq).unwrap_or(false) {
-                        let _n = self.consume_ident("expected argument name")?;
-                        self.advance(); // =
-                        let _v = self.parse_expression()?;
-                    } else {
-                        args.push(AttributeArg::Pos(self.parse_expression()?));
-                    }
-                }
+                args.push(AttributeArg::Pos(self.parse_attribute_arg()?));
             }
+            if !self.match_kind(&TokenKind::Comma) {
+                break;
+            }
+        }
+        if paren {
+            self.consume(&TokenKind::RParen, "expected ')' to close attribute arguments")?;
         }
         self.consume(&TokenKind::RBracket, "expected ']' to close attribute")?;
         let _ = inner;
         Ok(Attribute { name, args })
+    }
+
+    /// 属性的一个位置参数。
+    ///
+    /// 走 `parse_expression` 会让 `#[inline(never)]` 挂掉：`never` 是
+    /// `TyNever` 关键字，`parse_expression` 拿它当表达式起点直接报错。
+    /// 属性参数里的裸名字（`never` / `always` / `C`）都是标识符位置，
+    /// 关键字在这里要退化成标识符，和 `consume_ident` 的处理一致。
+    fn parse_attribute_arg(&mut self) -> Result<Expression> {
+        let span = self.peek().span;
+        if let TokenKind::Ident(_) = self.peek().kind {
+            if self.peek_n(1).map(|t| t.kind != TokenKind::Eq).unwrap_or(true) {
+                let name = self.consume_ident("expected attribute argument")?;
+                return Ok(Expression::Variable(name, span));
+            }
+        } else if self.peek().kind.keyword_text().is_some()
+            && self.peek_n(1).map(|t| t.kind != TokenKind::Eq).unwrap_or(true)
+        {
+            let name = self.consume_ident("expected attribute argument")?;
+            return Ok(Expression::Variable(name, span));
+        }
+        self.parse_expression()
     }
 
     // ===== 可见性 =====

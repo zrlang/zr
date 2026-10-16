@@ -484,3 +484,57 @@ pub fn runtime_diagnostic(target: &Target) -> String {
         None => format!("target {} needs no external runtime", target.describe()),
     }
 }
+
+/// 寄存器压力超出后端能力时报错并退出。
+///
+/// 已经实现溢出（spilling）的后端不会走到这里。
+pub fn unsupported_pressure(func: &str, pool: usize) -> ! {
+    eprintln!(
+        "zr: error: function `{func}` needs more than {pool} registers at once, \
+         and register spilling is not implemented for this target"
+    );
+    std::process::exit(1);
+}
+
+/// 遇到后端还没实现的字面量时报错并退出。
+///
+/// 早先五个后端在遇到浮点或字符串字面量时都安静地发射 `0`：程序能编出来、
+/// 能跑，只是结果是错的。那种 bug 比编译失败难查得多——运行期看到的
+/// 只是一个诡异的数字，没有任何线索指向代码生成。所以这里宁可编译失败。
+pub fn unsupported_const(kind: &str) -> ! {
+    eprintln!(
+        "zr: error: `{kind}` literals are not implemented for this target"
+    );
+    std::process::exit(1);
+}
+
+/// 遇到后端还没实现的数值转换时报错并退出。
+///
+/// 早先这些情况会静默发出 `0`——生成的程序能跑，但结果是错的，
+/// 比编译失败难查得多。
+pub fn unsupported_cast(from: crate::mir::NumTy, to: crate::mir::NumTy) -> ! {
+    eprintln!(
+        "zr: error: conversion {} -> {} is not implemented for this target",
+        num_ty_name(from),
+        num_ty_name(to)
+    );
+    std::process::exit(1);
+}
+
+/// 数值类型的可读名字。
+pub fn num_ty_name(t: crate::mir::NumTy) -> &'static str {
+    use crate::mir::NumTy::*;
+    match t {
+        Int(8) => "i8",
+        Int(16) => "i16",
+        Int(32) => "i32",
+        Int(_) => "i64",
+        Uint(8) => "u8",
+        Uint(16) => "u16",
+        Uint(32) => "u32",
+        Uint(_) => "u64",
+        Float(32) => "f32",
+        Float(_) => "f64",
+        Bool => "bool",
+    }
+}

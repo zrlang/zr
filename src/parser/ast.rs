@@ -54,8 +54,10 @@ pub struct Attribute {
 /// 属性参数：`name = value` 或位置参数。
 #[derive(Debug, Clone)]
 pub enum AttributeArg {
-    /// 位置参数：`#[foo(bar)]`。
+    /// 位置参数：`#[foo(bar)]`、`#[inline(always)]`。
     Pos(Expression),
+    /// 具名参数：`#[repr(align = 8)]`。
+    NameValue(String, Expression),
 }
 
 // ======================================================================
@@ -510,6 +512,8 @@ pub struct Arm {
 #[derive(Debug, Clone)]
 pub struct Function {
     pub name: String,
+    /// 函数上的属性（`#[inline]` / `#[test]` / `#[no_mangle]` …）。
+    pub attrs: Vec<Attribute>,
     pub is_async: bool,
     pub params: Vec<Param>,
     pub receiver: Option<Receiver>, // `self` / `&self` / `&mut self`

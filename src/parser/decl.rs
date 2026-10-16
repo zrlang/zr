@@ -178,7 +178,7 @@ impl Parser {
     pub fn parse_function(
         &mut self,
         _visibility: Visibility,
-        _attrs: Vec<Attribute>,
+        attrs: Vec<Attribute>,
         is_async: bool,
         _is_default: bool,
     ) -> Result<Function, CompileError> {
@@ -252,6 +252,9 @@ impl Parser {
 
         Ok(Function {
             name,
+            // 属性之前被直接丢掉（`_attrs`），于是 `#[inline]`、`#[test]`
+            // 之类只能解析、完全没有语义。必须原样带到 AST 上去。
+            attrs,
             is_async,
             params,
             receiver,

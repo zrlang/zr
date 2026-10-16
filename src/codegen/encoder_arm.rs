@@ -25,6 +25,7 @@
 
 use crate::codegen::target::{Arch, Os, Target};
 use crate::codegen::{CompilationUnit, Relocation, RelocationKind, Symbol, SymbolKind, SymbolSection};
+use crate::mir::NumTy;
 use crate::ssa::{SsaBinaryOp, SsaConst, SsaFunction, SsaInstr, SsaTerminator, SsaValue};
 
 /// ARM32 通用寄存器。
@@ -107,6 +108,72 @@ mod op {
     /// 立即数形式的 `rsb`（取负）：ARM 的立即数数据处理空间里
     /// 0b0011 才是 rsb（0b0010 在该空间表示 sub）——ARM 的历史包袱。
     pub const RSB_IMM: u32 = 0b0011;
+    /// extra load/store 空间里的扩展指令（imm4[11:8] 段）。
+    pub const EXTRA_SXTB: u32 = 0b0001;
+    pub const EXTRA_SXTH: u32 = 0b0010;
+    pub const EXTRA_UXTB: u32 = 0b0000;
+    pub const EXTRA_UXTH: u32 = 0b0011;
+}
+
+/// 类型转换。
+///
+/// ARM32 的寄存器本来就是 32 位，所以只有**变窄**的转换需要指令：
+/// 取低 w 位并按有无符号重新解释。转成 64 位在这里做不到（没有寄存器
+/// 放得下），直接报错。
+fn emit_cast(unit: &mut CompilationUnit, rd: Reg, rm: Reg, from: NumTy, to: NumTy) {
+    if from.is_float() || to.is_float() {
+        crate::codegen::unsupported_cast(from, to);
+    }
+    let (bits, signed) = match to {
+        NumTy::Int(w) => (w, true),
+        NumTy::Uint(w) => (w, false),
+        NumTy::Bool => (8, false),
+        NumTy::Float(_) => unreachable!(),
+    };
+    match bits {
+        8 | 16 => emit_extend(unit, rd, rm, bits, signed),
+        // 32 位：已经是整个寄存器，不需要扩展
+        32 => {
+            if rd != rm {
+                emit_mov_rr(unit, rd, rm);
+            }
+        }
+        _ => crate::codegen::unsupported_cast(from, to),
+    }
+}
+
+/// `sxth / sxtb / uxth / uxtb rd, rm`
+///
+/// 这些是 extra load/store 空间里的单指令扩展：
+/// `cond 00 1 0101 1 imm4 1 Rd 1 10 0 imm2 type Rm`
+fn emit_extend(unit: &mut CompilationUnit, rd: Reg, rm: Reg, bits: u8, signed: bool) {
+    // imm2[5:4] 与 type[1:0] 一起决定扩不扩展以及扩多少：
+    // type=00 字扩展(uxth)/半字，01 字节扩展(uxtb)，10/11 符号扩展。
+    let (imm2, ty) = match (bits, signed) {
+        (8, true) => (0b00u32, 0b01u32),  // sxtb
+        (8, false) => (0b00, 0b00),      // uxtb
+        (16, true) => (0b00, 0b10),      // sxth
+        (16, false) => (0b00, 0b11),     // uxth
+        _ => return,
+    };
+    let op = match (bits, signed) {
+        (8, true) => op::EXTRA_SXTB,
+        (8, false) => op::EXTRA_UXTB,
+        (16, true) => op::EXTRA_SXTH,
+        _ => op::EXTRA_UXTH,
+    };
+    insn(
+        unit,
+        (cc::AL << 28)
+            | (0b000110 << 20)
+            | (op << 4)
+            | (rd.bits() as u32) << 12
+            | 1 << 7
+            | 1 << 4
+            | (imm2 << 6)
+            | ty
+            | rm.bits() as u32,
+    );
 }
 
 // ==================================================================
@@ -399,6 +466,8 @@ fn block_label(func: &str, id: usize) -> String {
 /// 发射一个函数的机器码。
 pub fn emit_function(target: &Target, unit: &mut CompilationUnit, func: &SsaFunction) {
     debug_assert_eq!(target.arch(), Arch::Arm32, "ARM 后端只能用于 arm32 目标");
+
+    check_register_pressure(func);
     let start = unit.code.len();
     let sym_base = unit.symbols.len();
 
@@ -469,9 +538,8 @@ fn emit_instr(unit: &mut CompilationUnit, instr: &SsaInstr) {
             SsaConst::Int(i) => emit_mov_imm32(unit, alloc_reg(*result), *i as u32),
             SsaConst::Bool(b) => emit_mov_imm32(unit, alloc_reg(*result), u32::from(*b)),
             SsaConst::Unit => emit_mov_imm32(unit, alloc_reg(*result), 0),
-            SsaConst::Float(_) | SsaConst::Str(_) => {
-                emit_mov_imm32(unit, alloc_reg(*result), 0);
-            }
+            SsaConst::Float(_) => crate::codegen::unsupported_const("float"),
+            SsaConst::Str(_) => crate::codegen::unsupported_const("string"),
         },
         SsaInstr::Unary { result, op, operand } => emit_unary(unit, *result, *op, *operand),
         SsaInstr::Binary { result, op, lhs, rhs } => emit_binary(unit, *result, *op, *lhs, *rhs),
@@ -482,6 +550,9 @@ fn emit_instr(unit: &mut CompilationUnit, instr: &SsaInstr) {
         }
         // φ 的实际拷贝由前驱末尾的 emit_phi_copies 发出
         SsaInstr::Phi { .. } => {}
+        SsaInstr::Cast { result, src, from, to } => {
+            emit_cast(unit, alloc_reg(*result), alloc_reg(*src), *from, *to);
+        }
         SsaInstr::Copy { result, src } => {
             let (d, s) = (alloc_reg(*result), alloc_reg(*src));
             if d != s {
@@ -667,7 +738,8 @@ mod tests {
                     term: SsaTerminator::Return(Some(SsaValue(2))),
                 },
             ],
-        };
+                    inline_never: false,
+};
         let mut unit = empty_unit();
         emit_function(
             &Target::parse("arm-none-eabi").unwrap(),
@@ -910,5 +982,21 @@ mod tests {
         let mls = u32::from_le_bytes(u.code[4..8].try_into().unwrap());
         assert_eq!(sdiv, 0xe713_f110, "sdiv r3, r0, r1");
         assert_eq!(mls, 0xe063_3190, "mls r3, r0, r1, r3");
+    }
+}
+
+/// 寄存器压力检查。
+///
+/// 这些后端还没实现溢出（spilling）：活跃值超过可分配寄存器数时，
+/// `alloc_reg` 按编号取模会让同时存活的值抢同一个寄存器，生成**错的**代码。
+/// 宁可在这里明确报错，也不能安静地编出一个算错的程序。
+///
+/// x86-64 后端自己实现了溢出，见 `encoder.rs`。
+fn check_register_pressure(func: &SsaFunction) {
+    // 这些后端只用这次分配来**检测**压力，还没有按结果发射代码；
+    // 因此不传 callee-save 集合（它们本来也没建模调用破坏寄存器）。
+    let alloc = crate::codegen::regalloc::allocate_registers(func, ALLOCATABLE.len(), &[]);
+    if alloc.spilled > 0 {
+        crate::codegen::unsupported_pressure(&func.name, ALLOCATABLE.len());
     }
 }

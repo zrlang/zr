@@ -9,7 +9,7 @@
 //!
 //! HIR 是后续 MIR 降级、借用检查、模式穷尽性检查、闭包转换的输入。
 
-pub use crate::parser::ast::{Abi, Attribute, Span};
+pub use crate::parser::ast::{Abi, Span};
 use std::collections::HashMap;
 
 /// 一个 HIR 程序（已通过类型检查）。
@@ -179,8 +179,6 @@ pub enum ExprKind {
     AddrOf,
     /// 索引访问。
     Index(Box<HirExpr>),
-    /// 类型转换（已确定源类型与目标类型）。
-    Cast,
     /// 块表达式。
     Block(HirBlock),
     /// `if` 表达式。
@@ -211,8 +209,15 @@ pub enum ExprKind {
     Struct,
     /// Lambda / 闭包（已确定捕获列表与类型）。
     Closure,
-    /// `comptime` 块。
-    Comptime,
+    /// 类型转换 `Cast(操作数, 目标类型)`。
+    ///
+    /// 操作数必须留下来：丢掉它的话 MIR 侧无从生成转换指令。
+    Cast(Box<HirExpr>),
+    /// `comptime` 表达式，已经在编译期折成字面量。
+    ///
+    /// 只保留折叠结果，不保留内层表达式：求值成功后内层表达式不会再被
+    /// 任何阶段读取（MIR 直接用这个字面量），留着只是白占内存。
+    Comptime(Box<HirLiteral>),
     /// `await`。
     Await(Box<HirExpr>),
     /// 内联汇编。
@@ -368,6 +373,28 @@ pub struct HirBlock {
 // HIR 函数 / 类型定义
 // ======================================================================
 
+/// HIR 层的属性。
+///
+/// 语法树那边的 `ast::Attribute` 装的是完整表达式，而优化器、MIR 这些
+/// 下游只关心"属性叫什么、带什么字面量参数"，所以这里压成字符串参数：
+/// `#[inline(always)]` -> `{ name: "inline", args: ["always"] }`，
+/// `#[repr(align = 8)]` -> `{ name: "repr", named: [("align", "8")] }`。
+#[derive(Debug, Clone)]
+pub struct HirAttr {
+    pub name: String,
+    /// 位置参数。
+    pub args: Vec<String>,
+    /// 具名参数 `key = value`。
+    pub named: Vec<(String, String)>,
+}
+
+impl HirAttr {
+    /// 属性是否带某个位置参数（`#[inline(never)]`）。
+    pub fn has_arg(&self, arg: &str) -> bool {
+        self.args.iter().any(|a| a == arg)
+    }
+}
+
 /// HIR 函数。
 #[derive(Debug, Clone)]
 pub struct HirFunction {
@@ -380,6 +407,20 @@ pub struct HirFunction {
     /// 调用约定 / ABI（保留字段，后端按目标选择调用约定时使用）。
     #[allow(dead_code)]
     pub abi: Abi,
+    /// 函数上的属性（`#[inline]` / `#[test]` / `#[no_mangle]` …）。
+    pub attrs: Vec<HirAttr>,
+}
+
+impl HirFunction {
+    /// 是否带某个属性。
+    pub fn has_attr(&self, name: &str) -> bool {
+        self.attrs.iter().any(|a| a.name == name)
+    }
+
+    /// 第一个同名属性。
+    pub fn attr(&self, name: &str) -> Option<&HirAttr> {
+        self.attrs.iter().find(|a| a.name == name)
+    }
 }
 
 /// HIR 参数。
@@ -411,7 +452,7 @@ pub enum HirTypeDef {
 #[derive(Debug, Clone)]
 pub struct HirStruct {
     pub name: String,
-    pub attrs: Vec<Attribute>,
+    pub attrs: Vec<HirAttr>,
     pub fields: Vec<HirField>,
     pub repr: Repr,
 }

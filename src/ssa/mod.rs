@@ -30,6 +30,8 @@ pub struct SsaFunction {
     pub name: String,
     pub params: Vec<SsaValue>,
     pub blocks: Vec<SsaBasicBlock>,
+    /// `#[inline(never)]`：内联 pass 必须跳过它。
+    pub inline_never: bool,
 }
 
 /// 一个 SSA 基本块。
@@ -89,6 +91,13 @@ pub enum SsaInstr {
     Copy {
         result: SsaValue,
         src: SsaValue,
+    },
+    /// 类型转换 `result = cast src`。
+    Cast {
+        result: SsaValue,
+        src: SsaValue,
+        from: mir::NumTy,
+        to: mir::NumTy,
     },
     /// 变量引用（用于 φ 函数合并前的原始变量）。
     Var {
@@ -168,6 +177,7 @@ impl SsaInstr {
             SsaInstr::Binary { result, .. } => Some(*result),
             SsaInstr::Phi { result, .. } => Some(*result),
             SsaInstr::Copy { result, .. } => Some(*result),
+            SsaInstr::Cast { result, .. } => Some(*result),
             SsaInstr::Call { result, .. } => Some(*result),
             SsaInstr::Var { result, .. } => Some(*result),
         }
@@ -247,6 +257,17 @@ fn convert_function(func: &mir::MirFunction) -> SsaFunction {
             match instr {
                 mir::MirInstr::Assign(name, val) => {
                     let v = materialize(val, &mut instrs, &mut cur, &next_value);
+                    cur.insert(name.clone(), v);
+                }
+                mir::MirInstr::Cast(name, val, from, to) => {
+                    let s = materialize(val, &mut instrs, &mut cur, &next_value);
+                    let v = alloc();
+                    instrs.push(SsaInstr::Cast {
+                        result: v,
+                        src: s,
+                        from: *from,
+                        to: *to,
+                    });
                     cur.insert(name.clone(), v);
                 }
                 mir::MirInstr::Binary(name, a, op, b) => {
@@ -346,6 +367,7 @@ fn convert_function(func: &mir::MirFunction) -> SsaFunction {
         name: func.name.clone(),
         params,
         blocks: out_blocks,
+        inline_never: func.inline_never,
     }
 }
 
@@ -428,6 +450,7 @@ fn defined_names(block: &mir::MirBasicBlock) -> Vec<String> {
             mir::MirInstr::Unary(n, ..) => Some(n),
             mir::MirInstr::Call(n, ..) => Some(n),
             mir::MirInstr::Await(n, _) => Some(n),
+            mir::MirInstr::Cast(n, ..) => Some(n),
         };
         if let Some(n) = name {
             if !out.contains(n) {

@@ -202,6 +202,7 @@ fn uses(instr: &SsaInstr, out: &mut Vec<SsaValue>) {
     match instr {
         SsaInstr::Const { .. } | SsaInstr::Var { .. } => {}
         SsaInstr::Copy { src, .. } => out.push(*src),
+        SsaInstr::Cast { src, .. } => out.push(*src),
         SsaInstr::Unary { operand, .. } => out.push(*operand),
         SsaInstr::Binary { lhs, rhs, .. } => {
             out.push(*lhs);
@@ -501,6 +502,10 @@ pub fn inline_functions(module: SsaModule) -> SsaModule {
         if func.blocks.len() != 1 {
             continue;
         }
+        // `#[inline(never)]` 的函数不作为候选——属性语义在这里生效
+        if func.inline_never {
+            continue;
+        }
         let block = &func.blocks[0];
         let SsaTerminator::Return(Some(ret)) = block.term else {
             continue;
@@ -682,6 +687,12 @@ fn set_result(instr: SsaInstr, new: SsaValue) -> SsaInstr {
         },
         SsaInstr::Var { name, .. } => SsaInstr::Var { result: new, name },
         SsaInstr::Copy { src, .. } => SsaInstr::Copy { result: new, src },
+        SsaInstr::Cast { src, from, to, .. } => SsaInstr::Cast {
+            result: new,
+            src,
+            from,
+            to,
+        },
         // `Call` 必须一起改，否则内联时调用点保留了被调函数的旧结果号，
         // 后面追加的 `copy` 却指向新发号的临时量，直接读到未定义的值。
         SsaInstr::Call {

@@ -19,11 +19,13 @@
 //! 启动约定随平台变化（见 [`emit_start_wrapper`]）：Linux 直接用系统调用
 //! 退出进程；macOS 与 Windows 复用运行时的 `zr_exit`。
 
+use crate::codegen::regalloc::{Allocation, Location, X86_64_CALLEE_SAVE};
 use crate::codegen::target::{Arch, Os, Target};
 use crate::codegen::{
     CompilationUnit, Relocation, RelocationKind, Symbol, SymbolKind, SymbolSection,
 };
 use std::collections::HashMap;
+use crate::mir::NumTy;
 use crate::ssa::{SsaBinaryOp, SsaConst, SsaFunction, SsaInstr, SsaTerminator, SsaValue};
 
 /// x86-64 通用寄存器（System V ABI / Microsoft x64 ABI 共用编号）。
@@ -88,7 +90,9 @@ fn emit_phi_copies(unit: &mut CompilationUnit, func: &SsaFunction, succ: usize, 
     let Some(block) = func.blocks.iter().find(|b| b.id == succ) else {
         return;
     };
-    let mut moves: Vec<(Gpr, Gpr)> = Vec::new();
+    let mut moves: Vec<(Gpr, Src)> = Vec::new();
+    // 溢出结果先单独处理：它们没有固定寄存器，只能经 `rax` 中转。
+    // 放在最前面做是安全的——`rax` 不参与分配，不是任何搬运的源。
     for instr in &block.instrs {
         let SsaInstr::Phi { result, incoming, .. } = instr else {
             continue;
@@ -96,40 +100,37 @@ fn emit_phi_copies(unit: &mut CompilationUnit, func: &SsaFunction, succ: usize, 
         let Some((_, src)) = incoming.iter().find(|(p, _)| *p == from) else {
             continue;
         };
-        let (dst, src) = (alloc_reg(*result), alloc_reg(*src));
-        if dst != src {
-            moves.push((dst, src));
+        if let Location::Stack(slot) = location_of(*result) {
+            emit_mov_src(unit, SCRATCH_AX, src_of(*src));
+            emit_store_slot(unit, SCRATCH_AX, slot);
         }
     }
-    while !moves.is_empty() {
-        let safe = moves
-            .iter()
-            .position(|(dst, _)| !moves.iter().any(|(_, src)| src == dst));
-        match safe {
-            Some(at) => {
-                let (dst, src) = moves.remove(at);
-                emit_mov_rr(unit, dst, src);
-            }
-            None => {
-                let src = moves[0].1;
-                emit_mov_rr(unit, SCRATCH_AX, src);
-                for m in moves.iter_mut() {
-                    if m.1 == src {
-                        m.1 = SCRATCH_AX;
-                    }
-                }
-            }
-        }
+    // 剩下的都是寄存器到寄存器，统一走并行搬运处理环
+    for instr in &block.instrs {
+        let SsaInstr::Phi { result, incoming, .. } = instr else {
+            continue;
+        };
+        let Some((_, src)) = incoming.iter().find(|(p, _)| *p == from) else {
+            continue;
+        };
+        let Location::Reg(d) = location_of(*result) else {
+            continue;
+        };
+        moves.push((ALLOCATABLE[d], src_of(*src)));
     }
+    emit_parallel_moves(unit, &moves);
 }
 
 /// 本函数实际用到的 callee-save 寄存器（按 push 顺序）。
-fn callee_saved_regs(map: &HashMap<u32, usize>) -> Vec<Gpr> {
+fn callee_saved_regs(map: &HashMap<u32, Location>) -> Vec<Gpr> {
     ALLOCATABLE
         .iter()
         .copied()
         .filter(|r| matches!(r, Gpr::R12 | Gpr::R13 | Gpr::R14 | Gpr::R15))
-        .filter(|r| map.values().any(|idx| ALLOCATABLE[*idx] == *r))
+        .filter(|r| {
+            map.values()
+                .any(|loc| matches!(loc, Location::Reg(i) if ALLOCATABLE[*i] == *r))
+        })
         .collect()
 }
 
@@ -152,34 +153,89 @@ fn block_label(func: &str, id: usize) -> String {
 // thread_local 里：`emit_function` 开头写入、结尾清空。编译是单线程的，
 // 这样够用，也免得把映射逐层传进每个发射函数。
 thread_local! {
-    static REG_MAP: std::cell::RefCell<HashMap<u32, usize>> =
-        std::cell::RefCell::new(HashMap::new());
+    static REG_MAP: std::cell::RefCell<Allocation> =
+        std::cell::RefCell::new(Allocation::default());
+    /// 当前函数预留的栈槽数（驱动序言的 `sub rsp`）。
+    static FRAME_SLOTS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
-/// 取 `v` 的寄存器下标；没有分配记录时退回取模。
-fn reg_index(v: SsaValue) -> usize {
+/// 取 `v` 的位置；没有分配记录时退回取模。
+fn location_of(v: SsaValue) -> Location {
     REG_MAP.with(|m| {
         m.borrow()
+            .map
             .get(&v.id())
             .copied()
-            .unwrap_or((v.id() as usize) % ALLOCATABLE.len())
+            .unwrap_or(Location::Reg((v.id() as usize) % ALLOCATABLE.len()))
     })
 }
 
 /// 把 SSA value 映射到物理寄存器（线性扫描的结果）。
+///
+/// 溢出到内存的值没有寄存器——调用方必须先用 [`use_reg`] 把它们从栈槽
+/// 装回寄存器再取。直接调用本函数等于把一个错误编码进去，所以它只在
+/// 调用方已经保证该值有寄存器时使用。
 fn alloc_reg(v: SsaValue) -> Gpr {
-    ALLOCATABLE[reg_index(v)]
+    match location_of(v) {
+        Location::Reg(i) => ALLOCATABLE[i],
+        Location::Stack(_) => unreachable!("值溢出到了栈槽，必须先经 use_reg 取回"),
+    }
+}
+
+/// 取 `v` 所在的寄存器，必要时从栈槽装载。
+///
+/// 溢出值没有固定寄存器，用 `rax` 装载——它不参与分配，随时可用。
+fn use_reg(unit: &mut CompilationUnit, v: SsaValue) -> Gpr {
+    match location_of(v) {
+        Location::Reg(i) => ALLOCATABLE[i],
+        Location::Stack(slot) => {
+            emit_load_slot(unit, SCRATCH_AX, slot);
+            SCRATCH_AX
+        }
+    }
+}
+
+/// 并行搬运的来源：寄存器，或者某个溢出值的栈槽。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Src {
+    Reg(Gpr),
+    Mem(usize),
+}
+
+/// `mov dst, [rsp + 8*slot]`
+fn emit_load_slot(unit: &mut CompilationUnit, dst: Gpr, slot: usize) {
+    emit1(unit, 0x48 | if dst.rex_bit() { 0x01 } else { 0 });
+    emit1(unit, 0x8B);
+    // mod=10 (disp32), reg=dst, r/m=100 (SIB) -> SIB: base=rsp(100), index=none
+    emit1(unit, 0b10_000_100 | dst.bits() << 3);
+    emit1(unit, 0b00_100_100);
+    emit4(unit, (slot * 8) as u32);
+}
+
+/// `mov [rsp + 8*slot], src`
+fn emit_store_slot(unit: &mut CompilationUnit, src: Gpr, slot: usize) {
+    emit1(unit, 0x48 | if src.rex_bit() { 0x04 } else { 0 });
+    emit1(unit, 0x89);
+    // mod=10 (disp32), reg=src, r/m=100 (SIB)
+    emit1(unit, 0b10_000_100 | src.bits() << 3);
+    emit1(unit, 0b00_100_100);
+    emit4(unit, (slot * 8) as u32);
 }
 
 /// 发射一个函数的机器码。
 pub fn emit_function(target: &Target, unit: &mut CompilationUnit, func: &SsaFunction) {
     debug_assert_eq!(target.arch(), Arch::X86_64, "x86-64 后端只能用于 x86_64 目标");
     // 先做活跃区间分析 + 线性扫描，确定每个值落在哪个寄存器
-    let map = crate::codegen::regalloc::allocate_registers(func, ALLOCATABLE.len());
+    let alloc = crate::codegen::regalloc::allocate_registers(
+        func,
+        ALLOCATABLE.len(),
+        &X86_64_CALLEE_SAVE,
+    );
     // callee-save 集合要在发射尾声时再用，所以这里留一份
-    let callee_saved = callee_saved_regs(&map);
+    let callee_saved = callee_saved_regs(&alloc.map);
+    FRAME_SLOTS.with(|c| c.set(alloc.spilled));
     REG_MAP.with(|m| {
-        *m.borrow_mut() = map;
+        *m.borrow_mut() = alloc;
     });
     let start = unit.code.len();
 
@@ -206,6 +262,16 @@ pub fn emit_function(target: &Target, unit: &mut CompilationUnit, func: &SsaFunc
     for r in &callee_saved {
         emit_push_r(unit, *r);
     }
+    // 溢出值的栈槽。SysV 要求调用时 rsp 16 字节对齐，所以向上取整。
+    let frame = FRAME_SLOTS.with(|c| c.get()) * 8;
+    let frame = (frame + 15) & !15;
+    if frame > 0 {
+        // sub rsp, imm32
+        emit1(unit, 0x48);
+        emit1(unit, 0x81);
+        emit1(unit, 0xEC);
+        emit4(unit, frame as u32);
+    }
     emit_param_moves(unit, func);
 
     for block in &func.blocks {
@@ -224,7 +290,13 @@ pub fn emit_function(target: &Target, unit: &mut CompilationUnit, func: &SsaFunc
                 if let Some(v) = ret_val {
                     emit_mov_rr(unit, SCRATCH_AX, alloc_reg(*v));
                 }
-                // 尾声：pop callee-save; mov rsp, rbp; pop rbp; ret
+                // 尾声：add rsp, frame; pop callee-save; mov rsp, rbp; pop rbp; ret
+                if frame > 0 {
+                    emit1(unit, 0x48);
+                    emit1(unit, 0x81);
+                    emit1(unit, 0xC4);
+                    emit4(unit, frame as u32);
+                }
                 for r in callee_saved.iter().rev() {
                     emit_pop_r(unit, *r);
                 }
@@ -235,7 +307,8 @@ pub fn emit_function(target: &Target, unit: &mut CompilationUnit, func: &SsaFunc
             SsaTerminator::Goto(target) => emit_jmp(unit, &block_label(&func.name, *target)),
             SsaTerminator::Branch { cond, then_block, else_block } => {
                 // test cond, cond; jz else; jmp then
-                let r = alloc_reg(*cond);
+                // 条件可能溢出在栈上，先装回 rax 再测
+                let r = use_reg(unit, *cond);
                 emit_test_rr(unit, r, r);
                 emit_jcc_rel32(unit, 0x84, &block_label(&func.name, *else_block)); // jz
                 emit_jmp(unit, &block_label(&func.name, *then_block));
@@ -270,14 +343,45 @@ fn emit_instr(unit: &mut CompilationUnit, instr: &SsaInstr) {
         SsaInstr::Call { result, callee, args } => {
             emit_call_args(unit, args);
             emit_call(unit, callee);
-            emit_mov_rr(unit, alloc_reg(*result), SCRATCH_AX);
+            match location_of(*result) {
+                Location::Reg(i) => {
+                    let d = ALLOCATABLE[i];
+                    if d != SCRATCH_AX {
+                        emit_mov_rr(unit, d, SCRATCH_AX);
+                    }
+                }
+                Location::Stack(slot) => emit_store_slot(unit, SCRATCH_AX, slot),
+            }
         }
         // φ 的实际拷贝由前驱末尾的 emit_phi_copies 发出
         SsaInstr::Phi { .. } => {}
         SsaInstr::Copy { result, src } => {
-            let (d, s) = (alloc_reg(*result), alloc_reg(*src));
-            if d != s {
-                emit_mov_rr(unit, d, s);
+            let spilled = matches!(location_of(*result), Location::Stack(_));
+            let d = if spilled { SCRATCH_AX } else { alloc_reg(*result) };
+            match location_of(*src) {
+                Location::Reg(i) => {
+                    let s = ALLOCATABLE[i];
+                    if d != s {
+                        emit_mov_rr(unit, d, s);
+                    }
+                }
+                Location::Stack(slot) => emit_load_slot(unit, d, slot),
+            }
+            if spilled {
+                if let Location::Stack(slot) = location_of(*result) {
+                    emit_store_slot(unit, d, slot);
+                }
+            }
+        }
+        SsaInstr::Cast { result, src, from, to } => {
+            let spilled = matches!(location_of(*result), Location::Stack(_));
+            let d = if spilled { SCRATCH_AX } else { alloc_reg(*result) };
+            let s = use_reg(unit, *src);
+            emit_cast(unit, d, s, *from, *to);
+            if spilled {
+                if let Location::Stack(slot) = location_of(*result) {
+                    emit_store_slot(unit, d, slot);
+                }
             }
         }
         SsaInstr::Var { .. } => {
@@ -286,9 +390,101 @@ fn emit_instr(unit: &mut CompilationUnit, instr: &SsaInstr) {
     }
 }
 
+/// 类型转换。
+///
+/// 值一律放在 64 位寄存器里，所以转换就是"取低 w 位再按目标的有无符号
+/// 重新符号/零扩展到 64 位"。宽度已经是 64 时什么都不用做。
+fn emit_cast(
+    unit: &mut CompilationUnit,
+    dst: Gpr,
+    src: Gpr,
+    from: NumTy,
+    to: NumTy,
+) {
+    // 浮点之间的转换、浮点与整数之间的转换目前后端还没有实现。
+    // 宁可报错也不能静默发出 0 —— 那比编译失败更难查。
+    if from.is_float() || to.is_float() {
+        crate::codegen::unsupported_cast(from, to);
+    }
+    let (bits, signed) = match to {
+        NumTy::Int(w) => (w, true),
+        NumTy::Uint(w) => (w, false),
+        // bool 和 64 位整数之间转换只是取低 1 位 / 归一化
+        NumTy::Bool => (8, false),
+        NumTy::Float(_) => unreachable!("上面已经拦下了浮点"),
+    };
+    if bits >= 64 {
+        if dst != src {
+            emit_mov_rr(unit, dst, src);
+        }
+        return;
+    }
+    emit_extend_to64(unit, dst, src, bits, signed);
+}
+
+/// `movsx` / `movzx`：把 `src` 的低 `bits` 位按 `signed` 解释后扩展到 64 位。
+fn emit_extend_to64(unit: &mut CompilationUnit, dst: Gpr, src: Gpr, bits: u8, signed: bool) {
+    // 这些指令的 ModRM 都是 **reg = 目的(dst), r/m = 源(src)**，
+    // 和 `mov r/m, reg`（0x89）正好相反，REX 位也跟着换：
+    // REX.R(0x04) 扩展 reg 字段（dst），REX.B(0x01) 扩展 r/m 字段（src）。
+    // 写反的话 R8 会被当成 RAX 读。
+    let mut rex = 0x48u8;
+    if dst.rex_bit() {
+        rex |= 0x04;
+    }
+    if src.rex_bit() {
+        rex |= 0x01;
+    }
+    let reg_rm = dst.bits();
+    let rm = src.bits();
+    match (bits, signed) {
+        // movsx：0F BE /r 取字节、0F BF /r 取字
+        (8, true) => {
+            emit1(unit, rex);
+            emit1(unit, 0x0F);
+            emit1(unit, 0xBE);
+            modrm(unit, 3, reg_rm, rm);
+        }
+        (16, true) => {
+            emit1(unit, rex);
+            emit1(unit, 0x0F);
+            emit1(unit, 0xBF);
+            modrm(unit, 3, reg_rm, rm);
+        }
+        // movzx：0F B6 /r 取字节、0F B7 /r 取字
+        (8, false) => {
+            emit1(unit, rex);
+            emit1(unit, 0x0F);
+            emit1(unit, 0xB6);
+            modrm(unit, 3, reg_rm, rm);
+        }
+        (16, false) => {
+            emit1(unit, rex);
+            emit1(unit, 0x0F);
+            emit1(unit, 0xB7);
+            modrm(unit, 3, reg_rm, rm);
+        }
+        // movsxd r64, r/m32
+        (32, true) => {
+            emit1(unit, rex);
+            emit1(unit, 0x63);
+            modrm(unit, 3, reg_rm, rm);
+        }
+        // mov r32, r/m32：写 32 位子寄存器会把高 32 位清零，等于零扩展
+        (32, false) => {
+            emit1(unit, rex);
+            emit1(unit, 0x8B);
+            modrm(unit, 3, reg_rm, rm);
+        }
+        _ => {}
+    }
+}
+
 /// 发射常量加载。
 fn emit_const(unit: &mut CompilationUnit, result: SsaValue, value: SsaConst) {
-    let dst = alloc_reg(result);
+    // 溢出的结果没有寄存器：先装进 rax，再写回栈槽
+    let spilled = matches!(location_of(result), Location::Stack(_));
+    let dst = if spilled { SCRATCH_AX } else { alloc_reg(result) };
     match value {
         SsaConst::Int(i) => {
             // movabs（REX.W + 0xB8 + rd + imm64）加载 64 位立即数
@@ -300,7 +496,13 @@ fn emit_const(unit: &mut CompilationUnit, result: SsaValue, value: SsaConst) {
         // bool / unit 在通用寄存器里就是 0/1；浮点与字符串后端暂未实现
         SsaConst::Bool(b) => emit_const_bool(unit, dst.bits(), b),
         SsaConst::Unit => emit_const_int(unit, dst.bits(), 0),
-        SsaConst::Float(_) | SsaConst::Str(_) => emit_const_int(unit, dst.bits(), 0),
+        SsaConst::Float(_) => crate::codegen::unsupported_const("float"),
+        SsaConst::Str(_) => crate::codegen::unsupported_const("string"),
+    }
+    if spilled {
+        if let Location::Stack(slot) = location_of(result) {
+            emit_store_slot(unit, dst, slot);
+        }
     }
 }
 
@@ -324,11 +526,62 @@ fn emit_const_bool(unit: &mut CompilationUnit, dst: u8, value: bool) {
 
 /// 发射二元运算。
 fn emit_binary(unit: &mut CompilationUnit, result: SsaValue, op: SsaBinaryOp, lhs: SsaValue, rhs: SsaValue) {
-    let dst = alloc_reg(result);
-    let l = alloc_reg(lhs);
-    let r = alloc_reg(rhs);
-
     use SsaBinaryOp::*;
+
+    // 操作数可能是溢出的值：先按需从栈槽装进临时寄存器。
+    // 分配器保证溢出值没有固定寄存器，所以这里用的是**不参与分配**的
+    // `rax` / `rdx`。
+    let lhs_loc = location_of(lhs);
+    let rhs_loc = location_of(rhs);
+    let l_temp = match lhs_loc {
+        Location::Stack(slot) => {
+            emit_load_slot(unit, SCRATCH_AX, slot);
+            Some(SCRATCH_AX)
+        }
+        Location::Reg(_) => None,
+    };
+    let r_temp = match rhs_loc {
+        Location::Stack(_) => {
+            // `div`/`rem` 内部要用 `rax:rdx` 放被除数，`cqo` 还会把 rdx
+            // 写掉，所以除数不能借用这两个寄存器——借一个分配池里的，
+            // 用 push/pop 保护它当下的内容。
+            if matches!(op, Div | Rem) {
+                let slot = match rhs_loc {
+                    Location::Stack(slot) => slot,
+                    Location::Reg(_) => unreachable!(),
+                };
+                let protect = ALLOCATABLE[X86_64_CALLEE_SAVE[0]];
+                emit_push_r(unit, protect);
+                emit_load_slot(unit, protect, slot);
+                Some(protect)
+            } else {
+                // 两个操作数都溢出时只能用第二个临时寄存器
+                let tmp = if l_temp.is_some() { SCRATCH_DX } else { SCRATCH_AX };
+                let slot = match rhs_loc {
+                    Location::Stack(slot) => slot,
+                    Location::Reg(_) => unreachable!(),
+                };
+                emit_load_slot(unit, tmp, slot);
+                Some(tmp)
+            }
+        }
+        Location::Reg(_) => None,
+    };
+
+    // 结果寄存器：溢出的结果先算进一个临时寄存器，最后再存回栈槽。
+    // 除法/取模要占用 rax:rdx，比较要用 setcc al，移位要占 cl ——
+    // 这几种运算的结果临时寄存器换用 rcx，免得和它们打架。
+    let result_spilled = matches!(location_of(result), Location::Stack(_));
+    let scratch = match op {
+        Div | Rem | Eq | Ne | Lt | Gt | Le | Ge => SCRATCH_CX,
+        _ => SCRATCH_AX,
+    };
+    let dst = if result_spilled { scratch } else { alloc_reg(result) };
+    let l = l_temp.unwrap_or_else(|| alloc_reg(lhs));
+    let r = r_temp.unwrap_or_else(|| alloc_reg(rhs));
+
+    // 运算体
+    let _ = &mut ();
     match op {
         // 算术与位运算：dst = l OP r
         Add | Sub | BitAnd | BitOr | BitXor | And | Or => {
@@ -340,9 +593,24 @@ fn emit_binary(unit: &mut CompilationUnit, result: SsaValue, op: SsaBinaryOp, lh
             }
         }
         // 乘法 / 除法 / 取模 / 移位：需要专用指令编码
-        Mul => emit_mul(unit, dst, l, r),
-        Div => emit_divrem(unit, dst, l, r, false),
-        Rem => emit_divrem(unit, dst, l, r, true),
+        Mul => {
+            emit_mul(unit, dst, l, r);
+            if r_temp.is_some() {
+                emit_pop_r(unit, r);
+            }
+        }
+        Div => {
+            emit_divrem(unit, dst, l, r, false);
+            if r_temp.is_some() {
+                emit_pop_r(unit, r);
+            }
+        }
+        Rem => {
+            emit_divrem(unit, dst, l, r, true);
+            if r_temp.is_some() {
+                emit_pop_r(unit, r);
+            }
+        }
         Shl => emit_shift(unit, 4, dst, l, r), // shl r/m64, cl
         Shr => emit_shift(unit, 5, dst, l, r), // shr r/m64, cl
         // 比较运算：cmp l, r; setcc al; movzx dst, al
@@ -352,12 +620,27 @@ fn emit_binary(unit: &mut CompilationUnit, result: SsaValue, op: SsaBinaryOp, lh
             emit_movzx(unit, dst, SCRATCH_AX);
         }
     }
+
+    // 溢出结果写回栈槽
+    if result_spilled {
+        emit_store_slot(unit, dst, match location_of(result) {
+            Location::Stack(slot) => slot,
+            Location::Reg(_) => unreachable!(),
+        });
+    }
 }
 
 /// 发射一元运算。
 fn emit_unary(unit: &mut CompilationUnit, result: SsaValue, op: crate::ssa::SsaUnaryOp, operand: SsaValue) {
-    let dst = alloc_reg(result);
-    let r = alloc_reg(operand);
+    let spilled = matches!(location_of(result), Location::Stack(_));
+    let dst = if spilled { SCRATCH_AX } else { alloc_reg(result) };
+    let r = match location_of(operand) {
+        Location::Reg(i) => ALLOCATABLE[i],
+        Location::Stack(slot) => {
+            emit_load_slot(unit, SCRATCH_DX, slot);
+            SCRATCH_DX
+        }
+    };
 
     use crate::ssa::SsaUnaryOp::*;
     match op {
@@ -386,9 +669,15 @@ fn emit_unary(unit: &mut CompilationUnit, result: SsaValue, op: crate::ssa::SsaU
             modrm(unit, 3, 3, dst.bits()); // /3 = NEG
         }
     }
+
+    // 溢出结果写回栈槽
+    if spilled {
+        if let Location::Stack(slot) = location_of(result) {
+            emit_store_slot(unit, dst, slot);
+        }
+    }
 }
 
-/// 返回 ALU 指令的编码分类（对应 `emit_full_alu`）：
 /// 0=add, 1=or, 4=and, 5=sub, 6=xor。
 /// 对于 mul/div/rem/shl/shr 这类不能用简单 MR 形式编码的运算，
 /// 返回 `None`，由调用者走专用路径。
@@ -531,10 +820,10 @@ fn emit_movzx(unit: &mut CompilationUnit, dst: Gpr, src: Gpr) {
 /// 暂存到 rax（rax 不是实参寄存器），把环打开后继续。
 fn emit_call_args(unit: &mut CompilationUnit, args: &[SsaValue]) {
     let n = args.len().min(ARG_REGS.len());
-    let mut moves: Vec<(Gpr, Gpr)> = Vec::new();
+    let mut moves: Vec<(Gpr, Src)> = Vec::new();
     for i in 0..n {
-        let src = alloc_reg(args[i]);
-        if src != ARG_REGS[i] {
+        let src = src_of(args[i]);
+        if !matches!(src, Src::Reg(r) if r == ARG_REGS[i]) {
             moves.push((ARG_REGS[i], src));
         }
     }
@@ -543,38 +832,64 @@ fn emit_call_args(unit: &mut CompilationUnit, args: &[SsaValue]) {
     emit_parallel_moves(unit, &moves);
 }
 
-/// 并行搬运 `(dst, src)`：允许 dst/src 重叠，靠环检测保证正确。
+/// 并行搬运 `(dst, src)`：允许目标重叠，靠环检测保证正确。
 ///
 /// 直接按顺序发 `mov` 会在有环时互相覆盖（例如
 /// `rdi->rsi` 与 `rsi->rdi`），所以先发那些"目标没被别的搬运当源读"的，
 /// 剩下的环用 `rax`（不参与分配）中转打开。
-fn emit_parallel_moves(unit: &mut CompilationUnit, moves: &[(Gpr, Gpr)]) {
-    let mut moves: Vec<(Gpr, Gpr)> = moves
+///
+/// 源可以是栈槽（溢出值）。内存源不会被别的搬运读寄存器时踩到，但它
+/// 自己仍然可能覆盖某个源寄存器——所以它也要参与同一套环检测。
+fn emit_parallel_moves(unit: &mut CompilationUnit, moves: &[(Gpr, Src)]) {
+    let mut moves: Vec<(Gpr, Src)> = moves
         .iter()
         .copied()
-        .filter(|(dst, src)| dst != src)
+        .filter(|(dst, src)| !matches!(src, Src::Reg(r) if *r == *dst))
         .collect();
     while !moves.is_empty() {
         // 目标不再被任何待执行的搬运读取 -> 可以安全执行
-        let safe = moves
-            .iter()
-            .position(|(dst, _)| !moves.iter().any(|(_, src)| src == dst));
+        let safe = moves.iter().position(|(dst, _)| {
+            !moves
+                .iter()
+                .any(|(_, src)| matches!(src, Src::Reg(r) if *r == *dst))
+        });
         match safe {
             Some(at) => {
                 let (dst, src) = moves.remove(at);
-                emit_mov_rr(unit, dst, src);
+                emit_mov_src(unit, dst, src);
             }
             None => {
                 // 存在环：把第一个搬运的源暂存到 rax，把环打开
-                let src = moves[0].1;
-                emit_mov_rr(unit, SCRATCH_AX, src);
-                for m in moves.iter_mut() {
-                    if m.1 == src {
-                        m.1 = SCRATCH_AX;
+                if let Src::Reg(src) = moves[0].1 {
+                    emit_mov_rr(unit, SCRATCH_AX, src);
+                    for m in moves.iter_mut() {
+                        if m.1 == Src::Reg(src) {
+                            m.1 = Src::Reg(SCRATCH_AX);
+                        }
                     }
+                } else {
+                    // 没有纯寄存器的环可打破（正常不会走到这里）
+                    let (dst, src) = moves.remove(0);
+                    emit_mov_src(unit, dst, src);
                 }
             }
         }
+    }
+}
+
+/// `mov dst, src`，src 可以是寄存器或栈槽。
+fn emit_mov_src(unit: &mut CompilationUnit, dst: Gpr, src: Src) {
+    match src {
+        Src::Reg(r) => emit_mov_rr(unit, dst, r),
+        Src::Mem(slot) => emit_load_slot(unit, dst, slot),
+    }
+}
+
+/// 某个值的搬运来源。
+fn src_of(v: SsaValue) -> Src {
+    match location_of(v) {
+        Location::Reg(i) => Src::Reg(ALLOCATABLE[i]),
+        Location::Stack(slot) => Src::Mem(slot),
     }
 }
 
@@ -584,8 +899,18 @@ fn emit_parallel_moves(unit: &mut CompilationUnit, moves: &[(Gpr, Gpr)]) {
 /// SysV 约定（rdi/rsi/rdx/...）放的实参，两者对不上就会读到垃圾。
 fn emit_param_moves(unit: &mut CompilationUnit, func: &SsaFunction) {
     let n = func.params.len().min(ARG_REGS.len());
-    let moves: Vec<(Gpr, Gpr)> = (0..n)
-        .map(|i| (alloc_reg(func.params[i]), ARG_REGS[i]))
+    // 溢出形参没有固定寄存器：从 ABI 寄存器直接落进栈槽。这些 store
+    // 只写内存、不碰寄存器，所以可以先于寄存器搬运做。
+    for i in 0..n {
+        if let Location::Stack(slot) = location_of(func.params[i]) {
+            emit_store_slot(unit, ARG_REGS[i], slot);
+        }
+    }
+    let moves: Vec<(Gpr, Src)> = (0..n)
+        .filter_map(|i| match location_of(func.params[i]) {
+            Location::Reg(d) => Some((ALLOCATABLE[d], Src::Reg(ARG_REGS[i]))),
+            Location::Stack(_) => None,
+        })
         .collect();
     emit_parallel_moves(unit, &moves);
     // 超过 6 个的形参走栈上传参区，本后端尚未实现。

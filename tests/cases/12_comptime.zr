@@ -1,0 +1,89 @@
+//=============================================================================
+// tests/cases/12_comptime.zr — 编译期求值（comptime）
+//
+// 覆盖：表达式形式与块形式的 comptime、算术/位运算/移位折叠、比较与逻辑
+// 运算折叠、常量引用、嵌套 comptime。
+//
+// 关键性质：`comptime` 的值在**编译期**算完，运行期不再计算，所以这里
+// 断言的每一项都必须是被折叠成的字面量。
+//=============================================================================
+
+const LIMIT: i32 = 40;
+
+// 被 comptime 引用的常量也要能被折叠
+const ANSWER: i32 = 42;
+
+fn main() -> i32 {
+    // --- 表达式形式 ---
+    if comptime 40 + 2 != ANSWER {
+        return 1;
+    }
+    if comptime 6 * 7 != 42 {
+        return 2;
+    }
+    if comptime (10 + 5) * 2 != 30 {
+        return 3;
+    }
+    if comptime 100 / 3 != 33 {
+        return 4;
+    }
+    if comptime 1 << 5 != 32 {
+        return 5;
+    }
+    if comptime ((1 << 4) | 32) != 48 {
+        return 6;
+    }
+    if comptime 50 - 8 != 42 {
+        return 7;
+    }
+
+    // --- 块形式 ---
+    if comptime { 20 + 22 } != 42 {
+        return 8;
+    }
+
+    // --- 常量引用 ---
+    if comptime LIMIT + 2 != 42 {
+        return 9;
+    }
+
+    // --- 比较 / 逻辑折叠出 bool ---
+    if comptime 3 == 3 {
+        // 折叠为 true，应该进这里
+    } else {
+        return 10;
+    }
+    if comptime 3 == 4 {
+        return 11;
+    }
+    if comptime (true && false) {
+        return 12;
+    }
+    if comptime (false || true) != true {
+        return 13;
+    }
+    if comptime !(1 == 2) != true {
+        return 14;
+    }
+
+    // --- 一元 / 位运算 ---
+    if comptime -(-42) != 42 {
+        return 15;
+    }
+    if comptime ~0 != -1 {
+        return 16;
+    }
+
+    // --- 嵌套 ---
+    if comptime comptime 6 * 7 != 42 {
+        return 17;
+    }
+
+    // --- 结果能当作普通值用（说明真的折成了常量，不是运行期算的）---
+    let folded: i32 = comptime 40 + 2;
+    if folded != 42 {
+        return 18;
+    }
+
+    return 0;
+}

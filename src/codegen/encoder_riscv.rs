@@ -27,6 +27,7 @@
 
 use crate::codegen::target::{Arch, Os, Target};
 use crate::codegen::{CompilationUnit, Relocation, RelocationKind, Symbol, SymbolKind, SymbolSection};
+use crate::mir::NumTy;
 use crate::ssa::{SsaBinaryOp, SsaConst, SsaFunction, SsaInstr, SsaTerminator, SsaValue};
 
 /// RISC-V 通用寄存器（5 位编码）。
@@ -153,6 +154,36 @@ fn emit_shift_imm(unit: &mut CompilationUnit, funct3: u32, arith: u32, rd: Reg, 
         | (rd.bits() as u32) << 7
         | 0x13;
     insn(unit, word);
+}
+
+/// 类型转换：取低 `bits` 位并按 `signed` 扩展到 64 位。
+///
+/// 基础 ISA 没有单指令的任意位宽扩展，用 `slli` + (`srli` / `srai`)
+/// 两步拼出来——这也是 RISC-V 惯例的符号/零扩展写法。
+fn emit_cast(unit: &mut CompilationUnit, rd: Reg, rm: Reg, from: NumTy, to: NumTy) {
+    if from.is_float() || to.is_float() {
+        crate::codegen::unsupported_cast(from, to);
+    }
+    let (bits, signed) = match to {
+        NumTy::Int(w) => (w, true),
+        NumTy::Uint(w) => (w, false),
+        NumTy::Bool => (8, false),
+        NumTy::Float(_) => unreachable!(),
+    };
+    if bits >= 64 {
+        if rd != rm {
+            emit_mv(unit, rd, rm);
+        }
+        return;
+    }
+    // 先左移把有效位挪到高位，再右移回来：右移多少位就扩展多少位
+    let left = (64 - bits) as u32;
+    emit_shift_imm(unit, 1, 0x00, rd, rm, left); // slli
+    if signed {
+        emit_shift_imm(unit, 5, 0x20, rd, rd, left); // srai
+    } else {
+        emit_shift_imm(unit, 5, 0x00, rd, rd, left); // srli
+    }
 }
 
 /// `addi rd, rs1, imm`
@@ -394,6 +425,7 @@ pub fn emit_function(target: &Target, unit: &mut CompilationUnit, func: &SsaFunc
         matches!(target.arch(), Arch::RiscV32 | Arch::RiscV64),
         "RISC-V 后端只能用于 riscv 目标"
     );
+    check_register_pressure(func);
     let start = unit.code.len();
     let sym_base = unit.symbols.len();
 
@@ -465,7 +497,8 @@ fn emit_instr(unit: &mut CompilationUnit, instr: &SsaInstr) {
             // bool / unit 在整数寄存器里就是 0/1；浮点与字符串后端暂未实现
             SsaConst::Bool(b) => emit_li(unit, alloc_reg(*result), i32::from(*b)),
             SsaConst::Unit => emit_li(unit, alloc_reg(*result), 0),
-            SsaConst::Float(_) | SsaConst::Str(_) => emit_li(unit, alloc_reg(*result), 0),
+            SsaConst::Float(_) => crate::codegen::unsupported_const("float"),
+            SsaConst::Str(_) => crate::codegen::unsupported_const("string"),
         },
         SsaInstr::Unary { result, op, operand } => {
             emit_unary(unit, *result, *op, *operand);
@@ -478,6 +511,9 @@ fn emit_instr(unit: &mut CompilationUnit, instr: &SsaInstr) {
         }
         // φ 的实际拷贝由前驱末尾的 emit_phi_copies 发出
         SsaInstr::Phi { .. } => {}
+        SsaInstr::Cast { result, src, from, to } => {
+            emit_cast(unit, alloc_reg(*result), alloc_reg(*src), *from, *to);
+        }
         SsaInstr::Copy { result, src } => {
             let (d, s) = (alloc_reg(*result), alloc_reg(*src));
             if d != s {
@@ -729,7 +765,8 @@ mod tests {
                     term: SsaTerminator::Return(Some(SsaValue(2))),
                 },
             ],
-        };
+                    inline_never: false,
+};
         let mut unit = empty_unit();
         emit_function(
             &Target::parse("riscv64-unknown-none").unwrap(),
@@ -1038,5 +1075,21 @@ mod tests {
         // result 落在 a0 之外时才需要搬运；检查至少生成了 rem
         emit_binary(&mut u, SsaValue(0), SsaBinaryOp::Rem, SsaValue(1), SsaValue(2));
         assert!(!u.code.is_empty());
+    }
+}
+
+/// 寄存器压力检查。
+///
+/// 这些后端还没实现溢出（spilling）：活跃值超过可分配寄存器数时，
+/// `alloc_reg` 按编号取模会让同时存活的值抢同一个寄存器，生成**错的**代码。
+/// 宁可在这里明确报错，也不能安静地编出一个算错的程序。
+///
+/// x86-64 后端自己实现了溢出，见 `encoder.rs`。
+fn check_register_pressure(func: &SsaFunction) {
+    // 这些后端只用这次分配来**检测**压力，还没有按结果发射代码；
+    // 因此不传 callee-save 集合（它们本来也没建模调用破坏寄存器）。
+    let alloc = crate::codegen::regalloc::allocate_registers(func, ALLOCATABLE.len(), &[]);
+    if alloc.spilled > 0 {
+        crate::codegen::unsupported_pressure(&func.name, ALLOCATABLE.len());
     }
 }

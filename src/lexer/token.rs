@@ -346,6 +346,13 @@ impl TokenKind {
             TokenKind::KwExtern => Some("extern"),
             TokenKind::KwCrate => Some("crate"),
             TokenKind::KwAnyerror => Some("anyerror"),
+            // 类型关键字也要能在"名字位置"退化成标识符：`#[inline(never)]`
+            // 里的 `never` 就是这种用法。缺了这条，`consume_ident` 会直接
+            // 报错，`inline(never)` 根本解析不出来。
+            TokenKind::TyNever => Some("never"),
+            TokenKind::TyBool => Some("bool"),
+            TokenKind::TyStr => Some("str"),
+            TokenKind::TyChar => Some("char"),
             _ => None,
         }
     }

@@ -13,6 +13,7 @@
 //! - 保留 drop 语义与借用区间（骨架阶段为占位）。
 
 pub mod builder;
+pub mod test_harness;
 
 use crate::typeck::hir::HirModule;
 
@@ -28,6 +29,8 @@ pub struct MirFunction {
     pub name: String,
     pub params: Vec<MirParam>,
     pub blocks: Vec<MirBasicBlock>,
+    /// `#[inline(never)]`：优化器不许把这个函数自动内联进调用点。
+    pub inline_never: bool,
 }
 
 /// 函数参数。
@@ -59,6 +62,30 @@ pub enum MirInstr {
     Await(String, MirValue),
     /// 函数调用 `name = callee(args...)`。
     Call(String, String, Vec<MirValue>),
+    /// 类型转换 `name = value as to`。
+    ///
+    /// 之前 MIR 里根本没有这个指令：`x as i32` 在类型检查阶段就被丢掉
+    /// 了操作数，MIR 侧只能降级成 `Unit`，于是运行期读到的是 0。
+    Cast(String, MirValue, NumTy, NumTy),
+}
+
+/// 数值类型（只保留后端真正需要的部分）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NumTy {
+    /// 有符号整数，位宽 8 / 16 / 32 / 64。
+    Int(u8),
+    /// 无符号整数，位宽同上。
+    Uint(u8),
+    /// 浮点，位宽 32 / 64。
+    Float(u8),
+    /// 布尔。
+    Bool,
+}
+
+impl NumTy {
+    pub fn is_float(self) -> bool {
+        matches!(self, NumTy::Float(_))
+    }
 }
 
 /// MIR 终结器。
@@ -129,5 +156,14 @@ pub fn lower(hir: &HirModule) -> MirModule {
         }
     }
 
-    MirModule { functions }
+    let mut module = MirModule { functions };
+    // `#[test]`：用合成的测试桩替换掉用户写的 `main`
+    let names: Vec<String> = hir
+        .functions
+        .iter()
+        .filter(|f| f.has_attr("test"))
+        .map(|f| f.name.clone())
+        .collect();
+    test_harness::install(&mut module, &names);
+    module
 }

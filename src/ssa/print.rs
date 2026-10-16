@@ -12,6 +12,9 @@ pub fn print_module(module: &SsaModule) {
             for instr in &block.instrs {
                 print!("    ");
                 match instr {
+                    super::SsaInstr::Cast { result, src, from, to } => {
+                        println!("%{} = cast %{} : {:?} -> {:?}", result.id(), src.id(), from, to)
+                    }
                     super::SsaInstr::Const { result, value } => {
                         println!("%{} = const {:?}", result.id(), value)
                     }
