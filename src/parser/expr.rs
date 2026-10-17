@@ -56,6 +56,17 @@ impl Parser {
         let mut left = self.parse_prefix()?;
 
         loop {
+            // 块状表达式（`if` / `match` / `while` / `for` / `loop` / `{ }`）
+            // 在语句位置不再参与后续运算符绑定。
+            //
+            // 否则 `if c { .. }` 后面紧跟一条以 `*` 开头的语句（例如
+            // `*p = v`）会被当成二元乘法：`(if c { .. }) * (p = v)`，于是
+            // 赋值语句"消失"、类型检查报"expression is not assignable"。
+            // Rust 解析器同样禁止块表达式出现在二元运算的左侧。
+            if super::is_block_like(&left) {
+                break;
+            }
+
             let (op_kind, op_span) = {
                 let tk = &self.peek().kind;
                 match self.infix_binding_power(tk) {

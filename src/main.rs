@@ -867,6 +867,25 @@ fn emit_llvm_ir(target: &Target, module: &ssa::SsaModule) -> String {
                             src.id()
                         ));
                     }
+                    ssa::SsaInstr::Load { result, ptr, ty } => {
+                        out.push_str(&format!(
+                            "  %{} = load {:?}, ptr %{}\n",
+                            result.id(),
+                            ty,
+                            ptr.id()
+                        ));
+                    }
+                    ssa::SsaInstr::Store { ptr, value, ty } => {
+                        out.push_str(&format!(
+                            "  store {:?} %{}, ptr %{}\n",
+                            ty,
+                            value.id(),
+                            ptr.id()
+                        ));
+                    }
+                    ssa::SsaInstr::SlotAddr { result, local } => {
+                        out.push_str(&format!("  %{} = alloca_slot {}\n", result.id(), local));
+                    }
                     SsaInstr::Var { result, name } => {
                         out.push_str(&format!("  ; var {} -> %{}\n", name, result.id()));
                     }

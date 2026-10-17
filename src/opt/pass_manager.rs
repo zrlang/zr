@@ -39,7 +39,12 @@ impl Def {
 /// 指令是否无副作用（可被删除 / 替换）。
 fn is_pure(instr: &SsaInstr) -> bool {
     // `Call` 会调用任意函数（运行时 syscall、改全局状态），不能删。
-    !matches!(instr, SsaInstr::Call { .. })
+    // `Load`/`Store` 触及内存：`Store` 有副作用不能删；`Load` 读取的值会
+    // 被其它写改变，既不能当纯表达式合并（CSE）也不能提出循环（LICM）。
+    !matches!(
+        instr,
+        SsaInstr::Call { .. } | SsaInstr::Load { .. } | SsaInstr::Store { .. }
+    )
 }
 
 /// 构造某条指令的定义键。
@@ -56,6 +61,12 @@ fn def_of(instr: &SsaInstr) -> Def {
         // `Copy` 就是一次"寄存器搬���"，同一对 (结果, 源) 重复出现时第二条
         // 可以直接删掉（它的结果与第一条相同）。
         SsaInstr::Copy { src, .. } => Def::Op("copy", vec![*src]),
+        // 每个局部变量的栈槽地址都是不同的常量（但结果不等于彼此的）：
+        // 把 local id 编进键，避免 CSE 把 `&x` 与 `&y` 当成同一条。
+        SsaInstr::SlotAddr { local, .. } => Def::Op("slot", vec![SsaValue(*local)]),
+        // `Load`/`Store` 是 `is_pure == false` 的，不会被 CSE 查看；这里给个
+        // 独立键仅为满足穷尽匹配。
+        SsaInstr::Load { .. } | SsaInstr::Store { .. } => Def::Op("mem", vec![]),
         // `Phi` 只在块首有效（跨块合并由 GVN 负责），`Var` 是占位：
         // 两者都不参与块内等价合并。
         _ => Def::Op("other", vec![]),
@@ -307,6 +318,12 @@ fn uses(instr: &SsaInstr, out: &mut Vec<SsaValue>) {
             }
         }
         SsaInstr::Call { args, .. } => out.extend(args.iter().copied()),
+        SsaInstr::Load { ptr, .. } => out.push(*ptr),
+        SsaInstr::Store { ptr, value, .. } => {
+            out.push(*ptr);
+            out.push(*value);
+        }
+        SsaInstr::SlotAddr { .. } => {}
     }
 }
 
@@ -766,8 +783,13 @@ fn propagate_constants(func: &mut SsaFunction) {
                             changed = true;
                         }
                     }
-                    // 调用可能改全局状态；`Var` 是占位。
-                    SsaInstr::Call { .. } | SsaInstr::Var { .. } => {
+                    // 调用可能改全局状态；`Var` 是占位；Load/SlotAddr 的结果
+                    // 不是编译期常量；Store 没有结果（副作用不是本 pass 管的）。
+                    SsaInstr::Call { .. }
+                    | SsaInstr::Var { .. }
+                    | SsaInstr::Load { .. }
+                    | SsaInstr::SlotAddr { .. }
+                    | SsaInstr::Store { .. } => {
                         if let Some(r) = instr.result() {
                             if set_lattice(&mut lattice, r, Lattice::Top) {
                                 changed = true;
@@ -1269,6 +1291,19 @@ fn replace_operand(instr: &mut SsaInstr, from: SsaValue, to: SsaValue) {
                 *src = to;
             }
         }
+        SsaInstr::Load { ptr, .. } => {
+            if *ptr == from {
+                *ptr = to;
+            }
+        }
+        SsaInstr::Store { ptr, value, .. } => {
+            if *ptr == from {
+                *ptr = to;
+            }
+            if *value == from {
+                *value = to;
+            }
+        }
         _ => {}
     }
 }
@@ -1314,6 +1349,14 @@ fn set_result(instr: SsaInstr, new: SsaValue) -> SsaInstr {
             args,
             ty,
         },
+        SsaInstr::Load { ptr, ty, .. } => SsaInstr::Load {
+            result: new,
+            ptr,
+            ty,
+        },
+        SsaInstr::SlotAddr { local, .. } => SsaInstr::SlotAddr { result: new, local },
+        // Store 没有结果值；本函数只应被"有结果"的指令调用。原样重建即可。
+        SsaInstr::Store { ptr, value, ty } => SsaInstr::Store { ptr, value, ty },
     }
 }
 

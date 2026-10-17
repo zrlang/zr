@@ -222,6 +222,12 @@ thread_local! {
     /// 慢一点，但绝对正确，而且不碰已经验证过的整数分配器。
     static FLOAT_SLOTS: std::cell::RefCell<HashMap<u32, (usize, u8)>> =
         std::cell::RefCell::new(HashMap::new());
+    /// 被取地址的局部变量的专属栈槽：局部 id -> 绝对槽号。
+    ///
+    /// 与浮点槽同一块帧，只是排在浮点槽之后，所以 `[rsp + 8*slot]`
+    /// 寻址方式完全一样。`&x` 就是这块槽的地址。
+    static LOCAL_SLOTS: std::cell::RefCell<HashMap<u32, usize>> =
+        std::cell::RefCell::new(HashMap::new());
 }
 
 /// `v` 的浮点位宽（32 或 64）。整数返回 0。
@@ -626,6 +632,191 @@ fn emit_store_slot(unit: &mut CompilationUnit, src: Gpr, slot: usize) {
     emit4(unit, (slot * 8) as u32);
 }
 
+/// `lea dst, [rsp + 8*slot]`——被取地址的局部变量的地址。
+fn emit_lea_slot(unit: &mut CompilationUnit, dst: Gpr, slot: usize) {
+    emit1(unit, 0x48 | if dst.rex_bit() { 0x04 } else { 0 });
+    emit1(unit, 0x8D);
+    // mod=10 (disp32), reg=dst, r/m=100 (SIB)
+    emit1(unit, 0b10_000_100 | dst.bits() << 3);
+    emit1(unit, 0b00_100_100);
+    emit4(unit, (slot * 8) as u32);
+}
+
+/// 内存操作的位宽与有无符号：`(字节数, 有符号)`。
+fn mem_access(ty: NumTy) -> (usize, bool) {
+    match ty {
+        NumTy::Int(w) => ((w as usize) / 8, true),
+        NumTy::Uint(w) => ((w as usize) / 8, false),
+        // bool 只有一个字节；浮点不走内存 load/store（未实现）。
+        NumTy::Bool => (1, false),
+        NumTy::Float(w) => ((w as usize) / 8, false),
+    }
+}
+
+/// `dst = [base]`，按 `ty` 的位宽/符号扩展。地址用 `[base + 0]`（SIB）。
+fn emit_load_mem(unit: &mut CompilationUnit, dst: Gpr, base: Gpr, ty: NumTy) {
+    let (bytes, signed) = mem_access(ty);
+    let rex = 0x40 | if dst.rex_bit() { 0x04 } else { 0 } | if base.rex_bit() { 0x01 } else { 0 };
+    match (bytes, signed) {
+        (1, false) => {
+            emit1(unit, rex | 0x08);
+            emit1(unit, 0x0F);
+            emit1(unit, 0xB6);
+        }
+        (1, true) => {
+            emit1(unit, rex | 0x08);
+            emit1(unit, 0x0F);
+            emit1(unit, 0xBE);
+        }
+        (2, false) => {
+            emit1(unit, rex | 0x08);
+            emit1(unit, 0x0F);
+            emit1(unit, 0xB7);
+        }
+        (2, true) => {
+            emit1(unit, rex | 0x08);
+            emit1(unit, 0x0F);
+            emit1(unit, 0xBF);
+        }
+        // 32 位无符号：写 r32 自动零扩展到 64 位。
+        (4, false) => {
+            emit1(unit, rex);
+            emit1(unit, 0x8B);
+        }
+        // 32 位有符号：`movsxd r64, dword`.
+        (4, true) => {
+            emit1(unit, rex | 0x08);
+            emit1(unit, 0x63);
+        }
+        // 64 位。
+        _ => {
+            emit1(unit, rex | 0x08);
+            emit1(unit, 0x8B);
+        }
+    }
+    // mod=10 (disp32=0), reg=dst, r/m=100 (SIB)；SIB base=base、无 index。
+    emit1(unit, 0b10_000_100 | dst.bits() << 3);
+    emit1(unit, 0b00_100_000 | base.bits());
+    emit4(unit, 0);
+}
+
+/// `[base] = rax`（只写低 `bytes` 字节）。
+fn emit_store_mem(unit: &mut CompilationUnit, base: Gpr, ty: NumTy) {
+    let (bytes, _) = mem_access(ty);
+    let rex = 0x40 | if base.rex_bit() { 0x01 } else { 0 };
+    match bytes {
+        // byte：`mov [base], al`。
+        1 => {
+            if rex != 0x40 {
+                emit1(unit, rex);
+            }
+            emit1(unit, 0x88);
+        }
+        // word：`mov [base], ax`。
+        2 => {
+            emit1(unit, 0x66);
+            if rex != 0x40 {
+                emit1(unit, rex);
+            }
+            emit1(unit, 0x89);
+        }
+        // dword：`mov [base], eax`。
+        4 => {
+            if rex != 0x40 {
+                emit1(unit, rex);
+            }
+            emit1(unit, 0x89);
+        }
+        // qword：`mov [base], rax`。
+        _ => {
+            emit1(unit, rex | 0x08);
+            emit1(unit, 0x89);
+        }
+    }
+    // reg=0 (al/ax/eax/rax)，r/m=100 (SIB)。
+    emit1(unit, 0b10_000_100);
+    emit1(unit, 0b00_100_000 | base.bits());
+    emit4(unit, 0);
+}
+
+/// 把 `v` 的 64 位表示搬进 `dst`（寄存器间 mov，或从栈槽装载）。
+fn reg_into(unit: &mut CompilationUnit, v: SsaValue, dst: Gpr) {
+    match location_of(v) {
+        Location::Reg(i) => {
+            let s = ALLOCATABLE[i];
+            if s != dst {
+                emit_mov_rr(unit, dst, s);
+            }
+        }
+        Location::Stack(slot) => emit_load_slot(unit, dst, slot),
+    }
+}
+
+/// `result = *ptr`。
+fn emit_load(unit: &mut CompilationUnit, result: SsaValue, ptr: SsaValue, ty: NumTy) {
+    let p = use_reg(unit, ptr);
+    let spilled = matches!(location_of(result), Location::Stack(_));
+    let d = if spilled {
+        SCRATCH_AX
+    } else {
+        alloc_reg(result)
+    };
+    emit_load_mem(unit, d, p, ty);
+    if spilled {
+        if let Location::Stack(slot) = location_of(result) {
+            emit_store_slot(unit, d, slot);
+        }
+    }
+}
+
+/// `*ptr = value`。
+fn emit_store(unit: &mut CompilationUnit, ptr: SsaValue, value: SsaValue, ty: NumTy) {
+    // 先把地址放进一个稳定寄存器：溢出值或 rax 会经 `rcx` 中转（rcx 不参与
+    // 分配，任何时刻都是空的）。否则直接用它的寄存器。
+    let p = match location_of(ptr) {
+        Location::Reg(i) => {
+            let r = ALLOCATABLE[i];
+            if r == SCRATCH_AX {
+                emit_mov_rr(unit, SCRATCH_CX, SCRATCH_AX);
+                SCRATCH_CX
+            } else {
+                r
+            }
+        }
+        Location::Stack(slot) => {
+            emit_load_slot(unit, SCRATCH_CX, slot);
+            SCRATCH_CX
+        }
+    };
+    // 值搬进 rax（完整 64 位搬即可——小端下低字节就是要写的值）。
+    reg_into(unit, value, SCRATCH_AX);
+    emit_store_mem(unit, p, ty);
+}
+
+/// 扫出所有被取地址的局部变量，各分配一个栈槽（排在 `base` 之后）。
+fn assign_local_slots(func: &SsaFunction, base: usize) -> usize {
+    let mut ids: Vec<u32> = Vec::new();
+    for block in &func.blocks {
+        for instr in &block.instrs {
+            if let SsaInstr::SlotAddr { local, .. } = instr {
+                if !ids.contains(local) {
+                    ids.push(*local);
+                }
+            }
+        }
+    }
+    ids.sort_unstable();
+    let count = ids.len();
+    LOCAL_SLOTS.with(|m| {
+        let mut map = m.borrow_mut();
+        map.clear();
+        for (i, id) in ids.into_iter().enumerate() {
+            map.insert(id, base + i);
+        }
+    });
+    count
+}
+
 /// 发射一个函数的机器码。
 pub fn emit_function(target: &Target, unit: &mut CompilationUnit, func: &SsaFunction) {
     debug_assert_eq!(
@@ -638,9 +829,11 @@ pub fn emit_function(target: &Target, unit: &mut CompilationUnit, func: &SsaFunc
         crate::codegen::regalloc::allocate_registers(func, ALLOCATABLE.len(), &X86_64_CALLEE_SAVE);
     // callee-save 集合要在发射尾声时再用，所以这里留一份
     let callee_saved = callee_saved_regs(&alloc.map);
-    // 整数溢出的槽之后接着排浮点槽：两类槽共用一个帧，序言只需一次 sub rsp
+    // 整数溢出的槽之后接着排浮点槽，最后是被取地址的局部变量的槽：
+    // 三类槽共用一个帧，序言只需一次 sub rsp。
     let float_slots = assign_float_slots(func, alloc.spilled);
-    FRAME_SLOTS.with(|c| c.set(alloc.spilled + float_slots));
+    let local_slots = assign_local_slots(func, alloc.spilled + float_slots);
+    FRAME_SLOTS.with(|c| c.set(alloc.spilled + float_slots + local_slots));
     REG_MAP.with(|m| {
         *m.borrow_mut() = alloc;
     });
@@ -878,6 +1071,18 @@ fn emit_instr(unit: &mut CompilationUnit, instr: &SsaInstr) {
                 if let Location::Stack(slot) = location_of(*result) {
                     emit_store_slot(unit, d, slot);
                 }
+            }
+        }
+        SsaInstr::Load { result, ptr, ty } => emit_load(unit, *result, *ptr, *ty),
+        SsaInstr::Store { ptr, value, ty } => emit_store(unit, *ptr, *value, *ty),
+        SsaInstr::SlotAddr { result, local } => {
+            let slot = LOCAL_SLOTS.with(|m| m.borrow().get(local).copied().unwrap_or(0));
+            // 结果溢出的值经 rax 写回栈槽。
+            if let Location::Stack(s) = location_of(*result) {
+                emit_lea_slot(unit, SCRATCH_AX, slot);
+                emit_store_slot(unit, SCRATCH_AX, s);
+            } else {
+                emit_lea_slot(unit, alloc_reg(*result), slot);
             }
         }
         SsaInstr::Var { .. } => {
@@ -2006,6 +2211,67 @@ mod tests {
         let mut u = unit();
         emit_str_addr(&mut u, Gpr::R12, ".Lstr1");
         assert_eq!(u.code, vec![0x4c, 0x8d, 0x25, 0, 0, 0, 0]);
+    }
+
+    #[test]
+    fn mem_access_widths_and_signedness() {
+        assert_eq!(mem_access(NumTy::Int(8)), (1, true));
+        assert_eq!(mem_access(NumTy::Uint(8)), (1, false));
+        assert_eq!(mem_access(NumTy::Int(16)), (2, true));
+        assert_eq!(mem_access(NumTy::Uint(16)), (2, false));
+        assert_eq!(mem_access(NumTy::Int(32)), (4, true));
+        assert_eq!(mem_access(NumTy::Uint(32)), (4, false));
+        assert_eq!(mem_access(NumTy::Int(64)), (8, true));
+        assert_eq!(mem_access(NumTy::Bool), (1, false));
+    }
+
+    #[test]
+    fn load_mem_uses_sib_disp32_form() {
+        // 读 1 字节无符号：movzx eax, byte ptr [rdi]；地址用 [rdi+disp32=0]。
+        let mut u = unit();
+        emit_load_mem(&mut u, Gpr::Rax, Gpr::Rdi, NumTy::Uint(8));
+        assert_eq!(u.code, vec![0x48, 0x0F, 0xB6, 0x84, 0x27, 0, 0, 0, 0]);
+
+        // 读 1 字节有符号：movsx eax, byte ptr [rdi]。
+        let mut u = unit();
+        emit_load_mem(&mut u, Gpr::Rax, Gpr::Rdi, NumTy::Int(8));
+        assert_eq!(u.code, vec![0x48, 0x0F, 0xBE, 0x84, 0x27, 0, 0, 0, 0]);
+
+        // 读 4 字节有符号：movsxd rax, dword ptr [rdi]。
+        let mut u = unit();
+        emit_load_mem(&mut u, Gpr::Rax, Gpr::Rdi, NumTy::Int(32));
+        assert_eq!(u.code, vec![0x48, 0x63, 0x84, 0x27, 0, 0, 0, 0]);
+
+        // 读 8 字节：mov rax, qword ptr [rdi]。
+        let mut u = unit();
+        emit_load_mem(&mut u, Gpr::Rax, Gpr::Rdi, NumTy::Int(64));
+        assert_eq!(u.code, vec![0x48, 0x8B, 0x84, 0x27, 0, 0, 0, 0]);
+    }
+
+    #[test]
+    fn store_mem_writes_low_bytes_of_rax() {
+        // 写 1 字节：mov byte ptr [rdi], al（无 REX）。
+        let mut u = unit();
+        emit_store_mem(&mut u, Gpr::Rdi, NumTy::Uint(8));
+        assert_eq!(u.code, vec![0x88, 0x84, 0x27, 0, 0, 0, 0]);
+
+        // 写 2 字节：66 mov word ptr [rdi], ax。
+        let mut u = unit();
+        emit_store_mem(&mut u, Gpr::Rdi, NumTy::Uint(16));
+        assert_eq!(u.code, vec![0x66, 0x89, 0x84, 0x27, 0, 0, 0, 0]);
+
+        // 写 8 字节：mov qword ptr [rdi], rax。
+        let mut u = unit();
+        emit_store_mem(&mut u, Gpr::Rdi, NumTy::Int(64));
+        assert_eq!(u.code, vec![0x48, 0x89, 0x84, 0x27, 0, 0, 0, 0]);
+    }
+
+    #[test]
+    fn lea_slot_addresses_stack_slot() {
+        // lea rax, [rsp + 8*slot]，slot=3 → disp32=24。
+        let mut u = unit();
+        emit_lea_slot(&mut u, Gpr::Rax, 3);
+        assert_eq!(u.code, vec![0x48, 0x8D, 0x84, 0x24, 24, 0, 0, 0]);
     }
 
     #[test]

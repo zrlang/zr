@@ -648,6 +648,10 @@ fn emit_instr(unit: &mut CompilationUnit, instr: &SsaInstr) {
             }
         }
         SsaInstr::Var { .. } => {}
+        // 指针 / 内存访问：这些后端尚未实现。
+        SsaInstr::Load { .. } | SsaInstr::Store { .. } | SsaInstr::SlotAddr { .. } => {
+            crate::codegen::unsupported_const("pointer/memory access")
+        }
     }
 }
 

@@ -104,6 +104,21 @@ pub enum SsaInstr {
         from: mir::NumTy,
         to: mir::NumTy,
     },
+    /// 从地址加载：`result = *ptr`。`ty` 决定读取位宽与有无符号。
+    Load {
+        result: SsaValue,
+        ptr: SsaValue,
+        ty: mir::NumTy,
+    },
+    /// 存储：`*ptr = value`。**没有结果值，但有副作用**：不能被 DCE 消除，
+    /// 也不能与后续的 Load 交换顺序。
+    Store {
+        ptr: SsaValue,
+        value: SsaValue,
+        ty: mir::NumTy,
+    },
+    /// 取局部变量栈槽地址：`result = &slot{local}`。
+    SlotAddr { result: SsaValue, local: u32 },
     /// 变量引用（用于 φ 函数合并前的原始变量）。
     Var { result: SsaValue, name: String },
 }
@@ -198,7 +213,11 @@ impl SsaInstr {
             SsaInstr::Copy { result, .. } => Some(*result),
             SsaInstr::Cast { result, .. } => Some(*result),
             SsaInstr::Call { result, .. } => Some(*result),
+            SsaInstr::Load { result, .. } => Some(*result),
+            SsaInstr::SlotAddr { result, .. } => Some(*result),
             SsaInstr::Var { result, .. } => Some(*result),
+            // 存储没有结果值（但仍有副作用）。
+            SsaInstr::Store { .. } => None,
         }
     }
 }
@@ -519,6 +538,36 @@ fn convert_function(func: &mir::MirFunction) -> SsaFunction {
                     let res = materialize(future, &mut instrs, &mut stacks, &next_value);
                     stacks.entry(name.clone()).or_default().push(res);
                     pushed.push(name.clone());
+                }
+                mir::MirInstr::Load(name, addr, ty) => {
+                    let p = materialize(addr, &mut instrs, &mut stacks, &next_value);
+                    let res = alloc();
+                    instrs.push(SsaInstr::Load {
+                        result: res,
+                        ptr: p,
+                        ty: *ty,
+                    });
+                    stacks.entry(name.clone()).or_default().push(res);
+                    pushed.push(name.clone());
+                }
+                mir::MirInstr::SlotAddr(name, local) => {
+                    let res = alloc();
+                    instrs.push(SsaInstr::SlotAddr {
+                        result: res,
+                        local: *local,
+                    });
+                    stacks.entry(name.clone()).or_default().push(res);
+                    pushed.push(name.clone());
+                }
+                mir::MirInstr::Store(addr, value, ty) => {
+                    let p = materialize(addr, &mut instrs, &mut stacks, &next_value);
+                    let v = materialize(value, &mut instrs, &mut stacks, &next_value);
+                    instrs.push(SsaInstr::Store {
+                        ptr: p,
+                        value: v,
+                        ty: *ty,
+                    });
+                    // Store 不定义任何变量，也不压栈。
                 }
             }
         }
@@ -887,13 +936,17 @@ fn defined_name_set(block: &mir::MirBasicBlock) -> HashSet<String> {
     block
         .instrs
         .iter()
-        .map(|i| match i {
+        .filter_map(|i| match i {
             mir::MirInstr::Assign(n, _)
             | mir::MirInstr::Binary(n, ..)
             | mir::MirInstr::Unary(n, ..)
             | mir::MirInstr::Call(n, ..)
             | mir::MirInstr::Await(n, _)
-            | mir::MirInstr::Cast(n, ..) => n.clone(),
+            | mir::MirInstr::Cast(n, ..)
+            | mir::MirInstr::Load(n, ..)
+            | mir::MirInstr::SlotAddr(n, _) => Some(n.clone()),
+            // Store 不定义名字。
+            mir::MirInstr::Store(..) => None,
         })
         .collect()
 }
@@ -960,6 +1013,13 @@ fn used_before_def(block: &mir::MirBasicBlock) -> Vec<String> {
             mir::MirInstr::Call(_, _, args, _) => args.iter().flat_map(mir_value_names).collect(),
             mir::MirInstr::Await(_, v) => mir_value_names(v),
             mir::MirInstr::Cast(_, v, ..) => mir_value_names(v),
+            mir::MirInstr::Load(_, addr, _) => mir_value_names(addr),
+            mir::MirInstr::SlotAddr(..) => Vec::new(),
+            mir::MirInstr::Store(addr, value, _) => {
+                let mut v = mir_value_names(addr);
+                v.extend(mir_value_names(value));
+                v
+            }
         };
         note_read(reads, &defined, &mut out);
 
@@ -971,6 +1031,10 @@ fn used_before_def(block: &mir::MirBasicBlock) -> Vec<String> {
             mir::MirInstr::Call(n, ..) => Some(n),
             mir::MirInstr::Await(n, _) => Some(n),
             mir::MirInstr::Cast(n, ..) => Some(n),
+            mir::MirInstr::Load(n, ..) => Some(n),
+            mir::MirInstr::SlotAddr(n, _) => Some(n),
+            // Store 无定义。
+            mir::MirInstr::Store(..) => None,
         };
         if let Some(n) = name {
             if !defined.contains(n) {
@@ -1012,6 +1076,9 @@ fn defined_names(block: &mir::MirBasicBlock) -> Vec<String> {
             mir::MirInstr::Call(n, ..) => Some(n),
             mir::MirInstr::Await(n, _) => Some(n),
             mir::MirInstr::Cast(n, ..) => Some(n),
+            mir::MirInstr::Load(n, ..) => Some(n),
+            mir::MirInstr::SlotAddr(n, _) => Some(n),
+            mir::MirInstr::Store(..) => None,
         };
         if let Some(n) = name {
             if !out.contains(n) {
@@ -1298,5 +1365,12 @@ pub fn instr_uses(instr: &SsaInstr, out: &mut Vec<SsaValue>) {
             }
         }
         SsaInstr::Call { args, .. } => out.extend(args.iter().copied()),
+        SsaInstr::Load { ptr, .. } => out.push(*ptr),
+        // 存储读地址与值；地址是 uses，存储的值也是 uses。
+        SsaInstr::Store { ptr, value, .. } => {
+            out.push(*ptr);
+            out.push(*value);
+        }
+        SsaInstr::SlotAddr { .. } => {}
     }
 }

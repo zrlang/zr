@@ -546,6 +546,10 @@ impl WasmFunction {
                     SsaInstr::Var { result, .. } => {
                         ensure_local(result, &mut local_map, &mut locals, &mut next_local);
                     }
+                    // 指针 / 内存访问：wasm 后端尚未实现。
+                    SsaInstr::Load { .. } | SsaInstr::Store { .. } | SsaInstr::SlotAddr { .. } => {
+                        crate::codegen::unsupported_const("pointer/memory access")
+                    }
                 }
             }
             // 终结符

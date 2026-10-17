@@ -68,6 +68,15 @@ pub fn print_module(module: &SsaModule) {
                     super::SsaInstr::Copy { result, src } => {
                         println!("%{} = copy %{}", result.id(), src.id())
                     }
+                    super::SsaInstr::Load { result, ptr, ty } => {
+                        println!("%{} = load {:?} %{}", result.id(), ty, ptr.id())
+                    }
+                    super::SsaInstr::Store { ptr, value, ty } => {
+                        println!("store {:?} %{} -> %{}", ty, value.id(), ptr.id())
+                    }
+                    super::SsaInstr::SlotAddr { result, local } => {
+                        println!("%{} = &slot{}", result.id(), local)
+                    }
                     super::SsaInstr::Var { result, name } => {
                         println!("%{} = var {}", result.id(), name)
                     }

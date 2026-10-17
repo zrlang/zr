@@ -140,14 +140,19 @@ impl Parser {
 
     pub fn parse_extern(&mut self, _attrs: Vec<Attribute>) -> Result<ExternBlock, CompileError> {
         let _span = self.previous().span;
-        // `extern "C" { ... }` —— abi 名字是字符串，内容暂时丢弃。
+        // `extern "C" { ... }`：ABI 名字串被消费（目前只支持 C ABI）。
         if matches!(self.peek().kind, TokenKind::StringLiteral(_)) {
             self.advance();
         }
         self.consume(&TokenKind::LBrace, "expected '{' after extern")?;
+        let mut functions = Vec::new();
         while !self.check(&TokenKind::RBrace) && !self.is_at_end() {
             if self.match_kind(&TokenKind::KwFn) {
-                let _ = self.parse_function(Visibility::Private, vec![], false, false)?;
+                // 外部函数的签名必须保留——早先这里把解析结果直接丢掉，
+                // 于是 `extern "C" { fn zr_write(...); }` 之后调用 `zr_write`
+                // 会报"未定义名称"。解析出的 `Function` 的 `body` 为 `None`
+                // （以 `;` 结尾）。
+                functions.push(self.parse_function(Visibility::Private, vec![], false, false)?);
             } else if self.match_kind(&TokenKind::KwType) {
                 let _name = self.consume_ident("expected type name")?;
                 self.consume(&TokenKind::Semicolon, "expected ';'")?;
@@ -156,7 +161,7 @@ impl Parser {
             }
         }
         self.consume(&TokenKind::RBrace, "expected '}'")?;
-        Ok(ExternBlock)
+        Ok(ExternBlock { functions })
     }
 
     // ==================================================================

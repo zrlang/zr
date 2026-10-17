@@ -95,3 +95,52 @@ fn zr_language_cases() {
         failures.join(", ")
     );
 }
+
+/// `extern "C"` 声明在运行期接通到运行时：调用 `zr_write` 把字符串字面量
+/// 写到标准输出，并检查返回值。
+///
+/// 只测宿主目标——自行构造的 ELF（交叉编译、无平台链接器时走的那条路）不带
+/// 运行时，`zr_write` 会是未定义符号。所以这个用例不放进 `tests/cases/`：
+/// 那里每个用例还会在 aarch64 模拟器下再跑一遍。
+#[test]
+fn extern_c_write_prints_string_literal() {
+    let zr = env!("CARGO_BIN_EXE_zr");
+    let source = r#"extern "C" {
+    fn zr_write(fd: i32, buf: str, count: i64) -> i64;
+}
+
+fn main() -> i32 {
+    let n = zr_write(1, "hello, extern!\n", 15);
+    if n != 15 { return 1; }
+    return 0;
+}
+"#;
+    let src = std::env::temp_dir().join("zr_extern_write.zr");
+    std::fs::write(&src, source).unwrap();
+
+    for opt in OPT_LEVELS {
+        let out = std::env::temp_dir().join("zr_extern_write");
+        let compile = Command::new(zr)
+            .arg(&src)
+            .arg(opt)
+            .arg("-o")
+            .arg(&out)
+            .output()
+            .expect("failed to spawn the zr compiler");
+        assert!(
+            compile.status.success(),
+            "编译失败 ({opt}):\n{}",
+            String::from_utf8_lossy(&compile.stderr)
+        );
+        let run = Command::new(&out).output().expect("failed to run program");
+        assert_eq!(
+            run.status.code(),
+            Some(0),
+            "退出码异常 ({opt}); stderr: {}",
+            String::from_utf8_lossy(&run.stderr)
+        );
+        assert_eq!(run.stdout, b"hello, extern!\n", "标准输出不符 ({opt})");
+        let _ = std::fs::remove_file(&out);
+    }
+    let _ = std::fs::remove_file(&src);
+}

@@ -162,6 +162,10 @@ thread_local! {
     /// 用线性扫描的结果，而不是 `id % 18` 取模——取模会让两个同时存活、
     /// 编号同余的值抢同一个寄存器，后写者把先写者冲掉，安静地算错。
     static REG_MAP: RefCell<HashMap<u32, usize>> = RefCell::new(HashMap::new());
+    /// 被取地址的局部变量的专属栈槽：局部 id -> 槽号。
+    ///
+    /// 排在浮点槽之后，同一块帧里，`[sp, #8*slot]` 寻址。
+    static LOCAL_SLOTS: RefCell<HashMap<u32, usize>> = RefCell::new(HashMap::new());
 }
 
 /// `v` 的浮点位宽（32 或 64）。整数返回 0。
@@ -211,6 +215,76 @@ fn emit_ldr_sp(unit: &mut CompilationUnit, rt: u8, off: usize) {
         unit,
         0xf940_0000 | (((off / 8) as u32) << 10) | (31 << 5) | (rt & 31) as u32,
     );
+}
+
+/// 内存操作的位宽与有无符号：`(字节数, 有符号)`。
+fn mem_access(ty: NumTy) -> (usize, bool) {
+    match ty {
+        NumTy::Int(w) => ((w as usize) / 8, true),
+        NumTy::Uint(w) => ((w as usize) / 8, false),
+        NumTy::Bool => (1, false),
+        NumTy::Float(w) => ((w as usize) / 8, false),
+    }
+}
+
+/// `add <dst>, sp, #8*slot`——被取地址的局部变量的地址。
+fn emit_lea_slot(unit: &mut CompilationUnit, dst: u8, slot: usize) {
+    // ADD (immediate) 64 位、无移位：`0x91000000`。imm12 按 1 缩放。
+    insn(
+        unit,
+        0x9100_0000 | (((slot * 8) as u32 & 0xfff) << 10) | (31 << 5) | (dst & 31) as u32,
+    );
+}
+
+/// `<dst> = [<base>]`，按 `ty` 的位宽/符号扩展。
+fn emit_load_mem(unit: &mut CompilationUnit, dst: u8, base: u8, ty: NumTy) {
+    let (bytes, signed) = mem_access(ty);
+    let op = match (bytes, signed) {
+        (1, false) => 0x3940_0000, // ldrb w
+        (1, true) => 0x39c0_0000,  // ldrsb x（符号扩展到 64）
+        (2, false) => 0x7940_0000, // ldrh w
+        (2, true) => 0x79c0_0000,  // ldrsh x
+        (4, false) => 0xb940_0000, // ldr w（零扩展到 64）
+        (4, true) => 0xb980_0000,  // ldrsw x
+        _ => 0xf940_0000,          // ldr x
+    };
+    insn(unit, op | ((base & 31) as u32) << 5 | (dst & 31) as u32);
+}
+
+/// `[<base>] = <src>`，只写 `ty` 位宽对应的低字节。
+fn emit_store_mem(unit: &mut CompilationUnit, base: u8, src: u8, ty: NumTy) {
+    let (bytes, _) = mem_access(ty);
+    let op = match bytes {
+        1 => 0x3900_0000, // strb w
+        2 => 0x7900_0000, // strh w
+        4 => 0xb900_0000, // str w
+        _ => 0xf900_0000, // str x
+    };
+    insn(unit, op | ((base & 31) as u32) << 5 | (src & 31) as u32);
+}
+
+/// 扫出所有被取地址的局部变量，各分配一个栈槽（排在 `base` 之后）。
+fn assign_local_slots(func: &SsaFunction, base: usize) -> usize {
+    let mut ids: Vec<u32> = Vec::new();
+    for block in &func.blocks {
+        for instr in &block.instrs {
+            if let SsaInstr::SlotAddr { local, .. } = instr {
+                if !ids.contains(local) {
+                    ids.push(*local);
+                }
+            }
+        }
+    }
+    ids.sort_unstable();
+    let count = ids.len();
+    LOCAL_SLOTS.with(|m| {
+        let mut map = m.borrow_mut();
+        map.clear();
+        for (i, id) in ids.into_iter().enumerate() {
+            map.insert(id, base + i);
+        }
+    });
+    count
 }
 
 /// 标量浮点二元算术：`fadd/fsub/fmul/fdiv {s|d}<rd>, <rn>, <rm>`。
@@ -742,9 +816,11 @@ pub fn emit_function(target: &Target, unit: &mut CompilationUnit, func: &SsaFunc
         idx.into_iter().map(|i| ALLOCATABLE[i].bits()).collect()
     };
     let cs_bytes = (cs_used.len() * 8 + 15) & !15;
-    // 浮点值全部落专属栈槽；槽区在序言里一次性预留（16 字节对齐）。
+    // 浮点值全部落专属栈槽；被取地址的局部变量排在浮点槽之后。槽区在
+    // 序言里一次性预留（16 字节对齐）。
     let float_slots = assign_float_slots(func, 0);
-    let frame = (float_slots * 8 + 15) & !15;
+    let local_slots = assign_local_slots(func, float_slots);
+    let frame = ((float_slots + local_slots) * 8 + 15) & !15;
     FRAME_BYTES.with(|c| c.set(frame));
     let start = unit.code.len();
     let sym_base = unit.symbols.len();
@@ -925,6 +1001,16 @@ fn emit_instr(unit: &mut CompilationUnit, instr: &SsaInstr) {
             } else {
                 emit_cast(unit, alloc_reg(*result), alloc_reg(*src), *from, *to);
             }
+        }
+        SsaInstr::Load { result, ptr, ty } => {
+            emit_load_mem(unit, alloc_reg(*result).bits(), alloc_reg(*ptr).bits(), *ty);
+        }
+        SsaInstr::Store { ptr, value, ty } => {
+            emit_store_mem(unit, alloc_reg(*ptr).bits(), alloc_reg(*value).bits(), *ty);
+        }
+        SsaInstr::SlotAddr { result, local } => {
+            let slot = LOCAL_SLOTS.with(|m| m.borrow().get(local).copied().unwrap_or(0));
+            emit_lea_slot(unit, alloc_reg(*result).bits(), slot);
         }
         // `Var` 只是 SSA 值的命名引用，运行时不产生代码。
         SsaInstr::Var { .. } => {}
@@ -1234,6 +1320,60 @@ mod tests {
         assert_eq!(u.relocations[0].kind, RelocationKind::AdrPrelPage21);
         assert_eq!(u.relocations[1].kind, RelocationKind::AddAbsLo12);
         assert_eq!(u.relocations[0].symbol, ".Lstr0");
+    }
+
+    #[test]
+    fn load_mem_selects_width_and_sign() {
+        let word = |u: &CompilationUnit| u32::from_le_bytes(u.code[0..4].try_into().unwrap());
+        let mut u = empty_unit();
+        emit_load_mem(&mut u, Reg::X0.0, Reg(1).0, NumTy::Uint(8));
+        assert_eq!(word(&u), 0x3940_0020, "ldrb w0, [x1]");
+        let mut u = empty_unit();
+        emit_load_mem(&mut u, Reg::X0.0, Reg(1).0, NumTy::Int(8));
+        assert_eq!(word(&u), 0x39c0_0020, "ldrsb x0, [x1]");
+        let mut u = empty_unit();
+        emit_load_mem(&mut u, Reg::X0.0, Reg(1).0, NumTy::Uint(16));
+        assert_eq!(word(&u), 0x7940_0020, "ldrh w0, [x1]");
+        let mut u = empty_unit();
+        emit_load_mem(&mut u, Reg::X0.0, Reg(1).0, NumTy::Int(16));
+        assert_eq!(word(&u), 0x79c0_0020, "ldrsh x0, [x1]");
+        let mut u = empty_unit();
+        emit_load_mem(&mut u, Reg::X0.0, Reg(1).0, NumTy::Uint(32));
+        assert_eq!(word(&u), 0xb940_0020, "ldr w0, [x1]");
+        let mut u = empty_unit();
+        emit_load_mem(&mut u, Reg::X0.0, Reg(1).0, NumTy::Int(32));
+        assert_eq!(word(&u), 0xb980_0020, "ldrsw x0, [x1]");
+        let mut u = empty_unit();
+        emit_load_mem(&mut u, Reg::X0.0, Reg(1).0, NumTy::Int(64));
+        assert_eq!(word(&u), 0xf940_0020, "ldr x0, [x1]");
+    }
+
+    #[test]
+    fn store_mem_selects_width() {
+        let word = |u: &CompilationUnit| u32::from_le_bytes(u.code[0..4].try_into().unwrap());
+        let mut u = empty_unit();
+        emit_store_mem(&mut u, Reg(1).0, Reg::X0.0, NumTy::Uint(8));
+        assert_eq!(word(&u), 0x3900_0020, "strb w0, [x1]");
+        let mut u = empty_unit();
+        emit_store_mem(&mut u, Reg(1).0, Reg::X0.0, NumTy::Uint(16));
+        assert_eq!(word(&u), 0x7900_0020, "strh w0, [x1]");
+        let mut u = empty_unit();
+        emit_store_mem(&mut u, Reg(1).0, Reg::X0.0, NumTy::Uint(32));
+        assert_eq!(word(&u), 0xb900_0020, "str w0, [x1]");
+        let mut u = empty_unit();
+        emit_store_mem(&mut u, Reg(1).0, Reg::X0.0, NumTy::Int(64));
+        assert_eq!(word(&u), 0xf900_0020, "str x0, [x1]");
+    }
+
+    #[test]
+    fn lea_slot_uses_add_from_sp() {
+        // add x0, sp, #8*slot；slot=3 → #24。
+        let mut u = empty_unit();
+        emit_lea_slot(&mut u, Reg::X0.0, 3);
+        assert_eq!(
+            u32::from_le_bytes(u.code[0..4].try_into().unwrap()),
+            0x9100_63e0
+        );
     }
 
     #[test]

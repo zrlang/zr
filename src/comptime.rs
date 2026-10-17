@@ -673,8 +673,8 @@ fn describe(kind: &ExprKind) -> &'static str {
         ExprKind::For => "`for`",
         ExprKind::Field(_) => "field access",
         ExprKind::Deref(_) => "dereference",
-        ExprKind::AddrOf => "address-of",
-        ExprKind::Index(_) => "indexing",
+        ExprKind::AddrOf(_) => "address-of",
+        ExprKind::Index(..) => "indexing",
         ExprKind::Break => "`break`",
         ExprKind::Continue => "`continue`",
         ExprKind::Defer => "`defer`",
@@ -1276,9 +1276,10 @@ fn describe_ast(e: &crate::parser::ast::Expression) -> &'static str {
 fn children_mut(expr: &mut HirExpr) -> Vec<&mut HirExpr> {
     match &mut expr.kind {
         ExprKind::Binary(_, a, b) | ExprKind::Assign(a, b) => vec![a, b],
-        ExprKind::Unary(_, a) | ExprKind::Field(a) | ExprKind::Deref(a) | ExprKind::Index(a) => {
+        ExprKind::Unary(_, a) | ExprKind::Field(a) | ExprKind::Deref(a) | ExprKind::AddrOf(a) => {
             vec![a]
         }
+        ExprKind::Index(a, b) => vec![a, b],
         ExprKind::Cast(a) | ExprKind::Await(a) => vec![a],
         ExprKind::If(c, then_block, else_block) => {
             let mut out = vec![c.as_mut()];

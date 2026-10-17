@@ -115,12 +115,21 @@ pub enum UseTree {
 }
 
 /// 外部块（`extern "C" { fn ...; }`）。
+///
+/// 块里的函数声明会被并入 `Program::functions`（`body` 为 `None`），使其
+/// 能被类型检查与名称解析当作普通可调用函数；代码生成不产出函数体，调用点
+/// 以未定义符号交给平台链接器绑定到运行时 / C 库。
 #[derive(Debug, Clone)]
-pub struct ExternBlock;
+pub struct ExternBlock {
+    /// 块中声明的外部函数（`body` 恒为 `None`）。
+    pub functions: Vec<Function>,
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum Abi {
     Zr,
+    /// C ABI（`extern "C"`）。
+    C,
 }
 
 // ======================================================================

@@ -282,6 +282,12 @@ cargo test                 # 全部：单元测试 + tests/cases 下的语言用
 | `21_literal_suffixes` | 字面量类型后缀（`42u64` / `3.14f32` / `usize` …）影响推断，f32 舍入 |
 | `22_call_preserve` | 跨调用存活的值必须被保住（callee-save / 形参并行搬运） |
 | `23_strings` | 字符串字面量落 `.rodata`、去重、按地址比较、`str` 作实参跨调用 |
+| `24_pointers` | 字符串按字节索引 `s[i]`、取址 `&x`、解引用读写 `*p`/`*p = v`、指针索引 `p[i]`、地址被取的局部量与循环/φ 交互、i8 符号扩展 |
+
+除此之外，`tests/zr_language.rs` 里还有一个**只在宿主目标**跑的用例
+`extern_c_write_prints_string_literal`：声明 `extern "C" { fn zr_write(...); }`
+并通过运行时把字符串字面量写到标准输出。它不进 `tests/cases/`，因为自行构造的
+ELF（交叉、无平台链接器）不带运行时，`zr_write` 会是未定义符号。
 
 ---
 
@@ -1042,7 +1048,22 @@ zr 编译器采用经典的多阶段架构：
         （`R_AARCH64_ADR_PREL_PG_HI21`+`ADD_ABS_LO12_NC` / `ARM64_RELOC_PAGE21`+`PAGEOFFSET12`）
   - [x] `.rodata` 段归属：ELF 段索引 2、Mach-O `n_sect=2`、COFF 节号 2
   - [x] 字面量按内容去重，`==`/`!=` 比较指针（同内容共享同一地址），`str` 可作实参跨调用
-  - [ ] 解引用 / 输出字符串（需 std 或 extern 运行时接通）
+- [x] `extern "C"` 声明接通运行时（`zr_write` / `zr_read` / `zr_exit` …）
+  - [x] 外部函数声明并入函数表，参与类型检查与名称解析，调用点发未定义符号给平台链接器
+  - [x] 可把字符串字面量交给 `zr_write` 输出（宿主目标经 `clang`+`libzrrt.a`）
+  - [ ] std 里的 `extern`（`std/core.zr`）随标准库编译接通
+- [x] 指针 / 字符串的取址、解引用与索引（最小 SSA 内存模型）
+  - [x] 新指令 `Load` / `Store` / `SlotAddr`（MIR + SSA），按位宽区分有无符号
+        （x86-64 `movzx`/`movsx`/`movsxd`，AArch64 `ldrb`/`ldrsb`/`ldr`…）
+  - [x] `&x` 取局部变量地址：被取地址的量固定到栈槽（x86-64 / AArch64 各一套
+        槽位，与浮点槽同一帧），读写变成显式的 `Load`/`Store`
+  - [x] `*p` / `*p = v` / `p[i]` / `p[i] = v`，索引按元素字节大小缩放
+  - [x] `s[i]` 字符串按字节索引，结果为 `u8`
+  - [x] 浮点值的取址 / 解引用显式报错（后端不支持，避免"能编过但算错"）
+  - [x] 解析修复：块状表达式（`if`/`while`/`for`/`loop`/`match`/`{ }`）不再作为
+        二元运算的左侧——否则 `if c { }` 后跟 `*p = v` 会被误解析为乘法
+  - [ ] `str` 的真正切片表示（ptr+len）：目前 `s[i]` 无边界检查，越界是 UB
+- [ ] ARM32 / RISC-V 后端对指针 / 内存访问报错（尚未实现）
 - [ ] ARM32 / RISC-V 后端的栈溢出（AArch64 已改用线性扫描分配，但同样未实现溢出；
       目前仅 x86-64 实现了）
 - [ ] 更多架构（wasm64 / Thumb-2）与平台（FreeBSD / Android / iOS）

@@ -326,14 +326,14 @@ pub fn extract_attributes(
     hir: &crate::typeck::hir::HirModule,
     prog: &crate::parser::ast::Program,
 ) {
-    // 提取链接指令
+    // 提取链接指令。
+    //
+    // `extern "C"` 块里的函数声明已被并进 `prog.functions`（`body` 为 `None`），
+    // 所以这里一并覆盖，无需单独遍历 `prog.externs`。
     for item in &prog.functions {
         if let Some(directive) = crate::attributes::link_directive(&item.attrs) {
             unit.link_directives.push(directive);
         }
-    }
-    for item in &prog.externs {
-        let _ = item; // extern 块暂不处理
     }
 
     // 提取 repr 布局

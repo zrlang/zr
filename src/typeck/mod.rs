@@ -503,7 +503,12 @@ impl TypeChecker {
                     body: None,
                     is_async: item.is_async,
                     is_comptime: item.is_comptime,
-                    abi: hir::Abi::Zr,
+                    // 以 `;` 结尾的声明（`extern "C"` 块里的函数）按 C ABI 处理。
+                    abi: if item.body.is_none() {
+                        hir::Abi::C
+                    } else {
+                        hir::Abi::Zr
+                    },
                     attrs: convert_attrs(&item.attrs),
                 },
             );
@@ -1087,16 +1092,25 @@ impl TypeChecker {
             Expression::Unary(op, operand, _) => {
                 match op {
                     ast::UnaryOp::Deref => {
-                        // *p : 若 p: &T 则结果为 T
+                        // *p : p 是指针 `*T` 或引用 `&T`，结果是 `T`。
                         let operand = self.check_expr(operand, &Ty::Infer(InferId(0)))?;
-                        let inner = self.infer.fresh_infer(span);
-                        self.infer
-                            .unify(
-                                &operand.ty,
-                                &Ty::Reference(Box::new(inner.clone()), hir::Mutability::Immutable),
-                                span,
+                        let inner = pointee_of(&self.infer, &operand.ty).unwrap_or_else(|| {
+                            let i = self.infer.fresh_infer(span);
+                            self.infer
+                                .unify(
+                                    &operand.ty,
+                                    &Ty::Pointer(Box::new(i.clone()), hir::Mutability::Immutable),
+                                    span,
+                                )
+                                .ok();
+                            i
+                        });
+                        if matches!(self.infer.resolve(&inner), Ty::Float(_)) {
+                            return Err(CompileError::type_error(
+                                "floating-point dereference is not supported",
                             )
-                            .ok();
+                            .with_span(span));
+                        }
                         return Ok(HirExpr {
                             kind: ExprKind::Deref(Box::new(operand)),
                             ty: inner,
@@ -1105,11 +1119,11 @@ impl TypeChecker {
                     }
                     ast::UnaryOp::AddrOf => {
                         let operand = self.check_expr(operand, &Ty::Infer(InferId(0)))?;
-                        let _ = operand;
-                        let inner = self.infer.fresh_infer(span);
-                        let ty = Ty::Reference(Box::new(inner.clone()), hir::Mutability::Immutable);
+                        reject_float_address(&self.infer, &operand.ty, span)?;
+                        let ty =
+                            Ty::Pointer(Box::new(operand.ty.clone()), hir::Mutability::Immutable);
                         return Ok(HirExpr {
-                            kind: ExprKind::AddrOf,
+                            kind: ExprKind::AddrOf(Box::new(operand)),
                             ty,
                             span,
                         });
@@ -1168,26 +1182,33 @@ impl TypeChecker {
             }
             Expression::Index(receiver, index, _) => {
                 let recv = self.check_expr(receiver, &Ty::Infer(InferId(0)))?;
-                self.check_expr(index, &Ty::Int(64))?;
-                let elem_ty = self.infer.fresh_infer(span);
-                // 推断 receiver 为 array/slice/pointer
-                match &recv.ty {
-                    Ty::Array(t, _) | Ty::Slice(t, _) => {
-                        self.infer.unify(t, &elem_ty, span).ok();
-                    }
+                // 索引表达式本身要保留下来（MIR 用它算地址）。
+                let idx = self.check_expr(index, &Ty::Int(64))?;
+                // 元素类型 = receiver 的元素类型。`str` 按字节索引得到 `u8`。
+                let elem_ty = match self.infer.resolve(&recv.ty) {
+                    Ty::Array(t, _) | Ty::Slice(t, _) => (*t).clone(),
+                    Ty::Str => Ty::Uint(8),
+                    Ty::Pointer(t, _) | Ty::Reference(t, _) => (*t).clone(),
                     _ => {
-                        // 尝试索引为指针
+                        let elem = self.infer.fresh_infer(span);
                         self.infer
                             .unify(
                                 &recv.ty,
-                                &Ty::Pointer(Box::new(elem_ty.clone()), hir::Mutability::Immutable),
+                                &Ty::Pointer(Box::new(elem.clone()), hir::Mutability::Immutable),
                                 span,
                             )
                             .ok();
+                        elem
                     }
+                };
+                if matches!(self.infer.resolve(&elem_ty), Ty::Float(_)) {
+                    return Err(CompileError::type_error(
+                        "indexing into floating-point elements is not supported",
+                    )
+                    .with_span(span));
                 }
                 return Ok(HirExpr {
-                    kind: ExprKind::Index(Box::new(recv)),
+                    kind: ExprKind::Index(Box::new(recv), Box::new(idx)),
                     ty: elem_ty,
                     span,
                 });
@@ -1204,9 +1225,10 @@ impl TypeChecker {
             }
             Expression::AddrOf(e, m, _) => {
                 let inner = self.check_expr(e, &Ty::Infer(InferId(0)))?;
-                let ty = Ty::Reference(Box::new(inner.ty.clone()), *m);
+                reject_float_address(&self.infer, &inner.ty, span)?;
+                let ty = Ty::Pointer(Box::new(inner.ty.clone()), *m);
                 return Ok(HirExpr {
-                    kind: ExprKind::AddrOf,
+                    kind: ExprKind::AddrOf(Box::new(inner)),
                     ty,
                     span,
                 });
@@ -2452,7 +2474,7 @@ impl TypeChecker {
             ExprKind::Local(_) => Ok(()),
             ExprKind::Field(inner) => self.check_assignable(inner),
             ExprKind::Deref(inner) => self.check_assignable(inner),
-            ExprKind::Index(inner) => self.check_assignable(inner),
+            ExprKind::Index(inner, _) => self.check_assignable(inner),
             _ => Err(CompileError::type_error(
                 "expression is not assignable (expected variable, field, deref, or index)",
             )
@@ -3092,6 +3114,33 @@ fn is_more_specific(a: &hir::HirImpl, b: &hir::HirImpl) -> bool {
     }
     // 约束更多的更 specific
     a.where_clause.len() > b.where_clause.len()
+}
+
+/// 若 `ty`（解析后）是指针或引用，返回其指向的类型。
+///
+/// 解引用 / 索引都要拿它定结果类型。这里同时接受 `Pointer` 与
+/// `Reference`：语法上 `&x` 产出引用，而用户显式写的 `*T` 产指针，
+/// 两者在运行期都是同一个"地址"。
+fn pointee_of(infer: &InferCtxt<'_>, ty: &Ty) -> Option<Ty> {
+    match infer.resolve(ty) {
+        Ty::Pointer(t, _) | Ty::Reference(t, _) => Some((*t).clone()),
+        _ => None,
+    }
+}
+
+/// 拒绝对浮点值取地址。
+///
+/// 浮点值住在专属栈槽、只经 XMM 读写，而指针走整数寄存器与整数 load/store。
+/// 让两者交叉（`&f` / `*pf`）在当前后端只会安静地产生错值，所以这里直接
+/// 报编译错误，而不是留一个"能编过但算错"的坑。
+fn reject_float_address(infer: &InferCtxt<'_>, ty: &Ty, span: Span) -> Result<()> {
+    if matches!(infer.resolve(ty), Ty::Float(_)) {
+        return Err(CompileError::type_error(
+            "taking the address of a floating-point value is not supported",
+        )
+        .with_span(span));
+    }
+    Ok(())
 }
 
 /// 判断两个类型是否可能重叠（即是否存在一个具体类型同时匹配两者）。

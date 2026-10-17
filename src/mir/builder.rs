@@ -11,7 +11,7 @@ use crate::mir::{
     MirValue, NumTy,
 };
 use crate::typeck::hir::{self, HirBlock, HirConst, HirExpr, HirFunction, HirStmt};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 /// 降级单个函数。
 pub fn lower_function(
@@ -21,6 +21,10 @@ pub fn lower_function(
     consts: &std::collections::HashMap<hir::DefId, HirConst>,
 ) -> MirFunction {
     let mut b = Builder::new(func.name.clone(), def_names.clone(), const_values(consts));
+    // 先扫出被取地址的局部变量：它们不能住在寄存器里，必须固定到栈槽。
+    if let Some(body) = &func.body {
+        collect_addr_taken(body, &mut b.addr_taken);
+    }
 
     // 参数：先登记参数名，再分配入口块后把 `arg_N` 写进参数对应的局部
     // 变量。类型检查阶段已经把参数绑定成了局部变量，函数体里引用的是
@@ -34,10 +38,8 @@ pub fn lower_function(
     b.current = entry;
 
     for (i, p) in func.params.iter().enumerate() {
-        b.current_block_mut().instrs.push(MirInstr::Assign(
-            format!("v{}", p.local.0),
-            MirValue::Var(format!("arg_{i}")),
-        ));
+        let ty = num_ty_of(&p.ty);
+        b.def_local(p.local.0, MirValue::Var(format!("arg_{i}")), ty);
     }
 
     // 降级函数体
@@ -75,10 +77,10 @@ fn lower_block(b: &mut Builder, block: &HirBlock) -> Option<MirValue> {
 fn lower_stmt(b: &mut Builder, stmt: &HirStmt) {
     match stmt {
         HirStmt::Let { local, init } | HirStmt::Var { local, init } => {
-            let name = format!("v{}", local.0);
             if let Some(init) = init {
+                let ty = num_ty_of(&init.ty);
                 let v = lower_expr(b, init);
-                b.current_block_mut().instrs.push(MirInstr::Assign(name, v));
+                b.def_local(local.0, v, ty);
             }
         }
         HirStmt::Expr(expr) => {
@@ -93,7 +95,10 @@ fn lower_expr(b: &mut Builder, expr: &HirExpr) -> MirValue {
     use hir::ExprKind::*;
     match &expr.kind {
         Literal(lit) => mir_literal(lit, &expr.ty),
-        Local(id) => MirValue::Var(format!("v{}", id.0)),
+        Local(id) => {
+            let ty = num_ty_of(&expr.ty);
+            b.use_local(id.0, ty)
+        }
         // 全局 `const` 引用：直接把常量的值内联进来。
         //
         // 早先这里一律降级成 `MirValue::Unit`（"函数/常量引用降级为占位"），
@@ -129,16 +134,40 @@ fn lower_expr(b: &mut Builder, expr: &HirExpr) -> MirValue {
             MirValue::Var(name)
         }
         Assign(lhs, rhs) => {
-            // 骨架：仅处理局部变量赋值
-            let target = match &lhs.kind {
-                Local(id) => format!("v{}", id.0),
-                _ => format!("t{}", b.temp_id()),
-            };
             let v = lower_expr(b, rhs);
-            b.current_block_mut()
-                .instrs
-                .push(MirInstr::Assign(target.clone(), v));
-            MirValue::Var(target)
+            match &lhs.kind {
+                // 局部变量赋值。被取地址的局部写进它的栈槽，否则还是寄存器名。
+                Local(id) => {
+                    let ty = num_ty_of(&lhs.ty);
+                    b.def_local(id.0, v, ty);
+                    b.use_local(id.0, ty)
+                }
+                // `*p = v`：把值存到指针指向的地址。
+                Deref(inner) => {
+                    let addr = lower_expr(b, inner);
+                    let ty = num_ty_of(&lhs.ty);
+                    b.current_block_mut()
+                        .instrs
+                        .push(MirInstr::Store(addr, v, ty));
+                    MirValue::Unit
+                }
+                // `p[i] = v`：算出 `p + i*size` 再存。
+                Index(recv, idx) => {
+                    let addr = lower_index_addr(b, recv, idx, &lhs.ty);
+                    let ty = num_ty_of(&lhs.ty);
+                    b.current_block_mut()
+                        .instrs
+                        .push(MirInstr::Store(addr, v, ty));
+                    MirValue::Unit
+                }
+                _ => {
+                    let target = format!("t{}", b.temp_id());
+                    b.current_block_mut()
+                        .instrs
+                        .push(MirInstr::Assign(target.clone(), v));
+                    MirValue::Var(target)
+                }
+            }
         }
         Block(block) => lower_block(b, block).unwrap_or(MirValue::Unit),
         If(cond, then_block, else_block) => {
@@ -311,6 +340,42 @@ fn lower_expr(b: &mut Builder, expr: &HirExpr) -> MirValue {
             }
             MirValue::Unit
         }
+        // `*p`：从指针指向的地址加载。
+        Deref(inner) => {
+            let addr = lower_expr(b, inner);
+            let name = format!("t{}", b.temp_id());
+            let ty = num_ty_of(&expr.ty);
+            b.current_block_mut()
+                .instrs
+                .push(MirInstr::Load(name.clone(), addr, ty));
+            MirValue::Var(name)
+        }
+        // `p[i]` / `s[i]`：算出 `base + i*size` 再从该地址加载。
+        Index(recv, idx) => {
+            let addr = lower_index_addr(b, recv, idx, &expr.ty);
+            let name = format!("t{}", b.temp_id());
+            let ty = num_ty_of(&expr.ty);
+            b.current_block_mut()
+                .instrs
+                .push(MirInstr::Load(name.clone(), addr, ty));
+            MirValue::Var(name)
+        }
+        // `&place`：取位置地址。
+        AddrOf(place) => match &place.kind {
+            // `&local`：局部变量的栈槽地址。
+            Local(id) => {
+                let name = format!("t{}", b.temp_id());
+                b.current_block_mut()
+                    .instrs
+                    .push(MirInstr::SlotAddr(name.clone(), id.0));
+                MirValue::Var(name)
+            }
+            // `&*p` 就是 `p`。
+            Deref(inner) => lower_expr(b, inner),
+            // `&p[i]` 就是 `p + i*size`。
+            Index(recv, idx) => lower_index_addr(b, recv, idx, &place.ty),
+            _ => MirValue::Unit,
+        },
         _ => {
             // 其他表达式（Match/For/Struct 等）骨架阶段降级为占位
             MirValue::Unit
@@ -393,6 +458,11 @@ struct Builder {
     /// 引用 `const` 时把值直接内联进指令流：常量在编译期就定下来了，
     /// 运行时既没有存储也没有读取动作。
     const_values: HashMap<hir::DefId, MirValue>,
+    /// 被取过地址（`&x`）的局部变量 id。
+    ///
+    /// 这些变量不能再当作寄存器里的 SSA 值——取地址意味着它们的身份是
+    /// 一块内存。降级时把它们固定到栈槽，读写都变成显式的 Load/Store。
+    addr_taken: HashSet<u32>,
 }
 
 /// 把常量表折成 `DefId -> MirValue`。
@@ -436,6 +506,46 @@ impl Builder {
             loops: Vec::new(),
             functions,
             const_values,
+            addr_taken: HashSet::new(),
+        }
+    }
+
+    /// 新的临时量名。
+    fn temp(&mut self) -> String {
+        format!("t{}", self.temp_id())
+    }
+
+    /// 定义一个局部变量：被取地址的写进栈槽，否则是普通寄存器名。
+    fn def_local(&mut self, id: u32, value: MirValue, ty: NumTy) {
+        if self.addr_taken.contains(&id) {
+            let a = self.temp();
+            self.current_block_mut()
+                .instrs
+                .push(MirInstr::SlotAddr(a.clone(), id));
+            self.current_block_mut()
+                .instrs
+                .push(MirInstr::Store(MirValue::Var(a), value, ty));
+        } else {
+            self.current_block_mut()
+                .instrs
+                .push(MirInstr::Assign(format!("v{id}"), value));
+        }
+    }
+
+    /// 读一个局部变量的值：被取地址的从栈槽加载，否则直接用寄存器名。
+    fn use_local(&mut self, id: u32, ty: NumTy) -> MirValue {
+        if self.addr_taken.contains(&id) {
+            let a = self.temp();
+            self.current_block_mut()
+                .instrs
+                .push(MirInstr::SlotAddr(a.clone(), id));
+            let t = self.temp();
+            self.current_block_mut()
+                .instrs
+                .push(MirInstr::Load(t.clone(), MirValue::Var(a), ty));
+            MirValue::Var(t)
+        } else {
+            MirValue::Var(format!("v{id}"))
         }
     }
 
@@ -532,5 +642,111 @@ fn num_ty_of(ty: &hir::Ty) -> NumTy {
         Ty::Float(w) => NumTy::Float(*w as u8),
         Ty::Bool => NumTy::Bool,
         _ => NumTy::Int(64),
+    }
+}
+
+/// 元素类型的字节大小（用于索引缩放 `p + i*size`）。
+///
+/// 只处理本后端支持的标量；未知类型按 1 字节算（字符串字节正是这种情况）。
+fn element_size(ty: &hir::Ty) -> i128 {
+    use hir::Ty;
+    match ty {
+        Ty::Int(w) | Ty::Uint(w) => (*w as i128) / 8,
+        Ty::Float(w) => (*w as i128) / 8,
+        Ty::Bool | Ty::Char => 1,
+        Ty::Pointer(..) | Ty::Reference(..) | Ty::Str | Ty::Slice(..) => 8,
+        _ => 1,
+    }
+}
+
+/// 降级索引地址：`base + index * size(base 的元素类型)`。
+///
+/// `elem_ty` 是**元素**类型（不是 receiver 类型），用来定缩放系数：
+/// `s[i]`（str）缩放 1，`p[i]`（`*i32`）缩放 4。
+fn lower_index_addr(b: &mut Builder, recv: &HirExpr, idx: &HirExpr, elem_ty: &hir::Ty) -> MirValue {
+    let base = lower_expr(b, recv);
+    let index = lower_expr(b, idx);
+    let size = element_size(elem_ty);
+    let scaled = if size == 1 {
+        index
+    } else {
+        let name = b.temp();
+        b.current_block_mut().instrs.push(MirInstr::Binary(
+            name.clone(),
+            index,
+            MirBinaryOp::Mul,
+            MirValue::Int(size),
+            NumTy::Int(64),
+        ));
+        MirValue::Var(name)
+    };
+    let name = b.temp();
+    b.current_block_mut().instrs.push(MirInstr::Binary(
+        name.clone(),
+        base,
+        MirBinaryOp::Add,
+        scaled,
+        NumTy::Int(64),
+    ));
+    MirValue::Var(name)
+}
+
+/// 扫出函数体里所有被取地址的局部变量 id（`&x`）。
+///
+/// 只认 `&local` 这种直接形式。取地址是"该变量必须住内存"的信号，
+/// 后续降级据此决定走栈槽而不是寄存器。
+fn collect_addr_taken(block: &HirBlock, out: &mut HashSet<u32>) {
+    for stmt in &block.stmts {
+        match stmt {
+            HirStmt::Let { init, .. } | HirStmt::Var { init, .. } => {
+                if let Some(e) = init {
+                    collect_addr_taken_expr(e, out);
+                }
+            }
+            HirStmt::Expr(e) => collect_addr_taken_expr(e, out),
+            HirStmt::Item => {}
+        }
+    }
+    if let Some(t) = &block.tail {
+        collect_addr_taken_expr(t, out);
+    }
+}
+
+fn collect_addr_taken_expr(e: &HirExpr, out: &mut HashSet<u32>) {
+    use hir::ExprKind::*;
+    match &e.kind {
+        AddrOf(place) => {
+            if let Local(id) = &place.kind {
+                out.insert(id.0);
+            }
+            collect_addr_taken_expr(place, out);
+        }
+        Binary(_, a, b) | Assign(a, b) | Index(a, b) => {
+            collect_addr_taken_expr(a, out);
+            collect_addr_taken_expr(b, out);
+        }
+        Unary(_, a) | Field(a) | Deref(a) | Cast(a) | Await(a) => {
+            collect_addr_taken_expr(a, out);
+        }
+        Call { args, .. } => {
+            for a in args {
+                collect_addr_taken_expr(a, out);
+            }
+        }
+        Block(b) => collect_addr_taken(b, out),
+        If(c, t, e2) => {
+            collect_addr_taken_expr(c, out);
+            collect_addr_taken(t, out);
+            if let Some(e2) = e2 {
+                collect_addr_taken(e2, out);
+            }
+        }
+        While(c, b) => {
+            collect_addr_taken_expr(c, out);
+            collect_addr_taken(b, out);
+        }
+        Loop(b) => collect_addr_taken(b, out),
+        Return(Some(e)) => collect_addr_taken_expr(e, out),
+        _ => {}
     }
 }

@@ -181,10 +181,13 @@ pub enum ExprKind {
     Field(Box<HirExpr>),
     /// 解引用。
     Deref(Box<HirExpr>),
-    /// 取地址。
-    AddrOf,
-    /// 索引访问。
-    Index(Box<HirExpr>),
+    /// 取地址（`&place`）。操作数必须保留：MIR 要靠它算出被取址的位置。
+    AddrOf(Box<HirExpr>),
+    /// 索引访问 `receiver[index]`。
+    ///
+    /// 索引表达式必须保留。早先只存了 receiver，`s[i]` 的 `i` 在类型检查
+    /// 之后就被丢弃，MIR 侧无从计算地址。
+    Index(Box<HirExpr>, Box<HirExpr>),
     /// 块表达式。
     Block(HirBlock),
     /// `if` 表达式。

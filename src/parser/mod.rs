@@ -79,7 +79,12 @@ impl Parser {
                 ModuleItem::Static(s) => program.statics.push(s),
                 ModuleItem::Use(u) => program.imports.push(u),
                 ModuleItem::Module(m) => program.modules.push(m),
-                ModuleItem::Extern(e) => program.externs.push(e),
+                ModuleItem::Extern(e) => {
+                    // 外部函数并入函数表，让其参与类型检查 / 名称解析；
+                    // 同时保留外部块（链接指令等将来从这里取）。
+                    program.functions.extend(e.functions.iter().cloned());
+                    program.externs.push(e);
+                }
                 ModuleItem::Macro(m) => program.macros.push(m),
             }
         }
@@ -645,6 +650,27 @@ mod tests {
     fn parse_extern_block() {
         let p = parse_ok(r#"extern "C" { fn printf(fmt: *const u8, ...) -> i32; }"#);
         assert_eq!(p.externs.len(), 1);
+        // 外部函数声明必须并入函数表（否则调用点会报"未定义名称"）。
+        assert_eq!(p.externs[0].functions.len(), 1);
+        assert_eq!(p.functions.len(), 1);
+        assert_eq!(p.functions[0].name, "printf");
+        assert!(p.functions[0].body.is_none(), "外部函数没有函数体");
+        assert_eq!(p.functions[0].return_type, Type::I(32));
+    }
+
+    #[test]
+    fn block_expr_does_not_absorb_following_star_stmt() {
+        // 回归：`if c { }` 后跟一条以 `*` 开头的语句，曾被 Pratt 循环贪婪地
+        // 解析成 `(if c { }) * (p = v)`，于是赋值语句消失。块状表达式不能当
+        // 二元运算的左侧，这里应得到两条独立的语句。
+        let p = parse_ok("fn main() { if c { d; } *p = 42; }");
+        let body = p.functions[0].body.as_ref().expect("函数有体");
+        assert_eq!(body.stmts.len(), 2, "块后应另起一条语句");
+        assert!(
+            matches!(&body.stmts[1], Statement::Expr(Expression::Assign(..), _)),
+            "第二条语句应是赋值 `*p = 42`，实际是 {:?}",
+            body.stmts[1]
+        );
     }
 
     #[test]

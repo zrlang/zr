@@ -79,6 +79,16 @@ pub enum MirInstr {
     /// 之前 MIR 里根本没有这个指令：`x as i32` 在类型检查阶段就被丢掉
     /// 了操作数，MIR 侧只能降级成 `Unit`，于是运行期读到的是 0。
     Cast(String, MirValue, NumTy, NumTy),
+    /// 从地址加载：`name = *addr`。`ty` 决定读取位宽与有无符号。
+    Load(String, MirValue, NumTy),
+    /// 存储：`*addr = value`。无结果值，但**有副作用**，不可被消除或重排。
+    Store(MirValue, MirValue, NumTy),
+    /// 取局部变量专用栈槽的地址：`name = &slot{local}`。
+    ///
+    /// 局部变量被取地址（`&x`）后就不能再住在寄存器里——它的"身份"是一块
+    /// 内存。这里把它固定到一块栈槽，读写走 `Load`/`Store`，`&x` 得到
+    /// 槽的地址。`local` 是局部变量 id（`LocalId.0`）。
+    SlotAddr(String, u32),
 }
 
 /// 数值类型（只保留后端真正需要的部分）。
