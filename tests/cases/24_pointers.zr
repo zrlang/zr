@@ -61,5 +61,20 @@ fn main() -> i32 {
     let w: i32 = *pb as i32;
     if w != -1 { return 12; }
 
+    // 8. 指针算术：`p + n` / `n + p` 按元素字节大小缩放（i32 → 4 字节）。
+    let pa: *i32 = &x;
+    let pc: *i32 = pa + 3;
+    if (pc as i64) - (pa as i64) != 12 { return 13; }
+    if ((2 + pa) as i64) - (pa as i64) != 8 { return 14; }
+
+    // 9. 指针相减：结果是元素个数（isize / i64），不是字节差。
+    if (pa - pc) != 0 - 3 { return 15; }
+    if (pc - pa) != 3 { return 16; }
+
+    // 10. 指针宽度为 1 的算术不缩放。
+    let byte: i8 = 1;
+    let pbyte: *i8 = &byte;
+    if ((pbyte + 5) as i64) - (pbyte as i64) != 5 { return 17; }
+
     return 0;
 }

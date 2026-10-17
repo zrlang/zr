@@ -1610,6 +1610,59 @@ impl TypeChecker {
         let bin_op = self.ast_binary_op(*op);
         let l_ty = self.infer_expr_ty(lhs)?;
         let l = self.check_expr(lhs, &l_ty)?;
+
+        // 指针算术：`p + n` / `n + p` / `p - n` 结果还是指针，`p - q` 结果是
+        // 元素个数（isize）。必须在这里拦下——否则会走下面的整数统一逻辑，
+        // `n + p` 甚至会被期望类型挡成类型错误。
+        if matches!(op, ast::BinaryOp::Add | ast::BinaryOp::Sub) {
+            let l_ptr = matches!(
+                self.infer.resolve(&l.ty),
+                Ty::Pointer(..) | Ty::Reference(..)
+            );
+            let r_hint = self.infer_expr_ty(rhs)?;
+            let r_ptr = matches!(
+                self.infer.resolve(&r_hint),
+                Ty::Pointer(..) | Ty::Reference(..)
+            );
+            match (op, l_ptr, r_ptr) {
+                // 指针相减：结果是以元素为单位的差值。
+                (ast::BinaryOp::Sub, true, true) => {
+                    let r = self.check_expr(rhs, &l.ty)?;
+                    self.infer.unify(&l.ty, &r.ty, span).ok();
+                    return Ok(HirExpr {
+                        kind: ExprKind::Binary(bin_op, Box::new(l), Box::new(r)),
+                        ty: Ty::Int(64),
+                        span,
+                    });
+                }
+                // `p + n` / `p - n`：右操作数是整数偏移，结果仍是指针。
+                (ast::BinaryOp::Add | ast::BinaryOp::Sub, true, false) => {
+                    let r = self.check_expr(rhs, &Ty::Int(64))?;
+                    let ty = l.ty.clone();
+                    return Ok(HirExpr {
+                        kind: ExprKind::Binary(bin_op, Box::new(l), Box::new(r)),
+                        ty,
+                        span,
+                    });
+                }
+                // `n + p`：加法可交换，结果仍是指针。
+                (ast::BinaryOp::Add, false, true) => {
+                    let r = self.check_expr(rhs, &r_hint)?;
+                    let ty = r.ty.clone();
+                    return Ok(HirExpr {
+                        kind: ExprKind::Binary(bin_op, Box::new(l), Box::new(r)),
+                        ty,
+                        span,
+                    });
+                }
+                // 两个指针相加没有意义。
+                (ast::BinaryOp::Add, true, true) => {
+                    return Err(CompileError::type_error("cannot add two pointers").with_span(span));
+                }
+                _ => {}
+            }
+        }
+
         // 右操作数用左操作数**已解出**的类型当期望：`x_f32 * 100.0` 里
         // 100.0 默认推断成 f64，与 x 的 f32 混算会按错位宽读写。传 `l.ty`
         // 让字面量跟着左操作数走（与 `let y: f32 = 1.5` 是同一条规则）。
@@ -2212,6 +2265,20 @@ impl TypeChecker {
         self.locals_by_def.get(&id).copied()
     }
 
+    /// 按名字查当前作用域里局部变量的类型。
+    fn local_var_ty(&self, name: &str) -> Option<Ty> {
+        for layer in self.local_scopes.iter().rev() {
+            if let Some(def) = layer.get(name) {
+                if let Some(local) = self.locals_by_def.get(def) {
+                    if let Some(ty) = self.locals.get(local) {
+                        return Some(ty.clone());
+                    }
+                }
+            }
+        }
+        None
+    }
+
     // ==================================================================
     // 类型转换辅助
     // ==================================================================
@@ -2326,7 +2393,12 @@ impl TypeChecker {
                 crate::parser::ast::Mutability::Immutable,
             ),
             Expression::Variable(name, _) => {
-                if let Some(id) = self.symbols.get(name).copied() {
+                // 局部变量：从当前作用域查它的类型。早先这里只查模块级符号，
+                // 局部变量一律退化成未解推断变量——于是 `1 + p`（p 是局部
+                // 指针）在右侧检测不到指针类型。
+                if let Some(ty) = self.local_var_ty(name) {
+                    ty
+                } else if let Some(id) = self.symbols.get(name).copied() {
                     if let Some(t) = self.consts.get(&id) {
                         t.ty.clone()
                     } else if let Some(t) = self.statics.get(&id) {

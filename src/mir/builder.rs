@@ -111,6 +111,11 @@ fn lower_expr(b: &mut Builder, expr: &HirExpr) -> MirValue {
             None => MirValue::Unit,
         },
         Binary(op, lhs, rhs) => {
+            // 指针算术单独处理：需要按 pointee 大小缩放偏移、以及把指针差
+            // 除回元素个数，不能走下面的普通整数二元运算。
+            if let Some(v) = lower_pointer_arith(b, *op, lhs, rhs) {
+                return v;
+            }
             // 结果类型：优先用表达式自身的类型，推断没解出来时退回看操作数。
             let ty = binary_result_ty(*op, &expr.ty, &lhs.ty, &rhs.ty);
             let l = lower_expr(b, lhs);
@@ -689,6 +694,85 @@ fn lower_index_addr(b: &mut Builder, recv: &HirExpr, idx: &HirExpr, elem_ty: &hi
         NumTy::Int(64),
     ));
     MirValue::Var(name)
+}
+
+/// 类型是不是指针 / 引用（运行期都是同一个"地址"）。
+fn is_pointer_ty(ty: &hir::Ty) -> bool {
+    matches!(ty, hir::Ty::Pointer(..) | hir::Ty::Reference(..))
+}
+
+/// 指针指向元素的字节大小，用于 `p + n` 的偏移缩放。
+fn pointee_element_size(ty: &hir::Ty) -> i128 {
+    match ty {
+        hir::Ty::Pointer(inner, _) | hir::Ty::Reference(inner, _) => element_size(inner),
+        _ => 1,
+    }
+}
+
+/// 把某个 `MirValue` 与常量一起发一条 `MirInstr::Binary`，返回临时名。
+fn binary_into(b: &mut Builder, l: MirValue, op: MirBinaryOp, r: MirValue) -> MirValue {
+    let name = b.temp();
+    b.current_block_mut()
+        .instrs
+        .push(MirInstr::Binary(name.clone(), l, op, r, NumTy::Int(64)));
+    MirValue::Var(name)
+}
+
+/// 降级指针算术；不是指针算术时返回 `None`。
+///
+/// - `p + n` / `n + p` / `p - n`：`p ± n*size`，结果是指针；
+/// - `p - q`：`(p - q) / size`，结果是元素个数（`isize`，MIR 里按 i64）。
+///
+/// 类型检查已保证这两种指针操作数的组合是合法的（不会两个指针相加）。
+fn lower_pointer_arith(
+    b: &mut Builder,
+    op: hir::BinaryOp,
+    lhs: &HirExpr,
+    rhs: &HirExpr,
+) -> Option<MirValue> {
+    use hir::BinaryOp::*;
+    let l_ptr = is_pointer_ty(&lhs.ty);
+    let r_ptr = is_pointer_ty(&rhs.ty);
+    match (op, l_ptr, r_ptr) {
+        (Add, true, false) | (Sub, true, false) => {
+            let base = lower_expr(b, lhs);
+            let index = lower_expr(b, rhs);
+            let scaled = scale_index(b, index, pointee_element_size(&lhs.ty));
+            let bin = if op == Add {
+                MirBinaryOp::Add
+            } else {
+                MirBinaryOp::Sub
+            };
+            Some(binary_into(b, base, bin, scaled))
+        }
+        (Add, false, true) => {
+            let base = lower_expr(b, rhs);
+            let index = lower_expr(b, lhs);
+            let scaled = scale_index(b, index, pointee_element_size(&rhs.ty));
+            Some(binary_into(b, base, MirBinaryOp::Add, scaled))
+        }
+        (Sub, true, true) => {
+            let a = lower_expr(b, lhs);
+            let c = lower_expr(b, rhs);
+            let diff = binary_into(b, a, MirBinaryOp::Sub, c);
+            let size = pointee_element_size(&lhs.ty);
+            if size == 1 {
+                Some(diff)
+            } else {
+                Some(binary_into(b, diff, MirBinaryOp::Div, MirValue::Int(size)))
+            }
+        }
+        _ => None,
+    }
+}
+
+/// `index * size`，`size == 1` 时直接返回原值（省一条指令）。
+fn scale_index(b: &mut Builder, index: MirValue, size: i128) -> MirValue {
+    if size == 1 {
+        index
+    } else {
+        binary_into(b, index, MirBinaryOp::Mul, MirValue::Int(size))
+    }
 }
 
 /// 扫出函数体里所有被取地址的局部变量 id（`&x`）。
