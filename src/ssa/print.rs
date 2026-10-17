@@ -49,6 +49,7 @@ pub fn print_module(module: &SsaModule) {
                         result,
                         callee,
                         args,
+                        ..
                     } => {
                         let a: Vec<String> = args.iter().map(|v| format!("%{}", v.id())).collect();
                         println!("%{} = call {}({})", result.id(), callee, a.join(", "));

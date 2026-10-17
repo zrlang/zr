@@ -155,9 +155,10 @@ fn serialize_const(c: &SsaConst, buf: &mut Vec<u8>) {
             buf.push(0);
             buf.extend_from_slice(&i.to_le_bytes());
         }
-        SsaConst::Float(bits) => {
+        SsaConst::Float(bits, w) => {
             buf.push(1);
             buf.extend_from_slice(&bits.to_le_bytes());
+            buf.push(*w);
         }
         SsaConst::Bool(b) => {
             buf.push(2);
@@ -368,7 +369,8 @@ fn deserialize_const(cursor: &mut io::Cursor<&[u8]>) -> io::Result<SsaConst> {
         1 => {
             let mut bytes = [0u8; 8];
             cursor.read_exact(&mut bytes)?;
-            Ok(SsaConst::Float(u64::from_le_bytes(bytes)))
+            let w = read_u8(cursor)?;
+            Ok(SsaConst::Float(u64::from_le_bytes(bytes), w))
         }
         2 => {
             let b = read_u8(cursor)? != 0;

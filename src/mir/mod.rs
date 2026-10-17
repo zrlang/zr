@@ -63,13 +63,17 @@ pub enum MirInstr {
     /// 整数运算与浮点运算——`a + b` 在 GPR 里是 `add`，在 XMM 里是 `addsd`，
     /// 两者编码完全不同。缺了它，浮点会被当成整数做加法（位模式直接相加）。
     Binary(String, MirValue, MirBinaryOp, MirValue, NumTy),
-    /// 一元运算 `name = op x`（`-` 与 `~` 的结果类型与操作数一致）。
-    Unary(String, MirUnaryOp, MirValue, NumTy),
+    /// 一元运算 `name = op x`（结果类型与操作数一致，所以不必另带）。
+    Unary(String, MirUnaryOp, MirValue),
     /// await 点：暂停当前协程，等待 future 就绪。
     /// `name = await future`。
     Await(String, MirValue),
     /// 函数调用 `name = callee(args...)`。
-    Call(String, String, Vec<MirValue>),
+    /// `name = callee(args...)`，末位是返回值的类型。
+    ///
+    /// 返回类型必须显式带上：后端要靠它判断返回值是不是浮点（走 xmm0 还是
+    /// rax）。IR 的浮点常量不带位宽，没法事后从值反推。
+    Call(String, String, Vec<MirValue>, NumTy),
     /// 类型转换 `name = value as to`。
     ///
     /// 之前 MIR 里根本没有这个指令：`x as i32` 在类型检查阶段就被丢掉
@@ -119,8 +123,12 @@ pub enum MirTerminator {
 pub enum MirValue {
     /// 整数常量。
     Int(i128),
-    /// 浮点常量（按位存储）。
-    Float(u64),
+    /// 浮点常量（按位存储 + 位宽）。
+    ///
+    /// 位宽（32 / 64）必须随值携带：常量本身不含类型信息，后端只有拿到
+    /// 位宽才知道该按 `movss/addss` 还是 `movsd/addsd` 编码，否则 f32 会读到
+    /// 错误的字节。
+    Float(u64, u8),
     /// 布尔常量。
     Bool(bool),
     /// 单元值 `()`。

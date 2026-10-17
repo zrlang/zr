@@ -260,15 +260,16 @@ fn build_coff_symbols(unit: &CompilationUnit) -> (Vec<u8>, Vec<u8>) {
 
         symbols.extend_from_slice(&name_field);
         symbols.extend_from_slice(&(sym.offset as u32).to_le_bytes());
-        let section_number: i16 = if sym.section == SymbolSection::Undefined {
-            0
-        } else {
-            1
+        // 段号：0 = 未定义，1 = .text，2 = .rodata（与节表顺序一致）。
+        let section_number: i16 = match sym.section {
+            SymbolSection::Undefined => 0,
+            SymbolSection::Text => 1,
+            SymbolSection::Rodata => 2,
         };
         symbols.extend_from_slice(&section_number.to_le_bytes());
         let symbol_type: u16 = match sym.kind {
             SymbolKind::Function => 0x20,
-            SymbolKind::Section => 0,
+            SymbolKind::Object | SymbolKind::Section => 0,
         };
         symbols.extend_from_slice(&symbol_type.to_le_bytes());
         symbols.push(if sym.global { 3 } else { 0 }); // StorageClass = EXTERNAL / STATIC

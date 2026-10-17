@@ -297,8 +297,8 @@ fn ends_expression(prev: &TokenKind) -> bool {
     matches!(
         prev,
         Ident(_)
-            | IntLiteral(_)
-            | FloatLiteral(_)
+            | IntLiteral(..)
+            | FloatLiteral(..)
             | StringLiteral(_)
             | CharLiteral(_)
             | Lifetime(_)
@@ -325,8 +325,8 @@ fn render(kind: &TokenKind) -> String {
     use TokenKind::*;
     match kind {
         Ident(s) => s.clone(),
-        IntLiteral(v) => v.to_string(),
-        FloatLiteral(v) => v.to_string(),
+        IntLiteral(v, suffix) => format!("{v}{}", suffix.as_deref().unwrap_or("")),
+        FloatLiteral(v, suffix) => format!("{v}{}", suffix.as_deref().unwrap_or("")),
         StringLiteral(s) => format!("{s:?}"),
         CharLiteral(c) => format!("{c:?}"),
         LineComment(s) | BlockComment(s) => s.clone(),

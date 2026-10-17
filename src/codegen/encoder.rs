@@ -128,6 +128,13 @@ fn emit_phi_copies(unit: &mut CompilationUnit, func: &SsaFunction, succ: usize, 
         let Some((_, src)) = incoming.iter().find(|(p, _)| *p == from) else {
             continue;
         };
+        // 浮点 φ 的两侧都是浮点栈槽：xmm0 中转，不碰 GPR
+        if let (Some(rs), Some(ss)) = (float_slot(*result), float_slot(*src)) {
+            let w = float_width(*result).max(float_width(*src));
+            emit_load_float(unit, 0, ss, w);
+            emit_store_float(unit, 0, rs, w);
+            continue;
+        }
         if let Location::Stack(slot) = location_of(*result) {
             emit_mov_src(unit, SCRATCH_AX, src_of(*src));
             emit_store_slot(unit, SCRATCH_AX, slot);
@@ -144,6 +151,10 @@ fn emit_phi_copies(unit: &mut CompilationUnit, func: &SsaFunction, succ: usize, 
         let Some((_, src)) = incoming.iter().find(|(p, _)| *p == from) else {
             continue;
         };
+        // 浮点 φ 已在上面按栈槽处理完，这里跳过
+        if float_slot(*result).is_some() || float_slot(*src).is_some() {
+            continue;
+        }
         let Location::Reg(d) = location_of(*result) else {
             continue;
         };
@@ -203,6 +214,344 @@ thread_local! {
         std::cell::RefCell::new(Allocation::default());
     /// 当前函数预留的栈槽数（驱动序言的 `sub rsp`）。
     static FRAME_SLOTS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    /// 浮点值专用的栈槽。
+    ///
+    /// 浮点走 **XMM**，而整数分配器只认 GPR。与其给分配器加一整套并行的
+    /// 浮点活跃区间（收益很小，因为 SSA 里每个浮点值只定义一次），不如给
+    /// 每个浮点值一个专属栈槽，运算时用 `xmm0/xmm1` 当暂存器读写内存。
+    /// 慢一点，但绝对正确，而且不碰已经验证过的整数分配器。
+    static FLOAT_SLOTS: std::cell::RefCell<HashMap<u32, (usize, u8)>> =
+        std::cell::RefCell::new(HashMap::new());
+}
+
+/// `v` 的浮点位宽（32 或 64）。整数返回 0。
+fn float_width(v: SsaValue) -> u8 {
+    FLOAT_SLOTS.with(|m| m.borrow().get(&v.id()).map(|(_, w)| *w).unwrap_or(0))
+}
+
+/// `v` 如果是浮点值，返回它的栈槽。
+fn float_slot(v: SsaValue) -> Option<usize> {
+    FLOAT_SLOTS.with(|m| m.borrow().get(&v.id()).map(|(s, _)| *s))
+}
+
+/// 浮点标量移动 / 运算的前缀：f32 用 F3（`scalar single`），f64 用 F2（`scalar double`）。
+fn sse_prefix(width: u8) -> u8 {
+    if width == 32 {
+        0xF3
+    } else {
+        0xF2
+    }
+}
+
+/// `movss/movsd xmm, [rsp + 8*slot]`
+fn emit_load_float(unit: &mut CompilationUnit, xmm: u8, slot: usize, width: u8) {
+    emit1(unit, sse_prefix(width));
+    emit1(unit, 0x0F);
+    emit1(unit, 0x10);
+    // mod=10(disp32), reg=xmm, rm=100(SIB)
+    emit1(unit, 0b10_000_100 | (xmm & 7) << 3);
+    emit1(unit, 0b00_100_100);
+    emit4(unit, (slot * 8) as u32);
+}
+
+/// `movss/movsd [rsp + 8*slot], xmm`
+fn emit_store_float(unit: &mut CompilationUnit, xmm: u8, slot: usize, width: u8) {
+    emit1(unit, sse_prefix(width));
+    emit1(unit, 0x0F);
+    emit1(unit, 0x11);
+    emit1(unit, 0b10_000_100 | (xmm & 7) << 3);
+    emit1(unit, 0b00_100_100);
+    emit4(unit, (slot * 8) as u32);
+}
+
+/// `movq xmm, r64`：把 64 位位模式搬进 XMM。`66 REX.W 0F 6E /r`
+fn emit_movq_gpr_to_xmm(unit: &mut CompilationUnit, xmm: u8, gpr: Gpr) {
+    emit1(unit, 0x66);
+    emit1(unit, 0x48 | if gpr.rex_bit() { 0x01 } else { 0 });
+    emit1(unit, 0x0F);
+    emit1(unit, 0x6E);
+    modrm(unit, 3, xmm & 7, gpr.bits());
+}
+
+/// `movd xmm, r32`：把 32 位位模式搬进 XMM 低双字。`66 0F 6E /r`
+fn emit_movd_gpr_to_xmm(unit: &mut CompilationUnit, xmm: u8, gpr: Gpr) {
+    emit1(unit, 0x66);
+    if gpr.rex_bit() {
+        emit1(unit, 0x41);
+    }
+    emit1(unit, 0x0F);
+    emit1(unit, 0x6E);
+    modrm(unit, 3, xmm & 7, gpr.bits());
+}
+
+/// 浮点算术：`opss/opsd xmm1, xmm2`。opcode 0F 5x /r（58 add / 5C sub / 59 mul / 5E div）。
+fn emit_sse_arith(unit: &mut CompilationUnit, width: u8, opcode: u8, dst: u8, src: u8) {
+    emit1(unit, sse_prefix(width));
+    emit1(unit, 0x0F);
+    emit1(unit, opcode);
+    modrm(unit, 3, dst & 7, src & 7);
+}
+
+/// `xorps/xorpd xmm1, xmm2`（0F 57 /r）——用来给浮点取负（翻符号位）。
+fn emit_xor_sign(unit: &mut CompilationUnit, width: u8, dst: u8, src: u8) {
+    if width != 32 {
+        emit1(unit, 0x66);
+    }
+    emit1(unit, 0x0F);
+    emit1(unit, 0x57);
+    modrm(unit, 3, dst & 7, src & 7);
+}
+
+/// `ucomiss/ucomisd xmm1, xmm2`（0F 2E /r，f64 加 66 前缀）——浮点比较。
+fn emit_ucomis(unit: &mut CompilationUnit, width: u8, a: u8, b: u8) {
+    if width != 32 {
+        emit1(unit, 0x66);
+    }
+    emit1(unit, 0x0F);
+    emit1(unit, 0x2E);
+    modrm(unit, 3, a & 7, b & 7);
+}
+
+/// 单双精度互转（`cvtss2sd` 用 F3 前缀，`cvtsd2ss` 用 F2 前缀，都是 0F 5A /r）。
+fn emit_cvt_ss_dbl(unit: &mut CompilationUnit, src_is_ss: bool, dst: u8, src: u8) {
+    emit1(unit, if src_is_ss { 0xF3 } else { 0xF2 });
+    emit1(unit, 0x0F);
+    emit1(unit, 0x5A);
+    modrm(unit, 3, dst & 7, src & 7);
+}
+
+/// `cvtsi2ss/cvtsi2sd xmm, r64`：F3/F2 REX.W 0F 2A /r
+fn emit_cvtsi2f(unit: &mut CompilationUnit, width: u8, xmm: u8, gpr: Gpr) {
+    emit1(unit, sse_prefix(width));
+    emit1(unit, 0x48 | if gpr.rex_bit() { 0x01 } else { 0 });
+    emit1(unit, 0x0F);
+    emit1(unit, 0x2A);
+    modrm(unit, 3, xmm & 7, gpr.bits());
+}
+
+/// `cvttss2si/cvttsd2si r64, xmm`：F3/F2 REX.W 0F 2C /r（截断向零）
+fn emit_cvttf2si(unit: &mut CompilationUnit, width: u8, gpr: Gpr, xmm: u8) {
+    emit1(unit, sse_prefix(width));
+    emit1(unit, 0x48 | if gpr.rex_bit() { 0x01 } else { 0 });
+    emit1(unit, 0x0F);
+    emit1(unit, 0x2C);
+    modrm(unit, 3, gpr.bits(), xmm & 7);
+}
+
+/// 把一个浮点常量装进 `xmm`：位模式经 GPR / 立即数中转。
+fn emit_float_const(unit: &mut CompilationUnit, xmm: u8, bits: u64, width: u8) {
+    if width == 32 {
+        // mov eax, imm32；movd xmm, eax
+        emit1(unit, 0xb8);
+        emit4(unit, bits as u32);
+        emit_movd_gpr_to_xmm(unit, xmm, SCRATCH_AX);
+    } else {
+        // movabs rax, imm64；movq xmm, rax
+        emit1(unit, 0x48);
+        emit1(unit, 0xb8);
+        emit8(unit, bits);
+        emit_movq_gpr_to_xmm(unit, xmm, SCRATCH_AX);
+    }
+}
+
+/// 扫出一个函数里所有浮点值，给每个值分配专属栈槽。
+///
+/// 浮点的"性"要穿过 `Copy` 与 `Phi` 传播：优化会把 `a + b` 的结果复制
+/// 走（`x + 0 -> x`），循环里也会有 `φ`。只认"定义点"会让这些中转值
+/// 被当成整数去 GPR 里找，然后拿到栈槽里残渣当浮点数用。
+fn assign_float_slots(func: &SsaFunction, base: usize) -> usize {
+    // 一遍"先播种、再传播"是不够的：`Neg` 的播种条件是"操作数已是浮点"，
+    // 而操作数的浮点性要等 `Copy` 传播完才知道。所以把播种和传播合成
+    // 一个不动点，每轮都重新扫全部指令。
+    // (值 id -> 是否是浮点, 位宽)。位宽 0 表示还没推断出来。
+    let mut floats: HashMap<u32, u8> = HashMap::new();
+    let width_of =
+        |v: &SsaValue, map: &HashMap<u32, u8>| -> u8 { map.get(&v.id()).copied().unwrap_or(0) };
+    loop {
+        let mut changed = false;
+        {
+            let mark = |v: &SsaValue, w: u8, map: &mut HashMap<u32, u8>| -> bool {
+                match map.get(&v.id()) {
+                    // 已知但更窄的位宽，保留更宽的那个（f64 优先）
+                    Some(old) if *old >= w => false,
+                    _ => {
+                        map.insert(v.id(), w);
+                        true
+                    }
+                }
+            };
+            for block in &func.blocks {
+                for instr in &block.instrs {
+                    match instr {
+                        SsaInstr::Const {
+                            result,
+                            value: SsaConst::Float(_, w),
+                        } => {
+                            // 常量自带位宽，直接播种（f32 的 `1.5` 就该按 32 位搬）。
+                            if mark(result, *w, &mut floats) {
+                                changed = true;
+                            }
+                        }
+                        // 比较的结果是布尔，即使两个操作数都是浮点
+                        SsaInstr::Binary {
+                            result,
+                            ty,
+                            lhs,
+                            rhs,
+                            ..
+                        } => {
+                            if ty.is_float() {
+                                let w = match *ty {
+                                    NumTy::Float(w) => w,
+                                    _ => 64,
+                                };
+                                if mark(result, w, &mut floats) {
+                                    changed = true;
+                                }
+                                // 形参没有类型标注（`MirParam` 是空结构），只能从
+                                // "谁在拿它做浮点运算"反推：浮点二元运算的操作数
+                                // 一定是浮点。少了这一步，`fn f(a: f64, b: f64)`
+                                // 的形参会按整数走 rdi/rsi，返回值也按位模式搬。
+                                if mark(lhs, w, &mut floats) {
+                                    changed = true;
+                                }
+                                if mark(rhs, w, &mut floats) {
+                                    changed = true;
+                                }
+                            } else {
+                                // 比较 / 逻辑运算的结果是 bool，但操作数可能都是
+                                // 浮点。两边互相传播：`f < g` 里只要有一边已知是
+                                // 浮点，另一边必然也是。
+                                let lw = width_of(lhs, &floats);
+                                let rw = width_of(rhs, &floats);
+                                // 只有一边已知时，把已知的位宽推给另一边
+                                let (unknown, w) = match (lw, rw) {
+                                    (w, 0) if w > 0 => (rhs, w),
+                                    (0, w) if w > 0 => (lhs, w),
+                                    _ => continue,
+                                };
+                                if mark(unknown, w, &mut floats) {
+                                    changed = true;
+                                }
+                            }
+                        }
+                        SsaInstr::Unary {
+                            result, operand, ..
+                        } => {
+                            // 结果是浮点 -> 操作数也是；反过来同理。
+                            // 位宽原样传播——早先这里 `.max(64)` 把 f32 的
+                            // 取负强行拔到 64 位，于是 `-x` 会按 f64 读 f32 的
+                            // 槽，拿到完全不同的数。
+                            if floats.contains_key(&result.id()) {
+                                let w = width_of(result, &floats);
+                                if w > 0 && mark(operand, w, &mut floats) {
+                                    changed = true;
+                                }
+                            }
+                            if floats.contains_key(&operand.id()) {
+                                let w = width_of(operand, &floats);
+                                if w > 0 && mark(result, w, &mut floats) {
+                                    changed = true;
+                                }
+                            }
+                        }
+                        SsaInstr::Call {
+                            result, args, ty, ..
+                        } => {
+                            if ty.is_float() {
+                                let w = match *ty {
+                                    NumTy::Float(w) => w,
+                                    _ => 64,
+                                };
+                                if mark(result, w, &mut floats) {
+                                    changed = true;
+                                }
+                            }
+                            // 被调函数的形参类型 IR 里没有，只能按"这个实参
+                            // 已知是浮点"来传。调用方的浮点值会通过这里推给
+                            // 形参，但形参自己若是浮点而调用方没传浮点，IR
+                            // 里就无从得知——这是 `MirParam` 不带类型的代价。
+                            let _ = args;
+                        }
+                        SsaInstr::Cast {
+                            result,
+                            src,
+                            from,
+                            to,
+                        } => {
+                            // 结果是浮点 -> 目标类型就是位宽
+                            if to.is_float() {
+                                let w = match *to {
+                                    NumTy::Float(w) => w,
+                                    _ => 64,
+                                };
+                                if mark(result, w, &mut floats) {
+                                    changed = true;
+                                }
+                            }
+                            // 源是浮点 -> 结果是整数，但源本身要占槽
+                            if from.is_float() {
+                                let w = match *from {
+                                    NumTy::Float(w) => w,
+                                    _ => 64,
+                                };
+                                if mark(src, w, &mut floats) {
+                                    changed = true;
+                                }
+                            }
+                        }
+                        SsaInstr::Copy { result, src } => {
+                            // 前向：源是浮点 -> 结果是浮点
+                            if floats.contains_key(&src.id()) {
+                                let w = width_of(src, &floats);
+                                if mark(result, w, &mut floats) {
+                                    changed = true;
+                                }
+                            }
+                            // 反向：结果是浮点 -> 源也是。
+                            // 形参本身没有类型标注，只能靠这种反向推断：
+                            // `fn f(a: f64, b: f64) { a + b }` 里 `%2 = copy %0`
+                            // 的 %0 是形参，它的浮点性只能从 %2 反推出来。
+                            if floats.contains_key(&result.id()) {
+                                let w = width_of(result, &floats);
+                                if mark(src, w, &mut floats) {
+                                    changed = true;
+                                }
+                            }
+                        }
+                        SsaInstr::Phi {
+                            result, incoming, ..
+                        } if incoming.iter().any(|(_, v)| floats.contains_key(&v.id())) => {
+                            let w = incoming
+                                .iter()
+                                .map(|(_, v)| width_of(v, &floats))
+                                .max()
+                                .unwrap_or(64);
+                            if mark(result, w, &mut floats) {
+                                changed = true;
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+    let mut ids: Vec<u32> = floats.keys().copied().collect();
+    ids.sort_unstable();
+    let count = ids.len();
+    FLOAT_SLOTS.with(|m| {
+        let mut map = m.borrow_mut();
+        map.clear();
+        for (i, id) in ids.into_iter().enumerate() {
+            let w = floats.get(&id).copied().unwrap_or(64);
+            map.insert(id, (base + i, w));
+        }
+    });
+    count
 }
 
 /// 取 `v` 的位置；没有分配记录时退回取模。
@@ -289,7 +638,9 @@ pub fn emit_function(target: &Target, unit: &mut CompilationUnit, func: &SsaFunc
         crate::codegen::regalloc::allocate_registers(func, ALLOCATABLE.len(), &X86_64_CALLEE_SAVE);
     // callee-save 集合要在发射尾声时再用，所以这里留一份
     let callee_saved = callee_saved_regs(&alloc.map);
-    FRAME_SLOTS.with(|c| c.set(alloc.spilled));
+    // 整数溢出的槽之后接着排浮点槽：两类槽共用一个帧，序言只需一次 sub rsp
+    let float_slots = assign_float_slots(func, alloc.spilled);
+    FRAME_SLOTS.with(|c| c.set(alloc.spilled + float_slots));
     REG_MAP.with(|m| {
         *m.borrow_mut() = alloc;
     });
@@ -349,8 +700,13 @@ pub fn emit_function(target: &Target, unit: &mut CompilationUnit, func: &SsaFunc
                 // 必须走 `use_reg`：返回值本身可能是溢出的值，它没有固定
                 // 寄存器，直接 `alloc_reg` 会 panic。
                 if let Some(v) = ret_val {
-                    let r = use_reg(unit, *v);
-                    emit_mov_rr(unit, SCRATCH_AX, r);
+                    // 浮点返回值按 ABI 走 xmm0，不是 rax
+                    if let Some(slot) = float_slot(*v) {
+                        emit_load_float(unit, 0, slot, float_width(*v));
+                    } else {
+                        let r = use_reg(unit, *v);
+                        emit_mov_rr(unit, SCRATCH_AX, r);
+                    }
                 }
                 // 尾声：add rsp, frame; pop callee-save; mov rsp, rbp; pop rbp; ret
                 if frame > 0 {
@@ -434,33 +790,50 @@ fn emit_instr(unit: &mut CompilationUnit, instr: &SsaInstr) {
             op,
             lhs,
             rhs,
-            ..
-        } => emit_binary(unit, *result, *op, *lhs, *rhs),
+            ty,
+        } => emit_binary(unit, *result, *op, *lhs, *rhs, *ty),
         SsaInstr::Unary {
             result,
             op,
             operand,
-        } => emit_unary(unit, *result, *op, *operand),
+        } => {
+            // 一元运算的结果类型与操作数一致；用它核对浮点位宽
+            let operand_w = float_width(*operand);
+            emit_unary(unit, *result, *op, *operand, operand_w);
+        }
         SsaInstr::Call {
             result,
             callee,
             args,
+            ..
         } => {
             emit_call_args(unit, args);
             emit_call(unit, callee);
-            match location_of(*result) {
-                Location::Reg(i) => {
-                    let d = ALLOCATABLE[i];
-                    if d != SCRATCH_AX {
-                        emit_mov_rr(unit, d, SCRATCH_AX);
+            // 浮点返回值按 ABI 在 xmm0，不是 rax
+            if let Some(slot) = float_slot(*result) {
+                emit_store_float(unit, 0, slot, float_width(*result));
+            } else {
+                match location_of(*result) {
+                    Location::Reg(i) => {
+                        let d = ALLOCATABLE[i];
+                        if d != SCRATCH_AX {
+                            emit_mov_rr(unit, d, SCRATCH_AX);
+                        }
                     }
+                    Location::Stack(slot) => emit_store_slot(unit, SCRATCH_AX, slot),
                 }
-                Location::Stack(slot) => emit_store_slot(unit, SCRATCH_AX, slot),
             }
         }
         // φ 的实际拷贝由前驱末尾的 emit_phi_copies 发出
         SsaInstr::Phi { .. } => {}
         SsaInstr::Copy { result, src } => {
+            // 浮点之间经 xmm0 中转
+            if let (Some(rs), Some(ss)) = (float_slot(*result), float_slot(*src)) {
+                let w = float_width(*result).max(float_width(*src));
+                emit_load_float(unit, 0, ss, w);
+                emit_store_float(unit, 0, rs, w);
+                return;
+            }
             let spilled = matches!(location_of(*result), Location::Stack(_));
             let d = if spilled {
                 SCRATCH_AX
@@ -488,6 +861,11 @@ fn emit_instr(unit: &mut CompilationUnit, instr: &SsaInstr) {
             from,
             to,
         } => {
+            // 任一侧是浮点就走 XMM 路径
+            if from.is_float() || to.is_float() || float_slot(*src).is_some() {
+                emit_cast_float(unit, *result, *src, *from, *to);
+                return;
+            }
             let spilled = matches!(location_of(*result), Location::Stack(_));
             let d = if spilled {
                 SCRATCH_AX
@@ -508,13 +886,76 @@ fn emit_instr(unit: &mut CompilationUnit, instr: &SsaInstr) {
     }
 }
 
+/// 浮点参与的类型转换。
+///
+/// 浮点值住在专用栈槽里，整数值住在 GPR 里，所以四条方向各是一套指令：
+/// `cvtsi2sd` / `cvttsd2si`（都支持 64 位）与 `cvtss2sd` / `cvtsd2ss`。
+fn emit_cast_float(
+    unit: &mut CompilationUnit,
+    result: SsaValue,
+    src: SsaValue,
+    from: NumTy,
+    to: NumTy,
+) {
+    let dst_is_float = to.is_float();
+    let src_is_float = from.is_float() || float_slot(src).is_some();
+    // 源 / 目标的位宽。优先信 NumTy；它没给（如 `from` 是整数类型但值其实
+    // 住在浮点槽里，或反之）就退回槽的实际位宽。
+    let fw = match from {
+        NumTy::Float(w) => w,
+        _ => float_width(src),
+    };
+    let tw = match to {
+        NumTy::Float(w) => w,
+        _ => float_width(result),
+    };
+
+    // 源进 xmm0（浮点）或 rax（整数）
+    let (src_xmm, src_gpr): (Option<u8>, Option<Gpr>) = if src_is_float {
+        let sl = float_slot(src).expect("浮点源没有栈槽");
+        emit_load_float(unit, 0, sl, if fw == 0 { 64 } else { fw });
+        (Some(0), None)
+    } else {
+        let r = use_reg(unit, src);
+        if r != SCRATCH_AX {
+            emit_mov_rr(unit, SCRATCH_AX, r);
+        }
+        (None, Some(SCRATCH_AX))
+    };
+
+    if dst_is_float {
+        let sl = float_slot(result).expect("浮点目的没有栈槽");
+        if src_is_float {
+            // 同宽直接照搬；跨宽用 cvtss2sd / cvtsd2ss（都是 0F 5A /r）
+            if tw == 32 && fw != 32 {
+                emit_cvt_ss_dbl(unit, false, 0, src_xmm.unwrap());
+            } else if tw != 32 && fw == 32 {
+                emit_cvt_ss_dbl(unit, true, 0, src_xmm.unwrap());
+            }
+        } else {
+            // int -> f32/f64：cvtsi2ss / cvtsi2sd
+            emit_cvtsi2f(unit, tw, 0, src_gpr.unwrap());
+        }
+        emit_store_float(unit, 0, sl, tw);
+    } else if src_is_float {
+        // f32/f64 -> int：cvttss2si / cvttsd2si（截断向零，与 Rust `as` 一致）
+        let gpr = match location_of(result) {
+            Location::Stack(_) => SCRATCH_AX,
+            Location::Reg(i) => ALLOCATABLE[i],
+        };
+        emit_cvttf2si(unit, fw, gpr, 0);
+        if let Location::Stack(slot) = location_of(result) {
+            emit_store_slot(unit, SCRATCH_AX, slot);
+        }
+    }
+}
+
 /// 类型转换。
 ///
 /// 值一律放在 64 位寄存器里，所以转换就是"取低 w 位再按目标的有无符号
 /// 重新符号/零扩展到 64 位"。宽度已经是 64 时什么都不用做。
 fn emit_cast(unit: &mut CompilationUnit, dst: Gpr, src: Gpr, from: NumTy, to: NumTy) {
-    // 浮点之间的转换、浮点与整数之间的转换目前后端还没有实现。
-    // 宁可报错也不能静默发出 0 —— 那比编译失败更难查。
+    // 浮点参与的转换有专门路径（要用 XMM），这里只处理整数之间。
     if from.is_float() || to.is_float() {
         crate::codegen::unsupported_cast(from, to);
     }
@@ -609,17 +1050,49 @@ fn emit_const(unit: &mut CompilationUnit, result: SsaValue, value: SsaConst) {
             emit1(unit, 0xb8 + dst.bits());
             emit8(unit, i as u64);
         }
-        // bool / unit 在通用寄存器里就是 0/1；浮点与字符串后端暂未实现
+        // bool / unit 在通用寄存器里就是 0/1；字符串后端暂未实现
         SsaConst::Bool(b) => emit_const_bool(unit, dst.bits(), b),
         SsaConst::Unit => emit_const_int(unit, dst.bits(), 0),
-        SsaConst::Float(_) => crate::codegen::unsupported_const("float"),
-        SsaConst::Str(_) => crate::codegen::unsupported_const("string"),
+        // 浮点根本不进 GPR：位模式直接搬进 XMM，再落到浮点专用栈槽
+        SsaConst::Float(f, w) => {
+            if let Some(slot) = float_slot(result) {
+                emit_float_const(unit, 0, f, w);
+                emit_store_float(unit, 0, slot, w);
+            } else {
+                crate::codegen::unsupported_const("float");
+            }
+        }
+        // 字符串字面量：值是 `.rodata` 里那份字节的地址（指针）。
+        SsaConst::Str(text) => {
+            let sym = unit.intern_string(&text);
+            emit_str_addr(unit, dst, &sym);
+        }
     }
     if spilled {
         if let Location::Stack(slot) = location_of(result) {
             emit_store_slot(unit, dst, slot);
         }
     }
+}
+
+/// `lea dst, [rip + symbol]`：把 `.rodata` 符号的地址装进 `dst`。
+///
+/// 7 字节：`REX.W 8D /r`，modrm 的 mod=00、rm=101 表示 RIP 相对 disp32。
+/// 位移字段附一条 `RipRel32` 重定位（附加数 -4），链接器与自构造可执行
+/// 文件的回填路径都据此计算地址。
+fn emit_str_addr(unit: &mut CompilationUnit, dst: Gpr, sym: &str) {
+    let start = unit.code.len();
+    // `8D /r` 的 **reg 字段是目的**，因此 R8–R15 要靠 REX.R（0x04）扩展；
+    // 若误用 REX.B（0x01），低 3 位的 4/5 会被解码成 `rsp`/`rbp`，把栈指针
+    // 与帧指针直接写坏。
+    emit1(unit, 0x48 | if dst.rex_bit() { 0x04 } else { 0 });
+    emit1(unit, 0x8d);
+    emit1(unit, 0x05 | ((dst.bits() & 7) << 3));
+    let field = unit.code.len();
+    emit4(unit, 0);
+    let mut reloc = Relocation::new(field, start, 7, sym, RelocationKind::RipRel32);
+    reloc.addend = -4;
+    unit.relocations.push(reloc);
 }
 
 /// 用 mov 立即数加载一个小整数（0/1 之类）。
@@ -647,8 +1120,21 @@ fn emit_binary(
     op: SsaBinaryOp,
     lhs: SsaValue,
     rhs: SsaValue,
+    ty: NumTy,
 ) {
     use SsaBinaryOp::*;
+
+    // 任何一个操作数是浮点，整条运算就都走 XMM。
+    //
+    // 判据是**操作数**而不是结果类型：比较的结果是整数，但 `f < g` 必须
+    // 用 `ucomisd` 而不是 `cmp`——后者会比较两个 IEEE754 位模式当整数比，
+    // 负数与 NaN 的序完全错掉。
+    let lhs_is_f = float_slot(lhs).is_some();
+    let rhs_is_f = float_slot(rhs).is_some();
+    if lhs_is_f || rhs_is_f {
+        emit_binary_float(unit, result, op, lhs, rhs, ty);
+        return;
+    }
 
     let result_spilled = matches!(location_of(result), Location::Stack(_));
     let dst = if result_spilled {
@@ -791,6 +1277,119 @@ fn load_scratch(unit: &mut CompilationUnit, v: SsaValue, scratch: Gpr) -> Gpr {
     }
 }
 
+/// 浮点二元运算：算术结果落浮点栈槽，比较结果落 GPR/整数槽。
+fn emit_binary_float(
+    unit: &mut CompilationUnit,
+    result: SsaValue,
+    op: SsaBinaryOp,
+    lhs: SsaValue,
+    rhs: SsaValue,
+    _ty: NumTy,
+) {
+    use SsaBinaryOp::*;
+    let slot = |v: SsaValue| float_slot(v).expect("浮点操作数没有栈槽");
+    // 操作数位宽：比较的结果类型是 bool，所以只从两个操作数推。
+    // 两边都推不出来时退回 _ty。
+    let w = {
+        let lw = float_width(lhs);
+        let rw = float_width(rhs);
+        let mut w = lw.max(rw);
+        if w == 0 {
+            w = match _ty {
+                NumTy::Float(w) => w,
+                _ => 64,
+            };
+        }
+        w
+    };
+    // xmm0 = 左，xmm1 = 右
+    emit_load_float(unit, 0, slot(lhs), w);
+    emit_load_float(unit, 1, slot(rhs), w);
+
+    match op {
+        // 比较：结果是整数，写回整数一侧的位置
+        Eq | Ne | Lt | Gt | Le | Ge => {
+            // `ucomisd a, b` 设 CF/ZF/PF，NaN 时 CF=ZF=1。直接 `setcc` 会把
+            // 任何与 NaN 的比较判成"小于"（CF=1），而 IEEE754 要求全是 false。
+            // 解法是交换操作数后用"反向"的 setcc：
+            //   a <  b  <=>  b >  a （seta：ZF=0 且 CF=0）
+            //   a <= b  <=>  b >= a （setae：CF=0）
+            // 这样 NaN 落在 CF=1 一侧，被两个 setcc 一致地判 false。
+            // 相等 / 不等要额外看 PF：NaN 参与时 `ucomisd` 会把 ZF 和 PF
+            // 一起置 1，光用 `sete` 会把 `NaN == NaN` 判成真（IEEE754 要求
+            // 为假）。所以 Eq 是 `sete && setnp`，Ne 是 `setne || setp`。
+            //
+            // 小于 / 大于方向已经用"交换操作数 + 反向 setcc"绕开了：
+            // `a < b` 编成 `ucomisd b, a; seta`，NaN 时 CF=1 使 seta 为假。
+            let (left, right) = match op {
+                Eq | Ne => (0u8, 1u8),
+                Lt | Le => (1, 0),
+                Gt | Ge => (0, 1),
+                _ => unreachable!(),
+            };
+            emit_ucomis(unit, w, left, right);
+            // al 与 dl 都不参与分配（整数比较路径也用这两个做暂存器），
+            // 此刻没有待发射的实参搬运，所以取它们是安全的。
+            let al = SCRATCH_AX.bits();
+            let dl = SCRATCH_DX.bits();
+            match op {
+                Eq => {
+                    emit_setcc(unit, 0x94, SCRATCH_AX); // sete  al
+                    emit_setcc(unit, 0x9B, SCRATCH_DX); // setnp dl
+                    emit1(unit, 0x20); // and r/m8, r8  ->  and al, dl
+                    emit1(unit, 0xC0 | (dl << 3) | al);
+                }
+                Ne => {
+                    emit_setcc(unit, 0x95, SCRATCH_AX); // setne al
+                    emit_setcc(unit, 0x9A, SCRATCH_DX); // setp  dl
+                    emit1(unit, 0x08); // or r/m8, r8   ->  or al, dl
+                    emit1(unit, 0xC0 | (dl << 3) | al);
+                }
+                Lt | Le | Gt | Ge => {
+                    let cc = match op {
+                        Lt => 0x97u8, // seta（交换后：b > a）
+                        Gt => 0x97,   // seta
+                        Le => 0x93,   // setae（交换后：b >= a）
+                        Ge => 0x93,   // setae
+                        _ => unreachable!(),
+                    };
+                    emit_setcc(unit, cc, SCRATCH_AX);
+                }
+                _ => unreachable!(),
+            }
+            if let Location::Stack(sl) = location_of(result) {
+                emit_store_slot(unit, SCRATCH_AX, sl);
+                return;
+            }
+            let dst = alloc_reg(result);
+            if dst != SCRATCH_AX {
+                emit_movzx(unit, dst, SCRATCH_AX);
+            }
+        }
+        Add | Sub | Mul | Div => {
+            // F2 0F 58 addsd / 5C subsd / 59 mulsd / 5E divsd
+            let opcode = match op {
+                Add => 0x58,
+                Sub => 0x5C,
+                Mul => 0x59,
+                Div => 0x5E,
+                _ => unreachable!(),
+            };
+            emit_sse_arith(unit, w, opcode, 0, 1);
+            if let Some(sl) = float_slot(result) {
+                emit_store_float(unit, 0, sl, w);
+            } else {
+                crate::codegen::unsupported_const("float result");
+            }
+        }
+        // 浮点没有整数的位运算 / 逻辑运算；`Rem` 也先不做。
+        // 宁可报错也不能静默发出 0。
+        Shl | Shr | BitAnd | BitOr | BitXor | And | Or | Rem => {
+            crate::codegen::unsupported_binary_op(op)
+        }
+    }
+}
+
 /// `mov rax, l; cqo; idiv r`（除数在寄存器里），结果写到 `dst`。
 fn emit_divrem_reg(unit: &mut CompilationUnit, dst: Gpr, r: Gpr, want_rem: bool) -> Gpr {
     // 必须用 `cqo`（rax 的符号扩展进 rdx），**不能**用 `xor edx, edx`：
@@ -833,7 +1432,35 @@ fn emit_unary(
     result: SsaValue,
     op: crate::ssa::SsaUnaryOp,
     operand: SsaValue,
+    _operand_width: u8,
 ) {
+    use crate::ssa::SsaUnaryOp::*;
+
+    // 浮点取负：没有 `neg` 指令，翻符号位即可。
+    //
+    // 只有 `Neg` 有浮点语义。`Not` / `BitNot` 在浮点上没有定义——如果它们
+    // 走到这里，说明上游把一个布尔/整数误标成了浮点；翻符号位会静默给出
+    // 一个"能跑"的错值，所以直接报错。
+    if let Some(slot) = float_slot(operand) {
+        if !matches!(op, Neg) {
+            crate::codegen::unsupported_const("非 Neg 的一元浮点运算");
+        }
+        let w = float_width(operand);
+        emit_load_float(unit, 0, slot, w);
+        // 符号位掩码（f32 取低 32 位的 0x8000_0000）经 GPR 搬进 xmm1，再异或
+        let mask = if w == 32 {
+            0x8000_0000u64
+        } else {
+            0x8000_0000_0000_0000u64
+        };
+        emit_float_const(unit, 1, mask, w);
+        emit_xor_sign(unit, w, 0, 1);
+        if let Some(rs) = float_slot(result) {
+            emit_store_float(unit, 0, rs, w);
+        }
+        return;
+    }
+
     let spilled = matches!(location_of(result), Location::Stack(_));
     let dst = if spilled {
         SCRATCH_AX
@@ -848,7 +1475,6 @@ fn emit_unary(
         }
     };
 
-    use crate::ssa::SsaUnaryOp::*;
     match op {
         Not => {
             // test r, r; sete al; movzx dst, al
@@ -1046,16 +1672,29 @@ fn emit_movzx(unit: &mut CompilationUnit, dst: Gpr, src: Gpr) {
 /// 搬运先执行；如果一个都挑不出来（说明存在环），就把某个环上的源
 /// 暂存到 rax（rax 不是实参寄存器），把环打开后继续。
 fn emit_call_args(unit: &mut CompilationUnit, args: &[SsaValue]) {
-    let n = args.len().min(ARG_REGS.len());
+    // SysV：整数实参与浮点实参各自占一套寄存器、各自计数。
+    // `f(g(1, 2.0), 3)` 里 1 在 rdi、2.0 在 xmm0、3 在 rsi。
     let mut moves: Vec<(Gpr, Src)> = Vec::new();
-    for i in 0..n {
-        let src = src_of(args[i]);
-        if !matches!(src, Src::Reg(r) if r == ARG_REGS[i]) {
-            moves.push((ARG_REGS[i], src));
+    let mut gi = 0usize; // 整数形参下标
+    let mut xi = 0usize; // 浮点形参下标
+    for a in args {
+        if let Some(slot) = float_slot(*a) {
+            if xi < 8 {
+                emit_load_float(unit, xi as u8, slot, float_width(*a));
+            }
+            // 超过 8 个浮点实参走栈上传参区，本后端尚未实现。
+            xi += 1;
+        } else {
+            if gi < ARG_REGS.len() {
+                let src = src_of(*a);
+                if !matches!(src, Src::Reg(r) if r == ARG_REGS[gi]) {
+                    moves.push((ARG_REGS[gi], src));
+                }
+                gi += 1;
+            }
+            // 超过 6 个整数实参走栈上传参区，本后端尚未实现。
         }
     }
-    // 超过 6 个的实参走栈上传参区，本后端尚未实现。
-
     emit_parallel_moves(unit, &moves);
 }
 
@@ -1125,22 +1764,37 @@ fn src_of(v: SsaValue) -> Src {
 /// 之前完全没有这一步，形参直接从"分配器选的寄存器"读，而调用方是按
 /// SysV 约定（rdi/rsi/rdx/...）放的实参，两者对不上就会读到垃圾。
 fn emit_param_moves(unit: &mut CompilationUnit, func: &SsaFunction) {
-    let n = func.params.len().min(ARG_REGS.len());
-    // 溢出形参没有固定寄存器：从 ABI 寄存器直接落进栈槽。这些 store
-    // 只写内存、不碰寄存器，所以可以先于寄存器搬运做。
-    for i in 0..n {
-        if let Location::Stack(slot) = location_of(func.params[i]) {
-            emit_store_slot(unit, ARG_REGS[i], slot);
+    // 浮点形参走 xmm0..、整数形参走 rdi..，两类各自计数（SysV ABI）。
+    let mut gi = 0usize;
+    let mut xi = 0usize;
+    let mut moves: Vec<(Gpr, Src)> = Vec::new();
+    for p in &func.params {
+        if let Some(sl) = float_slot(*p) {
+            if xi < 8 {
+                emit_store_float(unit, xi as u8, sl, float_width(*p));
+            }
+            xi += 1;
+            continue;
         }
+        if gi >= ARG_REGS.len() {
+            // 超过 6 个整数形参走栈上传参区，本后端尚未实现。
+            continue;
+        }
+        match location_of(*p) {
+            // 溢出形参没有固定寄存器：从 ABI 寄存器直接落进栈槽。这些
+            // store 只写内存、不碰寄存器，可以先于寄存器搬运做。
+            Location::Stack(slot) => emit_store_slot(unit, ARG_REGS[gi], slot),
+            Location::Reg(d) if ALLOCATABLE[d] != ARG_REGS[gi] => {
+                moves.push((ALLOCATABLE[d], Src::Reg(ARG_REGS[gi])));
+            }
+            Location::Reg(_) => {}
+        }
+        gi += 1;
     }
-    let moves: Vec<(Gpr, Src)> = (0..n)
-        .filter_map(|i| match location_of(func.params[i]) {
-            Location::Reg(d) => Some((ALLOCATABLE[d], Src::Reg(ARG_REGS[i]))),
-            Location::Stack(_) => None,
-        })
-        .collect();
+    // 寄存器搬运必须并行：落点可能覆盖后面还要读的 ABI 源寄存器（例如第
+    // 5、6 个形参在 r8/r9，而中间某步的落点正好也是 r8/r9）。顺序搬运会
+    // 踩掉尚未读取的源。
     emit_parallel_moves(unit, &moves);
-    // 超过 6 个的形参走栈上传参区，本后端尚未实现。
 }
 
 /// `call rel32`：0xE8 + imm32（需重定位）。
@@ -1332,6 +1986,26 @@ mod tests {
         assert_eq!(reloc.instr_start, 0);
         assert_eq!(reloc.instr_len, 5);
         assert_eq!(reloc.kind, RelocationKind::PcRel32);
+    }
+
+    #[test]
+    fn string_address_uses_rip_relative_lea() {
+        // clang: `lea rsi, [rip+sym]` = 48 8d 35 <disp32>
+        let mut u = unit();
+        emit_str_addr(&mut u, Gpr::Rsi, ".Lstr0");
+        assert_eq!(u.code, vec![0x48, 0x8d, 0x35, 0, 0, 0, 0]);
+        let reloc = &u.relocations[0];
+        assert_eq!(reloc.kind, RelocationKind::RipRel32);
+        assert_eq!(reloc.offset, 3, "disp32 紧随 REX+opcode+modrm");
+        assert_eq!(reloc.instr_start, 0);
+        assert_eq!(reloc.instr_len, 7);
+        assert_eq!(reloc.addend, -4, "R_X86_64_PC32 加载符号地址用 -4");
+
+        // 扩展寄存器：目的在 modrm 的 reg 字段，需 REX.R（0x04）而非 REX.B。
+        // 用错会让 r12 被解码成 rsp。
+        let mut u = unit();
+        emit_str_addr(&mut u, Gpr::R12, ".Lstr1");
+        assert_eq!(u.code, vec![0x4c, 0x8d, 0x25, 0, 0, 0, 0]);
     }
 
     #[test]

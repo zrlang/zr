@@ -167,6 +167,8 @@ fn instrument_function(func: &MirFunction) -> MirFunction {
                 MirValue::Var(counter_name),
                 crate::mir::MirBinaryOp::Add,
                 MirValue::Int(1),
+                // 计数器是整数
+                crate::mir::NumTy::Int(64),
             ),
         );
 

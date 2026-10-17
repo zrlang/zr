@@ -70,11 +70,14 @@ pub enum SsaInstr {
     },
     /// 函数调用：`result = callee(args...)`。
     ///
-    /// 各后端按目标 ABI 负责把实参搬进调用约定寄存器。
+    /// 各后端按目标 ABI 负责把实参搬进调用约定寄存器。`ty` 是返回值类型：
+    /// 后端要靠它区分 `rax`（整数）与 `xmm0`（浮点），以及给返回值分配
+    /// 浮点栈槽。IR 的浮点常量不带位宽，所以这个类型没法事后反推。
     Call {
         result: SsaValue,
         callee: String,
         args: Vec<SsaValue>,
+        ty: mir::NumTy,
     },
     /// φ 函数：`result = φ(p0: v0, p1: v1, ...)`。
     ///
@@ -139,8 +142,11 @@ pub enum SsaConst {
     Int(i128),
     /// 布尔常量。
     Bool(bool),
-    /// 浮点常量（按位存储）。
-    Float(u64),
+    /// 浮点常量（按位存储 + 位宽）。
+    ///
+    /// 位宽（32 / 64）随值携带，后端据此选 `ss` 还是 `sd` 指令；常量自己没有
+    /// 类型标注，丢了位宽就只有按 f64 编码这一种可能——f32 会读到错的位。
+    Float(u64, u8),
     /// 单元值。
     Unit,
     /// 字符串字面量。
@@ -481,7 +487,7 @@ fn convert_function(func: &mir::MirFunction) -> SsaFunction {
                     stacks.entry(name.clone()).or_default().push(res);
                     pushed.push(name.clone());
                 }
-                mir::MirInstr::Unary(name, op, x, _) => {
+                mir::MirInstr::Unary(name, op, x) => {
                     let o = materialize(x, &mut instrs, &mut stacks, &next_value);
                     let res = alloc();
                     instrs.push(SsaInstr::Unary {
@@ -492,7 +498,7 @@ fn convert_function(func: &mir::MirFunction) -> SsaFunction {
                     stacks.entry(name.clone()).or_default().push(res);
                     pushed.push(name.clone());
                 }
-                mir::MirInstr::Call(name, callee, args) => {
+                mir::MirInstr::Call(name, callee, args, ty) => {
                     let mut ssa_args = Vec::with_capacity(args.len());
                     for a in args {
                         ssa_args.push(materialize(a, &mut instrs, &mut stacks, &next_value));
@@ -502,6 +508,7 @@ fn convert_function(func: &mir::MirFunction) -> SsaFunction {
                         result: res,
                         callee: callee.clone(),
                         args: ssa_args,
+                        ty: *ty,
                     });
                     stacks.entry(name.clone()).or_default().push(res);
                     pushed.push(name.clone());
@@ -949,8 +956,8 @@ fn used_before_def(block: &mir::MirBasicBlock) -> Vec<String> {
                 v.extend(mir_value_names(b));
                 v
             }
-            mir::MirInstr::Unary(_, _, a, _) => mir_value_names(a),
-            mir::MirInstr::Call(_, _, args) => args.iter().flat_map(mir_value_names).collect(),
+            mir::MirInstr::Unary(_, _, a) => mir_value_names(a),
+            mir::MirInstr::Call(_, _, args, _) => args.iter().flat_map(mir_value_names).collect(),
             mir::MirInstr::Await(_, v) => mir_value_names(v),
             mir::MirInstr::Cast(_, v, ..) => mir_value_names(v),
         };
@@ -1103,7 +1110,7 @@ fn materialize(
             let value = match val {
                 MirValue::Int(i) => SsaConst::Int(*i),
                 MirValue::Bool(b) => SsaConst::Bool(*b),
-                MirValue::Float(bits) => SsaConst::Float(*bits),
+                MirValue::Float(bits, w) => SsaConst::Float(*bits, *w),
                 MirValue::Str(text) => SsaConst::Str(text.clone()),
                 MirValue::Unit => SsaConst::Unit,
                 MirValue::Var(_) => unreachable!("上面已经处理了变量"),

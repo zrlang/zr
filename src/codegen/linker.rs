@@ -350,7 +350,9 @@ pub fn emit_elf(target: &Target, unit: &CompilationUnit, path: &std::path::Path)
     // 重定位作用于 code 段，且必须基于虚拟地址计算 PC 相对偏移。
     let mut unit = unit.clone();
     let text_base = align_up(target.image_base(), PAGE_ALIGN);
-    crate::codegen::objfile::apply_relocations(&mut unit, text_base);
+    // `.rodata` 紧跟在 `.text` 之后，按页对齐——与 `assemble_elf` 的布局一致。
+    let rodata_base = align_up(text_base + unit.code.len() as u64, PAGE_ALIGN);
+    crate::codegen::objfile::apply_relocations(&mut unit, text_base, rodata_base);
     let bytes = assemble_elf(target, &unit)?;
     std::fs::write(path, &bytes)
 }
@@ -522,6 +524,7 @@ fn symbol_to_elf(sym: &Symbol, name_offset: u32, is_64: bool, thumb: bool) -> Ve
     let bind = if sym.global { 1u8 } else { 0u8 }; // STB_GLOBAL or STB_LOCAL
     let ty = match sym.kind {
         SymbolKind::Function => 2u8, // STT_FUNC
+        SymbolKind::Object => 1u8,   // STT_OBJECT
         SymbolKind::Section => 3u8,  // STT_SECTION
     };
     let info = (bind << 4) | ty;
@@ -530,7 +533,8 @@ fn symbol_to_elf(sym: &Symbol, name_offset: u32, is_64: bool, thumb: bool) -> Ve
     // st_shndx
     // SHN_TEXT = 1（节表索引 0 保留给 SHT_NULL）。
     let shndx = match sym.section {
-        SymbolSection::Text => 1u16,
+        SymbolSection::Text => 1u16,   // 节表索引 1 = .text
+        SymbolSection::Rodata => 2u16, // 节表索引 2 = .rodata
         SymbolSection::Undefined => 0,
     };
     // st_value。Thumb 的函数符号要带 bit 0：那是"这个地址是 Thumb 状态"
@@ -653,6 +657,26 @@ mod tests {
             kind: SymbolKind::Function,
         });
         unit
+    }
+
+    #[test]
+    fn rodata_symbol_points_at_rodata_section() {
+        let sym = Symbol {
+            name: ".Lstr0".to_string(),
+            section: SymbolSection::Rodata,
+            offset: 0,
+            size: 6,
+            global: false,
+            kind: SymbolKind::Object,
+        };
+        let b = symbol_to_elf(&sym, 0, true, false);
+        // Elf64_Sym 布局：st_name[0..4] st_info[4] st_other[5] st_shndx[6..8] …
+        assert_eq!(b[4], 1, "st_info 的类型应为 STT_OBJECT");
+        assert_eq!(
+            u16::from_le_bytes(b[6..8].try_into().unwrap()),
+            2,
+            "st_shndx = .rodata"
+        );
     }
 
     #[test]

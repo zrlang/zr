@@ -277,6 +277,11 @@ cargo test                 # 全部：单元测试 + tests/cases 下的语言用
 | `16_comptime_fn` | `comptime fn`、递归、编译期循环、`const` 右值内联 |
 | `17_loop_break` | 循环出口的 φ（`break` / `continue` / 嵌套循环） |
 | `18_spill_ops` | 溢出值参与每一种运算（含 `idiv` 内存操作数） |
+| `19_float` | f64 算术、比较、取负、int<->f64 转换、浮点函数调用、循环累加、NaN 语义 |
+| `20_f32` | f32 算术、比较、取负、int<->f32、f32<->f64、无注解 `let`、字面量位宽推断、NaN 语义 |
+| `21_literal_suffixes` | 字面量类型后缀（`42u64` / `3.14f32` / `usize` …）影响推断，f32 舍入 |
+| `22_call_preserve` | 跨调用存活的值必须被保住（callee-save / 形参并行搬运） |
+| `23_strings` | 字符串字面量落 `.rodata`、去重、按地址比较、`str` 作实参跨调用 |
 
 ---
 
@@ -311,6 +316,10 @@ static mut GLOBAL: i32 = 0;
 | 字符 | `char` | 4 字节（Unicode 标量） |
 | 指针 | `*const T`, `*mut T` | ptr 字节 |
 | 引用 | `&T`, `&mut T` | ptr 字节 |
+
+数字字面量可带类型后缀直接确定类型：`42u64`、`255u8`、`7usize`、`3.14f32`、
+`2.0f64`。后缀须与字面量相符（整数后缀不能用在浮点字面量上，反之亦然）。
+无后缀时按上下文推断，默认 `i32` / `f64`。
 
 ### 控制流
 
@@ -990,6 +999,20 @@ zr 编译器采用经典的多阶段架构：
 - [x] 寄存器分配：CFG 活跃性分析 + 线性扫描 + 栈溢出
   - [x] 回边活跃区间延长；跨调用存活的值限定 callee-save
   - [x] 溢出路径覆盖除法 / 取模 / 移位 / 比较的每一个操作数位置
+- [x] x86-64 f64 指令选择（SSE2）
+  - [x] 浮点常量、算术（`addsd`/`subsd`/`mulsd`/`divsd`）、取负（`xorpd` 翻符号位）
+  - [x] 浮点比较（`ucomisd` + 交换操作数 + `setnp`，NaN 语义符合 IEEE754）
+  - [x] `cvtsi2sd` / `cvttsd2si` 的 int<->f64 转换
+  - [x] 浮点走专用栈槽 + XMM 暂存，不占用整数寄存器分配器
+  - [x] 浮点实参/返回值按 SysV ABI 走 `xmm0`-`xmm7`（与整数实参分别计数）
+- [x] x86-64 f32 指令选择（SSE2）
+  - [x] 浮点常量携带位宽（`Float(bits, width)`），按 32/64 位分别编码
+  - [x] `movss`/`addss`/`subss`/`mulss`/`divss`、`xorps` 取负、`ucomiss` 比较（NaN 语义同 f64）
+  - [x] `cvtsi2ss` / `cvttss2si` / `cvtss2sd` / `cvtsd2ss` 转换
+  - [x] 类型推断修正：函数名类型、无注解 `let` 的推断变量解析、一元取负与二元字面量的位宽跟随
+- [x] 字面量类型后缀贯通（`42u64` / `3.14f32` / `7usize` …）
+  - [x] 词法器把后缀随 `IntLiteral` / `FloatLiteral` token 传递，并在词法层拒绝后缀与字面量不符的组合
+  - [x] 类型推断据后缀定型；无后缀时沿用上下文推断
 - [x] 优化 pass 完整化
   - [x] 常量折叠（整数 + 浮点 + 类型转换）
   - [x] SCCP 稀疏条件常量传播（含恒定分支折叠）
@@ -997,11 +1020,31 @@ zr 编译器采用经典的多阶段架构：
   - [x] 块内 CSE 与全局值编号（覆盖 `Cast` / `Copy`）
   - [x] 窥孔优化、循环不变量外提、单块函数内联
 - [x] 编译确定性：块号与 φ 编号不再依赖 `HashMap` 遍历顺序
+- [x] 浮点类型贯通：`Binary` / `Call` 携带结果类型，后端据此选 GPR 还是 XMM 指令
 
-### v0.7.0（计划中） 🚧
-- [ ] 浮点指令选择（需先让 IR 携带类型信息）
-- [ ] 字符串字面量落到 `.rodata`（需重定位支持）
-- [ ] AArch64 / ARM32 / RISC-V 后端的栈溢出（目前仅 x86-64 实现了）
+### v0.7.0（进行中） 🚧
+- [x] x86-64 f32 支持（常量携带位宽，走 `ss` 指令；见 v0.6.0）
+- [x] AArch64 f32/f64 指令选择
+  - [x] 浮点常量、算术（`fadd`/`fsub`/`fmul`/`fdiv`）、取负（`fneg`）
+  - [x] 浮点比较（`fcmp` + `cset`，条件码 `mi`/`ls`/`gt`/`ge`/`eq`/`ne`，NaN 语义同 x86-64）
+  - [x] `scvtf`/`ucvtf`/`fcvtzs`/`fcvtzu`/`fcvt` 的 int<->f32/f64、f32<->f64 转换
+  - [x] 浮点走专用栈槽 + `d0`/`d1` 暂存，不占用整数寄存器分配器
+  - [x] 浮点实参/返回值按 AAPCS64 走 `v0`-`v7`（与整数实参分别计数）
+  - [x] 顺带修掉若干 AArch64 编码/分配 bug：`b.cond` 偏移量、零判定（`cmp x,x`）、
+        `fneg` 基址、移位基址、`as` 转换（SBFM/UBFM）、取模改线性扫描分配
+  - [x] AArch64 callee-save 寄存器（`x19`-`x28`）：跨调用存活的值不再被被调方覆盖
+  - [x] 修复 x86-64 `emit_param_moves`：形参搬运改回并行拷贝（顺序搬运会踩掉尚未读取的源）
+- [ ] ARM32 / RISC-V / wasm 后端的浮点指令选择（这些目标对浮点程序**报错**
+      而非静默按整数编码）
+- [x] 字符串字面量落到 `.rodata`（去重、NUL 结尾，取址即取指针）
+  - [x] 取址：x86-64 `lea reg,[rip+disp]`（`R_X86_64_PC32` / `X86_64_RELOC_SIGNED` /
+        `IMAGE_REL_AMD64_REL32`）、AArch64 `adrp`+`add :lo12:`
+        （`R_AARCH64_ADR_PREL_PG_HI21`+`ADD_ABS_LO12_NC` / `ARM64_RELOC_PAGE21`+`PAGEOFFSET12`）
+  - [x] `.rodata` 段归属：ELF 段索引 2、Mach-O `n_sect=2`、COFF 节号 2
+  - [x] 字面量按内容去重，`==`/`!=` 比较指针（同内容共享同一地址），`str` 可作实参跨调用
+  - [ ] 解引用 / 输出字符串（需 std 或 extern 运行时接通）
+- [ ] ARM32 / RISC-V 后端的栈溢出（AArch64 已改用线性扫描分配，但同样未实现溢出；
+      目前仅 x86-64 实现了）
 - [ ] 更多架构（wasm64 / Thumb-2）与平台（FreeBSD / Android / iOS）
 - [ ] 32 位目标的多字长（i64）算术
 - [ ] `comptime` 的 `match` / 结构体字面量（HIR 目前丢弃这些节点的数据）

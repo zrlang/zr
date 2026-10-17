@@ -66,6 +66,12 @@ pub struct CompilationUnit {
     pub link_directives: Vec<crate::attributes::LinkDirective>,
     /// 结构体 repr 布局信息（`#[repr(C)]` / `#[repr(packed)]` 等）。
     pub struct_reprs: Vec<(String, crate::typeck::hir::Repr)>,
+    /// 字符串字面量去重表：文本 → `.rodata` 中的局部符号名。
+    ///
+    /// 相同文本只存一份字节，符号名形如 `.Lstr0`。用 `CompilationUnit`
+    /// 上的字段（而不是全局计数）保证同一份产物里的编号确定，且跨编译
+    /// 互不影响。
+    pub string_pool: std::collections::HashMap<String, String>,
 }
 
 /// 输出文件类型。
@@ -122,7 +128,21 @@ impl Relocation {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RelocationKind {
     /// x86-64：PC 相对 32 位（ELF `R_X86_64_PLT32` / COFF `REL32`）。
+    ///
+    /// 用于 `call`/`jmp`/`jcc`：位移基准是**下一条指令**，因此自构造
+    /// 可执行文件时按 `instr_start + instr_len` 回填，目标文件则由链接器
+    /// 依 `S + A - P` 处理。
     PcRel32,
+    /// x86-64：`lea reg, [rip+disp32]` 的 32 位位移（ELF `R_X86_64_PC32`）。
+    ///
+    /// 与 `PcRel32` 分开：它加载的是**符号地址**（字符串字面量、将来的
+    /// 静态数据），链接器要的是 `PC32` 而不是 `PLT32`，附加数是 `-4`。
+    RipRel32,
+    /// AArch64：`adrp` 的 21 位页差（ELF `R_AARCH64_ADR_PREL_PG_HI21`）。
+    AdrPrelPage21,
+    /// AArch64：`add Xd, Xn, #imm12` 的 12 位页内偏移
+    /// （ELF `R_AARCH64_ADD_ABS_LO12_NC`）。
+    AddAbsLo12,
     /// AArch64：`b` 的 26 位字面量（ELF `R_AARCH64_JUMP26`）。
     Branch26,
     /// AArch64：`bl` 的 26 位字面量（ELF `R_AARCH64_CALL26`）。
@@ -158,14 +178,22 @@ pub struct Symbol {
 /// 符号所在段。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SymbolSection {
+    /// `.text`：代码。
     Text,
+    /// `.rodata`：只读数据（字符串字面量等）。
+    Rodata,
+    /// 未定义：外部符号，交由平台链接器解析。
     Undefined,
 }
 
 /// 符号类型。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SymbolKind {
+    /// 函数（ELF `STT_FUNC`）。
     Function,
+    /// 数据对象（ELF `STT_OBJECT`），例如 `.rodata` 里的字符串字面量。
+    Object,
+    /// 段符号（ELF `STT_SECTION`），用于基本块标签等。
     Section,
 }
 
@@ -177,6 +205,53 @@ impl CompilationUnit {
             kind: OutputKind::Executable,
             ..Default::default()
         }
+    }
+
+    /// 把字符串字面量的字节放进 `.rodata`，返回其符号名。
+    ///
+    /// 字节后跟一个 NUL 终止符（C 字符串约定）；相同文本只存一份，因此
+    /// 重复字面量不会把 `.rodata` 撑大。
+    pub fn intern_string(&mut self, text: &str) -> String {
+        if let Some(name) = self.string_pool.get(text) {
+            return name.clone();
+        }
+        let name = format!(".Lstr{}", self.string_pool.len());
+        let offset = self.rodata.len();
+        self.rodata.extend_from_slice(text.as_bytes());
+        self.rodata.push(0);
+        self.symbols.push(Symbol {
+            name: name.clone(),
+            section: SymbolSection::Rodata,
+            offset,
+            size: text.len() + 1,
+            global: false,
+            kind: SymbolKind::Object,
+        });
+        self.string_pool.insert(text.to_string(), name.clone());
+        name
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn intern_string_deduplicates_and_nul_terminates() {
+        let mut u = CompilationUnit::new();
+        let a = u.intern_string("hello");
+        let b = u.intern_string("world");
+        let c = u.intern_string("hello");
+        assert_eq!(a, ".Lstr0");
+        assert_eq!(b, ".Lstr1");
+        assert_eq!(c, a, "相同文本应共享同一个符号");
+        assert_eq!(u.rodata, b"hello\0world\0");
+
+        let s0 = u.symbols.iter().find(|s| s.name == ".Lstr0").unwrap();
+        assert_eq!(s0.section, SymbolSection::Rodata);
+        assert_eq!((s0.offset, s0.size), (0, 6));
+        let s1 = u.symbols.iter().find(|s| s.name == ".Lstr1").unwrap();
+        assert_eq!((s1.offset, s1.size), (6, 6));
     }
 }
 
@@ -582,10 +657,11 @@ pub fn unsupported_const(kind: &str) -> ! {
     std::process::exit(1);
 }
 
-/// 遇到后端还没实现的数值转换时报错并退出。
-///
-/// 早先这些情况会静默发出 `0`——生成的程序能跑，但结果是错的，
-/// 比编译失败难查得多。
+/// 这个目标后端没有实现该运算码。报错并终止。
+pub fn unsupported_binary_op(op: crate::ssa::SsaBinaryOp) -> ! {
+    panic!("zr: 该目标后端尚未实现二元运算 `{op:?}`（浮点/位运算等）")
+}
+
 pub fn unsupported_cast(from: crate::mir::NumTy, to: crate::mir::NumTy) -> ! {
     eprintln!(
         "zr: error: conversion {} -> {} is not implemented for this target",

@@ -606,7 +606,7 @@ fn emit_instr(unit: &mut CompilationUnit, instr: &SsaInstr) {
             SsaConst::Int(i) => emit_mov_imm32(unit, alloc_reg(*result), *i as u32),
             SsaConst::Bool(b) => emit_mov_imm32(unit, alloc_reg(*result), u32::from(*b)),
             SsaConst::Unit => emit_mov_imm32(unit, alloc_reg(*result), 0),
-            SsaConst::Float(_) => crate::codegen::unsupported_const("float"),
+            SsaConst::Float(..) => crate::codegen::unsupported_const("float"),
             SsaConst::Str(_) => crate::codegen::unsupported_const("string"),
         },
         SsaInstr::Unary {
@@ -625,6 +625,7 @@ fn emit_instr(unit: &mut CompilationUnit, instr: &SsaInstr) {
             result,
             callee,
             args,
+            ..
         } => {
             emit_call_args(unit, args);
             emit_bl(unit, callee);
@@ -809,7 +810,7 @@ mod tests {
                         op: SsaBinaryOp::Gt,
                         lhs: SsaValue(1),
                         rhs: SsaValue(2),
-                        ..
+                        ty: crate::mir::NumTy::Int(64),
                     }],
                     term: SsaTerminator::Branch {
                         cond: SsaValue(9),
@@ -833,7 +834,7 @@ mod tests {
         };
         let mut unit = empty_unit();
         emit_function(&Target::parse("arm-none-eabi").unwrap(), &mut unit, &func);
-        crate::codegen::objfile::apply_relocations(&mut unit, 0);
+        crate::codegen::objfile::apply_relocations(&mut unit, 0, 0);
 
         let word_at = |off: usize| u32::from_le_bytes(unit.code[off..off + 4].try_into().unwrap());
         let block_off = |n: usize| {

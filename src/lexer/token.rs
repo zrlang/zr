@@ -26,10 +26,11 @@ pub enum TokenKind {
     BlockComment(String),
 
     // ===== 字面量 =====
-    /// 整数字面量，含 `0x`/`0b`/`0o` 前缀，值已归一化为 i128。
-    IntLiteral(i128),
-    /// 浮点字面量（f32/f64）。
-    FloatLiteral(f64),
+    /// 整数字面量，含 `0x`/`0b`/`0o` 前缀，值已归一化为 i128；第二项是
+    /// 可选的类型后缀（`i8`/`u64`/…）。
+    IntLiteral(i128, Option<String>),
+    /// 浮点字面量（f32/f64）；第二项是可选的类型后缀。
+    FloatLiteral(f64, Option<String>),
     /// 字符串字面量（UTF-8，转义已处理）。
     StringLiteral(String),
     /// 字符字面量。

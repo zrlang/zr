@@ -478,7 +478,7 @@ impl WasmFunction {
                             // 浮点与字符串暂未在 wasm 后端实现
                             SsaConst::Bool(b) => body.push(WasmInstr::I64Const(i64::from(*b))),
                             SsaConst::Unit => body.push(WasmInstr::I64Const(0)),
-                            SsaConst::Float(_) => crate::codegen::unsupported_const("float"),
+                            SsaConst::Float(..) => crate::codegen::unsupported_const("float"),
                             SsaConst::Str(_) => crate::codegen::unsupported_const("string"),
                         }
                         body.push(WasmInstr::LocalSet(idx));
@@ -522,6 +522,7 @@ impl WasmFunction {
                         result,
                         callee,
                         args,
+                        ..
                     } => {
                         for a in args {
                             emit_value_ref(*a, &local_map, &mut body);

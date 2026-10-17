@@ -467,7 +467,7 @@ fn emit_instr(unit: &mut CompilationUnit, instr: &SsaInstr) {
             SsaConst::Int(i) => mov_imm32(unit, alloc_reg(*result), *i as u32),
             SsaConst::Bool(b) => mov_imm8(unit, alloc_reg(*result), u8::from(*b)),
             SsaConst::Unit => mov_imm8(unit, alloc_reg(*result), 0),
-            SsaConst::Float(_) => crate::codegen::unsupported_const("float"),
+            SsaConst::Float(..) => crate::codegen::unsupported_const("float"),
             SsaConst::Str(_) => crate::codegen::unsupported_const("string"),
         },
         SsaInstr::Unary {
@@ -492,6 +492,7 @@ fn emit_instr(unit: &mut CompilationUnit, instr: &SsaInstr) {
             result,
             callee,
             args,
+            ..
         } => {
             emit_call_args(unit, args);
             emit_bl(unit, callee);

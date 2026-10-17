@@ -427,13 +427,61 @@ impl<'a> Lexer<'a> {
             }
         }
 
+        // 注意：必须先把数值文本取出来（此时 pos 停在数字末尾），再读取后缀，
+        // 否则后缀会被并进数值文本。
         let text: String = self.src[num_start..self.pos].iter().collect();
         // 去掉下划线以便解析
         let clean: String = text.chars().filter(|c| *c != '_').collect();
 
+        // 类型后缀（如 `42u64`、`3.14f32`）。后缀随 token 一路传到解析器，
+        // 最终落到 AST 的 `Literal::{Int,Float}` 上，影响类型推断。
+        let mut suffix: Option<String> = None;
+        if self.pos < self.src.len() && self.src[self.pos].is_alphabetic() {
+            let suffix_start = self.pos;
+            while self.pos < self.src.len()
+                && (self.src[self.pos].is_alphanumeric() || self.src[self.pos] == '_')
+            {
+                self.advance();
+            }
+            let s: String = self.src[suffix_start..self.pos].iter().collect();
+            // 合法后缀集合
+            let valid = matches!(
+                s.as_str(),
+                "i8" | "i16"
+                    | "i32"
+                    | "i64"
+                    | "i128"
+                    | "u8"
+                    | "u16"
+                    | "u32"
+                    | "u64"
+                    | "u128"
+                    | "f32"
+                    | "f64"
+                    | "usize"
+                    | "isize"
+            );
+            if !valid {
+                return Token::new(
+                    TokenKind::LexError(format!("invalid literal suffix '{s}'")),
+                    Span::new(suffix_start, self.pos, line, col),
+                );
+            }
+            // 浮点字面量只接受浮点后缀，整数反之，避免 `1.5i32` / `1f32`。
+            let suffix_is_float = matches!(s.as_str(), "f32" | "f64");
+            if suffix_is_float != is_float {
+                let what = if is_float { "float" } else { "integer" };
+                return Token::new(
+                    TokenKind::LexError(format!("suffix '{s}' is not valid on a {what} literal")),
+                    Span::new(suffix_start, self.pos, line, col),
+                );
+            }
+            suffix = Some(s);
+        }
+
         let kind = if is_float {
             match clean.parse::<f64>() {
-                Ok(v) => TokenKind::FloatLiteral(v),
+                Ok(v) => TokenKind::FloatLiteral(v, suffix),
                 Err(_) => {
                     return Token::new(
                         TokenKind::LexError(format!("invalid float literal '{text}'")),
@@ -456,7 +504,7 @@ impl<'a> Lexer<'a> {
                 _ => clean.parse::<i128>(),
             };
             match value {
-                Ok(v) => TokenKind::IntLiteral(v),
+                Ok(v) => TokenKind::IntLiteral(v, suffix),
                 Err(_) => {
                     return Token::new(
                         TokenKind::LexError(format!("invalid integer literal '{text}'")),
@@ -465,41 +513,6 @@ impl<'a> Lexer<'a> {
                 }
             }
         };
-
-        // 类型后缀（如 `42u64`、`3.14f32`）
-        if self.pos < self.src.len() && self.src[self.pos].is_alphabetic() {
-            // 后缀目前仅做校验，不影响 kind
-            let suffix_start = self.pos;
-            while self.pos < self.src.len()
-                && (self.src[self.pos].is_alphanumeric() || self.src[self.pos] == '_')
-            {
-                self.advance();
-            }
-            let suffix: String = self.src[suffix_start..self.pos].iter().collect();
-            // 合法后缀集合
-            let valid = matches!(
-                suffix.as_str(),
-                "i8" | "i16"
-                    | "i32"
-                    | "i64"
-                    | "i128"
-                    | "u8"
-                    | "u16"
-                    | "u32"
-                    | "u64"
-                    | "u128"
-                    | "f32"
-                    | "f64"
-                    | "usize"
-                    | "isize"
-            );
-            if !valid {
-                return Token::new(
-                    TokenKind::LexError(format!("invalid literal suffix '{suffix}'")),
-                    Span::new(suffix_start, self.pos, line, col),
-                );
-            }
-        }
 
         Token::new(kind, Span::new(num_start, self.pos, line, col))
     }
@@ -858,19 +871,39 @@ mod tests {
     #[test]
     fn integers() {
         let t = Lexer::new("0 42 0xFF 0b1010 0o777 1_000").tokenize();
-        assert_eq!(t[0].kind, TokenKind::IntLiteral(0));
-        assert_eq!(t[1].kind, TokenKind::IntLiteral(42));
-        assert_eq!(t[2].kind, TokenKind::IntLiteral(255));
-        assert_eq!(t[3].kind, TokenKind::IntLiteral(10));
-        assert_eq!(t[4].kind, TokenKind::IntLiteral(511));
-        assert_eq!(t[5].kind, TokenKind::IntLiteral(1000));
+        assert_eq!(t[0].kind, TokenKind::IntLiteral(0, None));
+        assert_eq!(t[1].kind, TokenKind::IntLiteral(42, None));
+        assert_eq!(t[2].kind, TokenKind::IntLiteral(255, None));
+        assert_eq!(t[3].kind, TokenKind::IntLiteral(10, None));
+        assert_eq!(t[4].kind, TokenKind::IntLiteral(511, None));
+        assert_eq!(t[5].kind, TokenKind::IntLiteral(1000, None));
     }
 
     #[test]
     fn floats() {
-        let t = Lexer::new("3.14 2.0e10").tokenize();
-        assert_eq!(t[0].kind, TokenKind::FloatLiteral(3.14));
-        assert!(matches!(t[1].kind, TokenKind::FloatLiteral(_)));
+        let t = Lexer::new("2.5 2.0e10").tokenize();
+        assert_eq!(t[0].kind, TokenKind::FloatLiteral(2.5, None));
+        assert!(matches!(t[1].kind, TokenKind::FloatLiteral(_, None)));
+    }
+
+    #[test]
+    fn literal_suffixes() {
+        let t = Lexer::new("42u64 2.5f32 7i8 255u8 1.0f64").tokenize();
+        assert_eq!(t[0].kind, TokenKind::IntLiteral(42, Some("u64".into())));
+        assert_eq!(t[1].kind, TokenKind::FloatLiteral(2.5, Some("f32".into())));
+        assert_eq!(t[2].kind, TokenKind::IntLiteral(7, Some("i8".into())));
+        assert_eq!(t[3].kind, TokenKind::IntLiteral(255, Some("u8".into())));
+        assert_eq!(t[4].kind, TokenKind::FloatLiteral(1.0, Some("f64".into())));
+    }
+
+    #[test]
+    fn literal_suffix_mismatch_is_error() {
+        // 浮点本体 + 整数后缀
+        let t = Lexer::new("1.5i32").tokenize();
+        assert!(matches!(t[0].kind, TokenKind::LexError(_)));
+        // 整数本体 + 浮点后缀
+        let t = Lexer::new("1f32").tokenize();
+        assert!(matches!(t[0].kind, TokenKind::LexError(_)));
     }
 
     #[test]
@@ -906,7 +939,7 @@ mod tests {
         let ints: Vec<_> = t
             .iter()
             .filter_map(|tok| {
-                if let TokenKind::IntLiteral(v) = tok.kind {
+                if let TokenKind::IntLiteral(v, _) = tok.kind {
                     Some(v)
                 } else {
                     None

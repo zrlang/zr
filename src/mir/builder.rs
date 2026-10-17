@@ -92,7 +92,7 @@ fn lower_stmt(b: &mut Builder, stmt: &HirStmt) {
 fn lower_expr(b: &mut Builder, expr: &HirExpr) -> MirValue {
     use hir::ExprKind::*;
     match &expr.kind {
-        Literal(lit) => mir_literal(lit),
+        Literal(lit) => mir_literal(lit, &expr.ty),
         Local(id) => MirValue::Var(format!("v{}", id.0)),
         // 全局 `const` 引用：直接把常量的值内联进来。
         //
@@ -106,8 +106,8 @@ fn lower_expr(b: &mut Builder, expr: &HirExpr) -> MirValue {
             None => MirValue::Unit,
         },
         Binary(op, lhs, rhs) => {
-            // 结果类型先记下来：HIR 上每个表达式都带类型，是唯一可靠的来源。
-            let ty = num_ty_of(&expr.ty);
+            // 结果类型：优先用表达式自身的类型，推断没解出来时退回看操作数。
+            let ty = binary_result_ty(*op, &expr.ty, &lhs.ty, &rhs.ty);
             let l = lower_expr(b, lhs);
             let r = lower_expr(b, rhs);
             let name = format!("t{}", b.temp_id());
@@ -121,15 +121,11 @@ fn lower_expr(b: &mut Builder, expr: &HirExpr) -> MirValue {
             MirValue::Var(name)
         }
         Unary(op, operand) => {
-            let ty = num_ty_of(&expr.ty);
             let o = lower_expr(b, operand);
             let name = format!("t{}", b.temp_id());
-            b.current_block_mut().instrs.push(MirInstr::Unary(
-                name.clone(),
-                convert_unary(*op),
-                o,
-                ty,
-            ));
+            b.current_block_mut()
+                .instrs
+                .push(MirInstr::Unary(name.clone(), convert_unary(*op), o));
             MirValue::Var(name)
         }
         Assign(lhs, rhs) => {
@@ -275,9 +271,11 @@ fn lower_expr(b: &mut Builder, expr: &HirExpr) -> MirValue {
             for a in args {
                 mir_args.push(lower_expr(b, a));
             }
+            // 调用表达式的类型就是被调函数的返回类型
+            let ty = num_ty_of(&expr.ty);
             b.current_block_mut()
                 .instrs
-                .push(MirInstr::Call(name.clone(), fn_name, mir_args));
+                .push(MirInstr::Call(name.clone(), fn_name, mir_args, ty));
             MirValue::Var(name)
         }
         Cast(inner) => {
@@ -295,7 +293,7 @@ fn lower_expr(b: &mut Builder, expr: &HirExpr) -> MirValue {
             // 编译期求值的结果直接变成字面量常量：内层表达式在 HIR 阶段就
             // 被折叠掉了，这里没有原始表达式可降级，`comptime 40 + 2` 到
             // 这一步已经是一个 `Int(42)`。
-            mir_literal(folded)
+            mir_literal(folded, &expr.ty)
         }
         Break => {
             // `break` 终结当前块并跳到最内层循环的出口。用 `terminate_if_open`
@@ -321,11 +319,17 @@ fn lower_expr(b: &mut Builder, expr: &HirExpr) -> MirValue {
 }
 
 /// 把 HIR 字面量转为 MIR 值。
-fn mir_literal(lit: &hir::HirLiteral) -> MirValue {
+///
+/// `ty` 是字面量所在表达式的类型：浮点字面量要由此确定位宽（f32 / f64），
+/// `HirLiteral::Float` 自己只存了一个 `f64`。
+fn mir_literal(lit: &hir::HirLiteral, ty: &hir::Ty) -> MirValue {
     use hir::HirLiteral::*;
     match lit {
         Int(i) => MirValue::Int(*i),
-        Float(f) => MirValue::Float(f.to_bits()),
+        Float(f) => match ty {
+            hir::Ty::Float(32) => MirValue::Float((*f as f32).to_bits() as u64, 32),
+            _ => MirValue::Float(f.to_bits(), 64),
+        },
         Bool(b) => MirValue::Bool(*b),
         Char(c) => MirValue::Int(*c as i128),
         String(s) => MirValue::Str(s.clone()),
@@ -399,10 +403,10 @@ fn const_values(consts: &HashMap<hir::DefId, HirConst>) -> HashMap<hir::DefId, M
     let mut out = HashMap::with_capacity(consts.len());
     for (id, c) in consts {
         if let hir::ExprKind::Literal(lit) = &c.value.kind {
-            out.insert(*id, mir_literal(lit));
+            out.insert(*id, mir_literal(lit, &c.value.ty));
         } else if let hir::ExprKind::Comptime(folded) = &c.value.kind {
             // comptime 求值出来的常量：同样是一条字面量。
-            out.insert(*id, mir_literal(folded));
+            out.insert(*id, mir_literal(folded, &c.value.ty));
         }
     }
     out
@@ -477,6 +481,49 @@ impl Builder {
 ///
 /// 转换指令要靠它决定符号扩展还是零扩展，拿不到宽度就只能退化成
 /// "什么都不做"——那正是 `x as i32` 变成 0 的原因。
+/// 这个 [`NumTy`] 是不是"真的"推断出来了（而不是 [`num_ty_of`] 的兜底值）。
+///
+/// [`num_ty_of`] 对不认识的类型一律回退成 `Int(64)`，所以没法直接拿它判断
+/// "有没有类型"。这里单独判一次。
+fn is_resolved(ty: &NumTy) -> bool {
+    !matches!(ty, NumTy::Int(64) | NumTy::Uint(64))
+}
+
+/// 二元运算的结果类型。
+///
+/// 类型检查器偶尔会把 `f64 * f64` 留成一个没解出来的推断变量（尤其是运算
+/// 结果直接喂给比较、没有 `let` 标注的时候）。这时 `num_ty_of` 兜底成
+/// `Int(64)`，后端就会按整数指令编码浮点运算——位模式直接相加，"能跑"，
+/// 结果是错的。所以表达式类型不可信时，退回看操作数的类型。
+///
+/// **比较与逻辑运算单独处理**：它们的结果恒为 `Bool`，不能退回看操作数——
+/// `f < g` 的操作数是浮点，但结果是布尔。误当成浮点会让后端把布尔值塞进
+/// 浮点栈槽，`Not` 也会被编成翻符号位。
+fn binary_result_ty(
+    op: hir::BinaryOp,
+    expr_ty: &hir::Ty,
+    lhs_ty: &hir::Ty,
+    rhs_ty: &hir::Ty,
+) -> NumTy {
+    use hir::BinaryOp::*;
+    if matches!(op, Eq | Ne | Lt | Gt | Le | Ge | And | Or) {
+        return NumTy::Bool;
+    }
+    let t = num_ty_of(expr_ty);
+    if is_resolved(&t) {
+        return t;
+    }
+    let l = num_ty_of(lhs_ty);
+    if is_resolved(&l) {
+        return l;
+    }
+    let r = num_ty_of(rhs_ty);
+    if is_resolved(&r) {
+        return r;
+    }
+    t
+}
+
 fn num_ty_of(ty: &hir::Ty) -> NumTy {
     use hir::Ty;
     match ty {

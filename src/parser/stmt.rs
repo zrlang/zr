@@ -52,8 +52,8 @@ impl Parser {
                     t.kind,
                     TokenKind::Ident(_)
                         | TokenKind::Underscore
-                        | TokenKind::IntLiteral(_)
-                        | TokenKind::FloatLiteral(_)
+                        | TokenKind::IntLiteral(..)
+                        | TokenKind::FloatLiteral(..)
                         | TokenKind::CharLiteral(_)
                         | TokenKind::StringLiteral(_)
                         | TokenKind::KwTrue
@@ -352,9 +352,9 @@ impl TokenKind {
     fn is_lit_or_minus(&self) -> bool {
         matches!(
             self,
-            TokenKind::IntLiteral(_)
+            TokenKind::IntLiteral(..)
                 | TokenKind::Minus
-                | TokenKind::FloatLiteral(_)
+                | TokenKind::FloatLiteral(..)
                 | TokenKind::CharLiteral(_)
                 | TokenKind::KwTrue
                 | TokenKind::KwFalse

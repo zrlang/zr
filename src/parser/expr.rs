@@ -497,13 +497,13 @@ impl Parser {
     pub(crate) fn parse_literal(&mut self) -> Result<Option<Literal>, CompileError> {
         let tk = self.peek().kind.clone();
         Ok(Some(match tk {
-            TokenKind::IntLiteral(v) => {
+            TokenKind::IntLiteral(v, suffix) => {
                 self.advance();
-                Literal::Int(v, None)
+                Literal::Int(v, suffix)
             }
-            TokenKind::FloatLiteral(v) => {
+            TokenKind::FloatLiteral(v, suffix) => {
                 self.advance();
-                Literal::Float(v, None)
+                Literal::Float(v, suffix)
             }
             TokenKind::StringLiteral(s) => {
                 self.advance();
@@ -839,8 +839,8 @@ impl Parser {
     fn check_expr_start(&self) -> bool {
         matches!(
             self.peek().kind,
-            TokenKind::IntLiteral(_)
-                | TokenKind::FloatLiteral(_)
+            TokenKind::IntLiteral(..)
+                | TokenKind::FloatLiteral(..)
                 | TokenKind::StringLiteral(_)
                 | TokenKind::CharLiteral(_)
                 | TokenKind::KwTrue

@@ -44,7 +44,7 @@ pub fn build_harness(test_names: &[String]) -> MirFunction {
         blocks.push(MirBasicBlock {
             id,
             instrs: vec![
-                MirInstr::Call("r".into(), name.clone(), Vec::new()),
+                MirInstr::Call("r".into(), name.clone(), Vec::new(), NumTy::Int(64)),
                 MirInstr::Binary(
                     "bad".into(),
                     MirValue::Var("r".into()),

@@ -33,6 +33,15 @@ cargo test --test zr_language
 | `12_comptime.zr`     | 编译期求值：`comptime` 表达式与块形式 |
 | `13_casts.zr`        | 类型转换 `as`：截断、符号扩展、零扩展 |
 | `14_spill.zr`        | 寄存器溢出：24 个同时存活的值（仅 x86-64） |
+| `15_loops.zr`        | 循环控制流：`loop`/`break`/`continue`、循环头重定义计数器 |
+| `16_comptime_fn.zr`  | 编译期求值：`comptime` 中调用函数与常量 |
+| `17_loop_break.zr`   | 循环出口的 SSA 构造（`break` 的多种形状） |
+| `18_spill_ops.zr`    | 溢出值参与运算：左右操作数、比较、移位、除法 |
+| `19_float.zr`        | 浮点 `f64`：算术 / 比较 / NaN 语义 / 取负 / `as` 转换 |
+| `20_f32.zr`          | 浮点 `f32`：算术 / 比较 / 取负 / `f32`↔`f64` / `as` |
+| `21_literal_suffixes.zr` | 字面量类型后缀（`1u8` / `7i8` / `2.5f32` …） |
+| `22_call_preserve.zr` | 跨调用存活的值必须被保住（callee-save / 形参并行搬运） |
+| `23_strings.zr`      | 字符串字面量落 `.rodata`、去重、按地址比较、`str` 作实参跨调用 |
 
 ## 尚未覆盖（编译器还不支持）
 
@@ -44,8 +53,8 @@ Rust Book 的其余章节目前一个都测不了，因为对应特性尚未实�
 | 控制流：`for` | `for x in a..b` 的 `..` 表达式仍解析成标识符 |
 | 所有权 / 借用 / 引用 / 切片 | 借用检查与引用语义未实现 |
 | 结构体与枚举 | `struct` 能声明，但字段读取返回错值；`enum` 未实现 |
-| 浮点 | 五个后端都没有浮点支持，遇到浮点字面量会**明确报错**（不再静默发射 0） |
-| 字符串字面量 | 同上，遇到字符串字面量会明确报错 |
+| 浮点（仅 ARM32 / Thumb / RISC-V / wasm） | x86-64 与 aarch64 已支持；其余后端遇到浮点字面量会**明确报错**（不再静默发射 0） |
+| 字符串字面量（仅 ARM32 / Thumb / RISC-V / wasm） | x86-64 与 aarch64 已落 `.rodata`（可取址、按地址比较）；其余后端遇到字符串字面量会**明确报错**。尚无解引用 / 输出（需 std 或 extern 运行时） |
 | 模式匹配（`match` / `if let` / 解构） | `match` 未降低到 MIR |
 | 包管理与 Cargo | 标准库按需加载刚落地，模块系统还不完整 |
 | 集合（Vector / String / HashMap） | `std` 里对应的模块仍编译不过 |
@@ -111,6 +120,67 @@ Rust Book 的其余章节目前一个都测不了，因为对应特性尚未实�
 | 符号 / 入口地址 | 函数符号值和 `e_entry` 要置 bit 0，标明 Thumb 状态 |
 
 本机没有 `qemu-arm`，所以 Thumb 产物只做编码与对象格式验证，不做运行期验证。
+
+## AArch64 后端
+
+`aarch64-unknown-linux-gnu` / `aarch64-apple-darwin` 等走
+`src/codegen/encoder_aarch64.rs`。整数寄存器用线性扫描的活跃区间分配（与
+x86-64 同源，不再是取模），池子含 caller-save 的 `x0..x17` 与 callee-save
+的 `x19..x28`；跨调用存活的值会被分到 callee-save，序言保存、每个返回点
+恢复。浮点值不占整数寄存器——每个浮点 SSA 值分配一个专属栈槽，运算时用
+`d0`/`d1` 当暂存器读写内存，槽区在序言里 `sub sp, sp, #frame` 一次性预留。
+
+浮点覆盖 `f64` 与 `f32`：算术（`fadd` / `fsub` / `fmul` / `fdiv`）、取负
+（`fneg`）、比较（`fcmp` + `cset`）、`as` 转换（`scvtf` / `ucvtf` / `fcvtzs` /
+`fcvtzu` / `fcvt`）。比较条件码按 IEEE754 取 `mi` / `ls` / `gt` / `ge` /
+`eq` / `ne`，NaN 语义与 x86-64 一致。
+
+验证分两层：
+
+* 编码单测逐条对照 clang 的 `--target=aarch64-unknown-linux-gnu` 汇编输出；
+* **运行时**用 Unicorn（`pip3 install unicorn`）加载 zr 生成的 aarch64 静态
+  ELF 直接执行，`svc #0`（`write` / `exit`）由钩子处理。`tests/cases/*.zr`
+  在 `-O0..-Oz` 全部通过（`14_spill` / `17_loop_break` 因未实现溢出而按设计
+  报错）。
+
+运行时验证落地时抓出了一批"能编译、反汇编看着也像、结果却是错的"编码错误，
+都已修掉：
+
+| 位置 | 错误 | 后果 |
+| --- | --- | --- |
+| `b.cond` 偏移量 | 写成 `imm19=1`（应为 `2`） | 条件跳转恒落到 `then`，`if` / `while` 全错 |
+| 分支与 `!x` 的零判定 | `cmp x, x`（恒相等） | 条件为假也走 `then`；`!x` 恒为 `1` |
+| `fneg` 基址 | `0x1e204000`（应为 `0x1e214000`） | `fneg d` 编成非 `fneg` 的指令 |
+| 左移 / 右移基址 | `0x9ac22000` / `0x9ac22420` | 移位结果错 |
+| `as` 转换 | 源寄存器放错字段、基址缺失 | SBFM/UBFM 编成非法指令 |
+| 寄存器分配 | 取模而非线性扫描 | 编号同余的活跃值互相覆盖 |
+| call-clobber | 只用 caller-save（`x0..x17`） | 跨调用存活的值被被调方覆盖 |
+| 浮点常量 / int→float | 借 `x0` 当中转 | 踩掉同时活跃的整数值 |
+
+## 字符串字面量与 `.rodata`
+
+字符串字面量按内容去重后放进 `.rodata`（NUL 结尾），取字面量即取其地址，因此
+`==` / `!=` 实际比较指针：同内容共享同一地址，不同内容地址不同。为此新增了
+一条取址指令与两种重定位（见 `src/codegen/{encoder,encoder_aarch64}.rs`）：
+
+| 目标 | 取址指令 | ELF | Mach-O | COFF |
+| --- | --- | --- | --- | --- |
+| x86-64 | `lea reg,[rip+disp32]` | `R_X86_64_PC32`(2) | `SIGNED`(1) | `REL32`(0x0004) |
+| AArch64 | `adrp` + `add :lo12:` | `ADR_PREL_PG_HI21`(275) + `ADD_ABS_LO12_NC`(277) | `PAGE21`(3) + `PAGEOFFSET12`(4) | `PAGEBASE_REL21`(0x0004) + `PAGEOFFSET_12A`(0x0006) |
+
+自构造可执行文件走 `apply_relocations` 就地回填；`lea` 的附加数是 `-4`（PC32
+以字段末尾为基准，`S + A - P` 里的 `A = -4` 正好抵消）。符号归属 `.rodata`：
+ELF 段索引 2、Mach-O `n_sect = 2`、COFF 节号 2。
+
+运行时验证（`23_strings.zr`）又抓出两个"地址算错一半"的类型错误：
+
+| 位置 | 错误 | 后果 |
+| --- | --- | --- |
+| x86-64 `lea` 的 REX 位 | 目的寄存器在 ModRM 的 `reg` 字段，却用了 REX.B（`0x01`）而非 REX.R（`0x04`） | `r12`/`r13` 的低 3 位被解码成 `rsp`/`rbp`，直接写坏栈指针与帧指针（`-O2`/`-Oz` 下必现段错误） |
+| Mach-O 重定位类型 | 把取址当成分支，统一发 `BRANCH`(2)，且 `r_pcrel` 恒为 1 | x86-64 侥幸能跑但不合规；AArch64 的 `adrp`/`add` 会被当成 `BRANCH26`，且 `PAGEOFFSET12` 误标为 PC 相对 |
+
+Mach-O 的验证手段：`-c --target <triple>` 出对象后 `otool -rv` 与 clang 的
+对应输出逐字段比对（`type` 与 `pcrel` 两列）。
 
 ## ELF 输出上的两个坑
 
@@ -299,9 +369,9 @@ done
 
 - **溢出（spilling）只在 x86-64 后端实现了**。可分配池是 10 个 GPR，其中
   跨调用存活的只能占 4 个 callee-save；活跃值超过这个数就会溢出到栈帧。
-  其余四个后端（AArch64 / ARM32 / RISC-V / wasm）还按编号取模分配寄存器，
-  一旦寄存器压力超限就会**明确报错**，而不是安静地编出算错的程序。
-  把它们也改成真溢出是剩下的一块工作。
+  AArch64 用线性扫描结果分配寄存器（不再取模），但同样没有溢出：活跃值超过
+  18 个就**明确报错**。ARM32 / RISC-V / wasm 仍是取模分配，压力超限时也会
+  报错，而不是安静地编出算错的程序。把它们也改成真溢出是剩下的一块工作。
 
 > 早先的分配器是 `alloc_reg(v) = ALLOCATABLE[v.id() % 池大小]`，两个**同时
 > 存活**的值只要编号同余就会抢同一个寄存器。它安静地算错过很多次，最严重的

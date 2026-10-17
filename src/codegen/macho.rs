@@ -24,7 +24,7 @@
 use std::io::{self, Write};
 
 use crate::codegen::objfile::{
-    align_up, fixed_name, macho_reloc_type, mangle_symbol, MACH_O_R_LEN_4,
+    align_up, fixed_name, macho_reloc_is_pcrel, macho_reloc_type, mangle_symbol, MACH_O_R_LEN_4,
 };
 use crate::codegen::target::{Os, Target};
 use crate::codegen::{CompilationUnit, OutputKind, SymbolSection};
@@ -399,9 +399,13 @@ impl Symtab {
                     entry.extend_from_slice(&0u64.to_le_bytes()); // n_value
                     push_bucket(&mut buckets, &mut names, 2, &entry, name);
                 }
-                SymbolSection::Text => {
+                SymbolSection::Text | SymbolSection::Rodata => {
                     entry.push(if sym.global { N_SECT | N_EXT } else { N_SECT });
-                    entry.push(1); // n_sect = __text
+                    // n_sect：1 = __text，2 = __rodata（与 section 表顺序一致）。
+                    entry.push(match sym.section {
+                        SymbolSection::Rodata => 2,
+                        _ => 1,
+                    });
                     entry.extend_from_slice(&0u16.to_le_bytes());
                     entry.extend_from_slice(&(value_base + sym.offset as u64).to_le_bytes());
                     // bucket 0 = 局部符号，bucket 1 = 外部已定义符号
@@ -469,7 +473,7 @@ fn write_relocations<W: Write>(
         let symbol = mangle_symbol(true, &reloc.symbol);
         let index = order.iter().position(|s| *s == symbol).unwrap_or(0) as u32;
         let packed = (index & 0x00ff_ffff)
-            | (1 << 24) // r_pcrel
+            | (u32::from(macho_reloc_is_pcrel(reloc.kind)) << 24) // r_pcrel
             | ((MACH_O_R_LEN_4 as u32) << 25) // r_length
             | (1 << 27) // r_extern
             | ((macho_reloc_type(target.arch(), reloc.kind) as u32) << 28); // r_type
@@ -624,5 +628,69 @@ mod tests {
         assert_eq!((packed >> 25) & 3, 2, "r_length = 4 字节");
         assert_eq!((packed >> 27) & 1, 1, "r_extern");
         assert_eq!((packed >> 28) & 0xf, 2, "ARM64_RELOC_BRANCH26");
+    }
+
+    #[test]
+    fn string_relocations_use_signed_page21_pageoff12() {
+        use crate::codegen::objfile::{macho_reloc_is_pcrel, macho_reloc_type};
+        // clang: `lea` → SIGNED，`adrp` → PAGE21，`add :lo12:` → PAGEOFFSET12。
+        assert_eq!(
+            macho_reloc_type(Arch::X86_64, RelocationKind::RipRel32),
+            1,
+            "X86_64_RELOC_SIGNED"
+        );
+        assert_eq!(
+            macho_reloc_type(Arch::AArch64, RelocationKind::AdrPrelPage21),
+            3,
+            "ARM64_RELOC_PAGE21"
+        );
+        assert_eq!(
+            macho_reloc_type(Arch::AArch64, RelocationKind::AddAbsLo12),
+            4,
+            "ARM64_RELOC_PAGEOFFSET12"
+        );
+        assert!(macho_reloc_is_pcrel(RelocationKind::RipRel32));
+        assert!(macho_reloc_is_pcrel(RelocationKind::AdrPrelPage21));
+        assert!(
+            !macho_reloc_is_pcrel(RelocationKind::AddAbsLo12),
+            "页内偏移不是 PC 相对"
+        );
+    }
+
+    #[test]
+    fn string_address_relocation_entries_carry_types_and_pcrel() {
+        let mut unit = sample_unit(OutputKind::Relocatable);
+        unit.symbols.push(Symbol {
+            name: ".Lstr0".to_string(),
+            section: SymbolSection::Rodata,
+            offset: 0,
+            size: 6,
+            global: false,
+            kind: SymbolKind::Object,
+        });
+        unit.relocations.push(Relocation::new(
+            0,
+            0,
+            4,
+            ".Lstr0",
+            RelocationKind::AdrPrelPage21,
+        ));
+        unit.relocations.push(Relocation::new(
+            4,
+            4,
+            4,
+            ".Lstr0",
+            RelocationKind::AddAbsLo12,
+        ));
+        let symtab = Symtab::build(&unit, 0);
+        let mut out = Vec::new();
+        write_relocations(&target(Arch::AArch64), &mut out, &unit, &symtab.order).unwrap();
+
+        let adrp = u32::from_le_bytes(out[4..8].try_into().unwrap());
+        assert_eq!((adrp >> 28) & 0xf, 3, "PAGE21");
+        assert_eq!((adrp >> 24) & 1, 1, "r_pcrel");
+        let add = u32::from_le_bytes(out[12..16].try_into().unwrap());
+        assert_eq!((add >> 28) & 0xf, 4, "PAGEOFFSET12");
+        assert_eq!((add >> 24) & 1, 0, "lo12 非 r_pcrel");
     }
 }

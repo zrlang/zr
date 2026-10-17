@@ -151,8 +151,8 @@ pub fn fold_constants(module: SsaModule) -> SsaModule {
 fn eval_binary(op: SsaBinaryOp, a: &SsaConst, b: &SsaConst) -> Option<SsaConst> {
     use SsaBinaryOp::*;
     // 浮点先走这一支：位运算与取模对浮点没有意义，其余按 IEEE 直接算。
-    if let (SsaConst::Float(x), SsaConst::Float(y)) = (a, b) {
-        return float_binary(op, f64::from_bits(*x), f64::from_bits(*y));
+    if let (SsaConst::Float(x, wx), SsaConst::Float(y, wy)) = (a, b) {
+        return float_binary(op, *x, *y, (*wx).max(*wy));
     }
     let (x, y) = (a.as_int()?, b.as_int()?);
     let r = match op {
@@ -202,21 +202,45 @@ fn eval_binary(op: SsaBinaryOp, a: &SsaConst, b: &SsaConst) -> Option<SsaConst> 
 /// 浮点常量的二元运算。
 ///
 /// 折叠出来的位模式必须与运行期**逐位相同**，所以 NaN 也照常折（IEEE 的
-/// 运算结果确定，不是不确定）。后端目前还没实现浮点指令，遇到时仍会报错，
-/// 但 pass 本身的行为要正确——先补齐 pass，后端跟上即可。
-fn float_binary(op: SsaBinaryOp, x: f64, y: f64) -> Option<SsaConst> {
+/// 运算结果确定，不是不确定）。f32 必须用 f32 的算术来折——用 f64 算完再
+/// 截断会在非精确值上得到不同的舍入结果。
+fn float_binary(op: SsaBinaryOp, x_bits: u64, y_bits: u64, width: u8) -> Option<SsaConst> {
     use SsaBinaryOp::*;
+    if width == 32 {
+        let x = f32::from_bits(x_bits as u32);
+        let y = f32::from_bits(y_bits as u32);
+        return Some(match op {
+            Add => SsaConst::Float((x + y).to_bits() as u64, 32),
+            Sub => SsaConst::Float((x - y).to_bits() as u64, 32),
+            Mul => SsaConst::Float((x * y).to_bits() as u64, 32),
+            Div => {
+                if y == 0.0 {
+                    return None;
+                }
+                SsaConst::Float((x / y).to_bits() as u64, 32)
+            }
+            Eq => SsaConst::Int(i128::from(x == y)),
+            Ne => SsaConst::Int(i128::from(x != y)),
+            Lt => SsaConst::Int(i128::from(x < y)),
+            Gt => SsaConst::Int(i128::from(x > y)),
+            Le => SsaConst::Int(i128::from(x <= y)),
+            Ge => SsaConst::Int(i128::from(x >= y)),
+            _ => return None,
+        });
+    }
+    let x = f64::from_bits(x_bits);
+    let y = f64::from_bits(y_bits);
     Some(match op {
-        Add => SsaConst::Float((x + y).to_bits()),
-        Sub => SsaConst::Float((x - y).to_bits()),
-        Mul => SsaConst::Float((x * y).to_bits()),
+        Add => SsaConst::Float((x + y).to_bits(), 64),
+        Sub => SsaConst::Float((x - y).to_bits(), 64),
+        Mul => SsaConst::Float((x * y).to_bits(), 64),
         Div => {
             if y == 0.0 {
                 // 除零在编译期必须报错，不能折出一个与运行期不同的值
                 // （运行期会得到 inf 或 NaN）。交给调用方保留原样。
                 return None;
             }
-            SsaConst::Float((x / y).to_bits())
+            SsaConst::Float((x / y).to_bits(), 64)
         }
         Eq => SsaConst::Int(i128::from(x == y)),
         Ne => SsaConst::Int(i128::from(x != y)),
@@ -236,10 +260,18 @@ fn bool_const(b: bool) -> i128 {
 
 /// 常量求值：一元运算。
 fn eval_unary(op: SsaUnaryOp, a: &SsaConst) -> Option<SsaConst> {
-    if let SsaConst::Float(bits) = a {
+    if let SsaConst::Float(bits, w) = a {
+        if *w == 32 {
+            let x = f32::from_bits(*bits as u32);
+            return match op {
+                SsaUnaryOp::Neg => Some(SsaConst::Float((-x).to_bits() as u64, 32)),
+                SsaUnaryOp::Not => Some(SsaConst::Int(i128::from(x == 0.0))),
+                SsaUnaryOp::BitNot => None,
+            };
+        }
         let x = f64::from_bits(*bits);
         return match op {
-            SsaUnaryOp::Neg => Some(SsaConst::Float((-x).to_bits())),
+            SsaUnaryOp::Neg => Some(SsaConst::Float((-x).to_bits(), 64)),
             SsaUnaryOp::Not => Some(SsaConst::Int(i128::from(x == 0.0))),
             // `~` 对浮点无定义。
             SsaUnaryOp::BitNot => None,
@@ -897,23 +929,30 @@ fn set_lattice(lattice: &mut HashMap<SsaValue, Lattice>, v: SsaValue, new: Latti
 /// 常量转换（供 SCCP 折叠 `Cast`）。
 fn eval_cast(c: &SsaConst, from: crate::mir::NumTy, to: crate::mir::NumTy) -> Option<SsaConst> {
     use crate::mir::NumTy::{Float, Int, Uint};
-    match (from, to) {
-        // 浮点 <-> 浮点：按位宽决定 f32 还是 f64
-        (Float(_), Float(b)) => {
-            let x = match c {
-                SsaConst::Float(bits) => f64::from_bits(*bits),
-                SsaConst::Int(v) => *v as f64,
-                _ => return None,
-            };
-            let out = if b <= 32 { x as f32 as f64 } else { x };
-            Some(SsaConst::Float(out.to_bits()))
+    // 从常量取浮点值：f32 常量存的是 f32 位模式（零扩展到 64 位），
+    // 必须先按 32 位还原，`f64::from_bits` 会把它读成完全不同的数。
+    let as_f64 = |c: &SsaConst| -> Option<f64> {
+        match c {
+            SsaConst::Float(bits, 32) => Some(f32::from_bits(*bits as u32) as f64),
+            SsaConst::Float(bits, _) => Some(f64::from_bits(*bits)),
+            SsaConst::Int(v) => Some(*v as f64),
+            SsaConst::Bool(b) => Some(f64::from(u8::from(*b))),
+            _ => None,
         }
+    };
+    // 按目标位宽打包一个浮点常量。
+    let pack_float = |x: f64, w: u8| -> SsaConst {
+        if w <= 32 {
+            SsaConst::Float((x as f32).to_bits() as u64, 32)
+        } else {
+            SsaConst::Float(x.to_bits(), 64)
+        }
+    };
+    match (from, to) {
+        // 浮点 <-> 浮点：按目标位宽决定 f32 还是 f64
+        (Float(_), Float(b)) => Some(pack_float(as_f64(c)?, b)),
         (Float(_), Int(bits)) | (Float(_), Uint(bits)) => {
-            let x = match c {
-                SsaConst::Float(bits) => f64::from_bits(*bits),
-                _ => return None,
-            };
-            let raw = x as i128;
+            let raw = as_f64(c)? as i128;
             Some(SsaConst::Int(truncate_int(
                 raw,
                 u16::from(bits),
@@ -921,15 +960,7 @@ fn eval_cast(c: &SsaConst, from: crate::mir::NumTy, to: crate::mir::NumTy) -> Op
             )))
         }
         // 整数 -> 浮点
-        (_, Float(b)) => {
-            let x = match c {
-                SsaConst::Int(v) => *v as f64,
-                SsaConst::Bool(b) => f64::from(u8::from(*b)),
-                _ => return None,
-            };
-            let out = if b <= 32 { x as f32 as f64 } else { x };
-            Some(SsaConst::Float(out.to_bits()))
-        }
+        (_, Float(b)) => Some(pack_float(as_f64(c)?, b)),
         (crate::mir::NumTy::Bool, _) => {
             let v = match c {
                 SsaConst::Bool(b) => i128::from(*b),
@@ -1109,6 +1140,7 @@ pub fn inline_functions(module: SsaModule) -> SsaModule {
                     result,
                     callee,
                     args,
+                    ..
                 } = &block.instrs[i]
                 else {
                     continue;
@@ -1274,10 +1306,13 @@ fn set_result(instr: SsaInstr, new: SsaValue) -> SsaInstr {
         },
         // `Call` 必须一起改，否则内联时调用点保留了被调函数的旧结果号，
         // 后面追加的 `copy` 却指向新发号的临时量，直接读到未定义的值。
-        SsaInstr::Call { callee, args, .. } => SsaInstr::Call {
+        SsaInstr::Call {
+            callee, args, ty, ..
+        } => SsaInstr::Call {
             result: new,
             callee,
             args,
+            ty,
         },
     }
 }

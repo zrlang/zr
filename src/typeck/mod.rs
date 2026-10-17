@@ -25,6 +25,27 @@ use crate::typeck::hir::{
 };
 use crate::typeck::infer::InferCtxt;
 
+/// 整数字面量后缀 → 具体整型。无后缀或未知后缀返回 `None`。
+///
+/// `usize`/`isize` 目前按 64 位平台字长处理。
+fn int_suffix_ty(suffix: &str) -> Option<Ty> {
+    Some(match suffix {
+        "i8" => Ty::Int(8),
+        "i16" => Ty::Int(16),
+        "i32" => Ty::Int(32),
+        "i64" => Ty::Int(64),
+        "i128" => Ty::Int(128),
+        "isize" => Ty::Int(64),
+        "u8" => Ty::Uint(8),
+        "u16" => Ty::Uint(16),
+        "u32" => Ty::Uint(32),
+        "u64" => Ty::Uint(64),
+        "u128" => Ty::Uint(128),
+        "usize" => Ty::Uint(64),
+        _ => return None,
+    })
+}
+
 /// 类型检查器。
 #[derive(Debug)]
 pub struct TypeChecker {
@@ -1064,20 +1085,10 @@ impl TypeChecker {
                 return self.check_binary(lhs, op, rhs, expected, span);
             }
             Expression::Unary(op, operand, _) => {
-                let ty = match op {
-                    ast::UnaryOp::Neg => Ty::Int(32),
-                    ast::UnaryOp::Not => Ty::Bool,
-                    ast::UnaryOp::BitNot => Ty::Int(32),
-                    ast::UnaryOp::Deref => {
-                        // 需要 infer
-                        self.infer.fresh_infer(span)
-                    }
-                    ast::UnaryOp::AddrOf => self.infer.fresh_infer(span),
-                };
-                let operand = self.check_expr(operand, &ty)?;
                 match op {
                     ast::UnaryOp::Deref => {
                         // *p : 若 p: &T 则结果为 T
+                        let operand = self.check_expr(operand, &Ty::Infer(InferId(0)))?;
                         let inner = self.infer.fresh_infer(span);
                         self.infer
                             .unify(
@@ -1093,6 +1104,8 @@ impl TypeChecker {
                         });
                     }
                     ast::UnaryOp::AddrOf => {
+                        let operand = self.check_expr(operand, &Ty::Infer(InferId(0)))?;
+                        let _ = operand;
                         let inner = self.infer.fresh_infer(span);
                         let ty = Ty::Reference(Box::new(inner.clone()), hir::Mutability::Immutable);
                         return Ok(HirExpr {
@@ -1101,7 +1114,35 @@ impl TypeChecker {
                             span,
                         });
                     }
-                    _ => ExprKind::Unary(self.ast_unary_op(*op), Box::new(operand)),
+                    ast::UnaryOp::Not => {
+                        let operand = self.check_expr(operand, &Ty::Bool)?;
+                        // 结果留成推断变量（而不是写死 `bool`）：本语言的 `!`
+                        // 在整数上取真值，`let n: i32 = !x;` 依赖结果能与 i32
+                        // 统一。写死 bool 会把这类用法判成类型错误。
+                        return Ok(HirExpr {
+                            kind: ExprKind::Unary(self.ast_unary_op(*op), Box::new(operand)),
+                            ty: self.infer.fresh_infer(span),
+                            span,
+                        });
+                    }
+                    ast::UnaryOp::Neg | ast::UnaryOp::BitNot => {
+                        // 类型**跟随操作数**，不是硬编码的 i32。早先 `Neg`
+                        // 一律给 `Int(32)` 当期望，于是 `-30.0` 里的 `30.0`
+                        // 推断成默认 f64，与外层的 f32 混算读错位宽。
+                        // 把外层期望传下去，让字面量跟着上下文走。
+                        let want = if matches!(expected, Ty::Infer(_)) {
+                            Ty::Infer(InferId(0))
+                        } else {
+                            expected.clone()
+                        };
+                        let operand = self.check_expr(operand, &want)?;
+                        let ty = operand.ty.clone();
+                        return Ok(HirExpr {
+                            kind: ExprKind::Unary(self.ast_unary_op(*op), Box::new(operand)),
+                            ty,
+                            span,
+                        });
+                    }
                 }
             }
             Expression::Assign(lhs, op, rhs, _) => {
@@ -1493,11 +1534,18 @@ impl TypeChecker {
         // 全局定义）需要在这里补上——之前统一发一个全新的推断变量，导致
         // `fn f(n: i64) -> i64 { n }` 里的 `n` 退化成 `_`。
         let ty = match &kind {
-            ExprKind::Local(local) => self
-                .locals
-                .get(local)
-                .cloned()
-                .unwrap_or(Ty::Infer(InferId(0))),
+            // 局部变量的类型要走一遍推断替换：`let x = f();` 把 `x` 记成
+            // 一个推断变量，真正的类型在 `let` 处才 unify 进去。不 resolve
+            // 的话读 `x` 永远是 `_`，后续 `x * 100.0` 里的字面量会回落到
+            // f64 默认值，与 x 的实际位宽对不上。
+            ExprKind::Local(local) => {
+                let t = self
+                    .locals
+                    .get(local)
+                    .cloned()
+                    .unwrap_or(Ty::Infer(InferId(0)));
+                self.infer.resolve(&t)
+            }
             ExprKind::Def(id) => self.def_type(*id).unwrap_or(Ty::Infer(InferId(0))),
             _ => self.infer.fresh_infer(span),
         };
@@ -1539,8 +1587,15 @@ impl TypeChecker {
     ) -> Result<HirExpr> {
         let bin_op = self.ast_binary_op(*op);
         let l_ty = self.infer_expr_ty(lhs)?;
-        let r_ty = self.infer_expr_ty(rhs)?;
         let l = self.check_expr(lhs, &l_ty)?;
+        // 右操作数用左操作数**已解出**的类型当期望：`x_f32 * 100.0` 里
+        // 100.0 默认推断成 f64，与 x 的 f32 混算会按错位宽读写。传 `l.ty`
+        // 让字面量跟着左操作数走（与 `let y: f32 = 1.5` 是同一条规则）。
+        let r_ty = if matches!(l.ty, Ty::Infer(_)) {
+            self.infer_expr_ty(rhs)?
+        } else {
+            l.ty.clone()
+        };
         let r = self.check_expr(rhs, &r_ty)?;
         self.infer.unify(&l.ty, &r.ty, span).ok();
         let ty = match op {
@@ -1818,16 +1873,9 @@ impl TypeChecker {
     fn check_literal(&self, lit: &AstLiteral, expected: &Ty) -> Result<(ExprKind, Ty)> {
         Ok(match lit {
             AstLiteral::Int(v, suffix) => {
-                let ty = match suffix.as_deref() {
-                    Some("i8") => Ty::Int(8),
-                    Some("i16") => Ty::Int(16),
-                    Some("i32") => Ty::Int(32),
-                    Some("i64") => Ty::Int(64),
-                    Some("u8") => Ty::Uint(8),
-                    Some("u16") => Ty::Uint(16),
-                    Some("u32") => Ty::Uint(32),
-                    Some("u64") => Ty::Uint(64),
-                    _ => {
+                let ty = match suffix.as_deref().and_then(int_suffix_ty) {
+                    Some(t) => t,
+                    None => {
                         // 默认推断：尝试从 expected 推断
                         if let Ty::Int(w) = expected {
                             Ty::Int(*w)
@@ -1844,7 +1892,13 @@ impl TypeChecker {
                 let ty = match suffix.as_deref() {
                     Some("f32") => Ty::Float(32),
                     Some("f64") => Ty::Float(64),
-                    _ => Ty::Float(64),
+                    // 无后缀时从 expected 推断——与整数字面量一致。
+                    // 少了这一条，`let x: f32 = 1.5;` 会把 1.5 判成 f64，
+                    // 然后与注解 f32 冲突，f32 在这个语言里就用不了。
+                    _ => match expected {
+                        Ty::Float(w) => Ty::Float(*w),
+                        _ => Ty::Float(64),
+                    },
                 };
                 (ExprKind::Literal(hir::HirLiteral::Float(*v)), ty)
             }
@@ -2233,12 +2287,10 @@ impl TypeChecker {
     fn infer_expr_ty(&mut self, e: &Expression) -> Result<Ty> {
         // 快速类型推断（用于递归调用，避免无限递归）
         Ok(match e {
-            Expression::Literal(AstLiteral::Int(_, suffix), _) => match suffix.as_deref() {
-                Some("i64") => Ty::Int(64),
-                Some("u64") => Ty::Uint(64),
-                Some("i32") => Ty::Int(32),
-                _ => Ty::Int(32),
-            },
+            Expression::Literal(AstLiteral::Int(_, suffix), _) => suffix
+                .as_deref()
+                .and_then(int_suffix_ty)
+                .unwrap_or(Ty::Int(32)),
             Expression::Literal(AstLiteral::Float(_, suffix), _) => match suffix.as_deref() {
                 Some("f32") => Ty::Float(32),
                 _ => Ty::Float(64),
@@ -2257,8 +2309,16 @@ impl TypeChecker {
                         t.ty.clone()
                     } else if let Some(t) = self.statics.get(&id) {
                         t.ty.clone()
-                    } else if let Some(t) = self.functions.get(&id) {
-                        t.return_type.clone()
+                    } else if let Some(f) = self.functions.get(&id) {
+                        // 函数名的类型是**函数类型**，不是返回类型。返回
+                        // 类型会让上游 `Call` 分支取不到签名，`let x = f();`
+                        // 的 `x` 就退化成 `_`（f32 返回值尤其致命）。
+                        Ty::Function {
+                            params: f.params.iter().map(|p| p.ty.clone()).collect(),
+                            ret: Box::new(f.return_type.clone()),
+                            is_async: f.is_async,
+                            abi: hir::Abi::Zr,
+                        }
                     } else {
                         self.infer.fresh_infer(e.span())
                     }
@@ -2281,6 +2341,11 @@ impl TypeChecker {
                 ast::UnaryOp::Not => Ty::Bool,
                 _ => self.infer.fresh_infer(e.span()),
             },
+            // `x as T` 的结果类型就是 T，不需要推断。
+            //
+            // 漏掉这一条会让 `let y = x as f64;` 的 y 落到一个未解决的
+            // 推断变量上：后续 `y as i32` 直接报 "cannot cast `_` to i32"。
+            Expression::Cast(_, target, _) => self.ast_to_hir_type(target)?,
             Expression::Call(callee, _, _) => {
                 let cty = self.infer_expr_ty(callee)?;
                 match cty {
@@ -3229,21 +3294,24 @@ fn hir_repr(attrs: &[hir::HirAttr]) -> Result<hir::Repr> {
                 }
             }
         }
+        // 逐个校验参数，取第一个决定布局的那个。`align = 8` 的简写形式
+        // 只施加对齐约束，不决定布局，所以遇到它继续往后看。
+        let mut layout = hir::Repr::Rust;
         for arg in &attr.args {
-            return Ok(match arg.as_str() {
-                "C" => hir::Repr::C,
-                "packed" => hir::Repr::Packed,
-                "transparent" => hir::Repr::Transparent,
-                "simd" => hir::Repr::Simd,
-                // `align = 8` 的简写形式
-                other if other.starts_with("align") => hir::Repr::Rust,
+            match arg.as_str() {
+                "C" => layout = hir::Repr::C,
+                "packed" => layout = hir::Repr::Packed,
+                "transparent" => layout = hir::Repr::Transparent,
+                "simd" => layout = hir::Repr::Simd,
+                other if other.starts_with("align") => {}
                 other => {
                     return Err(CompileError::internal(format!(
                         "unknown representation `{other}`"
                     )))
                 }
-            });
+            }
         }
+        return Ok(layout);
     }
     Ok(hir::Repr::Rust)
 }

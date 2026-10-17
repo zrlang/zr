@@ -26,6 +26,9 @@ pub fn reloc_field_size(kind: RelocationKind) -> usize {
         // （ARM 的 [23:0]、AArch64 的 [25:0]、RISC-V J/B 型的分散字段），
         // 因此回填时都以整条指令为单位做"读-改-写"。
         RelocationKind::PcRel32
+        | RelocationKind::RipRel32
+        | RelocationKind::AdrPrelPage21
+        | RelocationKind::AddAbsLo12
         | RelocationKind::Branch26
         | RelocationKind::Call26
         | RelocationKind::ArmBranch24
@@ -42,8 +45,11 @@ pub fn elf_reloc_type(arch: crate::codegen::target::Arch, kind: RelocationKind) 
     use crate::codegen::target::Arch;
     match (arch, kind) {
         (Arch::X86_64, RelocationKind::PcRel32) => 4, // R_X86_64_PLT32
+        (Arch::X86_64, RelocationKind::RipRel32) => 2, // R_X86_64_PC32
         (Arch::AArch64, RelocationKind::Branch26) => 282, // R_AARCH64_JUMP26
         (Arch::AArch64, RelocationKind::Call26) => 283, // R_AARCH64_CALL26
+        (Arch::AArch64, RelocationKind::AdrPrelPage21) => 275, // R_AARCH64_ADR_PREL_PG_HI21
+        (Arch::AArch64, RelocationKind::AddAbsLo12) => 277, // R_AARCH64_ADD_ABS_LO12_NC
         (Arch::Arm32, RelocationKind::ArmBranch24) => 29, // R_ARM_JUMP24
         (Arch::Arm32, RelocationKind::ArmCallThumb) => 28, // R_ARM_THM_CALL
         (Arch::Arm32, RelocationKind::ArmBranchThumb) => 30, // R_ARM_THM_JUMP24
@@ -59,9 +65,12 @@ pub fn coff_reloc_type(arch: crate::codegen::target::Arch, kind: RelocationKind)
     use crate::codegen::target::Arch;
     match (arch, kind) {
         (Arch::X86_64, RelocationKind::PcRel32) => 0x0004, // IMAGE_REL_AMD64_REL32
+        (Arch::X86_64, RelocationKind::RipRel32) => 0x0004, // IMAGE_REL_AMD64_REL32
         (Arch::AArch64, RelocationKind::Branch26) | (Arch::AArch64, RelocationKind::Call26) => {
             0x0003 // IMAGE_REL_ARM64_BRANCH26
         }
+        (Arch::AArch64, RelocationKind::AdrPrelPage21) => 0x0004, // IMAGE_REL_ARM64_PAGEBASE_REL21
+        (Arch::AArch64, RelocationKind::AddAbsLo12) => 0x0006,    // IMAGE_REL_ARM64_PAGEOFFSET_12A
         _ => 0,
     }
 }
@@ -71,16 +80,27 @@ pub fn macho_reloc_type(arch: crate::codegen::target::Arch, kind: RelocationKind
     use crate::codegen::target::Arch;
     match (arch, kind) {
         // X86_64_RELOC_BRANCH 与 ARM64_RELOC_BRANCH26 都是 2（`bl` 与 `b` 同理）。
-        (Arch::X86_64, RelocationKind::PcRel32)
-        | (Arch::AArch64, RelocationKind::Branch26)
-        | (Arch::AArch64, RelocationKind::Call26)
-        | (Arch::Arm32, RelocationKind::ArmBranch24)
+        (Arch::X86_64, RelocationKind::PcRel32) => 2, // X86_64_RELOC_BRANCH
+        // 取符号地址的 `lea reg, [rip+disp]` 用 SIGNED（1），不能复用 BRANCH。
+        (Arch::X86_64, RelocationKind::RipRel32) => 1, // X86_64_RELOC_SIGNED
+        (Arch::AArch64, RelocationKind::Branch26) | (Arch::AArch64, RelocationKind::Call26) => 2, // ARM64_RELOC_BRANCH26
+        (Arch::AArch64, RelocationKind::AdrPrelPage21) => 3, // ARM64_RELOC_PAGE21
+        (Arch::AArch64, RelocationKind::AddAbsLo12) => 4,    // ARM64_RELOC_PAGEOFFSET12
+        (Arch::Arm32, RelocationKind::ArmBranch24)
         | (Arch::RiscV32, RelocationKind::RiscVJal)
         | (Arch::RiscV64, RelocationKind::RiscVJal)
         | (Arch::RiscV32, RelocationKind::RiscVBranch)
         | (Arch::RiscV64, RelocationKind::RiscVBranch) => 2,
         _ => 0,
     }
+}
+
+/// Mach-O 重定位是否置 `r_pcrel` 位。
+///
+/// 只有 AArch64 的 `add :lo12:`（页内偏移）不是 PC 相对；其余（分支、
+/// `adrp` 页号、x86-64 的 `call`/`lea`）都置位。
+pub fn macho_reloc_is_pcrel(kind: RelocationKind) -> bool {
+    !matches!(kind, RelocationKind::AddAbsLo12)
 }
 
 /// Mach-O 重定位项长度编码（2 = 4 字节）。
@@ -101,11 +121,23 @@ pub fn mangle_symbol(is_macho: bool, name: &str) -> String {
 /// 符号表 → 地址表（`text_base + offset`）。
 ///
 /// 外部（未定义）符号不在表内，交由平台链接器解析。
-pub fn symbol_addresses(unit: &CompilationUnit, text_base: u64) -> HashMap<String, u64> {
+pub fn symbol_addresses(
+    unit: &CompilationUnit,
+    text_base: u64,
+    rodata_base: u64,
+) -> HashMap<String, u64> {
     unit.symbols
         .iter()
         .filter(|s| s.section != SymbolSection::Undefined)
-        .map(|s| (s.name.clone(), text_base + s.offset as u64))
+        .map(|s| {
+            // 符号的偏移是**段内**偏移，因此要按所在段选基址：代码段用
+            // `text_base`，只读数据段用 `rodata_base`。
+            let base = match s.section {
+                SymbolSection::Rodata => rodata_base,
+                _ => text_base,
+            };
+            (s.name.clone(), base + s.offset as u64)
+        })
         .collect()
 }
 
@@ -115,8 +147,8 @@ pub fn symbol_addresses(unit: &CompilationUnit, text_base: u64) -> HashMap<Strin
 /// - `PcRel32`：立即数字段整体就是位移，x86-64 的 `call/jmp/jcc` 都如此；
 /// - `Branch26`：AArch64 的 26 位字面量嵌在指令自身的 [25:0] 位里，
 ///   因此必须"读-改-写"，保留高 6 位操作码。
-pub fn apply_relocations(unit: &mut CompilationUnit, text_base: u64) {
-    let addrs = symbol_addresses(unit, text_base);
+pub fn apply_relocations(unit: &mut CompilationUnit, text_base: u64, rodata_base: u64) {
+    let addrs = symbol_addresses(unit, text_base, rodata_base);
 
     for reloc in &unit.relocations {
         let Some(&target) = addrs.get(reloc.symbol.as_str()) else {
@@ -137,6 +169,34 @@ pub fn apply_relocations(unit: &mut CompilationUnit, text_base: u64) {
                 if end <= unit.code.len() {
                     unit.code[reloc.offset..end].copy_from_slice(&(delta as i32).to_le_bytes());
                 }
+            }
+            RelocationKind::RipRel32 => {
+                // `lea reg, [rip+disp32]`：P 是 4 字节位移字段本身的地址，
+                // 目标值 = S + A - P（加载符号地址时 A = -4）。x86 的 RIP
+                // 相对位移基准是字段末尾，两者正好抵消成 "S - 下一条指令"。
+                let p = text_base + reloc.offset as u64;
+                let delta = target - p as i64;
+                if reloc.offset + 4 <= unit.code.len() {
+                    unit.code[reloc.offset..reloc.offset + 4]
+                        .copy_from_slice(&(delta as i32).to_le_bytes());
+                }
+            }
+            RelocationKind::AdrPrelPage21 => {
+                // `adrp Xd, sym`：imm21 = (page(S+A) - page(P)) >> 12，P 是
+                // 指令地址（不是字段地址）。immlo 在 [30:29]、immhi 在 [23:5]。
+                let p = text_base + reloc.instr_start as u64;
+                let delta = (target - (p & !0xfff) as i64) >> 12;
+                let imm = delta as u32;
+                patch_word(&mut unit.code, reloc, |word| {
+                    (word & 0x9f00_001f) | ((imm & 0x3) << 29) | (((imm >> 2) & 0x7ffff) << 5)
+                });
+            }
+            RelocationKind::AddAbsLo12 => {
+                // `add Xd, Xn, #imm12`：imm12 = (S + A) & 0xfff，落在 [21:10]。
+                let imm12 = (target as u32) & 0xfff;
+                patch_word(&mut unit.code, reloc, |word| {
+                    (word & 0xffc0_03ff) | (imm12 << 10)
+                });
             }
             RelocationKind::ArmCbzThumb => {
                 // `cbz` / `cbnz`：6 位**有符号**半字偏移，落在 [9:3]，
@@ -344,7 +404,7 @@ mod tests {
     fn pcrel32_uses_next_instruction_address() {
         let (mut unit, relocs) = unit_with_one_call();
         unit.relocations = relocs;
-        apply_relocations(&mut unit, 0x400000);
+        apply_relocations(&mut unit, 0x400000, 0);
         // main 在 0x400000，call 在 0x400000，下一条指令 0x400005，
         // 因此位移应为 -5。
         assert_eq!(i32::from_le_bytes(unit.code[1..5].try_into().unwrap()), -5);
@@ -367,7 +427,7 @@ mod tests {
         });
         unit.relocations
             .push(Relocation::new(8, 8, 4, "main", RelocationKind::Branch26));
-        apply_relocations(&mut unit, 0x1000);
+        apply_relocations(&mut unit, 0x1000, 0);
         let word = u32::from_le_bytes(unit.code[8..12].try_into().unwrap());
         assert_eq!(word >> 26, 0b100101, "bl 操作码应保留");
         // 向后跳 8 字节 = -2 条指令，按 26 位补码编码。
@@ -384,7 +444,7 @@ mod tests {
         let (mut unit, relocs) = unit_with_one_call();
         unit.relocations = vec![Relocation::new(1, 0, 5, "zr_exit", RelocationKind::PcRel32)];
         let _ = relocs;
-        apply_relocations(&mut unit, 0x400000);
+        apply_relocations(&mut unit, 0x400000, 0);
         assert_eq!(unit.code[1..5], [0, 0, 0, 0]);
     }
 
@@ -432,7 +492,7 @@ mod tests {
         });
         unit.relocations
             .push(Relocation::new(12, 12, 4, "main", RelocationKind::RiscVJal));
-        apply_relocations(&mut unit, 0x1000);
+        apply_relocations(&mut unit, 0x1000, 0);
         let word = u32::from_le_bytes(unit.code[12..16].try_into().unwrap());
         // imm = -6（0x1FFFFA）→ imm[20]=1, imm[10:1]=0x3FD, imm[11]=1,
         // imm[19:12]=0xFF，目的寄存器 ra=1
@@ -457,12 +517,72 @@ mod tests {
         });
         unit.relocations
             .push(Relocation::new(8, 8, 4, "bb1", RelocationKind::RiscVBranch));
-        apply_relocations(&mut unit, 0x2000);
+        apply_relocations(&mut unit, 0x2000, 0);
         let word = u32::from_le_bytes(unit.code[8..12].try_into().unwrap());
         // imm = 4 个半字 → imm[4:1] = 2 → 指令的 [11:8] = 2
         assert_eq!((word >> 8) & 0xf, 2);
         // funct3 = 001（bne 用了 001；此处用 beq 的 000）与 opcode 0x63 必须保留
         assert_eq!(word & 0x707f, 0x0063, "funct3 与 opcode 必须保留");
+    }
+
+    #[test]
+    fn rip_relative_lea_resolves_rodata_symbol() {
+        // `lea rax, [rip+disp32]` 位于 .text+0，符号在 .rodata+0。
+        let mut unit = CompilationUnit::new();
+        unit.code = vec![0x48, 0x8d, 0x05, 0, 0, 0, 0];
+        unit.symbols.push(Symbol {
+            name: ".Lstr0".to_string(),
+            section: SymbolSection::Rodata,
+            offset: 0,
+            size: 3,
+            global: false,
+            kind: SymbolKind::Object,
+        });
+        let mut reloc = Relocation::new(3, 0, 7, ".Lstr0", RelocationKind::RipRel32);
+        reloc.addend = -4;
+        unit.relocations.push(reloc);
+        apply_relocations(&mut unit, 0x40_0000, 0x41_0000);
+        let disp = i32::from_le_bytes(unit.code[3..7].try_into().unwrap());
+        // 下一条指令地址 + disp 必须等于 .rodata 的地址。
+        assert_eq!(0x40_0000 + 7 + disp as i64, 0x41_0000);
+    }
+
+    #[test]
+    fn aarch64_page_relocations_resolve_rodata() {
+        let mut unit = CompilationUnit::new();
+        unit.code = vec![0u8; 8];
+        unit.code[0..4].copy_from_slice(&0x9000_0000u32.to_le_bytes()); // adrp x0, #0
+        unit.code[4..8].copy_from_slice(&0x9100_0000u32.to_le_bytes()); // add x0, x0, #0
+        unit.symbols.push(Symbol {
+            name: ".Lstr0".to_string(),
+            section: SymbolSection::Rodata,
+            offset: 0x0d,
+            size: 3,
+            global: false,
+            kind: SymbolKind::Object,
+        });
+        unit.relocations.push(Relocation::new(
+            0,
+            0,
+            4,
+            ".Lstr0",
+            RelocationKind::AdrPrelPage21,
+        ));
+        unit.relocations.push(Relocation::new(
+            4,
+            4,
+            4,
+            ".Lstr0",
+            RelocationKind::AddAbsLo12,
+        ));
+        apply_relocations(&mut unit, 0x40_0000, 0x40_1000);
+        let adrp = u32::from_le_bytes(unit.code[0..4].try_into().unwrap());
+        let add = u32::from_le_bytes(unit.code[4..8].try_into().unwrap());
+        // 目标页 0x401000 − 指令页 0x400000 = 1 页。
+        let imm = ((adrp >> 5) & 0x7ffff) << 2 | ((adrp >> 29) & 0x3);
+        assert_eq!(imm, 1, "adrp 页差应为 1");
+        assert_eq!(add & 0xffc0_03ff, 0x9100_0000, "保留 opcode/Rn/Rd");
+        assert_eq!((add >> 10) & 0xfff, 0x0d, "lo12 = 0x0d");
     }
 
     #[test]
