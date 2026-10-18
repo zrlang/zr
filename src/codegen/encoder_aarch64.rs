@@ -109,14 +109,97 @@ const ARG_REGS: [Reg; 8] = [
     Reg(7),
 ];
 
+/// 溢出值的暂存寄存器（不进分配池；跨指令不携带任何值）。
+///
+/// - `SPILL_SRC`(x16)：第一溢出操作数的装载目标。
+/// - `SPILL_SRC2`(x17)：第二溢出操作数——与 `SPILL_SRC` 分家，左右都溢出
+///   的二元运算不会互相冲掉。
+/// - `SPILL_DST`(x18)：溢出结果先算进这里，发射完立刻 [`put_out`] 落回槽。
+///   与 [`PHI_TMP`] 同用 x18：[SPILL_DST] 只在**单条指令发射内部**存活，
+///   [PHI_TMP] 只在块边界的 φ 并行搬运里存活，两者的生还不重叠。
+const SPILL_SRC: Reg = Reg(16);
+const SPILL_SRC2: Reg = Reg(17);
+const SPILL_DST: Reg = PHI_TMP;
+
+thread_local! {
+    /// 当前函数的整数溢出：值 id -> 溢出栈槽号（0 起）。只对被分配器放到
+    /// `Location::Stack` 的值有条目，寻址按 `[sp + FRAME_BYTES + slot*8]`——
+    /// 溢出区开在浮点/取址槽区的**下方**，所以要先加槽区高度。
+    static SPILL_SLOTS: RefCell<HashMap<u32, usize>> = RefCell::new(HashMap::new());
+}
+
+/// `v` 如果被溢出到栈，返回它的溢出槽号。
+fn spill_slot(v: SsaValue) -> Option<usize> {
+    SPILL_SLOTS.with(|m| m.borrow().get(&v.id()).copied())
+}
+
+/// 溢出槽相对 sp 的字节偏移（溢出区在槽区下方）。
+fn spill_offset(slot: usize) -> usize {
+    let off = FRAME_BYTES.get() + slot * 8;
+    debug_assert!(
+        off.is_multiple_of(8) && off <= 0xfff * 8,
+        "溢出槽偏移超出 ldr/str 立即数范围"
+    );
+    off
+}
+
+/// `ldr rd, [sp, FRAME + 8*slot]`：溢出值装载进暂存寄存器。
+fn load_spill(unit: &mut CompilationUnit, dst: Reg, slot: usize) {
+    emit_ldr_sp(unit, dst.bits(), spill_offset(slot));
+}
+
+/// `str rs, [sp, FRAME + 8*slot]`：把寄存器里的值落进溢出槽。
+fn store_spill(unit: &mut CompilationUnit, src: Reg, slot: usize) {
+    emit_str_sp(unit, src.bits(), spill_offset(slot));
+}
+
+/// `v` 里的**结果**要发射到的寄存器：溢出的结果先算进 [SPILL_DST]，
+/// 发射完用 [`put_out`] 落回槽。
+fn out_reg(v: SsaValue) -> Reg {
+    if spill_slot(v).is_some() {
+        SPILL_DST
+    } else {
+        alloc_reg(v)
+    }
+}
+
+/// 溢出的结果从 [SPILL_DST] 落回它的槽（其余值无事可做）。
+fn put_out(unit: &mut CompilationUnit, v: SsaValue) {
+    if let Some(slot) = spill_slot(v) {
+        store_spill(unit, SPILL_DST, slot);
+    }
+}
+
+/// 读出 `v`：溢出的值装载进 [SPILL_SRC]。
+fn val_reg(unit: &mut CompilationUnit, v: SsaValue) -> Reg {
+    if let Some(slot) = spill_slot(v) {
+        load_spill(unit, SPILL_SRC, slot);
+        return SPILL_SRC;
+    }
+    alloc_reg(v)
+}
+
+/// 读出二元的第二操作数：溢出的值装载进 [SPILL_SRC2]（与第一操作数的
+/// 暂存寄存器不同，左右都溢出时不会互相冲掉）。
+fn val_reg2(unit: &mut CompilationUnit, v: SsaValue) -> Reg {
+    if let Some(slot) = spill_slot(v) {
+        load_spill(unit, SPILL_SRC2, slot);
+        return SPILL_SRC2;
+    }
+    alloc_reg(v)
+}
+
 /// 把实参搬进 AAPCS64 的寄存器。
 ///
 /// 整数实参与浮点实参**各自计数**：`f(g(1, 2.0), 3)` 里 1 在 x0、2.0 在 v0、
 /// 3 在 x1。整数搬运是并行的（目标与源可能交叉），浮点则直接落 v 寄存器。
+/// 溢出的整数实参不能进并行走环——它们的"源寄存器"不存在——在走环之后
+/// 经 [SPILL_DST] 逐个装入目标实参寄存器（写在环之后，不会冲掉别人的源）。
 fn emit_call_args(unit: &mut CompilationUnit, args: &[SsaValue]) {
     let mut gi = 0usize;
     let mut xi = 0usize;
     let mut moves: Vec<(Reg, Reg)> = Vec::new();
+    let mut from_stack: Vec<(Reg, usize)> = Vec::new();
     for a in args {
         if let Some(slot) = float_slot(*a) {
             if xi < 8 {
@@ -125,12 +208,20 @@ fn emit_call_args(unit: &mut CompilationUnit, args: &[SsaValue]) {
             // 超过 8 个浮点实参走栈上传参区，本后端尚未实现。
             xi += 1;
         } else if gi < ARG_REGS.len() {
-            moves.push((ARG_REGS[gi], alloc_reg(*a)));
+            if let Some(slot) = spill_slot(*a) {
+                from_stack.push((ARG_REGS[gi], slot));
+            } else {
+                moves.push((ARG_REGS[gi], alloc_reg(*a)));
+            }
             gi += 1;
         }
         // 超过 8 个整数实参走栈上传参区，本后端尚未实现。
     }
     emit_parallel_reg_moves(unit, &moves);
+    for (dst, slot) in from_stack {
+        load_spill(unit, SPILL_DST, slot);
+        emit_mov_rr(unit, dst, SPILL_DST);
+    }
 }
 
 fn alloc_reg(v: SsaValue) -> Reg {
@@ -474,7 +565,11 @@ fn emit_param_moves(unit: &mut CompilationUnit, func: &SsaFunction) {
         if gi >= ARG_REGS.len() {
             continue; // 超过 8 个整数形参走栈上传参区，本后端尚未实现
         }
-        int_moves.push((alloc_reg(*p), ARG_REGS[gi]));
+        if let Some(slot) = spill_slot(*p) {
+            store_spill(unit, ARG_REGS[gi], slot);
+        } else {
+            int_moves.push((alloc_reg(*p), ARG_REGS[gi]));
+        }
         gi += 1;
     }
     // 整数形参的搬运要并行走环：`fn f(x: i32, y: i32)` 里目标寄存器与实参
@@ -766,8 +861,11 @@ fn emit_phi_copies(unit: &mut CompilationUnit, func: &SsaFunction, succ: usize, 
             emit_store_float(unit, 0, rs, w);
         }
     }
-    // 整数 φ 的拷贝是并行的（含环），浮点 φ 已在上面处理完。
-    let mut moves: Vec<(Reg, Reg)> = Vec::new();
+    // 整数 φ 的拷贝总表：溢出→溢出、槽←寄存器、槽→寄存器、寄存器→寄存器
+    // 四类分开处理（与 arm32 后端同一套路）。
+    let mut reg_moves: Vec<(Reg, Reg)> = Vec::new();
+    let mut store_stack: Vec<(usize, Reg)> = Vec::new();
+    let mut load_stack: Vec<(Reg, usize)> = Vec::new();
     for instr in &block.instrs {
         let SsaInstr::Phi {
             result, incoming, ..
@@ -781,12 +879,31 @@ fn emit_phi_copies(unit: &mut CompilationUnit, func: &SsaFunction, succ: usize, 
         if float_slot(*result).is_some() || float_slot(*src).is_some() {
             continue;
         }
-        let (dst, src) = (alloc_reg(*result), alloc_reg(*src));
-        if dst != src {
-            moves.push((dst, src));
+        if let (Some(ds_), Some(ss)) = (spill_slot(*result), spill_slot(*src)) {
+            // 溢出 → 溢出：栈对栈（经暂存寄存器）
+            load_spill(unit, SPILL_DST, ss);
+            store_spill(unit, SPILL_DST, ds_);
+        } else if let Some(ds_) = spill_slot(*result) {
+            // 槽 ← 寄存器：先存（读的是 φ 生效前的源寄存器）
+            store_stack.push((ds_, alloc_reg(*src)));
+        } else if let Some(ss) = spill_slot(*src) {
+            // 槽 → 寄存器：装载进暂存，走环之后落位
+            load_stack.push((alloc_reg(*result), ss));
+        } else {
+            let (dst, s) = (alloc_reg(*result), alloc_reg(*src));
+            if dst != s {
+                reg_moves.push((dst, s));
+            }
         }
     }
-    emit_parallel_reg_moves(unit, &moves);
+    for (slot, r) in &store_stack {
+        store_spill(unit, *r, *slot);
+    }
+    emit_parallel_reg_moves(unit, &reg_moves);
+    for (dst, slot) in &load_stack {
+        load_spill(unit, SPILL_SRC, *slot);
+        emit_mov_rr(unit, *dst, SPILL_SRC);
+    }
 }
 
 fn block_label(func: &str, id: usize) -> String {
@@ -821,6 +938,9 @@ pub fn emit_function(target: &Target, unit: &mut CompilationUnit, func: &SsaFunc
     let float_slots = assign_float_slots(func, 0);
     let local_slots = assign_local_slots(func, float_slots);
     let frame = ((float_slots + local_slots) * 8 + 15) & !15;
+    // 溢出槽区排在槽区下方（浅于槽区、深于 callee-save 区）；`bl` 要求
+    // 运行时 16 字节栈对齐，槽数向上取整。
+    let spill_bytes = (SPILL_SLOTS.with(|m| m.borrow().len()) * 8 + 15) & !15;
     FRAME_BYTES.with(|c| c.set(frame));
     let start = unit.code.len();
     let sym_base = unit.symbols.len();
@@ -846,6 +966,10 @@ pub fn emit_function(target: &Target, unit: &mut CompilationUnit, func: &SsaFunc
             emit_str_sp(unit, r, i * 8);
         }
     }
+    // 溢出槽区开在槽区下方，浮点/取址槽的 sp 偏移不受影响。
+    if spill_bytes > 0 {
+        emit_sub_sp(unit, spill_bytes as u32);
+    }
     if frame > 0 {
         emit_sub_sp(unit, frame as u32);
     }
@@ -865,6 +989,8 @@ pub fn emit_function(target: &Target, unit: &mut CompilationUnit, func: &SsaFunc
                     // 浮点返回值按 AAPCS64 走 v0，不是 x0。
                     if let Some(slot) = float_slot(*v) {
                         emit_load_float(unit, 0, slot, float_width(*v));
+                    } else if let Some(slot) = spill_slot(*v) {
+                        load_spill(unit, Reg::X0, slot);
                     } else {
                         let r = alloc_reg(*v);
                         if r != Reg::X0 {
@@ -874,6 +1000,9 @@ pub fn emit_function(target: &Target, unit: &mut CompilationUnit, func: &SsaFunc
                 }
                 if frame > 0 {
                     emit_add_sp(unit, frame as u32);
+                }
+                if spill_bytes > 0 {
+                    emit_add_sp(unit, spill_bytes as u32);
                 }
                 if cs_bytes > 0 {
                     for (i, &r) in cs_used.iter().enumerate() {
@@ -892,7 +1021,7 @@ pub fn emit_function(target: &Target, unit: &mut CompilationUnit, func: &SsaFunc
             } => {
                 // 判 cond 是否为 0：`cmp r, r` 恒为相等，无法区分零/非零，
                 // 必须与 xzr 比较（`cmp r, xzr`）。
-                let r = alloc_reg(*cond);
+                let r = val_reg(unit, *cond);
                 emit_cmp(unit, r, Reg(31));
                 emit_cond_branch(
                     unit,
@@ -925,9 +1054,18 @@ pub fn emit_function(target: &Target, unit: &mut CompilationUnit, func: &SsaFunc
 fn emit_instr(unit: &mut CompilationUnit, instr: &SsaInstr) {
     match instr {
         SsaInstr::Const { result, value } => match value {
-            SsaConst::Int(i) => emit_mov_imm64(unit, alloc_reg(*result), *i as u64),
-            SsaConst::Bool(b) => emit_mov_imm64(unit, alloc_reg(*result), u64::from(*b)),
-            SsaConst::Unit => emit_mov_imm64(unit, alloc_reg(*result), 0),
+            SsaConst::Int(i) => {
+                emit_mov_imm64(unit, out_reg(*result), *i as u64);
+                put_out(unit, *result);
+            }
+            SsaConst::Bool(b) => {
+                emit_mov_imm64(unit, out_reg(*result), u64::from(*b));
+                put_out(unit, *result);
+            }
+            SsaConst::Unit => {
+                emit_mov_imm64(unit, out_reg(*result), 0);
+                put_out(unit, *result);
+            }
             SsaConst::Float(bits, w) => {
                 emit_float_const(unit, 0, *bits, *w);
                 if let Some(slot) = float_slot(*result) {
@@ -937,7 +1075,8 @@ fn emit_instr(unit: &mut CompilationUnit, instr: &SsaInstr) {
             // 字符串字面量：值是 `.rodata` 里那份字节的地址（指针）。
             SsaConst::Str(text) => {
                 let sym = unit.intern_string(text);
-                emit_str_addr(unit, alloc_reg(*result), &sym);
+                emit_str_addr(unit, out_reg(*result), &sym);
+                put_out(unit, *result);
             }
         },
         SsaInstr::Unary {
@@ -969,6 +1108,8 @@ fn emit_instr(unit: &mut CompilationUnit, instr: &SsaInstr) {
             // 浮点返回值按 AAPCS64 在 v0，不是 x0。
             if let Some(slot) = float_slot(*result) {
                 emit_store_float(unit, 0, slot, float_width(*result));
+            } else if spill_slot(*result).is_some() {
+                store_spill(unit, Reg(0), spill_slot(*result).unwrap());
             } else {
                 let d = alloc_reg(*result);
                 if d != Reg(0) {
@@ -984,10 +1125,11 @@ fn emit_instr(unit: &mut CompilationUnit, instr: &SsaInstr) {
                 emit_load_float(unit, 0, ss, w);
                 emit_store_float(unit, 0, rs, w);
             } else {
-                let (d, s) = (alloc_reg(*result), alloc_reg(*src));
+                let (d, s) = (out_reg(*result), val_reg(unit, *src));
                 if d != s {
                     emit_mov_rr(unit, d, s);
                 }
+                put_out(unit, *result);
             }
         }
         SsaInstr::Cast {
@@ -999,18 +1141,27 @@ fn emit_instr(unit: &mut CompilationUnit, instr: &SsaInstr) {
             if from.is_float() || to.is_float() || float_slot(*src).is_some() {
                 emit_cast_float(unit, *result, *src, *from, *to);
             } else {
-                emit_cast(unit, alloc_reg(*result), alloc_reg(*src), *from, *to);
+                let d = out_reg(*result);
+                let s = val_reg(unit, *src);
+                emit_cast(unit, d, s, *from, *to);
+                put_out(unit, *result);
             }
         }
         SsaInstr::Load { result, ptr, ty } => {
-            emit_load_mem(unit, alloc_reg(*result).bits(), alloc_reg(*ptr).bits(), *ty);
+            let d = out_reg(*result);
+            let p = val_reg(unit, *ptr);
+            emit_load_mem(unit, d.bits(), p.bits(), *ty);
+            put_out(unit, *result);
         }
         SsaInstr::Store { ptr, value, ty } => {
-            emit_store_mem(unit, alloc_reg(*ptr).bits(), alloc_reg(*value).bits(), *ty);
+            let p = val_reg(unit, *ptr);
+            let v = val_reg2(unit, *value);
+            emit_store_mem(unit, p.bits(), v.bits(), *ty);
         }
         SsaInstr::SlotAddr { result, local } => {
             let slot = LOCAL_SLOTS.with(|m| m.borrow().get(local).copied().unwrap_or(0));
-            emit_lea_slot(unit, alloc_reg(*result).bits(), slot);
+            emit_lea_slot(unit, out_reg(*result).bits(), slot);
+            put_out(unit, *result);
         }
         // `Var` 只是 SSA 值的命名引用，运行时不产生代码。
         SsaInstr::Var { .. } => {}
@@ -1041,8 +1192,8 @@ fn emit_unary(
         return;
     }
 
-    let dst = alloc_reg(result);
-    let src = alloc_reg(operand);
+    let dst = out_reg(result);
+    let src = val_reg(unit, operand);
 
     match op {
         // !x：比较 x 是否为 0（`cmp x, x` 恒相等，必须与 xzr 比较）
@@ -1065,6 +1216,7 @@ fn emit_unary(
             );
         }
     }
+    put_out(unit, result);
 }
 
 /// 发射二元运算。
@@ -1075,9 +1227,9 @@ fn emit_binary(
     lhs: SsaValue,
     rhs: SsaValue,
 ) {
-    let dst = alloc_reg(result);
-    let rn = alloc_reg(lhs);
-    let rm = alloc_reg(rhs);
+    let dst = out_reg(result);
+    let rn = val_reg(unit, lhs);
+    let rm = val_reg2(unit, rhs);
 
     use SsaBinaryOp::*;
     match op {
@@ -1118,6 +1270,7 @@ fn emit_binary(
             emit_cset(unit, dst, condition_code(op));
         }
     }
+    put_out(unit, result);
 }
 
 /// 浮点二元运算：算术结果落浮点栈槽，比较结果落整数寄存器。
@@ -1874,9 +2027,26 @@ fn assign_float_slots(func: &SsaFunction, base: usize) -> usize {
 /// `alloc_reg` 使用。x86-64 后端自己实现了溢出，见 `encoder.rs`。
 fn check_register_pressure(func: &SsaFunction) {
     // 传 callee-save 集合：跨调用存活的值只放 x19..x28，否则 `call` 会破坏它。
-    let alloc = crate::codegen::regalloc::allocate_registers(func, ALLOCATABLE.len(), &CALLEE_SAVE);
+    let alloc = crate::codegen::regalloc::allocate_registers(
+        func,
+        ALLOCATABLE.len(),
+        &CALLEE_SAVE,
+        ARG_REGS.len(),
+    );
     if alloc.spilled > 0 {
-        crate::codegen::unsupported_pressure(&func.name, ALLOCATABLE.len());
+        // 池子装不下的值溢出到栈槽；槽数记进 `SPILL_SLOTS`，槽区高度由
+        // `emit_function` 预留。
+        SPILL_SLOTS.with(|m| {
+            let mut map = m.borrow_mut();
+            map.clear();
+            for (&v, loc) in &alloc.map {
+                if let crate::codegen::regalloc::Location::Stack(i) = loc {
+                    map.insert(v, *i);
+                }
+            }
+        });
+    } else {
+        SPILL_SLOTS.with(|m| m.borrow_mut().clear());
     }
     REG_MAP.with(|m| {
         let mut map = m.borrow_mut();

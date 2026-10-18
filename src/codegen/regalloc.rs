@@ -52,15 +52,46 @@ pub const X86_64_CALLEE_SAVE: [usize; 4] = [6, 7, 8, 9];
 /// 做法是"挤掉结束最早的占用者"——可那个值往往**还活着**，寄存器被复用
 /// 之后它的内容就没了，生成的程序会安静地算错。这里宁可溢出，也不产出
 /// 错代码：调用方负责在溢出发生时报错（见 `emit_function`）。
+///
+/// `pin_params` 是要钉进池前 `pin_params` 个下标的形参个数（= 实参寄存器
+/// 个数，且要求目标后端的池下标与实参寄存器一一对应——x86-64 的池以
+/// rsi/rdi 开头、顺序与实参寄存器不一致，传 0 走老路径；thumb 同理）。
 pub fn allocate_registers(
     func: &SsaFunction,
     pool_size: usize,
     callee_save: &[usize],
+    pin_params: usize,
 ) -> Allocation {
     let (intervals, calls) = live_intervals(func);
     let mut out = Allocation::default();
     if intervals.is_empty() || pool_size == 0 {
         return out;
+    }
+
+    // —— 形参钉子 ——
+    //
+    // ABI 保证第 i 个整型实参已经在实参寄存器 i 里。把形参钉在池下标
+    // `0..pin_params` 上（池下标与实参寄存器一一对应），caller 与 callee
+    // 的形参搬运就都不需要任何 mov——此前分配按 `(start,end,val)` 排序，
+    // 短命值（如 `add(x,y)` 调用点临时造的中间值）会先抢走池首的实参寄存器，
+    // 形参被挤到别的寄存器，产生一堆来回搬的 mov。
+    //
+    // 例外：实地越过某次 `call` 的形参**不能**钉住——实参寄存器全是
+    // caller-save，`call` 的被调用方会覆盖它们。这样的形参让常规分配
+    // 走 callee-save / 溢出。
+    let pin = pin_params.min(func.params.len()).min(pool_size);
+    let mut pinned: HashSet<u32> = HashSet::new();
+    for (gi, &p) in func.params.iter().enumerate().take(pin) {
+        let pv = p.id();
+        let Some(&(start, end)) = intervals.get(&pv) else {
+            continue; // 没用到的形参没有活跃区间，钉不钉都行
+        };
+        let spans_call = !callee_save.is_empty() && calls.iter().any(|&c| start < c && c < end);
+        if spans_call {
+            continue;
+        }
+        out.map.insert(pv, L::Reg(gi));
+        pinned.insert(pv);
     }
 
     // 按起点排序；同起点时终点短的先放（更容易共用）。
@@ -76,8 +107,21 @@ pub fn allocate_registers(
     let mut owners: Vec<Option<u32>> = vec![None; pool_size];
     let all_idx: Vec<usize> = (0..pool_size).collect();
 
+    // 被钉住的形参先占住实参寄存器：常规分配看到的是"还活着的占用者"，
+    // 不会把别的值塞进来；形参自己被 `pinned` 跳过。
+    for (&v, loc) in &out.map {
+        let L::Reg(i) = loc else { continue };
+        if let Some(&(_, e)) = intervals.get(&v) {
+            owners[*i] = Some(v);
+            free_at[*i] = e;
+        }
+    }
+
     for (val, start, end) in &ordered {
         let (val, start, end) = (*val, *start, *end);
+        if pinned.contains(&val) {
+            continue;
+        }
         // 回收所有已经结束的区间
         for i in 0..pool_size {
             if owners[i].is_some() && free_at[i] < start {
@@ -91,7 +135,7 @@ pub fn allocate_registers(
         // 正好等于调用位置的值也算进来是错的：那只是 `call` 的实参，
         // `call` 自己会读它，返回后不需要它 —— 而这样会把大量普通值挤进
         // 只有 4 个的 callee-save 集合，逼出本来不会发生的冲突。
-        let spans_call = callee_save.len() > 0 && calls.iter().any(|&c| start < c && c < end);
+        let spans_call = !callee_save.is_empty() && calls.iter().any(|&c| start < c && c < end);
         let allowed: &[usize] = if spans_call { callee_save } else { &all_idx };
         match allowed.iter().copied().find(|i| owners[*i].is_none()) {
             Some(i) => {

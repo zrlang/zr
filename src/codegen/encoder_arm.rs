@@ -63,6 +63,30 @@ const ALLOCATABLE: [Reg; 9] = [
 /// AAPCS32 的整数实参寄存器 r0-r3。
 const ARG_REGS: [Reg; 4] = [Reg(0), Reg(1), Reg(2), Reg(3)];
 
+/// 除法/取余序列的内部暂存：商（`sdiv` 的目的）。
+/// 平台寄存器 r11，不在分配池里，随时可以用。
+const MUL_TMP_A: Reg = Reg(11);
+
+thread_local! {
+    /// 当前函数的溢出：值 id -> 溢出栈槽号（0 起）。只对 Location::Stack
+    /// 的值有条目，读写都按 `[sp + SPILL_BASE + slot*8]` 寻址。
+    static SPILL_SLOTS: RefCell<HashMap<u32, usize>> = RefCell::new(HashMap::new());
+    /// 溢出槽区的 sp 偏移（字节数）：push 保存区与取址槽区的上方。每个函数
+    /// `emit_function` 里更新。
+    static SPILL_BASE: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// 溢出值的暂存寄存器（都不进分配池，也绝不会与活跃值同住）。
+///
+/// - `SPILL_SRC`(r9)：第一溢出操作数的装载目标，同时兼任 φ 搬运中转
+///   （φ 拷贝发生在指令之间，与单条指令的发射不重叠）。
+/// - `SPILL_SRC2`(r10)：二元运算的第二溢出操作数，左右都溢出时与
+///   `SPILL_SRC` 分家。
+/// - `SPILL_DST`(r12)：溢出结果先算进这里再落回槽。
+const SPILL_SRC: Reg = Reg(9);
+const SPILL_SRC2: Reg = Reg(10);
+const SPILL_DST: Reg = Reg(12);
+
 /// 被调用者保存的寄存器（分配池下标，arm32 池里恰与寄存器号一致）。
 /// 跨调用存活的值只会落进 r4-r8，序言/尾声 `push/pop {r4-r8}` 恰好覆盖。
 const CALLEE_SAVE: [usize; 5] = [4, 5, 6, 7, 8];
@@ -84,18 +108,103 @@ fn alloc_reg(v: SsaValue) -> Reg {
     ALLOCATABLE[(v.id() as usize) % ALLOCATABLE.len()]
 }
 
-/// 把实参搬进 AAPCS32 的 r0-r3。
-fn emit_call_args(unit: &mut CompilationUnit, args: &[SsaValue]) {
-    for (i, a) in args.iter().enumerate() {
-        if i >= ARG_REGS.len() {
-            break; // 栈上传参区尚未实现
-        }
-        let src = alloc_reg(*a);
-        let dst = ARG_REGS[i];
-        if src != dst {
-            emit_mov_rr(unit, dst, src);
+/// `v` 的溢出栈槽（不在寄存器里、只在栈上时返回编号）。
+fn spill_slot(v: SsaValue) -> Option<usize> {
+    SPILL_SLOTS.with(|m| m.borrow().get(&v.id()).copied())
+}
+
+/// 溢出槽号的 sp 偏移：溢出区开在最终 sp 上方 0 起排（push 保存区与
+/// 取址槽区都在它上方）。
+fn spill_offset(slot: usize) -> i32 {
+    (slot * 8) as i32
+}
+
+/// `ld r, [sp + ...]`：从溢出槽装载字。
+fn load_spill(unit: &mut CompilationUnit, dst: Reg, slot: usize) {
+    let off = spill_offset(slot);
+    debug_assert!((0..=4095).contains(&off), "溢出槽偏移超出 ldr 立即数范围");
+    insn(unit, 0xe59d_0000 | (dst.bits() as u32) << 12 | off as u32);
+}
+
+/// `str r, [sp + ...]`：把字存进溢出槽。
+fn store_spill(unit: &mut CompilationUnit, src: Reg, slot: usize) {
+    let off = spill_offset(slot);
+    debug_assert!((0..=4095).contains(&off), "溢出槽偏移超出 str 立即数范围");
+    insn(unit, 0xe58d_0000 | (src.bits() as u32) << 12 | off as u32);
+}
+
+/// 读出 `v`：溢出的值装载到 [`SPILL_SRC`]。
+fn val_reg(unit: &mut CompilationUnit, v: SsaValue) -> Reg {
+    if let Some(slot) = spill_slot(v) {
+        load_spill(unit, SPILL_SRC, slot);
+        return SPILL_SRC;
+    }
+    alloc_reg(v)
+}
+
+/// 读出二元的第二操作数：溢出的值装载到 [`SPILL_SRC2`]（与第一操作数
+/// 的暂存寄存器不同，左右都溢出时不会互相冲掉）。
+fn val_reg2(unit: &mut CompilationUnit, v: SsaValue) -> Reg {
+    if let Some(slot) = spill_slot(v) {
+        load_spill(unit, SPILL_SRC2, slot);
+        return SPILL_SRC2;
+    }
+    alloc_reg(v)
+}
+
+/// `v` 里的结果要发射到的寄存器：溢出的结果先算进 [`SPILL_DST`]，
+/// 发射完用 [`put_out`] 落回槽。
+fn out_reg(v: SsaValue) -> Reg {
+    if spill_slot(v).is_some() {
+        SPILL_DST
+    } else {
+        alloc_reg(v)
+    }
+}
+
+/// 溢出的结果从 [`SPILL_DST`] 落回它的槽（其余值无事可做）。
+fn put_out(unit: &mut CompilationUnit, v: SsaValue) {
+    if let Some(slot) = spill_slot(v) {
+        store_spill(unit, SPILL_DST, slot);
+    }
+}
+
+/// 把实参搬进 AAPCS32 的 r0-r3；第 5+ 个整型实参写进**栈上传参区**。
+/// 返回传出栈区的字节数——`bl` 之后调用方要加回去。
+///
+/// 顺序很要紧：栈上传参先落（`str` 只读源寄存器、不写 r0-r3），然后才是
+/// 搬进 r0-r3 的并行走环——第 5+ 个实参的源可能就住在 r0-r3 里，如果先走环，
+/// `str` 读到的就是被改写之后的值。溢出实参经 [SPILL_DST] 中转。
+fn emit_call_args(unit: &mut CompilationUnit, args: &[SsaValue]) -> u32 {
+    let out_bytes = (args.len().saturating_sub(ARG_REGS.len()) * 8) as u32;
+    if out_bytes > 0 {
+        emit_sub_sp_imm(unit, out_bytes);
+        for (i, a) in args.iter().enumerate().skip(ARG_REGS.len()) {
+            let off = ((i - ARG_REGS.len()) * 8) as u32;
+            let r = if let Some(slot) = spill_slot(*a) {
+                load_spill(unit, SPILL_DST, slot);
+                SPILL_DST
+            } else {
+                alloc_reg(*a)
+            };
+            emit_str_sp_imm(unit, r, off);
         }
     }
+    let mut moves: Vec<(Reg, Reg)> = Vec::new();
+    let mut from_stack: Vec<(Reg, usize)> = Vec::new();
+    for (i, a) in args.iter().enumerate().take(ARG_REGS.len()) {
+        if let Some(slot) = spill_slot(*a) {
+            from_stack.push((ARG_REGS[i], slot));
+        } else {
+            moves.push((ARG_REGS[i], alloc_reg(*a)));
+        }
+    }
+    emit_parallel_moves(unit, &mut moves);
+    for (dst, slot) in from_stack {
+        load_spill(unit, SPILL_DST, slot);
+        emit_mov_rr(unit, dst, SPILL_DST);
+    }
+    out_bytes
 }
 
 /// 条件码（A32 的 `cond` 字段）。
@@ -129,11 +238,6 @@ mod op {
     /// 立即数形式的 `rsb`（取负）：ARM 的立即数数据处理空间里
     /// 0b0011 才是 rsb（0b0010 在该空间表示 sub）——ARM 的历史包袱。
     pub const RSB_IMM: u32 = 0b0011;
-    /// extra load/store 空间里的扩展指令（imm4[11:8] 段）。
-    pub const EXTRA_SXTB: u32 = 0b0001;
-    pub const EXTRA_SXTH: u32 = 0b0010;
-    pub const EXTRA_UXTB: u32 = 0b0000;
-    pub const EXTRA_UXTH: u32 = 0b0011;
 }
 
 /// 类型转换。
@@ -168,33 +272,19 @@ fn emit_cast(unit: &mut CompilationUnit, rd: Reg, rm: Reg, from: NumTy, to: NumT
 /// 这些是 extra load/store 空间里的单指令扩展：
 /// `cond 00 1 0101 1 imm4 1 Rd 1 10 0 imm2 type Rm`
 fn emit_extend(unit: &mut CompilationUnit, rd: Reg, rm: Reg, bits: u8, signed: bool) {
-    // imm2[5:4] 与 type[1:0] 一起决定扩不扩展以及扩多少：
-    // type=00 字扩展(uxth)/半字，01 字节扩展(uxtb)，10/11 符号扩展。
-    let (imm2, ty) = match (bits, signed) {
-        (8, true) => (0b00u32, 0b01u32), // sxtb
-        (8, false) => (0b00, 0b00),      // uxtb
-        (16, true) => (0b00, 0b10),      // sxth
-        (16, false) => (0b00, 0b11),     // uxth
+    // A32 一字扩展（extra load/store 家族，gas 实测对账）：
+    // `sxtb  rd, rm` = 0xE6AF0070 | rd<<12 | rm
+    // `uxtb  rd, rm` = 0xE6EF0070 | rd<<12 | rm
+    // `sxth  rd, rm` = 0xE6BF0070 | rd<<12 | rm
+    // `uxth  rd, rm` = 0xE6FF0070 | rd<<12 | rm
+    let base: u32 = match (bits, signed) {
+        (8, true) => 0xE6AF_0070,   // sxtb
+        (8, false) => 0xE6EF_0070,  // uxtb
+        (16, true) => 0xE6BF_0070,  // sxth
+        (16, false) => 0xE6FF_0070, // uxth
         _ => return,
     };
-    let op = match (bits, signed) {
-        (8, true) => op::EXTRA_SXTB,
-        (8, false) => op::EXTRA_UXTB,
-        (16, true) => op::EXTRA_SXTH,
-        _ => op::EXTRA_UXTH,
-    };
-    insn(
-        unit,
-        (cc::AL << 28)
-            | (0b000110 << 20)
-            | (op << 4)
-            | (rd.bits() as u32) << 12
-            | 1 << 7
-            | 1 << 4
-            | (imm2 << 6)
-            | ty
-            | rm.bits() as u32,
-    );
+    insn(unit, base | (rd.bits() as u32) << 12 | rm.bits() as u32);
 }
 
 // ==================================================================
@@ -239,10 +329,14 @@ fn imm8_operand(rotate: u32, imm: u8) -> u32 {
 /// 8 位旋转立即数：若 `value` 能表示成 `imm8` 的 2n 倍旋转，返回操作数。
 ///
 /// 这是 ARM 唯一"单指令装载任意小常量"的手段，能覆盖约 1/4 的模式。
+/// 把 32 位常量拆成 ARM 的旋转立即数：硬件解码为 `value = imm8 ror 2×rot`，
+/// 所以编码时 `imm8 = value rol 2×rot`（谨防把移位方向弄反——records
+/// `300` 只有 `rol 30 = ror 2 「imm8=75, rot=15」是合法的）。旋转方向
+/// 写反会解码成 `imm8 ror 2×rot` 的错误值。
 fn rotated_imm8_operand(value: u32) -> Option<u32> {
     for rotation in 0..16u32 {
-        let rotated = value.rotate_right(rotation * 2);
-        if rotated & 0xffff_ff00 == 0 {
+        let rotated = value.rotate_left(rotation * 2);
+        if rotated <= 0xff {
             return Some(imm8_operand(rotation, rotated as u8));
         }
     }
@@ -351,7 +445,12 @@ fn emit_mul(unit: &mut CompilationUnit, rd: Reg, lhs: Reg, rhs: Reg) {
     );
 }
 
-/// `mls rd, lhs, rhs, acc`：rd = acc - lhs * rhs
+/// `mls rd, lhs, rhs, acc`：对应 A32 `MLS Rd, Rn, Rm, Ra`（gas 顺序
+/// `mls r1,r4,r7,r2` = 0xE061_2794 实测），语义 Rd = Ra − Rn·Rm。
+/// A32 MUL 家族的字段排布不太常规：**Rd@19:16**、Ra@15:12、Rm@11:8、
+/// Rn@3:0。调用方注意两点：`acc` 是**被减数 Ra**（对应 gas 的最后一
+/// 个操作数），且 Rd 与 Rn（`lhs`，位 [3:0]）重名时 UNPREDICTABLE——
+/// 取余序列里商走 MUL_TMP_A(r11)、结果走 SPILL_DST(r12)，避开了重名。
 fn emit_mls(unit: &mut CompilationUnit, rd: Reg, lhs: Reg, rhs: Reg, acc: Reg) {
     insn(
         unit,
@@ -460,21 +559,27 @@ fn arm_imm_field(v: u32) -> Option<u32> {
     None
 }
 
-/// `sub sp, sp, #imm`（只在 imm12 可编码时可用——槽区通常 ≤ 1020 字节，
-/// 溢出走 `unsupported_const` 而不是静默编错立即数）。
+/// `sub sp, sp, #imm`。imm 编不进 8 位旋转立即数时（大槽区，如 17 的一千多
+/// 字节溢出区退路），经 r12 用 `sub sp, sp, rm` 兜底——r12 不在分配池里。
 fn emit_sub_sp_imm(unit: &mut CompilationUnit, bytes: u32) {
-    let field = arm_imm_field(bytes).unwrap_or_else(|| {
-        crate::codegen::unsupported_const("too-large stack slot area for the arm32 backend")
-    });
-    insn(unit, 0xe24d_d000 | field);
+    match arm_imm_field(bytes) {
+        Some(field) => insn(unit, 0xe24d_d000 | field),
+        None => {
+            emit_mov_imm32(unit, SPILL_DST, bytes);
+            insn(unit, 0xe04d_d000 | SPILL_DST.bits() as u32); // sub sp, sp, r12
+        }
+    }
 }
 
-/// `add sp, sp, #imm`（尾声）。
+/// `add sp, sp, #imm`（尾声）；大立即数同样经 r12 兜底。
 fn emit_add_sp_imm(unit: &mut CompilationUnit, bytes: u32) {
-    let field = arm_imm_field(bytes).unwrap_or_else(|| {
-        crate::codegen::unsupported_const("too-large stack slot area for the arm32 backend")
-    });
-    insn(unit, 0xe28d_d000 | field);
+    match arm_imm_field(bytes) {
+        Some(field) => insn(unit, 0xe28d_d000 | field),
+        None => {
+            emit_mov_imm32(unit, SPILL_DST, bytes);
+            insn(unit, 0xe08d_d000 | SPILL_DST.bits() as u32); // add sp, sp, r12
+        }
+    }
 }
 
 /// `add rd, sp, #imm`：被取地址的槽（一般 ≤ 1020 字节偏移，编码上限同上）。
@@ -483,6 +588,18 @@ fn emit_add_rd_sp_imm(unit: &mut CompilationUnit, rd: Reg, bytes: u32) {
         crate::codegen::unsupported_const("slot offset out of range for the arm32 backend")
     });
     insn(unit, 0xe28d_0000 | (rd.bits() as u32) << 12 | field);
+}
+
+/// `ldr rd, [sp, #off]`：装载栈上传参区的第 5+ 个整型实参/接参。
+fn emit_ldr_sp_imm(unit: &mut CompilationUnit, rd: Reg, off: u32) {
+    debug_assert!((0..=4095).contains(&off), "栈传参偏移超出 ldr 立即数范围");
+    insn(unit, 0xe59d_0000 | (rd.bits() as u32) << 12 | off);
+}
+
+/// `str rs, [sp, #off]`：把第 5+ 个整型实参写进栈上传参区。
+fn emit_str_sp_imm(unit: &mut CompilationUnit, rs: Reg, off: u32) {
+    debug_assert!((0..=4095).contains(&off), "栈传参偏移超出 str 立即数范围");
+    insn(unit, 0xe58d_0000 | (rs.bits() as u32) << 12 | off);
 }
 
 /// `b .`——自陷到自身，等待调试器或复位（裸机没有"退出"）。
@@ -552,27 +669,12 @@ fn successors(block: &crate::ssa::SsaBasicBlock) -> Vec<usize> {
     }
 }
 
-/// 在当前块末尾把本块持有的值写进后继块的各个 φ 寄存器（并行拷贝）。
-fn emit_phi_copies(unit: &mut CompilationUnit, func: &SsaFunction, succ: usize, from: usize) {
-    let Some(block) = func.blocks.iter().find(|b| b.id == succ) else {
-        return;
-    };
-    let mut moves: Vec<(Reg, Reg)> = Vec::new();
-    for instr in &block.instrs {
-        let SsaInstr::Phi {
-            result, incoming, ..
-        } = instr
-        else {
-            continue;
-        };
-        let Some((_, src)) = incoming.iter().find(|(p, _)| *p == from) else {
-            continue;
-        };
-        let (dst, src) = (alloc_reg(*result), alloc_reg(*src));
-        if dst != src {
-            moves.push((dst, src));
-        }
-    }
+/// 把一组寄存器搬运并行执行（成环时经 [`PHI_TMP`] 打散）。
+fn emit_parallel_moves(unit: &mut CompilationUnit, moves: &mut Vec<(Reg, Reg)>) {
+    moves.retain(|(dst, src)| dst != src);
+    // 前趟直接拆链——把 (d, s) 与 (s, d) 这样的直接自环去掉后，纯环的
+    // 成员会被各自搬运么？不会：环上的每个寄存器既是某条搬运的 dst，
+    // 也是另一条的 src，SAFE 永远为空，只能走 PHI_TMP 路径。
     while !moves.is_empty() {
         let safe = moves
             .iter()
@@ -590,6 +692,89 @@ fn emit_phi_copies(unit: &mut CompilationUnit, func: &SsaFunction, succ: usize, 
                         m.1 = PHI_TMP;
                     }
                 }
+            }
+        }
+    }
+}
+
+/// 在当前块末尾把本块持有的值写进后继块的各个 φ 寄存器（并行拷贝）。
+fn emit_phi_copies(unit: &mut CompilationUnit, func: &SsaFunction, succ: usize, from: usize) {
+    let Some(block) = func.blocks.iter().find(|b| b.id == succ) else {
+        return;
+    };
+    let mut reg_moves: Vec<(Reg, Reg)> = Vec::new();
+    let mut store_stack: Vec<(usize, Reg)> = Vec::new();
+    let mut load_stack: Vec<(Reg, usize)> = Vec::new();
+    let ds: Vec<(SsaValue, SsaValue)> = block
+        .instrs
+        .iter()
+        .filter_map(|instr| match instr {
+            SsaInstr::Phi {
+                result, incoming, ..
+            } => {
+                let src = incoming.iter().find(|(p, _)| *p == from)?.1;
+                Some((*result, src))
+            }
+            _ => None,
+        })
+        .collect();
+    for (result, src) in &ds {
+        if let (Some(ds_), Some(ss)) = (spill_slot(*result), spill_slot(*src)) {
+            // 溢出 → 溢出：经暂存寄存器栈对栈
+            load_spill(unit, SPILL_DST, ss);
+            store_spill(unit, SPILL_DST, ds_);
+        } else if let Some(ds_) = spill_slot(*result) {
+            // 槽 ← 寄存器：先读（无论后续寄存器搬运怎么写这些源寄存器，
+            // 这里读到的都是 φ 之前的值）
+            store_stack.push((ds_, alloc_reg(*src)));
+        } else if let Some(ss) = spill_slot(*src) {
+            // 槽 → 寄存器：装载进暂存，最后并行生效
+            load_stack.push((alloc_reg(*result), ss));
+        } else {
+            let (dst, s) = (alloc_reg(*result), alloc_reg(*src));
+            if dst != s {
+                reg_moves.push((dst, s));
+            }
+        }
+    }
+    for (slot, r) in &store_stack {
+        store_spill(unit, *r, *slot);
+    }
+    emit_parallel_moves(unit, &mut reg_moves);
+    for (dst, slot) in &load_stack {
+        load_spill(unit, SPILL_SRC, *slot);
+        emit_mov_rr(unit, *dst, SPILL_SRC);
+    }
+}
+
+/// 把形参从 ABI 寄存器 r0-r3 搬到分配结果所在的寄存器。
+///
+/// 调用的世界：调用方把实参放进 r 组（`emit_call_args`），被调用方这里
+/// 按分配结果把值搬进自己的寄存器——没有搬运的话，函数体里读形参会用
+/// 到分配寄存器里的**垃圾**。
+/// 被调用方的形参搬运：前 4 个整型实参从 r0-r3 搬到各自被钉/被分配的
+/// 位置；第 5+ 个从**栈上传参区**装载（它在调用方 `sub sp` 后的 sp+0 起，
+/// 也就是进入本函数时的 `sp + 栈传参基址 + (i-4)*8`）。`stack_base` 是
+/// 进入函数时到当前 sp 的字节数（push 区 + 本函数的槽区）。
+fn emit_param_moves(unit: &mut CompilationUnit, func: &SsaFunction, stack_base: u32) {
+    for (gi, p) in func.params.iter().enumerate() {
+        if gi >= ARG_REGS.len() {
+            let off = stack_base + ((gi - ARG_REGS.len()) * 8) as u32;
+            if let Some(slot) = spill_slot(*p) {
+                emit_ldr_sp_imm(unit, SPILL_DST, off);
+                store_spill(unit, SPILL_DST, slot);
+            } else {
+                let r = alloc_reg(*p);
+                emit_ldr_sp_imm(unit, r, off);
+            }
+            continue;
+        }
+        if let Some(slot) = spill_slot(*p) {
+            store_spill(unit, ARG_REGS[gi], slot);
+        } else {
+            let r = alloc_reg(*p);
+            if r != ARG_REGS[gi] {
+                emit_mov_rr(unit, r, ARG_REGS[gi]);
             }
         }
     }
@@ -629,12 +814,24 @@ pub fn emit_function(target: &Target, unit: &mut CompilationUnit, func: &SsaFunc
     // 被取地址的局部变量的栈槽：槽区开在 push 区下方。
     let slot_count = assign_local_slots(func, 0);
     let slot_bytes = (slot_count * 8) as u32;
+    if slot_bytes > 1020 {
+        crate::codegen::unsupported_const("too many address-taken locals (arm32 slot area)");
+    }
+    // 溢出槽数：溢出区开在最终 sp 之上、取址槽区之下；取址槽的 sp 偏移
+    // 就得整体抬升溢出区高度（记进 SPILL_BASE）。
+    let spill_count = SPILL_SLOTS.with(|m| m.borrow().len());
+    let spill_bytes = (spill_count * 8) as u32;
+    SPILL_BASE.with(|c| c.set(spill_bytes as usize));
     if slot_bytes > 0 {
-        if slot_bytes > 1020 {
-            crate::codegen::unsupported_const("too many address-taken locals (arm32 slot area)");
-        }
         emit_sub_sp_imm(unit, slot_bytes);
     }
+    if spill_bytes > 0 {
+        emit_sub_sp_imm(unit, spill_bytes);
+    }
+    // 形参从 ABI 寄存器 r0-r3 搬到分配结果所在的寄存器；第 5+ 个从栈上
+    // 传参区装载——基址 = push 区（push {r4-r8, lr} = 24 字节）+ 本函数槽区。
+    let stack_arg_base = 24 + slot_bytes + spill_bytes;
+    emit_param_moves(unit, func, stack_arg_base);
 
     for block in &func.blocks {
         block_offsets.push(unit.code.len());
@@ -647,8 +844,11 @@ pub fn emit_function(target: &Target, unit: &mut CompilationUnit, func: &SsaFunc
         match &block.term {
             SsaTerminator::Return(ret_val) => {
                 if let Some(v) = ret_val {
-                    let r = alloc_reg(*v);
+                    let r = val_reg(unit, *v);
                     emit_mov_rr(unit, Reg::R0, r);
+                }
+                if spill_bytes > 0 {
+                    emit_add_sp_imm(unit, spill_bytes);
                 }
                 if slot_bytes > 0 {
                     emit_add_sp_imm(unit, slot_bytes);
@@ -663,8 +863,8 @@ pub fn emit_function(target: &Target, unit: &mut CompilationUnit, func: &SsaFunc
             } => {
                 // 判 cond 是否为 0：`cmp r, r` 恒为相等、分不清零/非零，
                 // 必须与立即数 0 比较（`cmp r, #0`），与 AArch64 的
-                // `cmp r, xzr` 同一约定。
-                let r = alloc_reg(*cond);
+                // `cmp r, xzr` 同一约定。溢出的条件值先装载到暂存寄存器。
+                let r = val_reg(unit, *cond);
                 emit_cmp_imm8(unit, r, 0);
                 // cond == 0 时跳到 else，否则顺序执行 then
                 // （x86-64 的 `jz else; jmp then` 与之等价）
@@ -695,9 +895,18 @@ pub fn emit_function(target: &Target, unit: &mut CompilationUnit, func: &SsaFunc
 fn emit_instr(unit: &mut CompilationUnit, instr: &SsaInstr) {
     match instr {
         SsaInstr::Const { result, value } => match value {
-            SsaConst::Int(i) => emit_mov_imm32(unit, alloc_reg(*result), *i as u32),
-            SsaConst::Bool(b) => emit_mov_imm32(unit, alloc_reg(*result), u32::from(*b)),
-            SsaConst::Unit => emit_mov_imm32(unit, alloc_reg(*result), 0),
+            SsaConst::Int(i) => {
+                emit_mov_imm32(unit, out_reg(*result), *i as u32);
+                put_out(unit, *result);
+            }
+            SsaConst::Bool(b) => {
+                emit_mov_imm32(unit, out_reg(*result), u32::from(*b));
+                put_out(unit, *result);
+            }
+            SsaConst::Unit => {
+                emit_mov_imm32(unit, out_reg(*result), 0);
+                put_out(unit, *result);
+            }
             SsaConst::Float(..) => crate::codegen::unsupported_const("float"),
             SsaConst::Str(_) => crate::codegen::unsupported_const("string"),
         },
@@ -719,9 +928,16 @@ fn emit_instr(unit: &mut CompilationUnit, instr: &SsaInstr) {
             args,
             ..
         } => {
-            emit_call_args(unit, args);
+            let out_bytes = emit_call_args(unit, args);
             emit_bl(unit, callee);
-            emit_mov_rr(unit, alloc_reg(*result), Reg(0));
+            if out_bytes > 0 {
+                emit_add_sp_imm(unit, out_bytes);
+            }
+            if let Some(slot) = spill_slot(*result) {
+                store_spill(unit, Reg(0), slot);
+            } else {
+                emit_mov_rr(unit, alloc_reg(*result), Reg(0));
+            }
         }
         // φ 的实际拷贝由前驱末尾的 emit_phi_copies 发出
         SsaInstr::Phi { .. } => {}
@@ -731,27 +947,53 @@ fn emit_instr(unit: &mut CompilationUnit, instr: &SsaInstr) {
             from,
             to,
         } => {
-            emit_cast(unit, alloc_reg(*result), alloc_reg(*src), *from, *to);
+            let s = val_reg(unit, *src);
+            emit_cast(unit, out_reg(*result), s, *from, *to);
+            put_out(unit, *result);
         }
         SsaInstr::Copy { result, src } => {
-            let (d, s) = (alloc_reg(*result), alloc_reg(*src));
-            if d != s {
-                emit_mov_rr(unit, d, s);
+            match (spill_slot(*result), spill_slot(*src)) {
+                (Some(ds), Some(ss)) => {
+                    // 溢出 → 溢出：经暂存寄存器栈对栈
+                    load_spill(unit, SPILL_SRC, ss);
+                    store_spill(unit, SPILL_SRC, ds);
+                }
+                (Some(ds), None) => {
+                    let r = val_reg(unit, *src);
+                    store_spill(unit, r, ds)
+                }
+                (None, Some(ss)) => {
+                    load_spill(unit, out_reg(*result), ss);
+                }
+                (None, None) => {
+                    let (d, s) = (alloc_reg(*result), alloc_reg(*src));
+                    if d != s {
+                        emit_mov_rr(unit, d, s);
+                    }
+                }
             }
         }
         SsaInstr::Var { .. } => {}
-        // 被取地址的局部变量的栈槽地址：`add rd, sp, 8*slot`。
+        // 被取地址的局部变量的栈槽地址：`add rd, sp, 8*slot`。取址槽区
+        // 下方腾出了溢出区，基址要抬升溢出高度。
         SsaInstr::SlotAddr { result, local } => {
             let slot = LOCAL_SLOTS.with(|m| m.borrow().get(local).copied().unwrap_or(0));
-            emit_add_rd_sp_imm(unit, alloc_reg(*result), (slot * 8) as u32);
+            let off = slot * 8 + SPILL_BASE.get();
+            emit_add_rd_sp_imm(unit, out_reg(*result), off as u32);
+            put_out(unit, *result);
         }
         SsaInstr::Load {
             result, ptr, ty, ..
         } => {
-            emit_load_mem(unit, alloc_reg(*result), alloc_reg(*ptr), *ty);
+            let d = out_reg(*result);
+            let p = val_reg(unit, *ptr);
+            emit_load_mem(unit, d, p, *ty);
+            put_out(unit, *result);
         }
         SsaInstr::Store { ptr, value, ty, .. } => {
-            emit_store_mem(unit, alloc_reg(*ptr), alloc_reg(*value), *ty);
+            let p = val_reg(unit, *ptr);
+            let v = val_reg2(unit, *value);
+            emit_store_mem(unit, p, v, *ty);
         }
     }
 }
@@ -835,17 +1077,22 @@ fn emit_unary(
     op: crate::ssa::SsaUnaryOp,
     operand: SsaValue,
 ) {
-    let dst = alloc_reg(result);
-    let src = alloc_reg(operand);
+    let dst = out_reg(result);
+    let src = val_reg(unit, operand);
     use crate::ssa::SsaUnaryOp::*;
     match op {
-        // !x：cmp 后条件置 1 / 0
-        Not => emit_compare(unit, dst, SsaBinaryOp::Eq, src, src),
+        // !x：x 与 0 比较（与 x 自己比较恒为相等），然后条件置 1/0
+        Not => {
+            emit_cmp_imm8(unit, src, 0);
+            emit_mov_cond(unit, cc::EQ, dst, 1);
+            emit_mov_cond(unit, cc::NE, dst, 0);
+        }
         // ~x：mvn dst, src
         BitNot => emit_mvn(unit, dst, src),
         // -x：rsb dst, src, #0
         Neg => emit_rsb(unit, dst, src),
     }
+    put_out(unit, result);
 }
 
 /// 发射二元运算。
@@ -856,9 +1103,9 @@ fn emit_binary(
     lhs: SsaValue,
     rhs: SsaValue,
 ) {
-    let dst = alloc_reg(result);
-    let rn = alloc_reg(lhs);
-    let rm = alloc_reg(rhs);
+    let dst = out_reg(result);
+    let rn = val_reg(unit, lhs);
+    let rm = val_reg2(unit, rhs);
     use SsaBinaryOp::*;
     match op {
         Add => emit_op3(unit, op::ADD, dst, rn, rm),
@@ -868,11 +1115,16 @@ fn emit_binary(
         BitXor => emit_op3(unit, op::EOR, dst, rn, rm),
         Mul => emit_mul(unit, dst, rn, rm),
         Div => emit_sdiv(unit, dst, rn, rm),
-        // 余数 = l - (l / r) * r：sdiv + mls 两条指令
+        // 余数 = l - (l / r) * r。ARM 的 MLS 规定 Rd == Rn 时 UNPREDICTABLE，
+        // 而商通常就想落在 dst 里；所以整条序列只用平台寄存器 r11/r12 做
+        // 中转，不碰分配池，再一次性搬回 dst（dst 溢出时 r12 就是
+        // SPILL_DST，`put_out` 直接落槽）。
         Rem => {
-            // 余数 = l - (l / r) * r：sdiv + mls 两条指令
-            emit_sdiv(unit, dst, rn, rm);
-            emit_mls(unit, dst, rn, rm, dst);
+            // 商 → r11；r12 = rn − r11·rm；dst 再接管。传参对应 gas
+            // （Rd, Rn, Rm, Ra）：被减数是 rn，落在 acc 位。
+            emit_sdiv(unit, MUL_TMP_A, rn, rm);
+            emit_mls(unit, SPILL_DST, MUL_TMP_A, rm, rn);
+            emit_mov_rr(unit, dst, SPILL_DST);
         }
         Shl => emit_shift_by_reg(unit, dst, rn, rm, Shift::Lsl),
         // 右移一律取算术（ASR），与 x86-64 的 sar 一致：IR 只有一个 Shr，
@@ -880,16 +1132,18 @@ fn emit_binary(
         Shr => emit_shift_by_reg(unit, dst, rn, rm, Shift::Asr),
         Eq | Ne | Lt | Gt | Le | Ge => emit_compare(unit, dst, op, rn, rm),
     }
+    put_out(unit, result);
 }
 
 /// 比较运算：把 0/1 写入 `dst`（靠 ARM 的条件执行）。
 fn emit_compare(unit: &mut CompilationUnit, dst: Reg, op: SsaBinaryOp, rn: Reg, rm: Reg) {
     use SsaBinaryOp::*;
     match op {
-        // 相等可以用异或后测零，省一次 compare 的依赖
+        // 相等可以用异或后测零，省一次 compare 的依赖。
+        // 注意必须与 **#0** 比较（cmp dst, dst 恒相等）。
         Eq | Ne => {
             emit_op3(unit, op::EOR, dst, rn, rm);
-            emit_cmp(unit, dst, dst);
+            emit_cmp_imm8(unit, dst, 0);
         }
         _ => emit_cmp(unit, rn, rm),
     }
@@ -1255,9 +1509,32 @@ mod tests {
 
     #[test]
     fn rotated_immediate_covers_common_constants() {
-        // 0x000000FF、0xFF000000、0x0000FF00 都应单指令完成
-        for value in [0x0000_00ffu32, 0x0000_ff00, 0x00ff_0000, 0xff00_0000] {
-            assert!(rotated_imm8_operand(value).is_some(), "{value:#x}");
+        // 0x000000FF、0xFF000000、0x0000FF00 都应单指令完成，且**解码回
+        // 原值**（硬件语义 `value = imm8 ror 2×rot`）——旋转方向写反时
+        // 典型反例 `300`（=75 ror 30）会编成 `75 ror 2` 的死值。
+        for value in [
+            0u32,
+            255,
+            256,
+            300,
+            1024,
+            75,
+            0x0000_00ff,
+            0x0000_ff00,
+            0x00ff_0000,
+            0xff00_0000,
+            0x1234_u32 << 20,
+        ] {
+            let Some(op) = rotated_imm8_operand(value) else {
+                continue;
+            };
+            let imm8 = op & 0xff;
+            let rot = (op >> 8) & 0xf;
+            let decoded = imm8.rotate_right(rot * 2);
+            assert_eq!(
+                decoded, value,
+                "rotated immediate {op:#x} 回解码应为 {value}"
+            );
         }
         assert!(rotated_imm8_operand(0x1234_5678).is_none());
     }
@@ -1316,11 +1593,15 @@ mod tests {
             SsaValue(0),
             SsaValue(1),
         );
-        // r3 = r0 / r1; r3 = r0 - r3 * r1
+        // 余数避开 MLS 的 Rd==Rn UNPREDICTABLE：商落 r11（MUL_TMP_A），
+        // 余数先落 r12（SPILL_DST）再搬回分配寄存器 r3。
+        //   r11 = r0 / r1; r12 = r0 - r11 * r1; r3 = r12
         let sdiv = u32::from_le_bytes(u.code[0..4].try_into().unwrap());
         let mls = u32::from_le_bytes(u.code[4..8].try_into().unwrap());
-        assert_eq!(sdiv, 0xe713_f110, "sdiv r3, r0, r1");
-        assert_eq!(mls, 0xe063_3190, "mls r3, r0, r1, r3");
+        let mv = u32::from_le_bytes(u.code[8..12].try_into().unwrap());
+        assert_eq!(sdiv, 0xe71b_f110, "sdiv r11, r0, r1");
+        assert_eq!(mls, 0xe06c_019b, "mls r12 = r0 - r11*r1");
+        assert_eq!(mv, 0xe1a0_300c, "mov r3, r12");
     }
 
     /// load/store 编码基准（clang --target=armv7a-none-eabi + objdump 实测）：
@@ -1405,16 +1686,27 @@ mod tests {
 /// x86-64 后端自己实现了溢出，见 `encoder.rs`。
 fn check_register_pressure(func: &SsaFunction) {
     // 跨调用存活的值只放被调用者保存的 r4-r8，否则 `bl` 会破坏它。
-    let alloc = crate::codegen::regalloc::allocate_registers(func, ALLOCATABLE.len(), &CALLEE_SAVE);
-    if alloc.spilled > 0 {
-        crate::codegen::unsupported_pressure(&func.name, ALLOCATABLE.len());
-    }
+    let alloc = crate::codegen::regalloc::allocate_registers(
+        func,
+        ALLOCATABLE.len(),
+        &CALLEE_SAVE,
+        ARG_REGS.len(),
+    );
     REG_MAP.with(|m| {
         let mut map = m.borrow_mut();
         map.clear();
         for (&v, loc) in &alloc.map {
             if let crate::codegen::regalloc::Location::Reg(i) = loc {
                 map.insert(v, *i);
+            }
+        }
+    });
+    SPILL_SLOTS.with(|m| {
+        let mut slots = m.borrow_mut();
+        slots.clear();
+        for (&v, loc) in &alloc.map {
+            if let crate::codegen::regalloc::Location::Stack(i) = loc {
+                slots.insert(v, *i);
             }
         }
     });

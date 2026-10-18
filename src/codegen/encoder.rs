@@ -825,8 +825,12 @@ pub fn emit_function(target: &Target, unit: &mut CompilationUnit, func: &SsaFunc
         "x86-64 后端只能用于 x86_64 目标"
     );
     // 先做活跃区间分析 + 线性扫描，确定每个值落在哪个寄存器
-    let alloc =
-        crate::codegen::regalloc::allocate_registers(func, ALLOCATABLE.len(), &X86_64_CALLEE_SAVE);
+    let alloc = crate::codegen::regalloc::allocate_registers(
+        func,
+        ALLOCATABLE.len(),
+        &X86_64_CALLEE_SAVE,
+        0,
+    );
     // callee-save 集合要在发射尾声时再用，所以这里留一份
     let callee_saved = callee_saved_regs(&alloc.map);
     // 整数溢出的槽之后接着排浮点槽，最后是被取地址的局部变量的槽：

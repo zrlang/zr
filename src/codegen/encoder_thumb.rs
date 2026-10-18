@@ -523,7 +523,7 @@ pub fn emit_function(
     func: &SsaFunction,
 ) {
     debug_assert!(target.is_arm32_thumb(), "Thumb-2 后端只用于 thumb 目标");
-    let alloc = crate::codegen::regalloc::allocate_registers(func, ALLOCATABLE.len(), &[]);
+    let alloc = crate::codegen::regalloc::allocate_registers(func, ALLOCATABLE.len(), &[], 0);
     if alloc.spilled > 0 {
         crate::codegen::unsupported_pressure(&func.name, ALLOCATABLE.len());
     }
