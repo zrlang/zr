@@ -1,0 +1,70 @@
+// match 运行期语义：脱糖成 if/else 链的分支条件，首匹配胜出。
+// 模式支持字面量（整数/bool/char，含负数）与 `_`、绑定臂（多与 guard）、
+// 或模式 `3 | 4`、guard `if`，以及 bool 穷尽的"无尾 `_`"写法。
+//
+// 注意：或模式 `3 | 4` 早先在解析器里只会留下第一个分支（4 静默掉进
+// `_`、match 静默算错），现在展开成两条分支条件，本用例锁住语义。
+
+fn classify(n: i32) -> i32 {
+    match n {
+        0 => 10,
+        1 | 2 => 20,
+        3 if n > 2 => 30,
+        _ => 40,
+    }
+}
+
+fn parity(b: bool) -> i32 {
+    // bool 的两条字面量臂已穷尽，可以没有尾 `_`
+    match b {
+        true => 1,
+        false => 0,
+    }
+}
+
+fn day_char(c: char) -> i32 {
+    match c {
+        'M' => 1,
+        _ => 0,
+    }
+}
+
+fn sign(n: i32) -> i32 {
+    let negative = match n {
+        -5 => 1,
+        _ => 0,
+    };
+    return negative;
+}
+
+fn with_binding(n: i32) -> i32 {
+    // 绑定臂 + guard：v 绑住臂值，guard 与臂体都能用
+    match n {
+        v if v > 100 => v,
+        _ => 0,
+    }
+}
+
+fn main() -> i32 {
+    let a = classify(0) + classify(1) + classify(2) + classify(3) + classify(4);
+    let b = parity(true) + parity(false) + day_char('M') + day_char('X');
+    let c = sign(-5) + sign(7);
+    let d = with_binding(105);
+    if a != 120 {
+        // 或模式 1|2 / 字面量臂 / 有 guard 的 3
+        return 1;
+    }
+    if b != 2 {
+        // bool 双字面量穷尽（无尾 `_`）+ char 字面量
+        return 2;
+    }
+    if c != 1 {
+        // 负数字面量模式
+        return 3;
+    }
+    if d != 105 {
+        // 绑定臂 + guard
+        return 4;
+    }
+    return 0;
+}

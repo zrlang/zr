@@ -34,14 +34,21 @@ impl Parser {
     }
 
     /// 解析或模式 `p1 | p2 | ...`。
+    ///
+    /// 早先这里丢弃后续分支（"第一个分支作为主模式"）——`3 | 4 => a` 只有
+    /// 3 匹配、4 静默掉进 `_`，是典型的"能编过但算错"。现在把所有分支
+    /// 收进 `Pattern::Or`，由类型检查展开成多条分支条件。
     fn parse_pattern_or(&mut self) -> Result<Pattern, CompileError> {
-        let pat = self.parse_pattern_single()?;
-        // 目前或模式暂不展开为独立节点，第一个分支作为主模式
+        let mut alts = vec![self.parse_pattern_single()?];
         while self.check(&TokenKind::Pipe) && self.next_can_start_pattern() {
             self.advance(); // |
-            self.parse_pattern_single()?;
+            alts.push(self.parse_pattern_single()?);
         }
-        Ok(pat)
+        if alts.len() == 1 {
+            Ok(alts.remove(0))
+        } else {
+            Ok(Pattern::Or(alts))
+        }
     }
 
     /// 判断下一个 token 是否可以作为模式的起始。
@@ -135,6 +142,20 @@ impl Parser {
             // 不是范围模式，回退为字面量模式
             return if let Expression::Literal(lit, _) = start {
                 Ok(Pattern::Literal(lit))
+            } else if let Expression::Unary(UnaryOp::Neg, inner, _) = &start {
+                // 负字面量模式：把符号折进数值（`-5` → `Int(-5)`），
+                // 否则停在 Unary 包装上会报"expected pattern"。
+                if let Expression::Literal(lit, _) = inner.as_ref() {
+                    match lit.clone() {
+                        Literal::Int(v, suffix) => Ok(Pattern::Literal(Literal::Int(-v, suffix))),
+                        Literal::Float(v, suffix) => {
+                            Ok(Pattern::Literal(Literal::Float(-v, suffix)))
+                        }
+                        _ => Err(CompileError::internal("expected pattern")),
+                    }
+                } else {
+                    Err(CompileError::internal("expected pattern"))
+                }
             } else {
                 Err(CompileError::internal("expected pattern"))
             };
@@ -434,5 +455,20 @@ mod tests {
             pat("mut count"),
             Pattern::Binding(_, crate::parser::ast::Mutability::Mutable, _, _)
         ));
+    }
+
+    #[test]
+    fn or_pattern_keeps_all_alternatives() {
+        // 早先解析器把 `3 | 4` 丢弃成单个 3 —— match 时 4 静默不匹配。
+        // 现在必须收集成 Or，供类型检查展开成多条分支条件。
+        match pat("3 | 4") {
+            Pattern::Or(alts) => assert_eq!(alts.len(), 2),
+            other => panic!("expected or-pattern, got {:?}", other),
+        }
+        match pat("1 | 2 | 3") {
+            Pattern::Or(alts) => assert_eq!(alts.len(), 3),
+            other => panic!("expected or-pattern, got {:?}", other),
+        }
+        assert!(matches!(pat("3"), Pattern::Literal(Literal::Int(3, _))));
     }
 }

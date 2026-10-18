@@ -1245,6 +1245,7 @@ fn pattern_kind(p: &crate::parser::ast::Pattern) -> &'static str {
         Pattern::Ref(..) => "reference",
         Pattern::Literal(..) => "literal",
         Pattern::Range(..) => "range",
+        Pattern::Or(_) => "or-pattern",
     }
 }
 

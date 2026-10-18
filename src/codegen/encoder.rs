@@ -1256,8 +1256,8 @@ fn emit_const(unit: &mut CompilationUnit, result: SsaValue, value: SsaConst) {
             emit8(unit, i as u64);
         }
         // bool / unit 在通用寄存器里就是 0/1；字符串后端暂未实现
-        SsaConst::Bool(b) => emit_const_bool(unit, dst.bits(), b),
-        SsaConst::Unit => emit_const_int(unit, dst.bits(), 0),
+        SsaConst::Bool(b) => emit_const_bool(unit, dst, b),
+        SsaConst::Unit => emit_const_int(unit, dst, 0),
         // 浮点根本不进 GPR：位模式直接搬进 XMM，再落到浮点专用栈槽
         SsaConst::Float(f, w) => {
             if let Some(slot) = float_slot(result) {
@@ -1301,20 +1301,23 @@ fn emit_str_addr(unit: &mut CompilationUnit, dst: Gpr, sym: &str) {
 }
 
 /// 用 mov 立即数加载一个小整数（0/1 之类）。
-fn emit_const_int(unit: &mut CompilationUnit, dst: u8, value: u64) {
+fn emit_const_int(unit: &mut CompilationUnit, dst: Gpr, value: u64) {
     if value == 0 {
-        // xor reg, reg —— 比 mov 短，且不破坏标志位
+        // xor reg, reg —— 比 mov 短，且不破坏标志位。
+        // reg==r/m 都是 dst：REX 要同时带上 REX.R 和 REX.B（R8+ 时得 0x09）。
+        let rex = 0x48u8 | if dst.rex_bit() { 0x09 } else { 0x00 };
+        emit1(unit, rex);
         emit1(unit, 0x31);
-        emit1(unit, 0xc0 | (dst << 3) | dst);
+        emit1(unit, 0xc0 | (dst.bits() << 3) | dst.bits());
     } else {
-        emit1(unit, 0x48 | if dst >= 8 { 0x04 } else { 0x00 });
-        emit1(unit, 0xb8 + (dst & 7));
+        emit1(unit, 0x48u8 | if dst.rex_bit() { 0x01 } else { 0x00 });
+        emit1(unit, 0xb8 + dst.bits());
         emit8(unit, value);
     }
 }
 
 /// 加载布尔常量。
-fn emit_const_bool(unit: &mut CompilationUnit, dst: u8, value: bool) {
+fn emit_const_bool(unit: &mut CompilationUnit, dst: Gpr, value: bool) {
     emit_const_int(unit, dst, u64::from(value));
 }
 

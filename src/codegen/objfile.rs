@@ -288,13 +288,14 @@ pub fn apply_relocations(unit: &mut CompilationUnit, text_base: u64, rodata_base
                 unit.code[reloc.offset..end].copy_from_slice(&patched.to_le_bytes());
             }
             RelocationKind::RiscVJal => {
-                // J 型（jal）：21 位半字偏移被拆成 4 段散落在指令里
+                // J 型（jal）：立即数是**字节**差（目标 − 指令地址），
+                // imm[0] 因指令半字对齐恒为 0、不入字段，拆位按规范：
                 //   imm[20]   → [31]      imm[10:1] → [30:21]
                 //   imm[11]   → [20]      imm[19:12]→ [19:12]
                 let delta = target - instr_va as i64;
-                let imm = (delta >> 1) as u32 & 0x1f_ffff;
+                let imm = delta as u32 & 0x1f_ffff;
                 patch_word(&mut unit.code, reloc, |word| {
-                    (word & 0x0007_ffff)                 // 保留 [18:0]（rd + opcode）
+                    (word & 0x0000_0fff)                 // 保留 [11:0]（rd + opcode）
                         | (imm & 0x000f_f000)             // imm[19:12] 原位
                         | ((imm & 0x0000_0800) << 9)      // imm[11]    → [20]
                         | ((imm & 0x0000_07fe) << 20)     // imm[10:1]  → [30:21]
@@ -302,17 +303,18 @@ pub fn apply_relocations(unit: &mut CompilationUnit, text_base: u64, rodata_base
                 });
             }
             RelocationKind::RiscVBranch => {
-                // B 型（beq 等）：13 位半字偏移散落在指令里
+                // B 型（beq 等）：立即数同样以字节为单位（imm[0] = 0 缺省），
+                // 字段拆位按规范：
                 //   imm[12]  → [31]   imm[10:5] → [30:25]
                 //   imm[4:1] → [11:8] imm[11]   → [7]
                 let delta = target - instr_va as i64;
-                let imm = (delta >> 1) as u32 & 0x1fff;
+                let imm = delta as u32 & 0x1fff;
                 patch_word(&mut unit.code, reloc, |word| {
-                    (word & 0x0000_707f)                 // 保留 funct3 + opcode
-                        | ((imm & 0x0000_1000) >> 4)     // imm[11]   → [7]
-                        | ((imm & 0x0000_000f) << 7)     // imm[4:1]  → [11:8]
-                        | ((imm & 0x0000_0fe0) << 20)    // imm[10:5] → [30:25]
-                        | ((imm & 0x0000_1000) << 19) // imm[12]   → [31]
+                    (word & 0x01ff_f07f)                 // 保留 rs1/rs2/funct3/opcode
+                        | ((imm & 0x0000_1000) << 19)    // imm[12]   → [31]
+                        | ((imm & 0x0000_07e0) << 20)    // imm[10:5] → [30:25]
+                        | ((imm & 0x0000_001e) << 7)     // imm[4:1]  → [11:8]
+                        | ((imm & 0x0000_0800) >> 4) // imm[11]   → [7]
                 });
             }
             RelocationKind::Branch26 | RelocationKind::Call26 => {
@@ -477,7 +479,7 @@ mod tests {
 
     #[test]
     fn riscv_jal_relocation_scatters_immediate_correctly() {
-        // jal ra, <向前 12 字节>：J 型立即数 -6（半字）要拆成 4 段
+        // jal ra, <向后 12 字节>：字节差 -12 拆到 J 型 4 段
         let mut unit = CompilationUnit::new();
         let mut code = vec![0u8; 12];
         code.extend_from_slice(&0x0000_00efu32.to_le_bytes()); // jal ra, imm=0
@@ -494,18 +496,18 @@ mod tests {
             .push(Relocation::new(12, 12, 4, "main", RelocationKind::RiscVJal));
         apply_relocations(&mut unit, 0x1000, 0);
         let word = u32::from_le_bytes(unit.code[12..16].try_into().unwrap());
-        // imm = -6（0x1FFFFA）→ imm[20]=1, imm[10:1]=0x3FD, imm[11]=1,
-        // imm[19:12]=0xFF，目的寄存器 ra=1
-        assert_eq!(word, 0xffbf_f0ef);
+        // 字节差 -12（imm = 0x1FFFF4）→ imm[20]=1（→[31]）、imm[10:1]=0x3FA
+        // （→[30:21]）、imm[11]=1（→[20]）、imm[19:12]=0xFF（原位），ra=1
+        assert_eq!(word, 0xff5f_f0ef);
         assert_eq!(word & 0xfff, 0x0ef, "rd 与 opcode 必须保留");
     }
 
     #[test]
     fn riscv_branch_relocation_scatters_immediate_correctly() {
-        // beq t0, zero, <向后 8 字节>：B 型立即数 4（半字）
+        // beq t0, zero, <向前 8 字节>：字节差 +8（bb1 在 +16，指令在 +8）
         let mut unit = CompilationUnit::new();
         let mut code = vec![0x00u8; 8];
-        code.extend_from_slice(&0x0000_8063u32.to_le_bytes()); // beq t0, zero, 0（占位）
+        code.extend_from_slice(&0x0002_8063u32.to_le_bytes()); // beq t0, zero, 0（占位）
         unit.code = code;
         unit.symbols.push(Symbol {
             name: "bb1".to_string(),
@@ -519,10 +521,11 @@ mod tests {
             .push(Relocation::new(8, 8, 4, "bb1", RelocationKind::RiscVBranch));
         apply_relocations(&mut unit, 0x2000, 0);
         let word = u32::from_le_bytes(unit.code[8..12].try_into().unwrap());
-        // imm = 4 个半字 → imm[4:1] = 2 → 指令的 [11:8] = 2
-        assert_eq!((word >> 8) & 0xf, 2);
-        // funct3 = 001（bne 用了 001；此处用 beq 的 000）与 opcode 0x63 必须保留
-        assert_eq!(word & 0x707f, 0x0063, "funct3 与 opcode 必须保留");
+        // 字节差 +8：imm[4:1] = 4 → [11:8] = 4，其余段为 0
+        assert_eq!(word, 0x0002_8463);
+        assert_eq!(word & 0x7000, 0, "funct3 必须保留");
+        assert_eq!((word >> 15) & 0x1f, 5, "rs1 必须保留");
+        assert_eq!((word >> 20) & 0x1f, 0, "rs2 必须保留");
     }
 
     #[test]

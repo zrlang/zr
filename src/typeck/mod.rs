@@ -20,8 +20,8 @@ use crate::parser::ast::{
     Program, Span, Spanned, Statement, StructDef as AstStruct, Type as AstType, UseTree,
 };
 use crate::typeck::hir::{
-    BasicBlock, BasicBlockId, Cfg, DefId, ExprKind, FieldIndex, HirArm, HirExpr, HirField,
-    HirLiteral, HirStmt, InferId, LocalId, Ty, WherePred,
+    BasicBlock, BasicBlockId, Cfg, DefId, ExprKind, FieldIndex, HirExpr, HirField, HirLiteral,
+    HirStmt, InferId, LocalId, Ty, WherePred,
 };
 use crate::typeck::infer::InferCtxt;
 
@@ -1035,14 +1035,20 @@ impl TypeChecker {
                     .with_span(*span));
                 };
                 let init_hir = if let Some(e) = init {
-                    Some(Box::new(self.check_expr(e, &ty)?))
+                    let h = self.check_expr(e, &ty)?;
+                    self.infer
+                        .unify(&h.ty, &ty, e.span())
+                        .map_err(|e| self.errors.push(e))
+                        .ok();
+                    Some(Box::new(h))
                 } else {
                     None
                 };
-                let local = self.alloc_local();
-                self.locals.insert(local, ty.clone());
-                self.infer.locals.insert(local, ty.clone());
-                self.scope_stack.last_mut().unwrap().push(local);
+                // 别像以前那样只登记 LocalId：`var y` 的名字必须进作用域，
+                // 否则任何使用都报 "cannot find value y"（var 语句实际上没
+                // 法用）。走 lower_pattern / bind_local，和 let 同一条路。
+                let hir_pat = self.lower_pattern(&_pat, &ty)?;
+                let local = first_binding(&hir_pat).unwrap_or_else(|| self.alloc_local());
                 Ok(HirStmt::Var {
                     local,
                     init: init_hir,
@@ -1779,54 +1785,147 @@ impl TypeChecker {
     ) -> Result<HirExpr> {
         let s_ty = self.infer_expr_ty(scrutinee)?;
         let s = self.check_expr(scrutinee, &s_ty)?;
-        let mut hir_arms = Vec::new();
+        // 或模式先在臂级展开：`3 | 4 => b` 变成两条"3 => b"、"4 => b"。
+        let mut lowered: Vec<(hir::HirPattern, Option<HirExpr>, HirExpr)> = Vec::new();
         for arm in arms {
-            let pat = self.lower_pattern(&arm.pattern, &s.ty)?;
-            if let Some(g) = &arm.guard {
-                let _ = self.check_expr(g, &Ty::Bool)?;
+            // 先展开模式（里的绑定要在此注册），再看 guard / 臂体——
+            // `v if v > 0 => v` 的两处 v 都得能解析到臂绑定。
+            self.push_scope();
+            let mut alts_hir: Vec<hir::HirPattern> = Vec::new();
+            let mut alts_ast: Vec<&AstPattern> = Vec::new();
+            push_or_alts(&arm.pattern, &mut alts_ast);
+            for alt in &alts_ast {
+                match self.lower_pattern(alt, &s.ty) {
+                    Ok(pat) => alts_hir.push(pat),
+                    Err(e) => {
+                        self.pop_scope();
+                        return Err(e);
+                    }
+                }
             }
+            let guard = match &arm.guard {
+                Some(g) => Some(self.check_expr(g, &Ty::Bool)?),
+                None => None,
+            };
             let body = self.check_expr(&arm.body, expected)?;
-            hir_arms.push(HirArm {
-                pattern: pat,
-                body: Box::new(body),
+            self.pop_scope();
+            for pat in alts_hir {
+                // 绑定臂把它绑的局部换写成 scrutinee 本身：`v if v > 0 => v`
+                // 的 v 两处都替换进去。臂绑定没有"先赋值再读"的独立存储，
+                // 直接内联 scrutinee 是唯一等价的降级（scrutinee 重复求值
+                // 是本实现已知的限定，见下）。
+                let mut g = guard.clone();
+                let mut b2 = body.clone();
+                if let hir::HirPattern::Binding(local) = pat {
+                    if let Some(g2) = &mut g {
+                        substitute_local(g2, local, &s);
+                    }
+                    substitute_local(&mut b2, local, &s);
+                }
+                lowered.push((pat, g, b2));
+            }
+        }
+        // 模式支持面：只译出"字面量 + 通配符 + 绑定臂"。枚举 payload / tuple / 结构体
+        // 模式需要聚合值表达，代码生成还没有那套——宁报编译错误，不静默算错。
+        for (pat, _, _) in &lowered {
+            if !matches!(
+                pat,
+                hir::HirPattern::Literal(_)
+                    | hir::HirPattern::Wildcard
+                    | hir::HirPattern::Binding(_)
+            ) {
+                return Err(CompileError::type_error(
+                    "match on this pattern kind is not implemented yet (only literal and `_` patterns)",
+                )
+                .with_span(span));
+            }
+        }
+        // 最后一条必须是"无条件匹配臂"（`_`），或穷尽 bool 的两条字面量臂：
+        // if/else 链缺 else 会把"没匹配上"变成取到 Unit 继续跑——另一种静默算错。
+        let last_unconditional = matches!(
+            lowered.last(),
+            Some((
+                hir::HirPattern::Wildcard | hir::HirPattern::Binding(_),
+                None,
+                _
+            ))
+        );
+        if !last_unconditional {
+            // bool 的字面量覆盖（true / false 各一条）也算穷尽。
+            let bool_covered = matches!(self.infer.resolve(&s.ty), Ty::Bool) && {
+                let mut seen = [false, false];
+                for (pat, _, _) in &lowered {
+                    if let hir::HirPattern::Literal(v) = pat {
+                        if *v == 0 {
+                            seen[0] = true;
+                        } else if *v == 1 {
+                            seen[1] = true;
+                        }
+                    }
+                }
+                seen[0] && seen[1]
+            };
+            if !bool_covered {
+                return Err(
+                    CompileError::type_error("match must have a trailing `_` arm").with_span(span),
+                );
+            }
+        }
+        // 把
+        //     match s { v1 => b1, v2 | guard => b2, _ => b3 }
+        // 脱糖成
+        //     if s == v1 { b1 } else if s == v2 && guard { b2 } else { b3 }
+        //
+        // scrutinee 在每个臂上重新求值一次：对字面量 / 局部变量无感，但带
+        // 副作用的 scrutinee 会被重复执行——HIR 表达式形态下的已知限定。
+        let ty = lowered
+            .first()
+            .map(|(_, _, b)| b.ty.clone())
+            .unwrap_or(Ty::Never);
+        let n = lowered.len();
+        let mut chain: Option<hir::HirBlock> = None;
+        for k in (0..n).rev() {
+            let (pat, guard, body) = &lowered[k];
+            let unconditional = guard.is_none()
+                && matches!(pat, hir::HirPattern::Wildcard | hir::HirPattern::Binding(_));
+            if unconditional {
+                // 无条件臂就是链尾的 else；可前面的臂永不可达（首匹配胜出）。
+                chain = Some(arm_body_block(body));
+                continue;
+            }
+            let cond = match_arm_cond(&s, pat, guard, span);
+            let else_block = chain.take();
+            let node = hir::HirExpr {
+                kind: ExprKind::If(Box::new(cond), arm_body_block(body), else_block),
+                ty: ty.clone(),
+                span,
+            };
+            chain = Some(hir::HirBlock {
+                stmts: Vec::new(),
+                tail: Some(Box::new(node)),
             });
         }
-        // 记录模式用于穷尽性检查
-        self.check_exhaustiveness_arm(&s.ty, &hir_arms, span)?;
-        let ty = if let Some(first) = hir_arms.first() {
-            first.body.ty.clone()
-        } else {
-            Ty::Never
-        };
-        Ok(HirExpr {
-            kind: ExprKind::Match,
-            ty,
-            span,
-        })
-    }
-
-    fn check_exhaustiveness_arm(
-        &self,
-        _scrutinee_ty: &Ty,
-        arms: &[HirArm],
-        span: ast::Span,
-    ) -> Result<()> {
-        // 简化检查：若最后一个模式不是通配符，且 scrutinee 类型不是 bool/数值，
-        // 则警告可能不穷尽。
-        if let Some(last) = arms.last() {
-            if !matches!(last.pattern, hir::HirPattern::Wildcard) {
-                // 对 bool / 单变体枚举 / 数值类型，至少需要覆盖所有可能值
-                // 此处为框架实现
-                let _ = span;
-            }
+        match chain {
+            Some(mut last) => match last.tail.take() {
+                Some(node) => Ok(*node),
+                // 整条链就是单个有返回块的臂体（如 `_ => { return 3; }`）。
+                None => Ok(hir::HirExpr {
+                    kind: ExprKind::Block(last),
+                    ty,
+                    span,
+                }),
+            },
+            None => Ok(hir::HirExpr {
+                kind: ExprKind::Match,
+                ty,
+                span,
+            }),
         }
-        Ok(())
     }
 
     fn check_exhaustiveness(&self, _functions: &[hir::HirFunction]) -> Result<()> {
-        // 遍历所有 match 表达式，验证穷尽性
-        // 使用算法：对每个 match，构造 "witness" —— 一个不在任何模式中的值
-        // 若存在 witness 且类型非可空，则报错
+        // match 表达式的穷尽性直接在 check_match 里强制（尾 `_` 臂），
+        // 这里其余的表达式形态暂无可校验项。
         Ok(())
     }
 
@@ -1997,13 +2096,34 @@ impl TypeChecker {
     }
 
     fn lower_pattern(&mut self, p: &AstPattern, ty: &Ty) -> Result<hir::HirPattern> {
-        Ok(match p {
-            AstPattern::Wildcard(_) => hir::HirPattern::Wildcard,
+        match p {
+            AstPattern::Wildcard(_) => Ok(hir::HirPattern::Wildcard),
             AstPattern::Literal(lit) => {
                 let (kind, _) = self.check_literal(lit, ty)?;
+                // 只支持能用一个 i128 表示的模式值（整数 / bool / char）。
+                // 浮点模式不缩窄成 i128（位模式与值语义不同），字符串字面量
+                // 模式是地址——都报"未支持"，不能落在通配符里装作匹配。
                 match kind {
-                    ExprKind::Literal(_) => hir::HirPattern::Literal,
-                    _ => hir::HirPattern::Wildcard,
+                    ExprKind::Literal(hir::HirLiteral::Int(v)) => Ok(hir::HirPattern::Literal(v)),
+                    ExprKind::Literal(hir::HirLiteral::Bool(b)) => {
+                        Ok(hir::HirPattern::Literal(b as i128))
+                    }
+                    ExprKind::Literal(hir::HirLiteral::Char(c)) => {
+                        Ok(hir::HirPattern::Literal(c as i128))
+                    }
+                    ExprKind::Literal(hir::HirLiteral::Float(_))
+                    | ExprKind::Literal(hir::HirLiteral::String(_)) => {
+                        // 浮点模式不能用位模式比较，字符串模式是地址。
+                        // 报"未支持"，不能落进通配符里装作匹配成功。
+                        Err(CompileError::type_error(
+                            "match on a float / string pattern is not supported (only integer / char / bool literals)",
+                        )
+                        .with_span(ast::Span::unknown()))
+                    }
+                    _ => Err(CompileError::type_error(
+                        "unsupported literal kind in a match pattern",
+                    )
+                    .with_span(ast::Span::unknown())),
                 }
             }
             AstPattern::Binding(name, mutability, sub, _) => {
@@ -2011,9 +2131,9 @@ impl TypeChecker {
                 let _ = mutability;
                 if let Some(s) = sub {
                     let _ = self.lower_pattern(s, ty)?;
-                    hir::HirPattern::Ref
+                    Ok(hir::HirPattern::Ref)
                 } else {
-                    hir::HirPattern::Binding(local)
+                    Ok(hir::HirPattern::Binding(local))
                 }
             }
             AstPattern::Tuple(pats, _) => {
@@ -2027,7 +2147,7 @@ impl TypeChecker {
                     .map(|(i, p)| self.lower_pattern(p, elem_tys.get(i).unwrap_or(ty)))
                     .collect();
                 let _ = hir_pats?;
-                hir::HirPattern::Tuple
+                Ok(hir::HirPattern::Tuple)
             }
             AstPattern::Struct {
                 path,
@@ -2045,7 +2165,7 @@ impl TypeChecker {
                     .collect();
                 let _ = hir_fields?;
                 let _ = rest;
-                hir::HirPattern::Struct
+                Ok(hir::HirPattern::Struct)
             }
             AstPattern::Variant { path, args, span } => {
                 let def_id = self.resolve_path(&path[..path.len() - 1], *span)?;
@@ -2058,27 +2178,35 @@ impl TypeChecker {
                     .map(|(i, p)| self.lower_pattern(p, payload_tys.get(i).unwrap_or(ty)))
                     .collect();
                 let _ = hir_args?;
-                hir::HirPattern::Variant
+                Ok(hir::HirPattern::Variant)
             }
             AstPattern::Slice(pats, _) => {
                 let _ = pats
                     .iter()
                     .map(|p| self.lower_pattern(p, ty))
                     .collect::<Result<Vec<_>>>()?;
-                hir::HirPattern::Slice
+                Ok(hir::HirPattern::Slice)
             }
             AstPattern::Range(start, end, inclusive, _) => {
                 let s = self.check_expr(start, &Ty::Infer(InferId(0)))?;
                 let en = self.check_expr(end, &Ty::Infer(InferId(0)))?;
                 let _ = (s, en, inclusive);
-                hir::HirPattern::Range
+                Ok(hir::HirPattern::Range)
             }
             AstPattern::Ref(inner, mutability, _) => {
                 let _ = self.lower_pattern(inner, ty)?;
                 let _ = mutability;
-                hir::HirPattern::Ref
+                Ok(hir::HirPattern::Ref)
             }
-        })
+            AstPattern::Or(_) => {
+                // 或模式需要拆成多条分支条件，只有 match 能做到；其他位置
+                // （let / 函数参数）没有"多选一"的语义容量。
+                Err(
+                    CompileError::type_error("or-patterns are only supported in match arms")
+                        .with_span(ast::Span::unknown()),
+                )
+            }
+        }
     }
 
     fn field_type(&self, def_id: DefId, name: &str, span: ast::Span) -> Result<Ty> {
@@ -2545,12 +2673,40 @@ impl TypeChecker {
         match &expr.kind {
             ExprKind::Local(_) => Ok(()),
             ExprKind::Field(inner) => self.check_assignable(inner),
-            ExprKind::Deref(inner) => self.check_assignable(inner),
-            ExprKind::Index(inner, _) => self.check_assignable(inner),
+            // `*p = v` / `p[i] = v`：先验证写入目标本身可写。
+            ExprKind::Deref(inner) => {
+                self.require_mutable_place(inner)?;
+                self.check_assignable(inner)
+            }
+            ExprKind::Index(inner, _) => {
+                self.require_mutable_place(inner)?;
+                self.check_assignable(inner)
+            }
             _ => Err(CompileError::type_error(
                 "expression is not assignable (expected variable, field, deref, or index)",
             )
             .with_span(expr.span)),
+        }
+    }
+
+    /// 写入目标必须"可写"：
+    ///
+    /// - 字符串字面量住在 `.rodata`（只读段），对 `s[i]` 赋值在运行期是
+    ///   段错误——在类型检查直接挡住；
+    /// - 通过 `*const T` / `&T` 写入同理：地址是只读的，`*p = v` 会安静地
+    ///   写坏只读页。要写就得拿 `*mut T` / `&mut T`。
+    fn require_mutable_place(&self, place: &HirExpr) -> Result<()> {
+        match self.infer.resolve(&place.ty) {
+            Ty::Str => Err(CompileError::type_error(
+                "cannot assign into a string (string literals live in read-only memory)",
+            )
+            .with_span(place.span)),
+            Ty::Pointer(_, hir::Mutability::Immutable)
+            | Ty::Reference(_, hir::Mutability::Immutable) => Err(CompileError::type_error(
+                "cannot assign through an immutable pointer (use `&mut` and a `*mut` type)",
+            )
+            .with_span(place.span)),
+            _ => Ok(()),
         }
     }
 
@@ -3278,6 +3434,165 @@ fn first_binding(p: &hir::HirPattern) -> Option<LocalId> {
     }
 }
 
+/// 把（可能嵌套的）或模式展开成分支条件列表：`3 | 4 | _` → [3, 4, _]。
+fn push_or_alts<'a>(p: &'a AstPattern, out: &mut Vec<&'a AstPattern>) {
+    if let AstPattern::Or(alts) = p {
+        for alt in alts {
+            push_or_alts(alt, out);
+        }
+    } else {
+        out.push(p);
+    }
+}
+
+/// 把 match 臂体包成分支块：块表达式原样使用，值表达式放进尾表达式位。
+fn arm_body_block(body: &HirExpr) -> hir::HirBlock {
+    match &body.kind {
+        ExprKind::Block(b) => b.clone(),
+        _ => hir::HirBlock {
+            stmts: Vec::new(),
+            tail: Some(Box::new(body.clone())),
+        },
+    }
+}
+
+/// 在表达式树里把对局部 `target` 的引用整体替换成 `with` 的拷贝。
+///
+/// 匹配臂的绑定（如 `v if v > 0 => v`）没有独立存储，guard / 臂体里对它的
+/// 读都内联成 scrutinee 表达式。树是已检查过的，等价替换不需要重新推断。
+fn substitute_local(e: &mut hir::HirExpr, target: LocalId, with: &hir::HirExpr) {
+    if matches!(&e.kind, ExprKind::Local(id) if *id == target) {
+        *e = with.clone();
+        return;
+    }
+    match &mut e.kind {
+        ExprKind::Binary(_, l, r) => {
+            substitute_local(l, target, with);
+            substitute_local(r, target, with);
+        }
+        ExprKind::Unary(_, v)
+        | ExprKind::Assign(v, _)
+        | ExprKind::Field(v)
+        | ExprKind::Deref(v)
+        | ExprKind::AddrOf(v)
+        | ExprKind::Await(v)
+        | ExprKind::Cast(v) => substitute_local(v, target, with),
+        ExprKind::Return(v) => {
+            if let Some(v) = v {
+                substitute_local(v, target, with);
+            }
+        }
+        ExprKind::Call { args, .. } => {
+            for arg in args {
+                substitute_local(arg, target, with);
+            }
+        }
+        ExprKind::If(cond, then, els) => {
+            substitute_local(cond, target, with);
+            walk_block(then, target, with);
+            if let Some(els) = els {
+                walk_block(els, target, with);
+            }
+        }
+        ExprKind::While(cond, body) => {
+            substitute_local(cond, target, with);
+            walk_block(body, target, with);
+        }
+        ExprKind::Loop(body) => walk_block(body, target, with),
+        ExprKind::Block(b) => walk_block(b, target, with),
+        ExprKind::Index(_, v) => substitute_local(v, target, with),
+        ExprKind::Comptime(_)
+        | ExprKind::Literal(_)
+        | ExprKind::Local(_)
+        | ExprKind::Def(_)
+        | ExprKind::Match
+        | ExprKind::For
+        | ExprKind::Break
+        | ExprKind::Continue
+        | ExprKind::Defer
+        | ExprKind::Try
+        | ExprKind::Throw
+        | ExprKind::Array
+        | ExprKind::Tuple
+        | ExprKind::Struct
+        | ExprKind::Closure
+        | ExprKind::Asm
+        | ExprKind::Yield
+        | ExprKind::Spawn
+        | ExprKind::Intrinsic => {}
+    }
+}
+
+/// `substitute_local` 的块部分（stmts 里的 Expr 语句 + tail）。
+fn walk_block(b: &mut hir::HirBlock, target: LocalId, with: &hir::HirExpr) {
+    for stmt in &mut b.stmts {
+        if let HirStmt::Expr(expr) = stmt {
+            substitute_local(expr, target, with);
+        }
+    }
+    if let Some(tail) = &mut b.tail {
+        substitute_local(tail, target, with);
+    }
+}
+
+/// match 臂的分支条件：`scrutinee == 字面量`，有 guard 再与它对半。
+///
+/// 字面量的 HIR 形态按 scrutinee 的类型回填（bool → Bool 字面量、char → Char），
+/// 否则 `match b { 1 => .., }` 对 bool scrutinee 会比较错类型的字面量。
+fn match_arm_cond(
+    scrutinee: &HirExpr,
+    pat: &hir::HirPattern,
+    guard: &Option<HirExpr>,
+    span: ast::Span,
+) -> HirExpr {
+    // 字面量臂：条件是 ` scrutinee == 字面量`；`_`/绑定臂无条件匹配——
+    // 条件就是 guard（没 guard 时调用方已经把它当链尾处理，这里也造恒真）。
+    let unpick = match pat {
+        hir::HirPattern::Literal(v) => Some(*v),
+        _ => None,
+    };
+    let mut cond = match unpick {
+        Some(val) => {
+            let lit = hir::HirExpr {
+                kind: ExprKind::Literal(match &scrutinee.ty {
+                    Ty::Bool => hir::HirLiteral::Bool(val != 0),
+                    Ty::Char => hir::HirLiteral::Char(
+                        u32::try_from(val)
+                            .ok()
+                            .and_then(char::from_u32)
+                            .unwrap_or('\0'),
+                    ),
+                    _ => hir::HirLiteral::Int(val),
+                }),
+                ty: scrutinee.ty.clone(),
+                span,
+            };
+            hir::HirExpr {
+                kind: ExprKind::Binary(
+                    hir::BinaryOp::Eq,
+                    Box::new(scrutinee.clone()),
+                    Box::new(lit),
+                ),
+                ty: Ty::Bool,
+                span,
+            }
+        }
+        None => hir::HirExpr {
+            kind: ExprKind::Literal(hir::HirLiteral::Bool(true)),
+            ty: Ty::Bool,
+            span,
+        },
+    };
+    if let Some(g) = guard {
+        cond = hir::HirExpr {
+            kind: ExprKind::Binary(hir::BinaryOp::And, Box::new(cond), Box::new(g.clone())),
+            ty: Ty::Bool,
+            span,
+        };
+    }
+    cond
+}
+
 /// 块是否以发散语句结束（`return` / `throw`）。
 ///
 /// 这类块不会把值交给调用方，所以类型检查不应要求它提供尾部表达式。
@@ -3474,5 +3789,74 @@ mod width_tests {
     #[test]
     fn default_checker_allows_128_bit_ints() {
         assert!(TypeChecker::new().check_int_width(128).is_ok());
+    }
+}
+
+#[cfg(test)]
+mod mutability_tests {
+    use super::*;
+    use crate::lexer::Lexer;
+    use crate::parser::Parser;
+
+    fn check(src: &str) -> Result<hir::HirModule> {
+        let tokens = Lexer::new(src).tokenize();
+        let prog = Parser::new(tokens).parse().expect("应能解析成功");
+        TypeChecker::new().check_program(&prog)
+    }
+
+    /// 字符串字面量在 `.rodata`（只读段），`s[i] = v` 是段错误。
+    #[test]
+    fn rejects_writing_into_a_string() {
+        let err = check(r#"fn main() -> i32 { let s = "ABC"; s[0] = 65; return 0; }"#)
+            .expect_err("应拒绝写入字符串");
+        assert!(
+            err.message.contains("cannot assign into a string"),
+            "actual: {err}"
+        );
+    }
+
+    /// `*T` 默认是 `*const T`，写入要 `*mut T`。
+    #[test]
+    fn rejects_write_through_const_pointer() {
+        let err = check(
+            "fn main() -> i32 { let x: i32 = 1; let p: *const i32 = &x; *p = 42; return 0; }",
+        )
+        .expect_err("应拒绝通过只读指针写入");
+        assert!(
+            err.message
+                .contains("cannot assign through an immutable pointer"),
+            "actual: {err}"
+        );
+        let err = check(
+            "fn main() -> i32 { let x: i32 = 1; let p: *const i32 = &x; p[0] = 42; return 0; }",
+        )
+        .expect_err("应拒绝通过只读指针索引写入");
+        assert!(
+            err.message
+                .contains("cannot assign through an immutable pointer"),
+            "actual: {err}"
+        );
+    }
+
+    /// `let p: *i32 = &x;` 里的 `&x` 是只读指针，写入同样拒绝。
+    #[test]
+    fn rejects_write_through_address_of() {
+        let err =
+            check("fn main() -> i32 { let x: i32 = 1; let p: *i32 = &x; *p = 42; return 0; }")
+                .expect_err("应拒绝通过 `&x` 写入");
+        assert!(
+            err.message
+                .contains("cannot assign through an immutable pointer"),
+            "actual: {err}"
+        );
+    }
+
+    /// 可变指针（`&mut x` + `*mut i32`）读写都放行。
+    #[test]
+    fn allows_write_through_mut_pointer() {
+        check("fn main() -> i32 { let x: i32 = 1; let p: *mut i32 = &mut x; *p = 42; if *p != 42 { return 1; } return 0; }")
+            .expect("可变指针写入应通过类型检查");
+        check("fn main() -> i32 { let x: i32 = 1; let p: *mut i32 = &mut x; p[0] = 42; if p[0] != 42 { return 1; } return 0; }")
+            .expect("可变指针索引写入应通过类型检查");
     }
 }

@@ -248,6 +248,8 @@ pub enum Pattern {
     Range(Box<Expression>, Box<Expression>, bool, Span),
     /// `ref mut p`（显式引用绑定）。
     Ref(Box<Pattern>, Mutability, Span),
+    /// 或模式 `p1 | p2`（只在 match 位置有效）。
+    Or(Vec<Pattern>),
 }
 
 /// 结构体模式中的字段。
@@ -760,6 +762,11 @@ impl Spanned for Pattern {
             Pattern::Slice(_, s) => *s,
             Pattern::Range(_, _, _, s) => *s,
             Pattern::Ref(_, _, s) => *s,
+            // 或模式没有自己的 token 位置——取第一个分支的位置。
+            Pattern::Or(alts) => match alts.first() {
+                Some(first) => first.span(),
+                None => Span::unknown(),
+            },
         }
     }
 }

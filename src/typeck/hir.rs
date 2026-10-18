@@ -339,13 +339,6 @@ pub enum Intrinsic {
     Transmute,
 }
 
-/// match 分支（已验证穷尽性）。
-#[derive(Debug, Clone)]
-pub struct HirArm {
-    pub pattern: HirPattern,
-    pub body: Box<HirExpr>,
-}
-
 // ======================================================================
 // HIR 模式（带类型，已解析为绑定）
 // ======================================================================
@@ -354,8 +347,11 @@ pub struct HirArm {
 #[derive(Debug, Clone)]
 pub enum HirPattern {
     Wildcard,
-    /// 字面量模式。
-    Literal,
+    /// 字面量模式：保留匹配值（int / char / bool 统一成 i128，bool 为 0/1）。
+    ///
+    /// 早先这里是 unit 变体，模式值在类型检查被丢掉——即便运行期实现也
+    /// 无从比较，这正是 `match` 静默算错的根源之一。
+    Literal(i128),
     /// 绑定（绑定到局部变量，携带它对应的 LocalId）。
     Binding(LocalId),
     /// 元组模式。

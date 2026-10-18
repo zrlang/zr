@@ -7,7 +7,7 @@
 //! I 型      addi / slti / sltiu / xori / ori / andi / slli / srli / srai
 //! R 型      add / sub / sll / slt / sltu / xor / srl / sra / or / and
 //! R×I      mul / mulh / div / divu / rem / remu
-//! 装载存储  lw / ld / sw / sd
+//! 装载存储  lw / ld / lb·lbu·lb / lh·lhu·lh / lwu / sw / sb / sh / sd
 //! 分支跳转  jal / jalr / beq / bne / blt / bge / bltu / bgeu / ret
 //! ```
 //!
@@ -24,6 +24,12 @@
 //!
 //! 宽度说明：zr 的 SSA 目前把整数统一建模为 i64，RV32 上按机器字长
 //! （32 位）逐条发射——多字长算术尚未实现。
+//!
+//! 栈槽说明：本后端是**无通用序言**的（没有 sp 下移 reserve），只有
+//! φ 搬运的环需要 16 字节临时槽（用完立即还回去）。被取地址的局部变量
+//! 需要"地址就是身份"的栈位，所以在出现 `SlotAddr` 的函数里加最小序言 /
+//! 尾声：`addi sp, sp, -N` / `addi sp, sp, +N`（N = 槽数 × 8）。临时槽
+//! 在槽数为 0 的函数里也安全（在保留区下方独自下探）。
 
 use crate::codegen::target::{Arch, Os, Target};
 use crate::codegen::{
@@ -31,6 +37,14 @@ use crate::codegen::{
 };
 use crate::mir::NumTy;
 use crate::ssa::{SsaBinaryOp, SsaConst, SsaFunction, SsaInstr, SsaTerminator, SsaValue};
+
+use std::cell::RefCell;
+use std::collections::HashMap;
+
+// 被取地址的局部变量 → 栈槽编号（`addi sp` 的字偏移 ×8 = 字节偏移）。
+thread_local! {
+    static LOCAL_SLOTS: RefCell<HashMap<u32, usize>> = RefCell::new(HashMap::new());
+}
 
 /// RISC-V 通用寄存器（5 位编码）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -341,6 +355,57 @@ fn emit_load(unit: &mut CompilationUnit, wide: bool, rd: Reg, base: Reg, off: i3
     );
 }
 
+/// `ty` 的（字节宽度，是否有符号）。浮点不走整数的 load/store 路径。
+fn mem_access(ty: NumTy) -> (usize, bool) {
+    match ty {
+        NumTy::Int(w) => ((w as usize) / 8, true),
+        NumTy::Uint(w) => ((w as usize) / 8, false),
+        NumTy::Bool => (1, false),
+        NumTy::Float(w) => ((w as usize) / 8, false),
+    }
+}
+
+/// `rd = [base + 0]`，按 `ty` 位宽/符号选 load（UTF32 上 4 字节零扩展要用 `lwu`，
+/// RV32 上 4 字节就是整字 `lw`）。8 字节只在 RV64 有效。
+fn emit_load_mem(unit: &mut CompilationUnit, rd: Reg, base: Reg, ty: NumTy, wide_target: bool) {
+    let (bytes, signed) = mem_access(ty);
+    let f3 = match (bytes, signed, wide_target) {
+        (1, false, _) => 4,     // lbu
+        (1, true, _) => 0,      // lb
+        (2, false, _) => 5,     // lhu
+        (2, true, _) => 1,      // lh
+        (4, false, false) => 2, // lw（RV32 整字）
+        (4, false, true) => 6,  // lwu（RV64 零扩展）
+        (4, true, _) => 2,      // lw（符号扩展）
+        (8, _, false) => {
+            // 32 位目标的多字长（i64）尚未实现。
+            crate::codegen::unsupported_const("64-bit memory access on 32-bit target")
+        }
+        _ => 3, // ld
+    };
+    insn(
+        unit,
+        (base.bits() as u32) << 15 | f3 << 12 | (rd.bits() as u32) << 7 | 0x03,
+    );
+}
+
+/// `[base + 0] = src`，只写 `ty` 位宽对应的低字节（RISC-V store 没有
+/// "宽存窄写"的坑，`sx` 就是窄的）。
+fn emit_store_mem(unit: &mut CompilationUnit, base: Reg, src: Reg, ty: NumTy, wide_target: bool) {
+    let (bytes, _) = mem_access(ty);
+    let f3 = match (bytes, wide_target) {
+        (1, _) => 0, // sb
+        (2, _) => 1, // sh
+        (4, _) => 2, // sw
+        (8, false) => crate::codegen::unsupported_const("64-bit memory access on 32-bit target"),
+        _ => 3, // sd
+    };
+    insn(
+        unit,
+        (src.bits() as u32) << 20 | (base.bits() as u32) << 15 | f3 << 12 | 0x23,
+    );
+}
+
 /// 一个块的后继。
 fn successors(block: &crate::ssa::SsaBasicBlock) -> Vec<usize> {
     match &block.term {
@@ -444,6 +509,18 @@ pub fn emit_function(target: &Target, unit: &mut CompilationUnit, func: &SsaFunc
         "RISC-V 后端只能用于 riscv 目标"
     );
     check_register_pressure(func);
+    let wide = matches!(target.arch(), Arch::RiscV64);
+
+    // 被取地址的局部变量：分配栈槽。没有取址的函数保持无帧（原样）。
+    let slot_count = assign_local_slots(func, 0);
+    if slot_count > 0 {
+        let bytes = slot_count * 8;
+        if bytes > 2040 {
+            crate::codegen::unsupported_const("too many address-taken locals (risc-v slot area)");
+        }
+        emit_addi(unit, Reg::SP, Reg::SP, -(bytes as i32));
+    }
+
     let start = unit.code.len();
     let sym_base = unit.symbols.len();
 
@@ -463,9 +540,8 @@ pub fn emit_function(target: &Target, unit: &mut CompilationUnit, func: &SsaFunc
     for block in &func.blocks {
         block_offsets.push(unit.code.len());
         for instr in &block.instrs {
-            emit_instr(unit, instr);
+            emit_instr(unit, instr, wide);
         }
-        let wide = matches!(target.arch(), Arch::RiscV64);
         for succ in successors(block) {
             emit_phi_copies(unit, func, succ, block.id, wide);
         }
@@ -474,6 +550,9 @@ pub fn emit_function(target: &Target, unit: &mut CompilationUnit, func: &SsaFunc
                 if let Some(v) = ret_val {
                     let r = alloc_reg(*v);
                     emit_mv(unit, Reg::A0, r);
+                }
+                if slot_count > 0 {
+                    emit_addi(unit, Reg::SP, Reg::SP, (slot_count * 8) as i32);
                 }
                 emit_ret(unit);
             }
@@ -517,8 +596,33 @@ pub fn emit_function(target: &Target, unit: &mut CompilationUnit, func: &SsaFunc
     });
 }
 
+/// 扫出所有被取地址的局部变量，各分配一个栈槽（编号从 `base` 起）。
+/// 返回槽数；`LOCAL_SLOTS` 保存局部变量 → 槽号的映射。
+fn assign_local_slots(func: &SsaFunction, base: usize) -> usize {
+    let mut ids: Vec<u32> = Vec::new();
+    for block in &func.blocks {
+        for instr in &block.instrs {
+            if let SsaInstr::SlotAddr { local, .. } = instr {
+                if !ids.contains(local) {
+                    ids.push(*local);
+                }
+            }
+        }
+    }
+    ids.sort_unstable();
+    let count = ids.len();
+    LOCAL_SLOTS.with(|m| {
+        let mut map = m.borrow_mut();
+        map.clear();
+        for (i, id) in ids.into_iter().enumerate() {
+            map.insert(id, base + i);
+        }
+    });
+    count
+}
+
 /// 发射一条 SSA 指令。
-fn emit_instr(unit: &mut CompilationUnit, instr: &SsaInstr) {
+fn emit_instr(unit: &mut CompilationUnit, instr: &SsaInstr, wide: bool) {
     match instr {
         SsaInstr::Const { result, value } => match value {
             SsaConst::Int(i) => emit_li(unit, alloc_reg(*result), *i as i32),
@@ -569,9 +673,22 @@ fn emit_instr(unit: &mut CompilationUnit, instr: &SsaInstr) {
             }
         }
         SsaInstr::Var { .. } => {}
-        // 指针 / 内存访问：这些后端尚未实现。
-        SsaInstr::Load { .. } | SsaInstr::Store { .. } | SsaInstr::SlotAddr { .. } => {
-            crate::codegen::unsupported_const("pointer/memory access")
+        // 被取地址的局部变量的栈槽地址：`addi rd, sp, 8*slot`。
+        SsaInstr::SlotAddr { result, local } => {
+            let slot = LOCAL_SLOTS.with(|m| m.borrow().get(local).copied().unwrap_or(0));
+            let offset = (slot * 8) as i32;
+            if offset > 2040 {
+                crate::codegen::unsupported_const("risc-v slot offset out of range");
+            }
+            emit_addi(unit, alloc_reg(*result), Reg::SP, offset);
+        }
+        SsaInstr::Load {
+            result, ptr, ty, ..
+        } => {
+            emit_load_mem(unit, alloc_reg(*result), alloc_reg(*ptr), *ty, wide);
+        }
+        SsaInstr::Store { ptr, value, ty, .. } => {
+            emit_store_mem(unit, alloc_reg(*ptr), alloc_reg(*value), *ty, wide);
         }
     }
 }
@@ -860,22 +977,22 @@ mod tests {
         )
     }
 
-    /// B 型立即数（半字单位）：imm[12|10:5] | imm[4:1|11]
+    /// B 型立即数（字节单位）：imm[12|10:5] | imm[4:1|11]
     fn b_imm(word: u32) -> i32 {
         let imm = ((word >> 31) & 1) << 12
             | ((word >> 25) & 0x3f) << 5
             | ((word >> 8) & 0xf) << 1
             | ((word >> 7) & 1) << 11;
-        (imm as i32) as i16 as i32
+        ((imm << 20) as i32) >> 20
     }
 
-    /// J 型立即数（半字单位）：imm[20|10:1|11|19:12]
+    /// J 型立即数（字节单位）：imm[20|10:1|11|19:12]
     fn j_imm(word: u32) -> i32 {
         let imm = ((word >> 31) & 1) << 20
             | ((word >> 21) & 0x3ff) << 1
             | ((word >> 20) & 1) << 11
             | ((word >> 12) & 0xff) << 12;
-        (imm as i32) as i16 as i32
+        ((imm << 11) as i32) >> 11
     }
 
     #[test]
@@ -895,12 +1012,12 @@ mod tests {
         // 语义核验：beq 落在 else 块，jal 落在 then 块
         let branch_pc = branch_at as i64;
         assert_eq!(
-            branch_pc + b_imm(branch) as i64 * 2,
+            branch_pc + b_imm(branch) as i64,
             else_off as i64,
             "beq 必须跳到 else 块"
         );
         assert_eq!(
-            branch_pc + 4 + j_imm(jump) as i64 * 2,
+            branch_pc + 4 + j_imm(jump) as i64,
             then_off as i64,
             "jal 必须跳到 then 块"
         );
@@ -1189,6 +1306,74 @@ mod tests {
             SsaValue(2),
         );
         assert!(!u.code.is_empty());
+    }
+
+    /// load/store 的编码基准来自 RISC-V 规范的 LOAD/STORE-OPCODE 表：
+    /// funct3：lb=0 lh=1 lw=2 ld=3 lbu=4 lhu=5 lwu=6；sb=0 sh=1 sw=2 sd=3。
+    #[test]
+    fn load_mem_selects_width_and_sign() {
+        // t0 = a0：lwu t0, 0(a0)（RV64，4 字节数据、无符号、机器 64 位）
+        // 编码：rs2 无用，f3=6，rs1=a0(x10)=1010，rd=t0(x5)=0101
+        //   imm=0 | rs1=0x0A<<15 | f3=6<<12 | rd=0x05<<7 | 0x03
+        // = 0x00A5_32E? 手算：0x0A<<15=0x0005_0000? 不对——立即手算：
+        //   0 << 20 = 0
+        //   0x0A << 15 = 0x0005_0000
+        //   6 << 12 = 0x6000
+        //   0x05 << 7 = 0x0280
+        //   0x03
+        // 合计 0x0005_0000 | 0x6000 | 0x0280 | 3 = 0x0005_6283
+        let mut u = empty_unit();
+        emit_load_mem(&mut u, Reg(5), Reg(10), NumTy::Uint(32), true);
+        assert_eq!(
+            u32::from_le_bytes(u.code[0..4].try_into().unwrap()),
+            0x0005_6283,
+            "RV64：u32 用 lwu 零扩展"
+        );
+        // t0 = a0：lw t0, 0(a0)（RV32 上同样读 4 字节无符号，机器 32 位）
+        //   f3=2 → 0x0005_2283
+        let mut u = empty_unit();
+        emit_load_mem(&mut u, Reg(5), Reg(10), NumTy::Uint(32), false);
+        assert_eq!(
+            u32::from_le_bytes(u.code[0..4].try_into().unwrap()),
+            0x0005_2283
+        );
+        // t1 = a1：lb t1, 0(a1)（有符号字节）
+        // rs1=0x0B<<15 | 0<<12 | rd=0x06<<7 | 3 = 0x0058_3083? 直接算：
+        //   0x0B << 15 = 0x0005_8000；f3=0；0x06 << 7 = 0x0300；opcode 0x03
+        // 合计 0x0005_8303
+        let mut u = empty_unit();
+        emit_load_mem(&mut u, Reg(6), Reg(11), NumTy::Int(8), true);
+        assert_eq!(
+            u32::from_le_bytes(u.code[0..4].try_into().unwrap()),
+            0x0005_8303
+        );
+        // t1 = a1：lbu t1, 0(a1)（无符号字节，f3=4 → +0x4000）
+        // = 0x0005_C303
+        let mut u = empty_unit();
+        emit_load_mem(&mut u, Reg(6), Reg(11), NumTy::Uint(8), true);
+        assert_eq!(
+            u32::from_le_bytes(u.code[0..4].try_into().unwrap()),
+            0x0005_C303
+        );
+    }
+
+    #[test]
+    fn store_mem_selects_width() {
+        // sb a1, 0(a0)：rs2=0x0B<<20 | rs1=0x0A<<15 | f3=0 | 0x23
+        // = 0x00B5_0023
+        let mut u = empty_unit();
+        emit_store_mem(&mut u, Reg(10), Reg(11), NumTy::Bool, true);
+        assert_eq!(
+            u32::from_le_bytes(u.code[0..4].try_into().unwrap()),
+            0x00B5_0023
+        );
+        // sw a1, 0(a0)：f3=2 → 0x00B5_2023
+        let mut u = empty_unit();
+        emit_store_mem(&mut u, Reg(10), Reg(11), NumTy::Int(32), false);
+        assert_eq!(
+            u32::from_le_bytes(u.code[0..4].try_into().unwrap()),
+            0x00B5_2023
+        );
     }
 }
 

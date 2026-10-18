@@ -30,6 +30,9 @@ use crate::codegen::{
 use crate::mir::NumTy;
 use crate::ssa::{SsaBinaryOp, SsaConst, SsaFunction, SsaInstr, SsaTerminator, SsaValue};
 
+use std::cell::RefCell;
+use std::collections::HashMap;
+
 /// ARM32 通用寄存器。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Reg(u8);
@@ -60,8 +63,24 @@ const ALLOCATABLE: [Reg; 9] = [
 /// AAPCS32 的整数实参寄存器 r0-r3。
 const ARG_REGS: [Reg; 4] = [Reg(0), Reg(1), Reg(2), Reg(3)];
 
-/// 把 SSA 值映射到物理寄存器（虚拟分配，与其他后端同策略）。
+/// 被调用者保存的寄存器（分配池下标，arm32 池里恰与寄存器号一致）。
+/// 跨调用存活的值只会落进 r4-r8，序言/尾声 `push/pop {r4-r8}` 恰好覆盖。
+const CALLEE_SAVE: [usize; 5] = [4, 5, 6, 7, 8];
+
+thread_local! {
+    /// 当前函数的整数寄存器分配：值 id -> `ALLOCATABLE` 下标。
+    ///
+    /// 用线性扫描的结果，而不是 `id % 9` 取模——取模会让两个同时存活、
+    /// 编号同余的值抢同一个寄存器，后写者把先写者冲掉，安静地算错。
+    /// 没进活跃区间的临时值才退回取模。
+    static REG_MAP: RefCell<HashMap<u32, usize>> = RefCell::new(HashMap::new());
+}
+
+/// 把 SSA 值映射到物理寄存器（优先用线性扫描的结果）。
 fn alloc_reg(v: SsaValue) -> Reg {
+    if let Some(i) = REG_MAP.with(|m| m.borrow().get(&v.id()).copied()) {
+        return ALLOCATABLE[i];
+    }
     ALLOCATABLE[(v.id() as usize) % ALLOCATABLE.len()]
 }
 
@@ -307,6 +326,20 @@ fn emit_cmp(unit: &mut CompilationUnit, rn: Reg, rm: Reg) {
     );
 }
 
+/// `cmp rn, #imm`：立即数比较（走 `subs r0, rn, #imm`）。
+fn emit_cmp_imm8(unit: &mut CompilationUnit, rn: Reg, imm: u8) {
+    data_processing(
+        unit,
+        cc::AL,
+        op::CMP,
+        true,
+        rn,
+        Reg(0),
+        imm8_operand(0, imm),
+        true,
+    );
+}
+
 /// `mul rd, lhs, rhs`（Rd = lhs * rhs）
 ///
 /// A32 的乘法字段把**第二个**操作数放在 [11:8]、**第一个**放在 [3:0]
@@ -407,6 +440,49 @@ fn emit_push(unit: &mut CompilationUnit) {
 fn emit_pop_pc(unit: &mut CompilationUnit) {
     // reglist: r4..r8 = 0x1F0, pc(r15) = 0x8000
     insn(unit, 0xe8bd_0000 | 0x81f0);
+}
+
+/// ARM32 的 imm12 立即数：8 位值**循环右移**偶数位（`imm8 ror k`，k 偶数）。
+///
+/// `imm12 = imm8 | ((k/2) << 8)`；k=0 就是普通不过的 0..=255。
+/// 返回编码后的 imm12 字段；v 编不进返回 None。
+fn arm_imm_field(v: u32) -> Option<u32> {
+    if v <= 0xff {
+        return Some(v);
+    }
+    // value == imm8 ror k ⟺ value == imm8 << (32-k) 且没有更高位丢失
+    for k in (2..=30).step_by(2) {
+        let t = v >> (32 - k);
+        if t > 0 && t <= 0xff && t << (32 - k) == v {
+            return Some(t | ((k / 2) << 8));
+        }
+    }
+    None
+}
+
+/// `sub sp, sp, #imm`（只在 imm12 可编码时可用——槽区通常 ≤ 1020 字节，
+/// 溢出走 `unsupported_const` 而不是静默编错立即数）。
+fn emit_sub_sp_imm(unit: &mut CompilationUnit, bytes: u32) {
+    let field = arm_imm_field(bytes).unwrap_or_else(|| {
+        crate::codegen::unsupported_const("too-large stack slot area for the arm32 backend")
+    });
+    insn(unit, 0xe24d_d000 | field);
+}
+
+/// `add sp, sp, #imm`（尾声）。
+fn emit_add_sp_imm(unit: &mut CompilationUnit, bytes: u32) {
+    let field = arm_imm_field(bytes).unwrap_or_else(|| {
+        crate::codegen::unsupported_const("too-large stack slot area for the arm32 backend")
+    });
+    insn(unit, 0xe28d_d000 | field);
+}
+
+/// `add rd, sp, #imm`：被取地址的槽（一般 ≤ 1020 字节偏移，编码上限同上）。
+fn emit_add_rd_sp_imm(unit: &mut CompilationUnit, rd: Reg, bytes: u32) {
+    let field = arm_imm_field(bytes).unwrap_or_else(|| {
+        crate::codegen::unsupported_const("slot offset out of range for the arm32 backend")
+    });
+    insn(unit, 0xe28d_0000 | (rd.bits() as u32) << 12 | field);
 }
 
 /// `b .`——自陷到自身，等待调试器或复位（裸机没有"退出"）。
@@ -550,6 +626,16 @@ pub fn emit_function(target: &Target, unit: &mut CompilationUnit, func: &SsaFunc
 
     emit_push(unit);
 
+    // 被取地址的局部变量的栈槽：槽区开在 push 区下方。
+    let slot_count = assign_local_slots(func, 0);
+    let slot_bytes = (slot_count * 8) as u32;
+    if slot_bytes > 0 {
+        if slot_bytes > 1020 {
+            crate::codegen::unsupported_const("too many address-taken locals (arm32 slot area)");
+        }
+        emit_sub_sp_imm(unit, slot_bytes);
+    }
+
     for block in &func.blocks {
         block_offsets.push(unit.code.len());
         for instr in &block.instrs {
@@ -564,6 +650,9 @@ pub fn emit_function(target: &Target, unit: &mut CompilationUnit, func: &SsaFunc
                     let r = alloc_reg(*v);
                     emit_mov_rr(unit, Reg::R0, r);
                 }
+                if slot_bytes > 0 {
+                    emit_add_sp_imm(unit, slot_bytes);
+                }
                 emit_pop_pc(unit);
             }
             SsaTerminator::Goto(target) => emit_b(unit, &block_label(&func.name, *target)),
@@ -572,8 +661,11 @@ pub fn emit_function(target: &Target, unit: &mut CompilationUnit, func: &SsaFunc
                 then_block,
                 else_block,
             } => {
+                // 判 cond 是否为 0：`cmp r, r` 恒为相等、分不清零/非零，
+                // 必须与立即数 0 比较（`cmp r, #0`），与 AArch64 的
+                // `cmp r, xzr` 同一约定。
                 let r = alloc_reg(*cond);
-                emit_cmp(unit, r, r);
+                emit_cmp_imm8(unit, r, 0);
                 // cond == 0 时跳到 else，否则顺序执行 then
                 // （x86-64 的 `jz else; jmp then` 与之等价）
                 emit_b_cond(unit, cc::EQ, &block_label(&func.name, *else_block));
@@ -648,11 +740,92 @@ fn emit_instr(unit: &mut CompilationUnit, instr: &SsaInstr) {
             }
         }
         SsaInstr::Var { .. } => {}
-        // 指针 / 内存访问：这些后端尚未实现。
-        SsaInstr::Load { .. } | SsaInstr::Store { .. } | SsaInstr::SlotAddr { .. } => {
-            crate::codegen::unsupported_const("pointer/memory access")
+        // 被取地址的局部变量的栈槽地址：`add rd, sp, 8*slot`。
+        SsaInstr::SlotAddr { result, local } => {
+            let slot = LOCAL_SLOTS.with(|m| m.borrow().get(local).copied().unwrap_or(0));
+            emit_add_rd_sp_imm(unit, alloc_reg(*result), (slot * 8) as u32);
+        }
+        SsaInstr::Load {
+            result, ptr, ty, ..
+        } => {
+            emit_load_mem(unit, alloc_reg(*result), alloc_reg(*ptr), *ty);
+        }
+        SsaInstr::Store { ptr, value, ty, .. } => {
+            emit_store_mem(unit, alloc_reg(*ptr), alloc_reg(*value), *ty);
         }
     }
+}
+
+// 被取地址的局部变量 → 栈槽编号（栈槽 ×8 = 字节偏移）。
+thread_local! {
+    static LOCAL_SLOTS: RefCell<HashMap<u32, usize>> = RefCell::new(HashMap::new());
+}
+
+/// 被取地址的局部变量 → 栈槽编号，返回槽数；映射存进 `LOCAL_SLOTS`。
+fn assign_local_slots(func: &SsaFunction, base: usize) -> usize {
+    let mut ids: Vec<u32> = Vec::new();
+    for block in &func.blocks {
+        for instr in &block.instrs {
+            if let SsaInstr::SlotAddr { local, .. } = instr {
+                if !ids.contains(local) {
+                    ids.push(*local);
+                }
+            }
+        }
+    }
+    ids.sort_unstable();
+    let count = ids.len();
+    LOCAL_SLOTS.with(|m| {
+        let mut map = m.borrow_mut();
+        map.clear();
+        for (i, id) in ids.into_iter().enumerate() {
+            map.insert(id, base + i);
+        }
+    });
+    count
+}
+
+/// `ty` 的（字节宽度，是否有符号）。浮点不走整数 load/store。
+fn mem_access(ty: NumTy) -> (usize, bool) {
+    match ty {
+        NumTy::Int(w) => ((w as usize) / 8, true),
+        NumTy::Uint(w) => ((w as usize) / 8, false),
+        NumTy::Bool => (1, false),
+        NumTy::Float(w) => ((w as usize) / 8, false),
+    }
+}
+
+/// `rd = [rn + 0]`，按 `ty` 位宽/符号选 load（8 字节 i64 多字长在 32 位
+/// 目标上明确报错）。
+fn emit_load_mem(unit: &mut CompilationUnit, rd: Reg, rn: Reg, ty: NumTy) {
+    let (bytes, signed) = mem_access(ty);
+    let base = match (bytes, signed) {
+        (1, false) => 0xe5d0_0000, // ldrb（零扩展）
+        (1, true) => 0xe1d0_00d0,  // ldrsb（符号扩展）
+        (2, false) => 0xe1d0_00b0, // ldrh
+        (2, true) => 0xe1d0_00f0,  // ldrsh
+        (4, _) => 0xe590_0000,     // ldr（整字，无扩展可言）
+        _ => crate::codegen::unsupported_const("64-bit memory access on 32-bit target"),
+    };
+    insn(
+        unit,
+        base | (rn.bits() as u32) << 16 | (rd.bits() as u32) << 12,
+    );
+}
+
+/// `[rn + 0] = rm`，只写 `ty` 位宽对应的低字节。
+fn emit_store_mem(unit: &mut CompilationUnit, rn: Reg, rm: Reg, ty: NumTy) {
+    let (bytes, _) = mem_access(ty);
+    let base = match bytes {
+        1 => 0xe5c0_0000, // strb
+        2 => 0xe1c0_00b0, // strh
+        4 => 0xe580_0000, // str
+        _ => crate::codegen::unsupported_const("64-bit memory access on 32-bit target"),
+    };
+    insn(
+        unit,
+        base | (rn.bits() as u32) << 16 | (rm.bits() as u32) << 12,
+    );
 }
 
 /// 发射一元运算。
@@ -924,6 +1097,44 @@ mod tests {
         );
     }
 
+    /// 条件结构的判零必须与**立即数 0** 比较，而不是寄存器自身：
+    /// `cmp r, r` 恒为相等，任何分支都会在第一轮跳去 else（while 循环
+    /// 直接不进循环体）。旧实现正是踩了这个坑。
+    #[test]
+    fn branch_tests_condition_against_zero_immediate() {
+        let BranchShape {
+            words, branch_at, ..
+        } = branch_shape();
+
+        // 在条件分支之前找最后一条数据处理指令：I=1、opcode=CMP、S=1、
+        // rd=0、operand2=0 —— 即 `cmp rX, #0`。
+        let limit = branch_at / 4;
+        let found = (0..limit).rev().find(|&i| {
+            let w = words[i];
+            w >> 28 == 0xe
+                    && (w >> 25) & 1 == 1
+                    && (w >> 21) & 0xf == op::CMP
+                    && (w >> 20) & 1 == 1 // S：设置标志位
+                    && (w >> 12) & 0xf == 0 // rd=0（CMP 的固定编码）
+                    && w & 0xfff == 0 // 立即数 0
+        });
+        assert!(
+            found.is_some(),
+            "cond 判零必须是 `cmp rX, #0`（立即数）words={words:08x?}"
+        );
+    }
+
+    /// `cmp rN, #0` 的编码钉死值（AAPCS 汇编表达式）。
+    #[test]
+    fn cmp_zero_immediate_encoding() {
+        let mut u = empty_unit();
+        emit_cmp_imm8(&mut u, Reg(4), 0);
+        assert_eq!(
+            u32::from_le_bytes(u.code[..4].try_into().unwrap()),
+            0xE354_0000
+        );
+    }
+
     /// 汇编器实测值（`clang -target armv7a-none-eabi -march=armv7ve` + objdump）。
     const REF: [(&str, u32); 13] = [
         ("sdiv r1,r4,r7", 0xE711_F714),
@@ -1111,20 +1322,100 @@ mod tests {
         assert_eq!(sdiv, 0xe713_f110, "sdiv r3, r0, r1");
         assert_eq!(mls, 0xe063_3190, "mls r3, r0, r1, r3");
     }
+
+    /// load/store 编码基准（clang --target=armv7a-none-eabi + objdump 实测）：
+    ///   ldr  r0, [r1]  = 0xE591_0000   str  r0, [r1]  = 0xE581_0000
+    ///   ldrb r0, [r1]  = 0xE5D1_0000   strb r0, [r1]  = 0xE5C1_0000
+    ///   ldrsb r0, [r1] = 0xE1D1_00D0   ldrh r0, [r1]  = 0xE1D1_00B0
+    ///   ldrsh r0, [r1] = 0xE1D1_00F0   strh r0, [r1]  = 0xE1C1_00B0
+    #[test]
+    fn load_store_select_width_and_sign() {
+        let ld = |ty| {
+            let mut u = empty_unit();
+            emit_load_mem(&mut u, Reg(0), Reg(1), ty);
+            u32::from_le_bytes(u.code[0..4].try_into().unwrap())
+        };
+        let st = |ty| {
+            let mut u = empty_unit();
+            emit_store_mem(&mut u, Reg(1), Reg(0), ty);
+            u32::from_le_bytes(u.code[0..4].try_into().unwrap())
+        };
+        assert_eq!(ld(NumTy::Int(8)), 0xe1d1_00d0, "ldrsb r0, [r1]");
+        assert_eq!(ld(NumTy::Uint(8)), 0xe5d1_0000, "ldrb r0, [r1]");
+        assert_eq!(ld(NumTy::Int(16)), 0xe1d1_00f0, "ldrsh r0, [r1]");
+        assert_eq!(ld(NumTy::Uint(16)), 0xe1d1_00b0, "ldrh r0, [r1]");
+        assert_eq!(ld(NumTy::Int(32)), 0xe591_0000, "ldr r0, [r1]");
+        assert_eq!(ld(NumTy::Bool), 0xe5d1_0000, "bool 也是无符号单字节");
+        assert_eq!(st(NumTy::Int(8)), 0xe5c1_0000, "strb r0, [r1]");
+        assert_eq!(st(NumTy::Int(16)), 0xe1c1_00b0, "strh r0, [r1]");
+        assert_eq!(st(NumTy::Int(32)), 0xe581_0000, "str r0, [r1]");
+    }
+
+    /// imm12 = 8 位值循环右移偶数位字段：0x1000 = 1<<(12)【k=20】、1020 =
+    /// 255<<2【k=2】、255 自身【k=0】。
+    #[test]
+    fn arm_immediates_encode_as_rotated_bytes() {
+        assert_eq!(arm_imm_field(255), Some(255), "k=0 直接落地");
+        // 1020 = 255<<2 = 255 ror 30 → imm12 = 0xFF | (15<<8)
+        assert_eq!(arm_imm_field(1020), Some(0x0fff), "1020 = 255ror30");
+        // 0x1000 = 1<<12 = 1 ror 20 → imm12 = 1 | (10<<8)
+        assert_eq!(
+            arm_imm_field(0x1000),
+            Some(1 | (10 << 8)),
+            "0x1000 = 1ror20"
+        );
+        // 1007 = 0b1111101111 不是任何 8 位值的偶数位旋转
+        assert_eq!(arm_imm_field(1007), None);
+    }
+
+    #[test]
+    fn sp_immediate_adjust_encodes() {
+        let mut u = empty_unit();
+        emit_sub_sp_imm(&mut u, 8);
+        assert_eq!(
+            u32::from_le_bytes(u.code[0..4].try_into().unwrap()),
+            0xe24d_d008,
+            "sub sp, sp, #8"
+        );
+        let mut u = empty_unit();
+        emit_add_sp_imm(&mut u, 1020);
+        // 1020 的字段为 0xFF | (15<<8) = 0xFFF
+        assert_eq!(
+            u32::from_le_bytes(u.code[0..4].try_into().unwrap()),
+            0xe28d_dfff,
+            "add sp, sp, #1020"
+        );
+        // add r5, sp, #24
+        let mut u = empty_unit();
+        emit_add_rd_sp_imm(&mut u, Reg(5), 24);
+        assert_eq!(
+            u32::from_le_bytes(u.code[0..4].try_into().unwrap()),
+            0xe28d_5018,
+            "add r5, sp, #24"
+        );
+    }
 }
 
-/// 寄存器压力检查。
+/// 寄存器分配。
 ///
-/// 这些后端还没实现溢出（spilling）：活跃值超过可分配寄存器数时，
-/// `alloc_reg` 按编号取模会让同时存活的值抢同一个寄存器，生成**错的**代码。
-/// 宁可在这里明确报错，也不能安静地编出一个算错的程序。
+/// 与 AArch64 同构：先用线性扫描给每个值定寄存器，`alloc_reg` 按结果走；
+/// 否则活跃值超过可分配寄存器数时报错——宁可明确报错，也不能安静地
+/// 编出一个算错的程序（取模分配会让同余的值抢同一个寄存器）。
 ///
 /// x86-64 后端自己实现了溢出，见 `encoder.rs`。
 fn check_register_pressure(func: &SsaFunction) {
-    // 这些后端只用这次分配来**检测**压力，还没有按结果发射代码；
-    // 因此不传 callee-save 集合（它们本来也没建模调用破坏寄存器）。
-    let alloc = crate::codegen::regalloc::allocate_registers(func, ALLOCATABLE.len(), &[]);
+    // 跨调用存活的值只放被调用者保存的 r4-r8，否则 `bl` 会破坏它。
+    let alloc = crate::codegen::regalloc::allocate_registers(func, ALLOCATABLE.len(), &CALLEE_SAVE);
     if alloc.spilled > 0 {
         crate::codegen::unsupported_pressure(&func.name, ALLOCATABLE.len());
     }
+    REG_MAP.with(|m| {
+        let mut map = m.borrow_mut();
+        map.clear();
+        for (&v, loc) in &alloc.map {
+            if let crate::codegen::regalloc::Location::Reg(i) = loc {
+                map.insert(v, *i);
+            }
+        }
+    });
 }
