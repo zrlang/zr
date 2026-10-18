@@ -151,39 +151,67 @@ const SPILL_DST: Reg = Reg(4); // tp
 const SPILL_SRC: Reg = Reg(17); // a7
 const SPILL_SRC2: Reg = Reg(3); // gp
 
-/// 把实参搬进 psABI 的 a0-a7。
+/// 把实参搬进 psABI 的 a0-a7 / fa0-fa7。
 ///
-/// 实参的落点可能与后续实参的源寄存器交叉（分配器会把值放到 a 组），
-/// 顺序 `mv` 会互相覆盖，必须并行走环；溢出实参先逐个从栈槽装载。
+/// 整数与浮点**分别计数**（psABI 就这么规定）：`f(x: f64, y: i32)` 里
+/// `x` 落 fa0、`y` 落 a0。实参的落点可能与后续实参的源寄存器交叉（分配
+/// 器会把值放到 a 组），顺序 `mv` 会互相覆盖，必须并行走环；溢出实参
+/// 先逐个从栈槽装载。浮点实参最后统一从浮点槽加载进 fa 组——`fld`
+/// 不碰整数寄存器，放在所有整数搬运之后也不会干扰。
 fn emit_call_args(unit: &mut CompilationUnit, args: &[SsaValue]) {
     let mut moves: Vec<(Reg, Reg)> = Vec::new();
     let mut from_stack: Vec<(Reg, usize)> = Vec::new();
-    for (i, a) in args.iter().enumerate() {
-        if i >= ARG_REGS.len() {
+    let mut fp_loads: Vec<(usize, usize, u8)> = Vec::new(); // (fa 编号, 槽, 位宽)
+    let mut ai = 0usize;
+    let mut fi = 0usize;
+    for a in args {
+        if let Some((slot, w)) = float_slot(*a) {
+            if fi < FA_REGS.len() {
+                fp_loads.push((fi, slot, w));
+            }
+            fi += 1;
+            continue;
+        }
+        if ai >= ARG_REGS.len() {
             break; // 栈上传参区尚未实现
         }
         if let Some(slot) = spill_slot(*a) {
-            from_stack.push((ARG_REGS[i], slot));
+            from_stack.push((ARG_REGS[ai], slot));
         } else {
-            moves.push((ARG_REGS[i], alloc_reg(*a)));
+            moves.push((ARG_REGS[ai], alloc_reg(*a)));
         }
+        ai += 1;
     }
     emit_parallel_moves(unit, &mut moves);
     for (dst, slot) in from_stack {
         load_spill(unit, SPILL_DST, slot);
         emit_mv(unit, dst, SPILL_DST);
     }
+    for (i, slot, w) in fp_loads {
+        emit_float_load(unit, FA_REGS[i], slot, w);
+    }
 }
 
-/// 把形参从 ABI 寄存器 a0-a7 搬到分配结果所在的寄存器。
+/// 把形参从 ABI 寄存器 a0-a7 / fa0-fa7 搬到分配结果所在的寄存器或槽。
 ///
-/// 调用的世界：调用方把实参放进 a 组（`emit_call_args`），被调用方这里
-/// 按分配结果把值搬进自己的寄存器——没有搬运的话，函数体里读形参会用
-/// 到分配寄存器里的**垃圾**。溢出的形参直接落到它的栈槽。
+/// 调用的世界：调用方把实参放进 a 组 / fa 组（`emit_call_args`），被调用
+/// 方这里按分配结果把值搬进自己的位置——没有搬运的话，函数体里读形参
+/// 会用到分配寄存器里的**垃圾**。溢出的形参直接落到它的栈槽。
+///
+/// 形参有没有浮点性只能靠浮点槽反推：`assign_float_slots` 已把函数体内
+/// 经浮点运算传播到的形参记进去了。
 fn emit_param_moves(unit: &mut CompilationUnit, func: &SsaFunction) {
     let mut gi = 0usize;
+    let mut fi = 0usize;
     let mut moves: Vec<(Reg, Reg)> = Vec::new();
     for p in &func.params {
+        if let Some((slot, w)) = float_slot(*p) {
+            if fi < FA_REGS.len() {
+                emit_float_store(unit, FA_REGS[fi], slot, w);
+            }
+            fi += 1;
+            continue;
+        }
         if gi >= ARG_REGS.len() {
             continue; // 超过 8 个整数形参走栈上传参区，本后端尚未实现
         }
@@ -642,7 +670,12 @@ fn emit_phi_copies(
         })
         .collect();
     for (result, src) in &ds {
-        if let (Some(ds_), Some(ss)) = (spill_slot(*result), spill_slot(*src)) {
+        if let (Some((ds_, dw)), Some((ss, sw))) = (float_slot(*result), float_slot(*src)) {
+            // 浮点 → 浮点：经 FT0 栈对栈直挪
+            let w = dw.max(sw);
+            emit_float_load(unit, FP_TMP0, ss, w);
+            emit_float_store(unit, FP_TMP0, ds_, w);
+        } else if let (Some(ds_), Some(ss)) = (spill_slot(*result), spill_slot(*src)) {
             // 溢出 → 溢出：经暂存寄存器栈对栈
             load_spill(unit, SPILL_DST, ss);
             store_spill(unit, SPILL_DST, ds_);
@@ -697,16 +730,18 @@ pub fn emit_function(target: &Target, unit: &mut CompilationUnit, func: &SsaFunc
         idx.dedup();
         idx.into_iter().map(|i| ALLOCATABLE[i].bits()).collect()
     };
-    // 帧布局（从 sp 起向上）：ra、被调用者保存的 s 组、取址局部变量槽、
-    // 溢出槽。保存区在下（恢复时按同一偏移加载）。
+    // 帧布局（从 sp 起向上）：ra、被调用者保存的 s 组、浮点槽区、取址
+    // 局部变量槽、溢出槽。保存区在下（恢复时按同一偏移加载）。
     let saved_bytes = (cs_used.len() + 1) * 8;
-    let slot_count = assign_local_slots(func, cs_used.len() + 1);
-    if slot_count > 0 && slot_count * 8 > 2040 {
+    let float_count = assign_float_slots(func);
+    let slot_count = assign_local_slots(func, cs_used.len() + 1 + float_count);
+    if slot_count > 0 && (slot_count + float_count) * 8 > 2040 {
         crate::codegen::unsupported_const("too many address-taken locals (risc-v slot area)");
     }
     let spill_count = SPILL_SLOTS.with(|m| m.borrow().len());
-    SPILL_BASE.with(|c| c.set(saved_bytes + slot_count * 8));
-    let frame_bytes = saved_bytes + (slot_count + spill_count) * 8;
+    FLOAT_BASE.with(|c| c.set(saved_bytes));
+    SPILL_BASE.with(|c| c.set(saved_bytes + (slot_count + float_count) * 8));
+    let frame_bytes = saved_bytes + (slot_count + float_count + spill_count) * 8;
     if frame_bytes > 2040 {
         crate::codegen::unsupported_const("function frame too large (risc-v)");
     }
@@ -749,8 +784,12 @@ pub fn emit_function(target: &Target, unit: &mut CompilationUnit, func: &SsaFunc
         match &block.term {
             SsaTerminator::Return(ret_val) => {
                 if let Some(v) = ret_val {
-                    let r = val_reg(unit, *v);
-                    emit_mv(unit, Reg::A0, r);
+                    if let Some((slot, w)) = float_slot(*v) {
+                        emit_float_load(unit, Reg(10), slot, w); // fa0
+                    } else {
+                        let r = val_reg(unit, *v);
+                        emit_mv(unit, Reg::A0, r);
+                    }
                 }
                 // 尾声：恢复 s 组与 ra、归还帧、返回。
                 if frame_bytes > 0 {
@@ -828,6 +867,172 @@ fn assign_local_slots(func: &SsaFunction, base: usize) -> usize {
     count
 }
 
+/// 扫出一个函数里所有浮点值，给每个值分配专属栈槽，返回槽数。
+///
+/// 与 AArch64 后端同一套不动点算法（移植）：浮点"性"必须穿过 `Copy` 与
+/// `Phi` 传播——只认定义点会让中转值被当成整数去找寄存器，然后拿到栈槽
+/// 里的残渣当浮点数用。播种（`Neg` 依赖操作数已是浮点）与传播合成一轮
+/// 重扫全函数，直到不再变化。
+///
+/// 槽号从 0 起编，寻址时由 `float_offset` 加上 `FLOAT_BASE`。
+fn assign_float_slots(func: &SsaFunction) -> usize {
+    let mut floats: HashMap<u32, u8> = HashMap::new();
+    let width_of =
+        |v: &SsaValue, map: &HashMap<u32, u8>| -> u8 { map.get(&v.id()).copied().unwrap_or(0) };
+    loop {
+        let mut changed = false;
+        let mark = |v: &SsaValue, w: u8, map: &mut HashMap<u32, u8>| -> bool {
+            match map.get(&v.id()) {
+                // 已知但更窄，保留更宽的那个（f64 优先）
+                Some(old) if *old >= w => false,
+                _ => {
+                    map.insert(v.id(), w);
+                    true
+                }
+            }
+        };
+        for block in &func.blocks {
+            for instr in &block.instrs {
+                match instr {
+                    SsaInstr::Const {
+                        result,
+                        value: SsaConst::Float(_, w),
+                    } => {
+                        if mark(result, *w, &mut floats) {
+                            changed = true;
+                        }
+                    }
+                    SsaInstr::Binary {
+                        result,
+                        ty,
+                        lhs,
+                        rhs,
+                        ..
+                    } => {
+                        if ty.is_float() {
+                            let w = match *ty {
+                                NumTy::Float(w) => w,
+                                _ => 64,
+                            };
+                            for v in [result, lhs, rhs] {
+                                if mark(v, w, &mut floats) {
+                                    changed = true;
+                                }
+                            }
+                        } else {
+                            // 比较的结果是 bool，但操作数可能都是浮点：两边互相传播
+                            let lw = width_of(lhs, &floats);
+                            let rw = width_of(rhs, &floats);
+                            let (unknown, w) = match (lw, rw) {
+                                (w, 0) if w > 0 => (rhs, w),
+                                (0, w) if w > 0 => (lhs, w),
+                                _ => continue,
+                            };
+                            if mark(unknown, w, &mut floats) {
+                                changed = true;
+                            }
+                        }
+                    }
+                    SsaInstr::Unary {
+                        result, operand, ..
+                    } => {
+                        if floats.contains_key(&result.id()) {
+                            let w = width_of(result, &floats);
+                            if w > 0 && mark(operand, w, &mut floats) {
+                                changed = true;
+                            }
+                        }
+                        if floats.contains_key(&operand.id()) {
+                            let w = width_of(operand, &floats);
+                            if w > 0 && mark(result, w, &mut floats) {
+                                changed = true;
+                            }
+                        }
+                    }
+                    SsaInstr::Call { result, ty, .. } => {
+                        if ty.is_float() {
+                            let w = match *ty {
+                                NumTy::Float(w) => w,
+                                _ => 64,
+                            };
+                            if mark(result, w, &mut floats) {
+                                changed = true;
+                            }
+                        }
+                    }
+                    SsaInstr::Cast {
+                        result,
+                        src,
+                        from,
+                        to,
+                    } => {
+                        if to.is_float() {
+                            let w = match *to {
+                                NumTy::Float(w) => w,
+                                _ => 64,
+                            };
+                            if mark(result, w, &mut floats) {
+                                changed = true;
+                            }
+                        }
+                        if from.is_float() {
+                            let w = match *from {
+                                NumTy::Float(w) => w,
+                                _ => 64,
+                            };
+                            if mark(src, w, &mut floats) {
+                                changed = true;
+                            }
+                        }
+                    }
+                    SsaInstr::Copy { result, src } => {
+                        if floats.contains_key(&src.id()) {
+                            let w = width_of(src, &floats);
+                            if mark(result, w, &mut floats) {
+                                changed = true;
+                            }
+                        }
+                        if floats.contains_key(&result.id()) {
+                            let w = width_of(result, &floats);
+                            if mark(src, w, &mut floats) {
+                                changed = true;
+                            }
+                        }
+                    }
+                    SsaInstr::Phi {
+                        result, incoming, ..
+                    } if incoming.iter().any(|(_, v)| floats.contains_key(&v.id())) => {
+                        let w = incoming
+                            .iter()
+                            .map(|(_, v)| width_of(v, &floats))
+                            .max()
+                            .unwrap_or(64);
+                        if mark(result, w, &mut floats) {
+                            changed = true;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+    let mut ids: Vec<u32> = floats.keys().copied().collect();
+    ids.sort_unstable();
+    let count = ids.len();
+    FLOAT_SLOTS.with(|m| {
+        let mut map = m.borrow_mut();
+        map.clear();
+        for (i, id) in ids.into_iter().enumerate() {
+            let w = floats.get(&id).copied().unwrap_or(64);
+            map.insert(id, (i, w));
+        }
+    });
+    count
+}
+
 /// 发射一条 SSA 指令。
 /// 发射一条 SSA 指令。
 fn emit_instr(unit: &mut CompilationUnit, instr: &SsaInstr, wide: bool) {
@@ -847,7 +1052,7 @@ fn emit_instr(unit: &mut CompilationUnit, instr: &SsaInstr, wide: bool) {
                 emit_li(unit, out_reg(*result), 0);
                 put_out(unit, *result);
             }
-            SsaConst::Float(..) => crate::codegen::unsupported_const("float"),
+            SsaConst::Float(bits, w) => emit_const_float(unit, *result, *bits, *w),
             SsaConst::Str(_) => crate::codegen::unsupported_const("string"),
         },
         SsaInstr::Unary {
@@ -855,15 +1060,27 @@ fn emit_instr(unit: &mut CompilationUnit, instr: &SsaInstr, wide: bool) {
             op,
             operand,
         } => {
-            emit_unary(unit, *result, *op, *operand);
+            if *op == crate::ssa::SsaUnaryOp::Neg
+                && (float_slot(*result).is_some() || float_slot(*operand).is_some())
+            {
+                emit_unary_float(unit, *result, *operand);
+            } else {
+                emit_unary(unit, *result, *op, *operand);
+            }
         }
         SsaInstr::Binary {
             result,
             op,
             lhs,
             rhs,
-            ..
-        } => emit_binary(unit, *result, *op, *lhs, *rhs),
+            ty,
+        } => {
+            if ty.is_float() || float_slot(*lhs).is_some() || float_slot(*rhs).is_some() {
+                emit_binary_float(unit, *result, *op, *lhs, *rhs, *ty);
+            } else {
+                emit_binary(unit, *result, *op, *lhs, *rhs);
+            }
+        }
         SsaInstr::Call {
             result,
             callee,
@@ -872,7 +1089,9 @@ fn emit_instr(unit: &mut CompilationUnit, instr: &SsaInstr, wide: bool) {
         } => {
             emit_call_args(unit, args);
             emit_jal(unit, Reg::RA, callee);
-            if let Some(slot) = spill_slot(*result) {
+            if let Some((slot, w)) = float_slot(*result) {
+                emit_float_store(unit, Reg(10), slot, w); // fa0
+            } else if let Some(slot) = spill_slot(*result) {
                 store_spill(unit, Reg::A0, slot);
             } else {
                 emit_mv(unit, alloc_reg(*result), Reg::A0);
@@ -886,18 +1105,26 @@ fn emit_instr(unit: &mut CompilationUnit, instr: &SsaInstr, wide: bool) {
             from,
             to,
         } => {
-            let rs = val_reg(unit, *src);
-            let rd = out_reg(*result);
-            emit_cast(unit, rd, rs, *from, *to);
-            put_out(unit, *result);
+            if from.is_float() || to.is_float() {
+                emit_cast_float(unit, *result, *src, *from, *to);
+            } else {
+                let rs = val_reg(unit, *src);
+                let rd = out_reg(*result);
+                emit_cast(unit, rd, rs, *from, *to);
+                put_out(unit, *result);
+            }
         }
         SsaInstr::Copy { result, src } => {
-            let s = val_reg(unit, *src);
-            let d = out_reg(*result);
-            if d != s {
-                emit_mv(unit, d, s);
+            if float_slot(*result).is_some() {
+                emit_float_copy(unit, *result, *src);
+            } else {
+                let s = val_reg(unit, *src);
+                let d = out_reg(*result);
+                if d != s {
+                    emit_mv(unit, d, s);
+                }
+                put_out(unit, *result);
             }
-            put_out(unit, *result);
         }
         SsaInstr::Var { .. } => {}
         // 被取地址的局部变量的栈槽地址：`addi rd, sp, 8*slot`。
@@ -1035,6 +1262,301 @@ fn emit_seqz(unit: &mut CompilationUnit, dst: Reg, rs: Reg) {
 /// `snez rd, rs`：`sltu rd, zero, rs`
 fn emit_snez(unit: &mut CompilationUnit, dst: Reg, rs: Reg) {
     emit_r(unit, 0x33, dst, 3, Reg::ZERO, rs, 0);
+}
+
+// ==================================================================
+// 浮点（RV64 的 F/D 扩展指令选择）
+// ==================================================================
+//
+// 与 AArch64 后端同一套数据流模型：浮点值**不占整数分配池**，平时躺在
+// 專属栈槽里（-value 一个槽），只在进出形参/返回值/运算时落到浮点寄存器
+// （fa0-fa7 传参，ft0-ft2 暂存）。整数寄存器分配照旧，两套互不干扰。
+//
+// 编码纪律（RISC-V 未授权规范卷一表 11.x）：
+//   FADD.S/D 指令系列用 F 型（funct7 低 7 位发射 + fmt 位在 funct7[5]）；
+//   转换指令用 rs2 字段区分子类（w/wu/l/lu），funct7 区分方向与格式。
+
+thread_local! {
+    /// 当前函数的浮点栈槽：值 id -> (槽号, 位宽 32/64)。
+    static FLOAT_SLOTS: RefCell<HashMap<u32, (usize, u8)>> = RefCell::new(HashMap::new());
+    /// 浮点槽区的基址：槽区位于 ra/保存区之上、取址槽之下。emit_function 设置。
+    static FLOAT_BASE: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// 浮点暂存寄存器：`ft0`/`ft1`/`ft2` = f5/f6/f7（caller-save，跨指令不携带）。
+const FP_TMP0: Reg = Reg(5);
+const FP_TMP1: Reg = Reg(6);
+const FP_TMP2: Reg = Reg(7);
+
+/// psABI 的浮点实参寄存器 fa0-fa7（f10-f17），返回值在 fa0。
+const FA_REGS: [Reg; 8] = [
+    Reg(10),
+    Reg(11),
+    Reg(12),
+    Reg(13),
+    Reg(14),
+    Reg(15),
+    Reg(16),
+    Reg(17),
+];
+
+/// `v` 如果是浮点值，返回 (槽号, 位宽)。
+fn float_slot(v: SsaValue) -> Option<(usize, u8)> {
+    FLOAT_SLOTS.with(|m| m.borrow().get(&v.id()).copied())
+}
+
+/// 浮点槽相对 sp 的字节偏移。
+fn float_offset(slot: usize) -> i32 {
+    (FLOAT_BASE.with(|c| c.get()) + slot * 8) as i32
+}
+
+/// `fld/flw rd, off(sp)`——浮点槽装载。
+fn emit_float_load(unit: &mut CompilationUnit, rd: Reg, slot: usize, w: u8) {
+    let f3 = if w == 64 { 3 } else { 2 };
+    let off = float_offset(slot) as u32 & 0xfff;
+    insn(
+        unit,
+        off << 20 | (Reg::SP.bits() as u32) << 15 | f3 << 12 | (rd.bits() as u32) << 7 | 0x07,
+    );
+}
+
+/// `fsd/fsw rs, off(sp)`——把浮点寄存器值落进槽。
+fn emit_float_store(unit: &mut CompilationUnit, rs: Reg, slot: usize, w: u8) {
+    let f3 = if w == 64 { 3 } else { 2 };
+    let off = float_offset(slot) as u32;
+    let hi = (off >> 5) & 0x7f;
+    let lo = off & 0x1f;
+    insn(
+        unit,
+        hi << 25
+            | (rs.bits() as u32) << 20
+            | (Reg::SP.bits() as u32) << 15
+            | f3 << 12
+            | lo << 7
+            | 0x27,
+    );
+}
+
+/// F 型运算：`funct7` 直接给（含 fmt 位），`rm` 编进 funct3。
+fn emit_f(unit: &mut CompilationUnit, funct7: u32, rm: u32, rd: Reg, rs1: Reg, rs2: Reg) {
+    emit_r(unit, 0x53, rd, rm, rs1, rs2, funct7);
+}
+
+/// 浮点转换：`rd = funct7 目标(rs2 字段选 w/wu/l/lu 变体)`。
+fn emit_f_cvt(unit: &mut CompilationUnit, rd: Reg, rs1: Reg, funct7: u32, variant: u32, rm: u32) {
+    emit_r(unit, 0x53, rd, rm, rs1, Reg((variant & 31) as u8), funct7);
+}
+
+/// 64 位立即数装载（f64 位型常量用）。
+///
+/// `emit_li` 只能装 32 位符号扩展值；位型 64 位常量分三段：
+/// 1. lo32 经 `slli+srli` 零扩展进 `rd`；
+/// 2. hi32 经 `emit_li` 正确 64 位化后上移；
+/// 3. `or` 合并。中转借用 gp(x3)——指令发射期间 φ 中转必然空闲。
+fn emit_li64(unit: &mut CompilationUnit, rd: Reg, imm: u64) {
+    let bits = imm as i64;
+    if bits >= i32::MIN as i64 && bits <= i32::MAX as i64 {
+        emit_li(unit, rd, bits as i32);
+        return;
+    }
+    // lo32 零扩展落位（li 是符号扩展的，左移 32 再无符号右移抹掉高位）
+    emit_li(unit, rd, (imm & 0xffff_ffff) as u32 as i32);
+    emit_shift_imm(unit, 1, 0x00, rd, rd, 32);
+    emit_shift_imm(unit, 5, 0x00, rd, rd, 32);
+    let hi = (imm >> 32) as i32;
+    if hi != 0 {
+        // li(hi) 符号扩到 64 位，slli 32 把低 32 位的符号垃圾移出界
+        let tmp = PHI_TMP;
+        emit_li(unit, tmp, hi);
+        emit_shift_imm(unit, 1, 0x00, tmp, tmp, 32);
+        emit_r(unit, 0x33, rd, 6, rd, tmp, 0); // or
+    }
+}
+
+/// f64/f32 位型常量：`li` 出位型 → `fmv.d.x/fmv.w.x` 送进浮点暂存 → 存槽。
+fn emit_const_float(unit: &mut CompilationUnit, result: SsaValue, bits: u64, w: u8) {
+    let (slot, _) = float_slot(result).expect("浮点常量没有栈槽");
+    let tmp = PHI_TMP;
+    emit_li64(unit, tmp, bits);
+    let funct7 = if w == 64 { 0x79 } else { 0x78 }; // FMV.D.X / FMV.W.X
+    emit_f(unit, funct7, 0, FP_TMP0, tmp, Reg::ZERO);
+    emit_float_store(unit, FP_TMP0, slot, w);
+}
+
+/// 浮点一元取负：`fneg`（= FSGNJN rd, rs, rs）。
+fn emit_unary_float(unit: &mut CompilationUnit, result: SsaValue, operand: SsaValue) {
+    let (_, sw) = float_slot(operand).expect("浮点取负的操作数没有栈槽");
+    let (dst, dw) = float_slot(result).expect("浮点取负的结果没有栈槽");
+    let w = dw.max(sw);
+    emit_float_load(
+        unit,
+        FP_TMP0,
+        float_slot(operand).map(|(s, _)| s).unwrap(),
+        w,
+    );
+    let funct7 = if w == 64 { 0x11 } else { 0x10 }; // FSGNJN.D / FSGNJN.S，rm=01
+    emit_f(unit, funct7, 1, FP_TMP1, FP_TMP0, FP_TMP0);
+    emit_float_store(unit, FP_TMP1, dst, w);
+}
+
+/// 浮点槽对槽复制：经 FT0 中转。
+fn emit_float_copy(unit: &mut CompilationUnit, result: SsaValue, src: SsaValue) {
+    let (_, sw) = float_slot(src).expect("浮点复制源没有栈槽");
+    let (dst, dw) = float_slot(result).expect("浮点复制目标没有栈槽");
+    let w = dw.max(sw);
+    let ss = float_slot(src).map(|(s, _)| s).unwrap();
+    emit_float_load(unit, FP_TMP0, ss, w);
+    emit_float_store(unit, FP_TMP0, dst, w);
+}
+
+/// 浮点二元运算与比较。
+///
+/// 算术结果落浮点槽（FT2 暂存）；比较（IEEE754 无序时取假：`feq/flt/fle`
+/// 对 NaN 一律返回 0）的结果物化到**整数寄存器**的 0/1——后续 `beq`
+/// 只认整数布尔。
+///
+/// 两个操作数位宽不一致时把窄的先转成宽的再运算（理论上是 tyc k 的事，
+/// 这里兜底留住正确性）。
+fn emit_binary_float(
+    unit: &mut CompilationUnit,
+    result: SsaValue,
+    op: SsaBinaryOp,
+    lhs: SsaValue,
+    rhs: SsaValue,
+    ty: NumTy,
+) {
+    use SsaBinaryOp::*;
+    let (ls, lw) = float_slot(lhs).expect("浮点运算左操作数没有栈槽");
+    let (rs, rw) = float_slot(rhs).expect("浮点运算右操作数没有栈槽");
+    let tw = match ty {
+        NumTy::Float(w) if w != 0 => w,
+        _ => 64,
+    };
+    let w = tw.max(lw).max(rw);
+    let fmt = u32::from(w == 64); // .D 的 funct7 位
+                                  // 左操作数 → FT0，右 → FT1；不足宽先转
+    emit_float_load(unit, FP_TMP0, ls, lw);
+    if w != lw {
+        emit_f(unit, 0x21, 0, FP_TMP0, FP_TMP0, Reg::ZERO); // fcvt.d.s
+    }
+    emit_float_load(unit, FP_TMP1, rs, rw);
+    if w != rw {
+        emit_f(unit, 0x21, 0, FP_TMP1, FP_TMP1, Reg::ZERO); // fcvt.d.s
+    }
+    if matches!(op, Eq | Ne | Lt | Gt | Le | Ge) {
+        let dst = out_reg(result); // 比较结果落整数寄存器
+        match op {
+            Eq => emit_f(unit, 0x50 | fmt, 2, dst, FP_TMP0, FP_TMP1), // feq
+            Ne => {
+                emit_f(unit, 0x50 | fmt, 2, dst, FP_TMP0, FP_TMP1);
+                emit_xori(unit, dst, dst, 1);
+            }
+            Lt => emit_f(unit, 0x50 | fmt, 1, dst, FP_TMP0, FP_TMP1), // flt
+            Gt => emit_f(unit, 0x50 | fmt, 1, dst, FP_TMP1, FP_TMP0),
+            Le => emit_f(unit, 0x50 | fmt, 0, dst, FP_TMP0, FP_TMP1), // fle
+            Ge => emit_f(unit, 0x50 | fmt, 0, dst, FP_TMP1, FP_TMP0),
+            _ => unreachable!(),
+        }
+        put_out(unit, result);
+        return;
+    }
+    // 算术：结果统一算进 FT2，再落回结果槽（位宽以 ty 为准）
+    let base = match op {
+        Add => 0x00, // FADD
+        Sub => 0x04,
+        Mul => 0x08,
+        Div => 0x0c,
+        _ => crate::codegen::unsupported_binary_op(op),
+    };
+    emit_f(unit, base | fmt, 0, FP_TMP2, FP_TMP0, FP_TMP1);
+    emit_float_store(
+        unit,
+        FP_TMP2,
+        float_slot(result).map(|(s, _)| s).unwrap_or_default(),
+        tw,
+    );
+}
+
+/// 浮点转换：f↔f 跨宽（fcvt.d.s / fcvt.s.d）、f↔整数（`as` 语义 =
+/// 向零截断，rm=001）。整数源总是 represented 成 x 寄存器里的 i64/u64。
+fn emit_cast_float(
+    unit: &mut CompilationUnit,
+    result: SsaValue,
+    src: SsaValue,
+    from: NumTy,
+    to: NumTy,
+) {
+    if from.is_float() && to.is_float() {
+        let fw = match from {
+            NumTy::Float(w) => w,
+            _ => 64,
+        };
+        let tw = match to {
+            NumTy::Float(w) => w,
+            _ => 64,
+        };
+        let (ss, _) = float_slot(src).expect("浮点转换源没有栈槽");
+        let (dst, _) = float_slot(result).expect("浮点转换结果没有栈槽");
+        emit_float_load(unit, FP_TMP0, ss, fw);
+        if fw != tw {
+            // 0x21 = FCVT.D.S（f32→f64），0x20 = FCVT.S.D
+            let funct7 = if tw == 64 { 0x21 } else { 0x20 };
+            emit_f(unit, funct7, 0, FP_TMP0, FP_TMP0, Reg::ZERO);
+        }
+        emit_float_store(unit, FP_TMP0, dst, tw);
+        return;
+    }
+    if to.is_float() {
+        // 整数 → 浮点：窄宽度已在 x 寄存器里扩展好，宽变体同样适用。
+        // rs2 字段：0=w 1=wu 2=l 3=lu；有符号 / 无符号由源类型定。
+        let variant: u32 = match from {
+            NumTy::Int(32) => 0,
+            NumTy::Uint(32) | NumTy::Bool => 1,
+            NumTy::Int(_) => 2,
+            NumTy::Uint(_) => 3,
+            NumTy::Float(_) => unreachable!(),
+        };
+        let rs = val_reg(unit, src);
+        let (dst, tw) = float_slot(result).expect("浮点转换结果没有栈槽");
+        // funct7：0b1101XXX = int→f（低 3 位=fmt + rs2 变体用 rs2 字段）
+        let funct7 = if tw == 64 { 0x69 } else { 0x68 };
+        emit_f_cvt(unit, FP_TMP0, rs, funct7, variant, 0);
+        emit_float_store(unit, FP_TMP0, dst, tw);
+        return;
+    }
+    // 浮点 → 整数：rm=001 = 向零取整，与 Rust `as` 一致。
+    let (ss, fw) = float_slot(src).expect("浮点转换源没有栈槽");
+    let variant: u32 = match to {
+        NumTy::Int(32) => 0,
+        NumTy::Uint(32) | NumTy::Bool => 1,
+        NumTy::Int(_) => 2,
+        NumTy::Uint(_) => 3,
+        NumTy::Float(_) => unreachable!(),
+    };
+    let funct7 = if fw == 64 { 0x61 } else { 0x60 };
+    let want64 = matches!(to, NumTy::Int(64) | NumTy::Uint(64));
+    emit_float_load(unit, FP_TMP0, ss, fw);
+    emit_f_cvt(unit, FP_TMP0, FP_TMP0, funct7, variant, 1);
+    let r = SPILL_DST;
+    emit_fmv_x(unit, r, FP_TMP0, want64); // 浮点轨 → 整数轨
+    let rd = out_reg(result);
+    if rd != r {
+        emit_mv(unit, rd, r);
+    }
+    // 窄宽度需要按整数世界的扩展规则收尾（值已在 i64 语义里）
+    if !want64 {
+        emit_cast(unit, rd, rd, NumTy::Int(64), to);
+    }
+    put_out(unit, result);
+}
+
+/// `fmv.x.d/fmv.x.w rd, rs`：浮点寄存器 → x 寄存器（位型搬运）。
+///
+/// `.w` 按规范把低 32 位**符号扩展**；窄整数结果随后由 `emit_cast` 的
+/// 扩展规则修正，无碍。64 位结果必须走 `.d`（全 64 位照搬）。
+fn emit_fmv_x(unit: &mut CompilationUnit, rd: Reg, rs: Reg, wide: bool) {
+    let funct7 = if wide { 0x71 } else { 0x70 };
+    emit_r(unit, 0x53, rd, 0, rs, Reg::ZERO, funct7);
 }
 
 /// 发射程序入口 `_start`：调用 `main` 之后自旋等待复位。
