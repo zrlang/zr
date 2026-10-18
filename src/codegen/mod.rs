@@ -162,6 +162,15 @@ pub enum RelocationKind {
     RiscVJal,
     /// RISC-V：13 位半字对齐偏移（条件分支，ELF `R_RISCV_BRANCH`）。
     RiscVBranch,
+    /// RISC-V：`lui rd, %hi(sym)` 的高 20 位（ELF `R_RISCV_HI20`）。
+    ///
+    /// `lui + addi %lo` 的绝对取址对——符号直引（REL 型），自链接与
+    /// GNU ld 都按 `S + A` 处理；`hi` 取 `(S + 0x800) >> 12` 的标准
+    /// 进位舍入，与负的 `lo12` 相互抵消。
+    RiscVHi20,
+    /// RISC-V：`addi rd, rd, %lo(sym)` 的符号扩展 imm12（ELF
+    /// `R_RISCV_LO12_I`），与 [`RelocationKind::RiscVHi20`] 成对。
+    RiscVLo12I,
 }
 
 /// 符号。

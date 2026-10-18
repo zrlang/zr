@@ -318,6 +318,22 @@ fn emit_lui(unit: &mut CompilationUnit, rd: Reg, imm: u32) {
     );
 }
 
+/// `lui rd, %hi(sym)` + `addi rd, rd, %lo(sym)`：取**符号**的绝对地址。
+///
+/// 字符串字面量在 `.rodata` 里，静态可执行文件的加载地址编译期已知，
+/// 绝对取址（相对 `adrp` 成对解）同时兼容自链接与 ELF 目标文件的
+/// `R_RISCV_HI20`/`R_RISCV_LO12_I`（REL 型符号直引）。
+fn emit_str_addr(unit: &mut CompilationUnit, dst: Reg, sym: &str) {
+    let a = unit.code.len();
+    emit_lui(unit, dst, 0); // %hi 后填
+    unit.relocations
+        .push(Relocation::new(a, a, 4, sym, RelocationKind::RiscVHi20));
+    let b = unit.code.len();
+    emit_addi(unit, dst, dst, 0); // %lo 后填
+    unit.relocations
+        .push(Relocation::new(b, b, 4, sym, RelocationKind::RiscVLo12I));
+}
+
 /// I 型：`opcode | rd | funct3 | rs1 | imm12`
 fn emit_i(unit: &mut CompilationUnit, opcode: u32, rd: Reg, funct3: u32, rs1: Reg, imm: i32) {
     let word = opcode
@@ -1053,7 +1069,11 @@ fn emit_instr(unit: &mut CompilationUnit, instr: &SsaInstr, wide: bool) {
                 put_out(unit, *result);
             }
             SsaConst::Float(bits, w) => emit_const_float(unit, *result, *bits, *w),
-            SsaConst::Str(_) => crate::codegen::unsupported_const("string"),
+            SsaConst::Str(text) => {
+                let sym = unit.intern_string(text);
+                emit_str_addr(unit, out_reg(*result), &sym);
+                put_out(unit, *result);
+            }
         },
         SsaInstr::Unary {
             result,

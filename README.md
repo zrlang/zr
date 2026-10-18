@@ -1054,9 +1054,12 @@ zr 编译器采用经典的多阶段架构：
 - [x] 字符串字面量落到 `.rodata`（去重、NUL 结尾，取址即取指针）
   - [x] 取址：x86-64 `lea reg,[rip+disp]`（`R_X86_64_PC32` / `X86_64_RELOC_SIGNED` /
         `IMAGE_REL_AMD64_REL32`）、AArch64 `adrp`+`add :lo12:`
-        （`R_AARCH64_ADR_PREL_PG_HI21`+`ADD_ABS_LO12_NC` / `ARM64_RELOC_PAGE21`+`PAGEOFFSET12`）
+        （`R_AARCH64_ADR_PREL_PG_HI21`+`ADD_ABS_LO12_NC` / `ARM64_RELOC_PAGE21`+`PAGEOFFSET12`）、
+        RISC-V `lui`+`addi`（`R_RISCV_HI20`+`LO12_I`，REL 符号直引）
   - [x] `.rodata` 段归属：ELF 段索引 2、Mach-O `n_sect=2`、COFF 节号 2
   - [x] 字面量按内容去重，`==`/`!=` 比较指针（同内容共享同一地址），`str` 可作实参跨调用
+  - [x] 裸机自构造 ELF 的 `.rodata` 布局：vaddr 与文件偏移同对齐（SECT_ALIGN），
+        保证整文件平移可加载（`vaddr - off` 恒定）——页对齐会破坏平移不变性
 - [x] `extern "C"` 声明接通运行时（`zr_write` / `zr_read` / `zr_exit` …）
   - [x] 外部函数声明并入函数表，参与类型检查与名称解析，调用点发未定义符号给平台链接器
   - [x] 可把字符串字面量交给 `zr_write` 输出（宿主目标经 `clang`+`libzrrt.a`）

@@ -117,10 +117,19 @@ pub fn assemble_elf(target: &Target, unit: &CompilationUnit) -> io::Result<Vec<u
     let strtab_off = align_up(symtab_off + symtab.len() as u64, SECT_ALIGN);
 
     // ---------- 虚拟地址布局 ----------
-    // 三个 PT_LOAD 段共享同一个虚拟基址起点（按页对齐）。
-    let text_vaddr = align_up(target.image_base(), PAGE_ALIGN);
-    let rodata_vaddr = align_up(text_vaddr + text.len() as u64, PAGE_ALIGN);
-    let data_vaddr = align_up(rodata_vaddr + rodata.len() as u64, PAGE_ALIGN);
+    // 有 Program Header 的镜像按页对齐（加载器/链接器按段映射）。
+    // 裸机自构造镜像没有加载器，靠整文件平移加载（见 run_elf.py 的
+    // file_shift），因此 vaddr 必须与文件偏移用**相同对齐**，保证所有
+    // 段的 vaddr - off 恒定——否则 .rodata 会被平移到错误地址。
+    let (text_vaddr, rodata_vaddr, data_vaddr) = if has_segments {
+        let t = align_up(target.image_base(), PAGE_ALIGN);
+        let r = align_up(t + text.len() as u64, PAGE_ALIGN);
+        (t, r, align_up(r + rodata.len() as u64, PAGE_ALIGN))
+    } else {
+        let t = align_up(target.image_base(), SECT_ALIGN);
+        let r = align_up(t + text.len() as u64, SECT_ALIGN);
+        (t, r, align_up(r + rodata.len() as u64, SECT_ALIGN))
+    };
 
     // === ELF Header ===
     // ident: magic + 32/64 位标记 + 小端 + 版本
@@ -349,9 +358,16 @@ pub fn assemble_elf(target: &Target, unit: &CompilationUnit) -> io::Result<Vec<u
 pub fn emit_elf(target: &Target, unit: &CompilationUnit, path: &std::path::Path) -> io::Result<()> {
     // 重定位作用于 code 段，且必须基于虚拟地址计算 PC 相对偏移。
     let mut unit = unit.clone();
-    let text_base = align_up(target.image_base(), PAGE_ALIGN);
-    // `.rodata` 紧跟在 `.text` 之后，按页对齐——与 `assemble_elf` 的布局一致。
-    let rodata_base = align_up(text_base + unit.code.len() as u64, PAGE_ALIGN);
+    // 裸机镜像与 assemble_elf 的 Bare 布局一致：vaddr 用 SECT_ALIGN
+    // （与文件偏移同对齐，保证整文件平移可加载）；宿主镜像按页对齐。
+    let align = if target.os() == Os::Bare {
+        SECT_ALIGN
+    } else {
+        PAGE_ALIGN
+    };
+    let text_base = align_up(target.image_base(), align);
+    // `.rodata` 紧跟在 `.text` 之后，与 `assemble_elf` 的布局一致。
+    let rodata_base = align_up(text_base + unit.code.len() as u64, align);
     crate::codegen::objfile::apply_relocations(&mut unit, text_base, rodata_base);
     let bytes = assemble_elf(target, &unit)?;
     std::fs::write(path, &bytes)

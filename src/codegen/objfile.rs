@@ -36,7 +36,9 @@ pub fn reloc_field_size(kind: RelocationKind) -> usize {
         | RelocationKind::ArmBranchThumb
         | RelocationKind::ArmCbzThumb
         | RelocationKind::RiscVJal
-        | RelocationKind::RiscVBranch => 4,
+        | RelocationKind::RiscVBranch
+        | RelocationKind::RiscVHi20
+        | RelocationKind::RiscVLo12I => 4,
     }
 }
 
@@ -56,6 +58,8 @@ pub fn elf_reloc_type(arch: crate::codegen::target::Arch, kind: RelocationKind) 
         (Arch::Arm32, RelocationKind::ArmCbzThumb) => 31, // R_ARM_THM_JUMP8
         (Arch::RiscV32 | Arch::RiscV64, RelocationKind::RiscVJal) => 17, // R_RISCV_JAL
         (Arch::RiscV32 | Arch::RiscV64, RelocationKind::RiscVBranch) => 16, // R_RISCV_BRANCH
+        (Arch::RiscV32 | Arch::RiscV64, RelocationKind::RiscVHi20) => 26, // R_RISCV_HI20
+        (Arch::RiscV32 | Arch::RiscV64, RelocationKind::RiscVLo12I) => 27, // R_RISCV_LO12_I
         _ => 0,
     }
 }
@@ -315,6 +319,22 @@ pub fn apply_relocations(unit: &mut CompilationUnit, text_base: u64, rodata_base
                         | ((imm & 0x0000_07e0) << 20)    // imm[10:5] → [30:25]
                         | ((imm & 0x0000_001e) << 7)     // imm[4:1]  → [11:8]
                         | ((imm & 0x0000_0800) >> 4) // imm[11]   → [7]
+                });
+            }
+            RelocationKind::RiscVHi20 => {
+                // `lui rd, %hi(S+A)`：imm20 = (S + 0x800) >> 12（进位舍入，
+                // 和 addi %lo 的符号扩展互相抵消），落在 [31:12]。
+                let hi = ((target + 0x800) >> 12) as u32 & 0xf_ffff;
+                patch_word(&mut unit.code, reloc, |word| {
+                    (word & 0x0000_0fff) | (hi << 12)
+                });
+            }
+            RelocationKind::RiscVLo12I => {
+                // `addi rd, rd, %lo(S+A)`：imm12 = (S + A) & 0xfff，按
+                // 符号扩展进 [31:20]——负半程由 `hi20` 的进位舍入抵消。
+                let lo = target as u32 & 0xfff;
+                patch_word(&mut unit.code, reloc, |word| {
+                    (word & 0x000f_ffff) | (lo << 20)
                 });
             }
             RelocationKind::Branch26 | RelocationKind::Call26 => {
