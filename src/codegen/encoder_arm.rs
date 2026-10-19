@@ -31,7 +31,7 @@ use crate::mir::NumTy;
 use crate::ssa::{SsaBinaryOp, SsaConst, SsaFunction, SsaInstr, SsaTerminator, SsaValue};
 
 use std::cell::RefCell;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 /// ARM32 通用寄存器。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -74,6 +74,13 @@ thread_local! {
     /// 溢出槽区的 sp 偏移（字节数）：push 保存区与取址槽区的上方。每个函数
     /// `emit_function` 里更新。
     static SPILL_BASE: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    /// 当前函数的多字长（i64）值 id 集合（32 位目标）。
+    static WIDE_VALUES: RefCell<HashSet<u32>> = RefCell::new(HashSet::new());
+}
+
+/// `v` 是否是多字长（i64）值（32 位目标走栈槽 + 双 32 位运算）。
+fn is_wide(v: SsaValue) -> bool {
+    WIDE_VALUES.with(|w| w.borrow().contains(&v.id()))
 }
 
 /// 溢出值的暂存寄存器（都不进分配池，也绝不会与活跃值同住）。
@@ -231,6 +238,8 @@ mod op {
     pub const EOR: u32 = 0b0001;
     pub const SUB: u32 = 0b0010;
     pub const ADD: u32 = 0b0100;
+    pub const ADC: u32 = 0b0101;
+    pub const SBC: u32 = 0b0110;
     pub const ORR: u32 = 0b1100;
     pub const CMP: u32 = 0b1010;
     pub const MOV: u32 = 0b1101;
@@ -403,6 +412,16 @@ fn movw_imm(imm: u16) -> u32 {
 /// `op rd, rn, rm`
 fn emit_op3(unit: &mut CompilationUnit, opcode: u32, rd: Reg, rn: Reg, rm: Reg) {
     data_processing(unit, cc::AL, opcode, false, rn, rd, rm.bits() as u32, false);
+}
+
+/// `opss rd, rn, rm`：设置条件码（用于 i64 加减的进位/借位传播）。
+fn emit_adds(unit: &mut CompilationUnit, rd: Reg, rn: Reg, rm: Reg) {
+    data_processing(unit, cc::AL, op::ADD, true, rn, rd, rm.bits() as u32, false);
+}
+
+/// `subs rd, rn, rm`：设置条件码（用于 i64 减法的借位传播）。
+fn emit_subs(unit: &mut CompilationUnit, rd: Reg, rn: Reg, rm: Reg) {
+    data_processing(unit, cc::AL, op::SUB, true, rn, rd, rm.bits() as u32, false);
 }
 
 /// `cmp rn, rm`：只更新标志位（编码上等价于 `subs r0, rn, rm`，
@@ -719,7 +738,10 @@ fn emit_phi_copies(unit: &mut CompilationUnit, func: &SsaFunction, succ: usize, 
         })
         .collect();
     for (result, src) in &ds {
-        if let (Some(ds_), Some(ss)) = (spill_slot(*result), spill_slot(*src)) {
+        if is_wide(*result) || is_wide(*src) {
+            wide_load(unit, *src, SPILL_SRC, SPILL_SRC2);
+            wide_store(unit, *result, SPILL_SRC, SPILL_SRC2);
+        } else if let (Some(ds_), Some(ss)) = (spill_slot(*result), spill_slot(*src)) {
             // 溢出 → 溢出：经暂存寄存器栈对栈
             load_spill(unit, SPILL_DST, ss);
             store_spill(unit, SPILL_DST, ds_);
@@ -778,6 +800,149 @@ fn emit_param_moves(unit: &mut CompilationUnit, func: &SsaFunction, stack_base: 
             }
         }
     }
+}
+
+/// i64 helper functions for 32-bit ARM target.
+fn load_spill_hi(unit: &mut CompilationUnit, dst: Reg, slot: usize) {
+    let off = spill_offset(slot) + 4;
+    debug_assert!((0..=4095).contains(&off), "溢出槽高字偏移超出 ldr 立即数范围");
+    insn(unit, 0xe59d_0000 | (dst.bits() as u32) << 12 | off as u32);
+}
+
+fn store_spill_hi(unit: &mut CompilationUnit, src: Reg, slot: usize) {
+    let off = spill_offset(slot) + 4;
+    debug_assert!((0..=4095).contains(&off), "溢出槽高字偏移超出 str 立即数范围");
+    insn(unit, 0xe58d_0000 | (src.bits() as u32) << 12 | off as u32);
+}
+
+fn wide_load(unit: &mut CompilationUnit, v: SsaValue, lo: Reg, hi: Reg) {
+    let slot = spill_slot(v).expect("i64 值没有宽槽");
+    load_spill(unit, lo, slot);
+    load_spill_hi(unit, hi, slot);
+}
+
+fn wide_load2(unit: &mut CompilationUnit, v: SsaValue, lo: Reg, hi: Reg) {
+    let slot = spill_slot(v).expect("i64 值没有宽槽");
+    load_spill(unit, lo, slot);
+    load_spill_hi(unit, hi, slot);
+}
+
+fn wide_store(unit: &mut CompilationUnit, v: SsaValue, lo: Reg, hi: Reg) {
+    let slot = spill_slot(v).expect("i64 值没有宽槽");
+    store_spill(unit, lo, slot);
+    store_spill_hi(unit, hi, slot);
+}
+
+fn emit_cmp_cond(unit: &mut CompilationUnit, cond: u32, rn: Reg, rm: Reg) {
+    data_processing(unit, cond, op::CMP, true, rn, Reg(0), rm.bits() as u32, false);
+}
+
+fn emit_const_wide(unit: &mut CompilationUnit, result: SsaValue, i: i128) {
+    let slot = spill_slot(result).expect("i64 常量没有宽槽");
+    let lo = (i as u64 & 0xffff_ffff) as u32;
+    let hi = ((i as u64) >> 32) as u32;
+    emit_mov_imm32(unit, SPILL_SRC, lo);
+    store_spill(unit, SPILL_SRC, slot);
+    emit_mov_imm32(unit, SPILL_SRC2, hi);
+    store_spill_hi(unit, SPILL_SRC2, slot);
+}
+
+fn emit_addsub_wide(
+    unit: &mut CompilationUnit,
+    result: SsaValue,
+    op: SsaBinaryOp,
+    lhs: SsaValue,
+    rhs: SsaValue,
+) {
+    wide_load(unit, lhs, SPILL_SRC, SPILL_SRC2);
+    wide_load2(unit, rhs, MUL_TMP_A, SPILL_DST);
+    if op == SsaBinaryOp::Add {
+        emit_adds(unit, SPILL_SRC, SPILL_SRC, MUL_TMP_A);
+        emit_op3(unit, op::ADC, SPILL_SRC2, SPILL_SRC2, SPILL_DST);
+    } else {
+        emit_subs(unit, SPILL_SRC, SPILL_SRC, MUL_TMP_A);
+        emit_op3(unit, op::SBC, SPILL_SRC2, SPILL_SRC2, SPILL_DST);
+    }
+    wide_store(unit, result, SPILL_SRC, SPILL_SRC2);
+}
+
+fn emit_compare_wide(
+    unit: &mut CompilationUnit,
+    result: SsaValue,
+    op: SsaBinaryOp,
+    lhs: SsaValue,
+    rhs: SsaValue,
+) {
+    wide_load(unit, lhs, SPILL_SRC, SPILL_SRC2);
+    wide_load2(unit, rhs, MUL_TMP_A, SPILL_DST);
+    emit_cmp(unit, SPILL_SRC, MUL_TMP_A);
+    emit_cmp_cond(unit, cc::EQ, SPILL_SRC2, SPILL_DST);
+    let dst = out_reg(result);
+    emit_mov_cond(unit, condition_code(op), dst, 1);
+    emit_mov_cond(unit, inverse_condition_code(op), dst, 0);
+    put_out(unit, result);
+}
+
+fn emit_cast_wide(
+    unit: &mut CompilationUnit,
+    result: SsaValue,
+    src: SsaValue,
+    from: NumTy,
+    to: NumTy,
+) {
+    let to_wide = matches!(to, NumTy::Int(64) | NumTy::Uint(64));
+    let from_wide = matches!(from, NumTy::Int(64) | NumTy::Uint(64));
+    if from_wide && to_wide {
+        wide_load(unit, src, SPILL_SRC, SPILL_SRC2);
+        wide_store(unit, result, SPILL_SRC, SPILL_SRC2);
+    } else if !from_wide && to_wide {
+        let s = val_reg(unit, src);
+        emit_op3(unit, op::MOV, SPILL_SRC, Reg(0), s);
+        let op2 = (31 << 5) | (Shift::Asr.type_code() << 4) | (s.bits() as u32);
+        insn(unit, 0xe1a0_0000 | (SPILL_SRC2.bits() as u32) << 12 | op2);
+        wide_store(unit, result, SPILL_SRC, SPILL_SRC2);
+    } else {
+        wide_load(unit, src, SPILL_SRC, SPILL_SRC2);
+        let dst = out_reg(result);
+        emit_mov_rr(unit, dst, SPILL_SRC);
+        put_out(unit, result);
+    }
+}
+
+fn emit_mul_wide(
+    unit: &mut CompilationUnit,
+    result: SsaValue,
+    lhs: SsaValue,
+    rhs: SsaValue,
+) {
+    wide_load(unit, lhs, SPILL_SRC, SPILL_SRC2);
+    wide_load2(unit, rhs, MUL_TMP_A, SPILL_DST);
+    insn(unit, 0xe080_0090 | (SPILL_SRC.bits() as u32) << 16 | (SPILL_SRC2.bits() as u32) << 12 | (MUL_TMP_A.bits() as u32) << 8 | SPILL_DST.bits() as u32);
+    emit_cmp(unit, SPILL_SRC2, Reg(0));
+    insn(unit, 0x41a0_0000 | (SPILL_SRC2.bits() as u32) << 16 | (SPILL_SRC2.bits() as u32) << 12 | SPILL_DST.bits() as u32);
+    emit_cmp(unit, SPILL_DST, Reg(0));
+    insn(unit, 0x41a0_0000 | (SPILL_SRC2.bits() as u32) << 16 | (SPILL_SRC2.bits() as u32) << 12 | MUL_TMP_A.bits() as u32);
+    wide_store(unit, result, SPILL_SRC, SPILL_SRC2);
+}
+
+fn emit_divmod_wide(
+    unit: &mut CompilationUnit,
+    result: SsaValue,
+    lhs: SsaValue,
+    rhs: SsaValue,
+    is_div: bool,
+) {
+    crate::codegen::unsupported_binary_op(if is_div { SsaBinaryOp::Div } else { SsaBinaryOp::Rem });
+}
+
+fn emit_shift_wide(
+    unit: &mut CompilationUnit,
+    result: SsaValue,
+    op: SsaBinaryOp,
+    lhs: SsaValue,
+    rhs: SsaValue,
+) {
+    crate::codegen::unsupported_binary_op(op);
 }
 
 fn block_label(func: &str, id: usize) -> String {
@@ -844,8 +1009,12 @@ pub fn emit_function(target: &Target, unit: &mut CompilationUnit, func: &SsaFunc
         match &block.term {
             SsaTerminator::Return(ret_val) => {
                 if let Some(v) = ret_val {
-                    let r = val_reg(unit, *v);
-                    emit_mov_rr(unit, Reg::R0, r);
+                    if is_wide(*v) {
+                        wide_load(unit, *v, Reg::R0, Reg(1));
+                    } else {
+                        let r = val_reg(unit, *v);
+                        emit_mov_rr(unit, Reg::R0, r);
+                    }
                 }
                 if spill_bytes > 0 {
                     emit_add_sp_imm(unit, spill_bytes);
@@ -896,8 +1065,12 @@ fn emit_instr(unit: &mut CompilationUnit, instr: &SsaInstr) {
     match instr {
         SsaInstr::Const { result, value } => match value {
             SsaConst::Int(i) => {
-                emit_mov_imm32(unit, out_reg(*result), *i as u32);
-                put_out(unit, *result);
+                if is_wide(*result) {
+                    emit_const_wide(unit, *result, *i);
+                } else {
+                    emit_mov_imm32(unit, out_reg(*result), *i as u32);
+                    put_out(unit, *result);
+                }
             }
             SsaConst::Bool(b) => {
                 emit_mov_imm32(unit, out_reg(*result), u32::from(*b));
@@ -921,7 +1094,27 @@ fn emit_instr(unit: &mut CompilationUnit, instr: &SsaInstr) {
             lhs,
             rhs,
             ..
-        } => emit_binary(unit, *result, *op, *lhs, *rhs),
+        } => {
+            if is_wide(*lhs) || is_wide(*rhs) {
+                match op {
+                    SsaBinaryOp::Add | SsaBinaryOp::Sub => {
+                        emit_addsub_wide(unit, *result, *op, *lhs, *rhs)
+                    }
+                    SsaBinaryOp::Mul => emit_mul_wide(unit, *result, *lhs, *rhs),
+                    SsaBinaryOp::Div => emit_divmod_wide(unit, *result, *lhs, *rhs, true),
+                    SsaBinaryOp::Rem => emit_divmod_wide(unit, *result, *lhs, *rhs, false),
+                    SsaBinaryOp::Shl | SsaBinaryOp::Shr => {
+                        emit_shift_wide(unit, *result, *op, *lhs, *rhs)
+                    }
+                    SsaBinaryOp::Eq | SsaBinaryOp::Ne | SsaBinaryOp::Lt | SsaBinaryOp::Gt | SsaBinaryOp::Le | SsaBinaryOp::Ge => {
+                        emit_compare_wide(unit, *result, *op, *lhs, *rhs)
+                    }
+                    _ => crate::codegen::unsupported_binary_op(*op),
+                }
+            } else {
+                emit_binary(unit, *result, *op, *lhs, *rhs);
+            }
+        }
         SsaInstr::Call {
             result,
             callee,
@@ -933,7 +1126,9 @@ fn emit_instr(unit: &mut CompilationUnit, instr: &SsaInstr) {
             if out_bytes > 0 {
                 emit_add_sp_imm(unit, out_bytes);
             }
-            if let Some(slot) = spill_slot(*result) {
+            if is_wide(*result) {
+                wide_store(unit, *result, Reg(0), Reg(1));
+            } else if let Some(slot) = spill_slot(*result) {
                 store_spill(unit, Reg(0), slot);
             } else {
                 emit_mov_rr(unit, alloc_reg(*result), Reg(0));
@@ -947,28 +1142,38 @@ fn emit_instr(unit: &mut CompilationUnit, instr: &SsaInstr) {
             from,
             to,
         } => {
-            let s = val_reg(unit, *src);
-            emit_cast(unit, out_reg(*result), s, *from, *to);
-            put_out(unit, *result);
+            if matches!(from, NumTy::Int(64) | NumTy::Uint(64))
+                || matches!(to, NumTy::Int(64) | NumTy::Uint(64))
+            {
+                emit_cast_wide(unit, *result, *src, *from, *to);
+            } else {
+                let s = val_reg(unit, *src);
+                emit_cast(unit, out_reg(*result), s, *from, *to);
+                put_out(unit, *result);
+            }
         }
         SsaInstr::Copy { result, src } => {
-            match (spill_slot(*result), spill_slot(*src)) {
-                (Some(ds), Some(ss)) => {
-                    // 溢出 → 溢出：经暂存寄存器栈对栈
-                    load_spill(unit, SPILL_SRC, ss);
-                    store_spill(unit, SPILL_SRC, ds);
-                }
-                (Some(ds), None) => {
-                    let r = val_reg(unit, *src);
-                    store_spill(unit, r, ds)
-                }
-                (None, Some(ss)) => {
-                    load_spill(unit, out_reg(*result), ss);
-                }
-                (None, None) => {
-                    let (d, s) = (alloc_reg(*result), alloc_reg(*src));
-                    if d != s {
-                        emit_mov_rr(unit, d, s);
+            if is_wide(*result) || is_wide(*src) {
+                wide_load(unit, *src, SPILL_SRC, SPILL_SRC2);
+                wide_store(unit, *result, SPILL_SRC, SPILL_SRC2);
+            } else {
+                match (spill_slot(*result), spill_slot(*src)) {
+                    (Some(ds), Some(ss)) => {
+                        load_spill(unit, SPILL_SRC, ss);
+                        store_spill(unit, SPILL_SRC, ds);
+                    }
+                    (Some(ds), None) => {
+                        let r = val_reg(unit, *src);
+                        store_spill(unit, r, ds);
+                    }
+                    (None, Some(ss)) => {
+                        load_spill(unit, out_reg(*result), ss);
+                    }
+                    (None, None) => {
+                        let (d, s) = (alloc_reg(*result), alloc_reg(*src));
+                        if d != s {
+                            emit_mov_rr(unit, d, s);
+                        }
                     }
                 }
             }
@@ -985,15 +1190,33 @@ fn emit_instr(unit: &mut CompilationUnit, instr: &SsaInstr) {
         SsaInstr::Load {
             result, ptr, ty, ..
         } => {
-            let d = out_reg(*result);
-            let p = val_reg(unit, *ptr);
-            emit_load_mem(unit, d, p, *ty);
-            put_out(unit, *result);
+            if is_wide(*result) || matches!(ty, NumTy::Int(64) | NumTy::Uint(64)) {
+                let p = val_reg(unit, *ptr);
+                emit_load_mem(unit, SPILL_SRC, p, NumTy::Int(32));
+                emit_mov_imm32(unit, SPILL_DST, 4);
+                emit_op3(unit, op::ADD, SPILL_DST, p, SPILL_DST);
+                emit_load_mem(unit, SPILL_SRC2, SPILL_DST, NumTy::Int(32));
+                wide_store(unit, *result, SPILL_SRC, SPILL_SRC2);
+            } else {
+                let d = out_reg(*result);
+                let p = val_reg(unit, *ptr);
+                emit_load_mem(unit, d, p, *ty);
+                put_out(unit, *result);
+            }
         }
         SsaInstr::Store { ptr, value, ty, .. } => {
-            let p = val_reg(unit, *ptr);
-            let v = val_reg2(unit, *value);
-            emit_store_mem(unit, p, v, *ty);
+            if is_wide(*value) || matches!(ty, NumTy::Int(64) | NumTy::Uint(64)) {
+                let p = val_reg(unit, *ptr);
+                wide_load(unit, *value, SPILL_SRC, SPILL_SRC2);
+                emit_store_mem(unit, p, SPILL_SRC, NumTy::Int(32));
+                emit_mov_imm32(unit, SPILL_DST, 4);
+                emit_op3(unit, op::ADD, SPILL_DST, p, SPILL_DST);
+                emit_store_mem(unit, SPILL_DST, SPILL_SRC2, NumTy::Int(32));
+            } else {
+                let p = val_reg(unit, *ptr);
+                let v = val_reg2(unit, *value);
+                emit_store_mem(unit, p, v, *ty);
+            }
         }
     }
 }
@@ -1686,12 +1909,19 @@ mod tests {
 /// x86-64 后端自己实现了溢出，见 `encoder.rs`。
 fn check_register_pressure(func: &SsaFunction) {
     // 跨调用存活的值只放被调用者保存的 r4-r8，否则 `bl` 会破坏它。
+    // 多字长（i64）值走栈槽，不占寄存器池。
+    let wide = crate::codegen::regalloc::assign_int_widths(func);
     let alloc = crate::codegen::regalloc::allocate_registers(
         func,
         ALLOCATABLE.len(),
         &CALLEE_SAVE,
         ARG_REGS.len(),
+        &wide,
     );
+    WIDE_VALUES.with(|w| {
+        w.borrow_mut().clear();
+        w.borrow_mut().extend(wide.iter().copied());
+    });
     REG_MAP.with(|m| {
         let mut map = m.borrow_mut();
         map.clear();

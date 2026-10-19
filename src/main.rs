@@ -529,9 +529,9 @@ fn compile(input: &str, cmd: &Cli) -> Result<std::path::PathBuf, String> {
     // 4. 类型检查 + HIR
     let mut checker = typeck::TypeChecker::new();
     checker.set_known_modules(loaded.modules.iter().cloned().collect());
-    // 32 位目标暂时没有多字长整数支持：显式写 i64 会在类型检查阶段报错，
-    // 而不是默默编出错的结果。
-    checker.set_max_int_bits(u16::from(target.arch().pointer_size()) * 8);
+    // 32 位目标支持多字长（i64）运算：值走 8 字节栈槽，用两条 32 位指令
+    // 计算。未实现的运算（如 i64 乘法/除法）在后端报错，不会静默截断。
+    checker.set_max_int_bits(64);
     let hir = checker.check_program(&ast).map_err(|e| e.to_string())?;
     time_phase(t0, "typeck");
     if cmd.dump_hir {

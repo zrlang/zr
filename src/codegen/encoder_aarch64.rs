@@ -2027,11 +2027,12 @@ fn assign_float_slots(func: &SsaFunction, base: usize) -> usize {
 /// `alloc_reg` 使用。x86-64 后端自己实现了溢出，见 `encoder.rs`。
 fn check_register_pressure(func: &SsaFunction) {
     // 传 callee-save 集合：跨调用存活的值只放 x19..x28，否则 `call` 会破坏它。
-    let alloc = crate::codegen::regalloc::allocate_registers(
+let alloc = crate::codegen::regalloc::allocate_registers(
         func,
         ALLOCATABLE.len(),
         &CALLEE_SAVE,
         ARG_REGS.len(),
+        &std::collections::HashSet::new(),
     );
     if alloc.spilled > 0 {
         // 池子装不下的值溢出到栈槽；槽数记进 `SPILL_SLOTS`，槽区高度由

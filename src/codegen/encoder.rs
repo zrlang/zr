@@ -26,7 +26,7 @@ use crate::codegen::{
 };
 use crate::mir::NumTy;
 use crate::ssa::{SsaBinaryOp, SsaConst, SsaFunction, SsaInstr, SsaTerminator, SsaValue};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 /// x86-64 通用寄存器（System V ABI / Microsoft x64 ABI 共用编号）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -825,11 +825,12 @@ pub fn emit_function(target: &Target, unit: &mut CompilationUnit, func: &SsaFunc
         "x86-64 后端只能用于 x86_64 目标"
     );
     // 先做活跃区间分析 + 线性扫描，确定每个值落在哪个寄存器
-    let alloc = crate::codegen::regalloc::allocate_registers(
+let alloc = crate::codegen::regalloc::allocate_registers(
         func,
         ALLOCATABLE.len(),
         &X86_64_CALLEE_SAVE,
         0,
+        &HashSet::new(),
     );
     // callee-save 集合要在发射尾声时再用，所以这里留一份
     let callee_saved = callee_saved_regs(&alloc.map);

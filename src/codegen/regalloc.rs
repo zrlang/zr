@@ -16,7 +16,7 @@
 
 use std::collections::{HashMap, HashSet};
 
-use crate::ssa::{SsaFunction, SsaInstr, SsaTerminator, SsaValue};
+use crate::ssa::{SsaFunction, SsaInstr, SsaTerminator, SsaValue, SsaBinaryOp};
 use Location as L;
 
 /// 一个值的存放位置。
@@ -53,14 +53,131 @@ pub const X86_64_CALLEE_SAVE: [usize; 4] = [6, 7, 8, 9];
 /// 之后它的内容就没了，生成的程序会安静地算错。这里宁可溢出，也不产出
 /// 错代码：调用方负责在溢出发生时报错（见 `emit_function`）。
 ///
+/// 扫出函数里所有多字长（i64）值的 id 集合。
+///
+/// zr 的 SSA 把整数统一建模为 i64，但 32 位目标上一次只能运算 32 位——
+/// 宽度不够的值必须走"双 32 位"路径（栈槽 + 两条指令）。识别哪些值
+/// 真的是 64 位：常量超 i32 范围的、64 位类型的运算/转换结果、以及经
+/// `Copy`/`Phi` 传播过去的。
+///
+/// 传播到不动点：`Unary`/`Copy` 的宽度要等对端确定，`Phi` 取各 incoming
+/// 的最大宽度。
+pub fn assign_int_widths(func: &SsaFunction) -> HashSet<u32> {
+    let mut wide: HashSet<u32> = HashSet::new();
+    let is_wide_ty = |ty: &crate::mir::NumTy| -> bool {
+        matches!(ty, crate::mir::NumTy::Int(64) | crate::mir::NumTy::Uint(64))
+    };
+    loop {
+        let mut changed = false;
+        let mark = |v: &SsaValue, set: &mut HashSet<u32>| -> bool {
+            if set.insert(v.id()) {
+                true
+            } else {
+                false
+            }
+        };
+        for block in &func.blocks {
+            for instr in &block.instrs {
+                match instr {
+                    SsaInstr::Const {
+                        result,
+                        value: crate::ssa::SsaConst::Int(i),
+                    } => {
+                        // 常量超 i32 范围 → i64
+                        if *i < i32::MIN as i128 || *i > i32::MAX as i128 {
+                            if mark(result, &mut wide) {
+                                changed = true;
+                            }
+                        }
+                    }
+                    SsaInstr::Binary { result, ty, lhs, rhs, op } => {
+                        if is_wide_ty(ty) {
+                            for v in [result, lhs, rhs] {
+                                if mark(v, &mut wide) {
+                                    changed = true;
+                                }
+                            }
+                        }
+                        // 比较运算（Eq/Ne/Lt/Gt/Le/Ge）结果是 Bool，但若任一操作数是
+                        // i64，另一侧也必须是 i64——比较要求两侧位宽一致。
+                        if matches!(op, SsaBinaryOp::Eq | SsaBinaryOp::Ne | SsaBinaryOp::Lt | SsaBinaryOp::Gt | SsaBinaryOp::Le | SsaBinaryOp::Ge) {
+                            let lhs_wide = wide.contains(&lhs.id());
+                            let rhs_wide = wide.contains(&rhs.id());
+                            if lhs_wide && mark(rhs, &mut wide) { changed = true; }
+                            if rhs_wide && mark(lhs, &mut wide) { changed = true; }
+                        }
+                    }
+                    SsaInstr::Unary { result, operand, .. } => {
+                        // 一元运算：result 和 operand 同宽
+                        if wide.contains(&result.id()) && mark(operand, &mut wide) {
+                            changed = true;
+                        }
+                        if wide.contains(&operand.id()) && mark(result, &mut wide) {
+                            changed = true;
+                        }
+                    }
+                    SsaInstr::Call { result, ty, .. } => {
+                        if is_wide_ty(ty) && mark(result, &mut wide) {
+                            changed = true;
+                        }
+                    }
+                    SsaInstr::Cast { result, src, from, to } => {
+                        if is_wide_ty(from) && mark(src, &mut wide) {
+                            changed = true;
+                        }
+                        if is_wide_ty(to) && mark(result, &mut wide) {
+                            changed = true;
+                        }
+                    }
+                    SsaInstr::Copy { result, src } => {
+                        if wide.contains(&result.id()) && mark(src, &mut wide) {
+                            changed = true;
+                        }
+                        if wide.contains(&src.id()) && mark(result, &mut wide) {
+                            changed = true;
+                        }
+                    }
+                    SsaInstr::Phi { result, incoming, .. } => {
+                        if incoming.iter().any(|(_, v)| wide.contains(&v.id())) {
+                            if mark(result, &mut wide) {
+                                changed = true;
+                            }
+                        }
+                    }
+                    SsaInstr::Load { result, ty, .. } => {
+                        if is_wide_ty(ty) && mark(result, &mut wide) {
+                            changed = true;
+                        }
+                    }
+                    SsaInstr::Store { value, ty, .. } => {
+                        if is_wide_ty(ty) && mark(value, &mut wide) {
+                            changed = true;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+    wide
+}
+
 /// `pin_params` 是要钉进池前 `pin_params` 个下标的形参个数（= 实参寄存器
 /// 个数，且要求目标后端的池下标与实参寄存器一一对应——x86-64 的池以
 /// rsi/rdi 开头、顺序与实参寄存器不一致，传 0 走老路径；thumb 同理）。
+///
+/// `wide` 是多字长（i64）值的 id 集合（32 位目标）：这些值不占寄存器池，
+/// 直接走 8 字节栈槽，后端用两条 32 位指令实现 i64 运算。64 位目标传
+/// 空集（i64 就是机器字长）。
 pub fn allocate_registers(
     func: &SsaFunction,
     pool_size: usize,
     callee_save: &[usize],
     pin_params: usize,
+    wide: &HashSet<u32>,
 ) -> Allocation {
     let (intervals, calls) = live_intervals(func);
     let mut out = Allocation::default();
@@ -120,6 +237,13 @@ pub fn allocate_registers(
     for (val, start, end) in &ordered {
         let (val, start, end) = (*val, *start, *end);
         if pinned.contains(&val) {
+            continue;
+        }
+        // 多字长（i64）值：不占寄存器池，直接走 8 字节栈槽。
+        // 后端 emit 时从栈槽装载低/高两个 32 位半做运算。
+        if wide.contains(&val) {
+            out.map.insert(val, Location::Stack(out.spilled));
+            out.spilled += 1;
             continue;
         }
         // 回收所有已经结束的区间

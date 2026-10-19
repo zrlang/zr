@@ -14,7 +14,7 @@
 // （`1011 1111 cond(4) mask(4)`，单条指令时 mask = 0b1000）。
 //==============================================================================
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use crate::codegen::{
     CompilationUnit, Relocation, RelocationKind, Symbol, SymbolKind, SymbolSection,
@@ -523,7 +523,8 @@ pub fn emit_function(
     func: &SsaFunction,
 ) {
     debug_assert!(target.is_arm32_thumb(), "Thumb-2 后端只用于 thumb 目标");
-    let alloc = crate::codegen::regalloc::allocate_registers(func, ALLOCATABLE.len(), &[], 0);
+    let alloc =
+        crate::codegen::regalloc::allocate_registers(func, ALLOCATABLE.len(), &[], 0, &HashSet::new());
     if alloc.spilled > 0 {
         crate::codegen::unsupported_pressure(&func.name, ALLOCATABLE.len());
     }
