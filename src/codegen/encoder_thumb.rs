@@ -80,16 +80,18 @@ thread_local! {
     static LOCAL_SLOTS: RefCell<HashMap<u32, usize>> = RefCell::new(HashMap::new());
     /// 当前函数里的整数常量：值 id -> 常量值（用于 i64 除/取余的常量强度削减）。
     static CONSTS: RefCell<HashMap<u32, i128>> = RefCell::new(HashMap::new());
-    /// 函数内局部标签的全局计数器。
+    /// 函数内局部标签：所属函数名前缀 + 计数器。
     ///
     /// Thumb 没有 A32 的条件执行后缀，宽移位要按 `cnt < 32` 分两段，只能靠
     /// 条件跳转绕开。编码器原先只有块级标签（每块一个 `{func}.bN`），这里
-    /// 补一个函数内任意位置的标签设施：名字必须**唯一**（`symbol_addresses`
-    /// 按名字建表），计数器在线程内单调递增、从不复位即可保证。
+    /// 补一个函数内任意位置的标签设施。名字带**函数名前缀**、计数器在
+    /// `emit_function` 开头复位：既保证同一份产物内唯一（`symbol_addresses`
+    /// 按名字建表），又不受并行代码生成时的调度顺序影响（确定性输出）。
+    static LOCAL_LABEL_PREFIX: RefCell<String> = const { RefCell::new(String::new()) };
     static LOCAL_LABEL: Cell<u32> = const { Cell::new(0) };
 }
 
-/// 造一个跨函数唯一的函数内标签，并把它的符号放在当前代码位置。
+/// 造一个函数内唯一的标签，并把它的符号放在当前代码位置。
 fn define_label(unit: &mut CompilationUnit, name: &str) {
     unit.symbols.push(Symbol {
         name: name.to_string(),
@@ -101,14 +103,15 @@ fn define_label(unit: &mut CompilationUnit, name: &str) {
     });
 }
 
-/// 申请一个跨函数唯一的局部标签名（尚未落点）。
+/// 申请一个函数内唯一的局部标签名（尚未落点）。
 fn fresh_label() -> String {
+    let prefix = LOCAL_LABEL_PREFIX.with(|p| p.borrow().clone());
     let n = LOCAL_LABEL.with(|c| {
         let v = c.get();
         c.set(v + 1);
         v
     });
-    format!("__zr_local_{n}")
+    format!("{prefix}.L{n}")
 }
 
 fn alloc_reg(v: SsaValue) -> Reg {
@@ -1800,6 +1803,10 @@ pub fn emit_function(
     func: &SsaFunction,
 ) {
     debug_assert!(target.is_arm32_thumb(), "Thumb-2 后端只用于 thumb 目标");
+
+    // 函数内局部标签用函数名前缀 + 每函数复位的计数器命名（确定性 + 唯一）。
+    LOCAL_LABEL_PREFIX.with(|p| *p.borrow_mut() = func.name.clone());
+    LOCAL_LABEL.with(|c| c.set(0));
 
     let wide = crate::codegen::regalloc::assign_int_widths(func);
     let alloc = crate::codegen::regalloc::allocate_registers(

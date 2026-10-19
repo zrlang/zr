@@ -955,7 +955,10 @@ impl TypeChecker {
             }
             self.pop_scope();
         }
-        Ok(self.functions.values().cloned().collect())
+        // 函数顺序必须确定：按 DefId 排序（保证可复现产物）。
+        let mut funcs: Vec<_> = self.functions.iter().collect();
+        funcs.sort_by_key(|(id, _)| id.0);
+        Ok(funcs.into_iter().map(|(_, f)| f.clone()).collect())
     }
 
     fn check_block(&mut self, b: &AstBlock, expected: &Ty) -> Result<hir::HirBlock> {

@@ -37,7 +37,7 @@ pub mod wasm;
 
 use std::path::Path;
 
-use crate::ssa::SsaModule;
+use crate::ssa::{SsaConst, SsaFunction, SsaInstr, SsaModule};
 use target::{Arch, ObjectFormat, Os, Target};
 
 /// 编译产物（可重定位目标文件 / 可执行文件）。
@@ -282,28 +282,30 @@ mod tests {
 
 /// 把一个 SSA 模块编译为机器码。
 ///
-/// `target` 决定指令后端（x86-64 / aarch64）与入口桩的调用约定。
+/// `target` 决定指令后端（x86-64 / aarch64 / …）与入口桩的调用约定。
+///
+/// **多线程编译**：指令选择 / 寄存器分配 / 代码发射是**逐函数独立**的
+/// （活跃区间、栈帧布局都局限在函数内），因此按函数并行发射。为了拿到
+/// 逐字节可复现的产物，字符串字面量在并行之前按确定顺序统一登记进
+/// `.rodata`，各线程只做查表；片段按函数顺序（连续分块）合并，符号 /
+/// 重定位顺序与单线程一致。
 pub fn compile(target: &Target, module: &SsaModule) -> Result<CompilationUnit, String> {
     let mut unit = CompilationUnit::new();
     unit.is_thumb = target.is_arm32_thumb();
 
+    // 0. 先把所有字符串字面量按确定顺序登记进 `.rodata`。并行发射时每个
+    //    函数只查表（`intern_string` 命中已有条目），不再改共享的字符串池，
+    //    编号与单线程顺序完全一致。
+    intern_module_strings(&mut unit, module);
+
     // 1. 指令选择 + 寄存器分配 + 代码发射（按目标架构分派后端）
     let arch = target.arch();
-    for func in &module.functions {
-        match arch {
-            Arch::X86_64 => encoder::emit_function(target, &mut unit, func),
-            Arch::AArch64 => encoder_aarch64::emit_function(target, &mut unit, func),
-            Arch::Arm32 | Arch::Arm32Thumb => {
-                if target.is_arm32_thumb() {
-                    encoder_thumb::emit_function(target, &mut unit, func)
-                } else {
-                    encoder_arm::emit_function(target, &mut unit, func)
-                }
-            }
-            Arch::RiscV32 | Arch::RiscV64 => encoder_riscv::emit_function(target, &mut unit, func),
-            Arch::Wasm32 | Arch::Wasm64 => {
-                return Err("wasm is handled by `wasm::WasmModule`, not the native backend".into())
-            }
+    let workers = codegen_workers(module.functions.len());
+    if workers > 1 {
+        emit_functions_parallel(target, arch, module, &mut unit, workers);
+    } else {
+        for func in &module.functions {
+            emit_one(target, arch, &mut unit, func);
         }
     }
 
@@ -340,6 +342,144 @@ pub fn compile(target: &Target, module: &SsaModule) -> Result<CompilationUnit, S
     }
 
     Ok(unit)
+}
+
+/// 一个函数分派给对应架构的后端发射。
+fn emit_one(target: &Target, arch: Arch, unit: &mut CompilationUnit, func: &SsaFunction) {
+    match arch {
+        Arch::X86_64 => encoder::emit_function(target, unit, func),
+        Arch::AArch64 => encoder_aarch64::emit_function(target, unit, func),
+        Arch::Arm32 | Arch::Arm32Thumb => {
+            if target.is_arm32_thumb() {
+                encoder_thumb::emit_function(target, unit, func)
+            } else {
+                encoder_arm::emit_function(target, unit, func)
+            }
+        }
+        Arch::RiscV32 | Arch::RiscV64 => encoder_riscv::emit_function(target, unit, func),
+        Arch::Wasm32 | Arch::Wasm64 => {
+            unreachable!("wasm 由 `wasm::WasmModule` 处理，不走原生后端")
+        }
+    }
+}
+
+/// 并行代码生成的线程数。`ZR_THREADS` 可覆盖（`1` 关闭并行）。
+///
+/// 函数太少时并行得不偿失（线程启动开销大于收益），低于两函数一律串行。
+fn codegen_workers(func_count: usize) -> usize {
+    if func_count < 2 {
+        return 1;
+    }
+    if let Some(override_n) = std::env::var_os("ZR_THREADS") {
+        if let Ok(k) = override_n.to_string_lossy().parse::<usize>() {
+            return k.clamp(1, func_count);
+        }
+    }
+    let hw = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(1);
+    hw.min(MAX_CODEGEN_WORKERS).clamp(1, func_count)
+}
+
+/// 并行线程上限（避免在核数很多的机器上为一个模块开过多线程）。
+const MAX_CODEGEN_WORKERS: usize = 8;
+
+/// 按确定顺序把所有 `SsaConst::Str` 登记进 `.rodata`。
+fn intern_module_strings(unit: &mut CompilationUnit, module: &SsaModule) {
+    for func in &module.functions {
+        for block in &func.blocks {
+            for instr in &block.instrs {
+                if let SsaInstr::Const {
+                    value: SsaConst::Str(text),
+                    ..
+                } = instr
+                {
+                    unit.intern_string(text);
+                }
+            }
+        }
+    }
+}
+
+/// 按函数连续分块、并行发射，再按块顺序合并——符号 / 重定位顺序与串行一致。
+fn emit_functions_parallel(
+    target: &Target,
+    arch: Arch,
+    module: &SsaModule,
+    unit: &mut CompilationUnit,
+    workers: usize,
+) {
+    let funcs: &[SsaFunction] = &module.functions;
+    let chunk = funcs.len().div_ceil(workers);
+    let is_thumb = target.is_arm32_thumb();
+    let pool = unit.string_pool.clone();
+    if std::env::var_os("ZR_CODEGEN_DEBUG").is_some() {
+        eprintln!(
+            "[codegen] {} funcs, {} workers, chunk {}",
+            funcs.len(),
+            workers,
+            chunk
+        );
+        for (i, f) in funcs.iter().enumerate() {
+            eprintln!("  func[{i}] = {}", f.name);
+        }
+    }
+
+    std::thread::scope(|scope| {
+        let mut handles = Vec::new();
+        for t in 0..workers {
+            let lo = t * chunk;
+            let hi = ((t + 1) * chunk).min(funcs.len());
+            if lo >= hi {
+                break;
+            }
+            let pool = pool.clone();
+            handles.push(scope.spawn(move || {
+                // 片段单元：只带字符串池（已全部预登记，`intern_string` 命中
+                // 已有的编号），代码 / 符号 / 重定位都从空开始。
+                let mut part = CompilationUnit::new();
+                part.is_thumb = is_thumb;
+                part.string_pool = pool;
+                for func in &funcs[lo..hi] {
+                    emit_one(target, arch, &mut part, func);
+                }
+                part
+            }));
+        }
+        for h in handles {
+            let mut part = h.join().unwrap_or_else(|e| std::panic::resume_unwind(e));
+            if std::env::var_os("ZR_CODEGEN_DEBUG").is_some() {
+                eprintln!(
+                    "[codegen] merge part: {} bytes, first sym {:?}",
+                    part.code.len(),
+                    part.symbols.first().map(|s| &s.name)
+                );
+            }
+            merge_fragment(unit, &mut part);
+        }
+    });
+}
+
+/// 把一个函数的发射片段并入主单元（重定位与 `.text` 符号整体平移）。
+fn merge_fragment(unit: &mut CompilationUnit, part: &mut CompilationUnit) {
+    // 片段里不该再出现字符串符号 / 字节——预登记后 `intern_string` 只查表。
+    debug_assert!(
+        part.rodata.is_empty(),
+        "并行代码生成片段里又登记了字符串，预登记漏了字面量"
+    );
+    let base = unit.code.len() as i64;
+    unit.code.append(&mut part.code);
+    for r in &mut part.relocations {
+        r.offset = (r.offset as i64 + base) as usize;
+        r.instr_start = (r.instr_start as i64 + base) as usize;
+    }
+    unit.relocations.append(&mut part.relocations);
+    for s in &mut part.symbols {
+        if s.section == SymbolSection::Text {
+            s.offset = (s.offset as i64 + base) as usize;
+        }
+    }
+    unit.symbols.append(&mut part.symbols);
 }
 
 /// 从 HIR 模块提取链接指令和 repr 布局信息。
