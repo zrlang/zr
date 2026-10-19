@@ -35,6 +35,8 @@ pub fn reloc_field_size(kind: RelocationKind) -> usize {
         | RelocationKind::ArmCallThumb
         | RelocationKind::ArmBranchThumb
         | RelocationKind::ArmCbzThumb
+        | RelocationKind::ArmMovwAbs
+        | RelocationKind::ArmMovtAbs
         | RelocationKind::ThumbMovwAbs
         | RelocationKind::ThumbMovtAbs
         | RelocationKind::RiscVJal
@@ -58,6 +60,8 @@ pub fn elf_reloc_type(arch: crate::codegen::target::Arch, kind: RelocationKind) 
         (Arch::Arm32, RelocationKind::ArmCallThumb) => 28, // R_ARM_THM_CALL
         (Arch::Arm32, RelocationKind::ArmBranchThumb) => 30, // R_ARM_THM_JUMP24
         (Arch::Arm32, RelocationKind::ArmCbzThumb) => 31, // R_ARM_THM_JUMP8
+        (Arch::Arm32, RelocationKind::ArmMovwAbs) => 43, // R_ARM_MOVW_ABS_NC
+        (Arch::Arm32, RelocationKind::ArmMovtAbs) => 44, // R_ARM_MOVT_ABS
         (Arch::Arm32Thumb, RelocationKind::ThumbMovwAbs) => 47, // R_ARM_THM_MOVW_ABS_NC
         (Arch::Arm32Thumb, RelocationKind::ThumbMovtAbs) => 48, // R_ARM_THM_MOVT_ABS
         (Arch::RiscV32 | Arch::RiscV64, RelocationKind::RiscVJal) => 17, // R_RISCV_JAL
@@ -245,7 +249,7 @@ pub fn apply_relocations(unit: &mut CompilationUnit, text_base: u64, rodata_base
             }
             RelocationKind::ArmBranchThumb => {
                 if reloc.instr_len == 2 {
-                    // T1 条件分支：8 位半字偏移在 [10:2]
+                    // T1 条件分支：8 位半字偏移在 [7:0]（`1101 cond imm8`）
                     let pc = instr_va as i64 + 4;
                     let delta = target - pc;
                     let off = (delta >> 1) & 0xff;
@@ -254,7 +258,7 @@ pub fn apply_relocations(unit: &mut CompilationUnit, text_base: u64, rodata_base
                             unit.code[reloc.offset],
                             unit.code[reloc.offset + 1],
                         ]);
-                        let patched = (hw & !0x03fc) | ((off as u16 & 0xff) << 2);
+                        let patched = (hw & !0x00ff) | (off as u16 & 0xff);
                         unit.code[reloc.offset..reloc.offset + 2]
                             .copy_from_slice(&patched.to_le_bytes());
                     }
@@ -280,6 +284,21 @@ pub fn apply_relocations(unit: &mut CompilationUnit, text_base: u64, rodata_base
                             .copy_from_slice(&hw2.to_le_bytes());
                     }
                 }
+            }
+            RelocationKind::ArmMovwAbs | RelocationKind::ArmMovtAbs => {
+                // A32 `movw`/`movt` 绝对取址对：`movw` 装 (S+A) 低 16 位、
+                // `movt` 装高 16 位。imm16 拆成 imm4[19:16] 与 imm12[11:0]。
+                let full = target as u32;
+                let imm16 = match reloc.kind {
+                    RelocationKind::ArmMovwAbs => full & 0xffff,
+                    _ => full >> 16,
+                };
+                let imm4 = ((imm16 >> 12) & 0xf) << 16;
+                let imm12 = imm16 & 0xfff;
+                patch_word(&mut unit.code, reloc, |word| {
+                    const MASK: u32 = !((0xf << 16) | 0xfff);
+                    (word & MASK) | imm4 | imm12
+                });
             }
             RelocationKind::ThumbMovwAbs | RelocationKind::ThumbMovtAbs => {
                 // `movw`/`movt` 绝对取址对：`movw` 装 (S+A) 低 16 位、
@@ -629,6 +648,44 @@ mod tests {
         assert_eq!(imm, 1, "adrp 页差应为 1");
         assert_eq!(add & 0xffc0_03ff, 0x9100_0000, "保留 opcode/Rn/Rd");
         assert_eq!((add >> 10) & 0xfff, 0x0d, "lo12 = 0x0d");
+    }
+
+    #[test]
+    fn arm_movw_movt_absolute_pair_resolves_rodata() {
+        // `movw r9,#0` / `movt r9,#0` 位于 .text+0/+4，字符串在 .rodata+0x1a6。
+        let mut unit = CompilationUnit::new();
+        unit.code = Vec::new();
+        unit.code.extend_from_slice(&0xe300_9000u32.to_le_bytes()); // movw r9, #0
+        unit.code.extend_from_slice(&0xe340_9000u32.to_le_bytes()); // movt r9, #0
+        unit.symbols.push(Symbol {
+            name: ".Lstr0".to_string(),
+            section: SymbolSection::Rodata,
+            offset: 0x1a6,
+            size: 6,
+            global: false,
+            kind: SymbolKind::Object,
+        });
+        unit.relocations.push(Relocation::new(
+            0,
+            0,
+            4,
+            ".Lstr0",
+            RelocationKind::ArmMovwAbs,
+        ));
+        unit.relocations.push(Relocation::new(
+            4,
+            4,
+            4,
+            ".Lstr0",
+            RelocationKind::ArmMovtAbs,
+        ));
+        apply_relocations(&mut unit, 0x0800_0000, 0x0800_0000);
+        let movw = u32::from_le_bytes(unit.code[0..4].try_into().unwrap());
+        let movt = u32::from_le_bytes(unit.code[4..8].try_into().unwrap());
+        // 目标 = 0x08000000 + 0x1a6 = 0x080001a6：movw 装低 16 位 0x01a6，
+        // movt 装高 16 位 0x0800（imm4[19:16] | imm12[11:0]）。
+        assert_eq!(movw, 0xe300_91a6, "movw 应装 (S+A) 低 16 位");
+        assert_eq!(movt, 0xe340_9800, "movt 应装 (S+A) 高 16 位");
     }
 
     #[test]

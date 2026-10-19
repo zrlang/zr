@@ -80,6 +80,35 @@ thread_local! {
     static LOCAL_SLOTS: RefCell<HashMap<u32, usize>> = RefCell::new(HashMap::new());
     /// 当前函数里的整数常量：值 id -> 常量值（用于 i64 除/取余的常量强度削减）。
     static CONSTS: RefCell<HashMap<u32, i128>> = RefCell::new(HashMap::new());
+    /// 函数内局部标签的全局计数器。
+    ///
+    /// Thumb 没有 A32 的条件执行后缀，宽移位要按 `cnt < 32` 分两段，只能靠
+    /// 条件跳转绕开。编码器原先只有块级标签（每块一个 `{func}.bN`），这里
+    /// 补一个函数内任意位置的标签设施：名字必须**唯一**（`symbol_addresses`
+    /// 按名字建表），计数器在线程内单调递增、从不复位即可保证。
+    static LOCAL_LABEL: Cell<u32> = const { Cell::new(0) };
+}
+
+/// 造一个跨函数唯一的函数内标签，并把它的符号放在当前代码位置。
+fn define_label(unit: &mut CompilationUnit, name: &str) {
+    unit.symbols.push(Symbol {
+        name: name.to_string(),
+        section: SymbolSection::Text,
+        offset: unit.code.len(),
+        size: 0,
+        global: false,
+        kind: SymbolKind::Section,
+    });
+}
+
+/// 申请一个跨函数唯一的局部标签名（尚未落点）。
+fn fresh_label() -> String {
+    let n = LOCAL_LABEL.with(|c| {
+        let v = c.get();
+        c.set(v + 1);
+        v
+    });
+    format!("__zr_local_{n}")
 }
 
 fn alloc_reg(v: SsaValue) -> Reg {
@@ -274,6 +303,16 @@ fn cmp_imm8(unit: &mut CompilationUnit, rn: Reg, imm: u8) {
     }
 }
 
+/// `sub.w rd, rn, #imm8`（32 位 T2，`imm8` 需能放进 8 位立即数）。
+fn sub_imm8(unit: &mut CompilationUnit, rd: Reg, rn: Reg, imm: u8) {
+    w32(unit, 0xf1a0 | rn.bits(), (rd.bits() << 8) | imm as u16);
+}
+
+/// `rsb.w rd, rn, #imm8`（32 位，`rd = imm - rn`）。
+fn rsb_imm8(unit: &mut CompilationUnit, rd: Reg, rn: Reg, imm: u8) {
+    w32(unit, 0xf1c0 | rn.bits(), (rd.bits() << 8) | imm as u16);
+}
+
 /// `mov.w rd, rm`（32 位 T3），寄存器范围不限。
 fn mov_wide(unit: &mut CompilationUnit, rd: Reg, rm: Reg) {
     w32(unit, 0xea4f, (rd.bits() << 8) | rm.bits());
@@ -329,6 +368,11 @@ fn subs(unit: &mut CompilationUnit, rd: Reg, rn: Reg, rm: Reg) {
 }
 fn sbcs(unit: &mut CompilationUnit, rd: Reg, rn: Reg, rm: Reg) {
     w32(unit, 0xeb70 | rn.bits(), (rd.bits() << 8) | rm.bits());
+}
+
+/// `orr.w rd, rn, rm`（32 位 T2，不置标志）。
+fn orr(unit: &mut CompilationUnit, rd: Reg, rn: Reg, rm: Reg) {
+    dp3(unit, 0xea40, rd, rn, rm);
 }
 
 /// `umull rdlo, rdhi, rn, rm`（无符号 32x32->64）。
@@ -841,6 +885,67 @@ fn emit_compare_wide(
     put_out(unit, result);
 }
 
+/// 变量移位的 i64 逻辑（`lhs << rhs` / `lhs >> rhs`，算术右移）。
+///
+/// Thumb 没有 A32 的条件执行后缀，故用 `cmp cnt, #32` + 条件跳转把移位量
+/// 分成 `< 32` 与 `>= 32` 两段：前段做双字拼接（跨字进位用 `32 - cnt` 的
+/// 反向移位补进来），后段整字搬移并补符号/零。Thumb-2 的寄存器移位指令
+/// (`LSL.W`/`LSR.W`/`ASR.W Rd, Rn, Rm`) 允许 Rd == Rm，因此拼进位不需要
+/// 额外的暂存寄存器（r9=lo、r10=hi、r11=cnt、r12=scratch 恰好够用）。
+fn emit_shift_wide(
+    unit: &mut CompilationUnit,
+    result: SsaValue,
+    op: SsaBinaryOp,
+    lhs: SsaValue,
+    rhs: SsaValue,
+) {
+    wide_load_any(unit, lhs, SPILL_SRC, SPILL_SRC2);
+    wide_load_any(unit, rhs, MUL_TMP, SPILL_DST);
+    cmp_imm8(unit, MUL_TMP, 32);
+    let less = fresh_label();
+    let end = fresh_label();
+    emit_b_cond(unit, 0b0011, &less); // CC / LO：cnt < 32
+
+    // --- cnt >= 32：整字搬移 ---
+    sub_imm8(unit, MUL_TMP, MUL_TMP, 32); // cnt -= 32
+    match op {
+        SsaBinaryOp::Shl => {
+            shift_reg(unit, 0b0000, SPILL_SRC, SPILL_SRC, MUL_TMP); // lo = lo << (cnt-32)
+            mov_reg_imm8(unit, SPILL_SRC2, 0); // hi = 0
+        }
+        SsaBinaryOp::Shr => {
+            shift_reg(unit, 0b0010, SPILL_SRC, SPILL_SRC2, MUL_TMP); // lo = asr(hi, cnt-32)
+            asr_imm(unit, SPILL_SRC2, SPILL_SRC2, 31); // hi = 符号位
+        }
+        _ => unreachable!(),
+    }
+    emit_b(unit, &end);
+
+    // --- cnt < 32：双字拼接 ---
+    define_label(unit, &less);
+    match op {
+        SsaBinaryOp::Shl => {
+            // lo' = lo << cnt;  hi' = (hi << cnt) | (lo >> (32-cnt))
+            rsb_imm8(unit, SPILL_DST, MUL_TMP, 32); // scratch = 32 - cnt
+            shift_reg(unit, 0b0001, SPILL_DST, SPILL_SRC, SPILL_DST); // scratch = lo >> (32-cnt)
+            shift_reg(unit, 0b0000, SPILL_SRC2, SPILL_SRC2, MUL_TMP); // hi <<= cnt
+            shift_reg(unit, 0b0000, SPILL_SRC, SPILL_SRC, MUL_TMP); // lo <<= cnt
+            orr(unit, SPILL_SRC2, SPILL_SRC2, SPILL_DST); // hi |= 进位
+        }
+        SsaBinaryOp::Shr => {
+            // hi' = hi >> cnt;  lo' = (lo >> cnt) | (hi << (32-cnt))
+            rsb_imm8(unit, SPILL_DST, MUL_TMP, 32); // scratch = 32 - cnt
+            shift_reg(unit, 0b0000, SPILL_DST, SPILL_SRC2, SPILL_DST); // scratch = hi << (32-cnt)
+            shift_reg(unit, 0b0010, SPILL_SRC2, SPILL_SRC2, MUL_TMP); // hi >>= cnt（算术）
+            shift_reg(unit, 0b0001, SPILL_SRC, SPILL_SRC, MUL_TMP); // lo >>= cnt
+            orr(unit, SPILL_SRC, SPILL_SRC, SPILL_DST); // lo |= 进位
+        }
+        _ => unreachable!(),
+    }
+    define_label(unit, &end);
+    wide_store(unit, result, SPILL_SRC, SPILL_SRC2);
+}
+
 /// i64 除以/取余一个 2 的幂常量：通用 64 位除法代价过高，而元素大小、
 /// 对齐等场景的除数几乎都是 2 的幂，用移位/掩码即可（除数须为正）。
 fn emit_divrem_wide_const(
@@ -1036,6 +1141,23 @@ fn emit_b(unit: &mut CompilationUnit, target: &str) {
     });
 }
 
+/// `b<cond> label`（T1，16 位条件分支，范围 ±256 字节）。
+///
+/// Thumb 没有 A32 的条件执行后缀，宽移位按 `cnt < 32` 分两段时用它绕开。
+/// 立即数落在 [7:0]（8 位半字偏移），由 `ArmBranchThumb`（`instr_len == 2`）回填。
+fn emit_b_cond(unit: &mut CompilationUnit, cond: u16, target: &str) {
+    let at = unit.code.len();
+    hw(unit, 0xd000 | ((cond & 0xf) << 8));
+    unit.relocations.push(Relocation {
+        offset: at,
+        instr_start: at,
+        instr_len: 2,
+        symbol: target.to_string(),
+        kind: RelocationKind::ArmBranchThumb,
+        addend: 0,
+    });
+}
+
 /// `cbz` / `cbnz rn, label`（16 位），高寄存器退化为 `cmp #0` + 条件跳。
 fn emit_branch_if_nonzero(
     unit: &mut CompilationUnit,
@@ -1185,6 +1307,9 @@ fn emit_instr(unit: &mut CompilationUnit, instr: &SsaInstr) {
                         emit_addsub_wide(unit, *result, *op, *lhs, *rhs)
                     }
                     SsaBinaryOp::Mul => emit_mul_wide(unit, *result, *lhs, *rhs),
+                    SsaBinaryOp::Shl | SsaBinaryOp::Shr => {
+                        emit_shift_wide(unit, *result, *op, *lhs, *rhs)
+                    }
                     SsaBinaryOp::Eq
                     | SsaBinaryOp::Ne
                     | SsaBinaryOp::Lt
@@ -2106,5 +2231,124 @@ mod tests {
         let mut u = empty_unit();
         mov_imm32(&mut u, Reg(1), 0x42);
         assert_eq!(halfwords(&u), [0xf240, 0x0142], "小常量只用一条 movw");
+    }
+
+    /// 宽移位用到的算术/移位/分支编码，逐条对照 `clang --target=thumbv7em-none-eabi`。
+    #[test]
+    fn wide_shift_helper_encodings_match_gnu_assembler_output() {
+        let mut u = empty_unit();
+        sub_imm8(&mut u, Reg(12), Reg(11), 32);
+        assert_eq!(halfwords(&u), [0xf1ab, 0x0c20], "sub.w r12, r11, #32");
+
+        let mut u = empty_unit();
+        rsb_imm8(&mut u, Reg(12), Reg(11), 32);
+        assert_eq!(halfwords(&u), [0xf1cb, 0x0c20], "rsb.w r12, r11, #32");
+
+        let mut u = empty_unit();
+        orr(&mut u, Reg(10), Reg(10), Reg(11));
+        assert_eq!(halfwords(&u), [0xea4a, 0x0a0b], "orr.w r10, r10, r11");
+
+        let mut u = empty_unit();
+        shift_reg(&mut u, 0b0001, Reg(12), Reg(9), Reg(12));
+        assert_eq!(halfwords(&u), [0xfa29, 0xfc0c], "lsr.w r12, r9, r12");
+
+        let mut u = empty_unit();
+        emit_b_cond(&mut u, 0b0011, "x");
+        assert_eq!(halfwords(&u), [0xd300], "blo 待回填");
+    }
+
+    /// 函数内局部标签 + T1 条件分支的重定位（`b<cond>` 立即数落在 [7:0]）。
+    #[test]
+    fn local_label_conditional_branch_resolves() {
+        let mut u = empty_unit();
+        let end = fresh_label();
+        emit_b_cond(&mut u, 0b0001, &end); // 偏移 0：bne end
+        mov_imm8(&mut u, Reg(0), 0); // 偏移 2
+        mov_imm8(&mut u, Reg(0), 0); // 偏移 4
+        mov_imm8(&mut u, Reg(0), 0); // 偏移 6
+        define_label(&mut u, &end); // 偏移 8
+        crate::codegen::objfile::apply_relocations(&mut u, 0, 0);
+        let hw = u16::from_le_bytes([u.code[0], u.code[1]]);
+        // pc = 0 + 4，delta = 8 - 4 = 4，off = 2 → 0xd100 | 2
+        assert_eq!(hw, 0xd102, "bne 到偏移 8");
+    }
+
+    /// i64 变量移位的整段发射序列（分 `cnt < 32` / `cnt >= 32` 两段）。
+    #[test]
+    fn wide_shift_emits_split_sequence() {
+        let setup = || {
+            WIDE_VALUES.with(|w| {
+                let mut w = w.borrow_mut();
+                w.insert(1);
+                w.insert(2);
+                w.insert(3);
+            });
+            SPILL_SLOTS.with(|m| {
+                let mut m = m.borrow_mut();
+                m.insert(1, 0);
+                m.insert(2, 1);
+                m.insert(3, 2);
+            });
+        };
+
+        setup();
+        let mut u = empty_unit();
+        emit_shift_wide(&mut u, SsaValue(3), SsaBinaryOp::Shl, SsaValue(1), SsaValue(2));
+        assert_eq!(
+            halfwords(&u),
+            [
+                0xf8dd, 0x9000, // ldr.w r9, [sp, #0]    ; lo
+                0xf8dd, 0xa004, // ldr.w r10, [sp, #4]   ; hi
+                0xf8dd, 0xb008, // ldr.w r11, [sp, #8]   ; cnt
+                0xf8dd, 0xc00c, // ldr.w r12, [sp, #12]
+                0xf1bb, 0x0f20, // cmp.w r11, #32
+                0xd300, // blo <cnt<32>
+                0xf1ab, 0x0b20, // sub.w r11, r11, #32
+                0xfa09, 0xf90b, // lsl.w r9, r9, r11
+                0xf04f, 0x0a00, // mov.w r10, #0
+                0xf000, 0xbffe, // b <end>
+                0xf1cb, 0x0c20, // rsb.w r12, r11, #32
+                0xfa29, 0xfc0c, // lsr.w r12, r9, r12
+                0xfa0a, 0xfa0b, // lsl.w r10, r10, r11
+                0xfa09, 0xf90b, // lsl.w r9, r9, r11
+                0xea4a, 0x0a0c, // orr.w r10, r10, r12
+                0xf8cd, 0x9010, // str.w r9, [sp, #16]
+                0xf8cd, 0xa014, // str.w r10, [sp, #20]
+            ],
+            "i64 shl"
+        );
+
+        setup();
+        let mut u = empty_unit();
+        emit_shift_wide(&mut u, SsaValue(3), SsaBinaryOp::Shr, SsaValue(1), SsaValue(2));
+        assert_eq!(
+            halfwords(&u)[..13],
+            [
+                0xf8dd, 0x9000, // lo
+                0xf8dd, 0xa004, // hi
+                0xf8dd, 0xb008, // cnt
+                0xf8dd, 0xc00c, //
+                0xf1bb, 0x0f20, // cmp.w r11, #32
+                0xd300, // blo
+                0xf1ab, 0x0b20, // sub.w r11, r11, #32
+            ],
+            "i64 shr 头部"
+        );
+        assert_eq!(
+            halfwords(&u)[13..],
+            [
+                0xfa4a, 0xf90b, // asr.w r9, r10, r11
+                0xea4f, 0x7aea, // asr.w r10, r10, #31
+                0xf000, 0xbffe, // b <end>
+                0xf1cb, 0x0c20, // rsb.w r12, r11, #32
+                0xfa0a, 0xfc0c, // lsl.w r12, r10, r12
+                0xfa4a, 0xfa0b, // asr.w r10, r10, r11
+                0xfa29, 0xf90b, // lsr.w r9, r9, r11
+                0xea49, 0x090c, // orr.w r9, r9, r12
+                0xf8cd, 0x9010, // str.w r9, [sp, #16]
+                0xf8cd, 0xa014, // str.w r10, [sp, #20]
+            ],
+            "i64 shr 尾部"
+        );
     }
 }

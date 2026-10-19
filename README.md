@@ -1048,6 +1048,14 @@ zr 编译器采用经典的多阶段架构：
       静默编错）、`emit_extend` 的 sxtb/uxth 基址、形参未钉在实参寄存器
       （分配顺序让短命值抢走 r0-r3，调用两侧来回搬错值）、第 5+ 个整数
       实参接通栈上传参区、大槽区 `sub sp, #1000+` 经 r12 兜底
+- [x] 修复 ARM32 另一批"能编过但算错"：VFP 编码（`vldr`/`vstr` 的双精度
+      槽偏移、数据处理的 `opc1`/减法位、`vneg`/`vcmp`/`vcvt` 的寄存器半位、
+      `vmov` 核心↔VFP）、立即数移位（`asr rd,rm,#31` 的 imm5 在 [11:7]、类型在
+      [6:5]）、int↔float 转换的取数路径（整数先 `vmov` 进 `s` 寄存器再 `vcvt`，
+      结果再 `vmov` 回核心寄存器）；编码逐条对照 clang 钉进单测
+- [x] ARM32 字符串字面量取址（`movw`/`movt` + `R_ARM_MOVW_ABS_NC`/`MOVT_ABS`，
+      落 `.rodata`）、i64 除以 2 的幂常量的强度削减——`23_strings`/`24_pointers`
+      在 `arm-none-eabi` 打通
 - [x] RISC-V 后端的浮点指令选择（F/D 扩展，复用 AArch64 的"浮点槽"数据流
       模型）：算术 / 比较（IEEE754 无序取假）/ 取负、int↔f32↔f64 转换
       （`as` 按向零截断）、跨函数浮点实参（整数/浮点按 psABI 分别计数）
@@ -1105,8 +1113,9 @@ zr 编译器采用经典的多阶段架构：
         `_`，是"能编过但算错"）；现在收集为 `Pattern::Or` 展开为多条分支
   - [x] `comptime` 的 `match` 支持（脱糖为 if/else 后在编译期求值）
 - [x] ARM32 / Thumb-2 / RISC-V 指针 / 内存访问（`Load`/`Store`/`SlotAddr`、
-      指针算术、`s[i]`）——指针机制本身可用；`24_pointers` 在 `riscv32` /
-      `thumbv7em-none-eabi` 已通过，ARM32（A32）的字符串字面量取址待补
+      指针算术、`s[i]`）、字符串字面量取址——`23_strings`/`24_pointers` 在
+      `arm-none-eabi` / `thumbv7em-none-eabi` / `riscv32` 全部通过
+      （A32 用 `movw`/`movt` + `R_ARM_MOVW_ABS_NC`/`MOVT_ABS` 落在 `.rodata`）
 - [x] 寄存器溢出四大整数后端齐了：x86-64 / AArch64 / ARM32 /
       RISC-V64 都用线性扫描把装不下的值溢出到栈槽（AArch64 用 x16/x17 暂存、
       x18 兼 φ 中转；ARM32/Thumb-2 用 r9/r10/r12；溢出槽开在槽区下方）
@@ -1120,23 +1129,54 @@ zr 编译器采用经典的多阶段架构：
         与目标文件两条路径都覆盖）
   - [x] i64 多字长：加/减（`adds`/`adcs`/`subs`/`sbcs`）、乘（`umull` + 交叉项）、
         比较（高低字两级比较）、32↔64 转换（`asr #31` 符号扩展）、
+        变量移位（`lsl`/`lsr`/`asr` 按 `cnt<32` 分两段，用函数内局部标签 +
+        T1 条件分支拼接跨字进位/借位）、
         2 的幂常量除/取余（移位 / 掩码强度削减）
   - [x] 浮点 VFP：算术 / 取负 / 比较（`vcmp`+`vmrs`）/ 整数↔浮点↔单双互转 /
         常量装载；`w32` 与 `word` 两种 32 位写法分清（Thumb-2 高半字在前）
   - [x] 顺带修正 Thumb 一处静默算错：`ldr`/`str`（含 `sp` 相对）的
-        Rt 字段是 [15:12] 而非 [11:8]；`sub.w sp` 大立即数经 r12 兜底
+        Rt 字段是 [15:12] 而非 [11:8]；`sub.w sp` 大立即数经 r12 兜底；
+        T1 条件分支（`ArmBranchThumb`，`instr_len == 2`）的 8 位半字偏移
+        应落在 [7:0] 而非 [9:2]（原回填掩码会改写条件码）
   - [x] 26 个语言用例在 `-O0..-Oz` 全部交叉编译通过（本机无 ARM 模拟器，
         以编码/对象格式验证为准）
 - [x] 更多架构与平台：wasm64、FreeBSD、Android 交叉编译打通；iOS 仅缺
       本机 SDK / 链接器（环境限制，非编译器缺口）
 - [x] 32 位目标的多字长（i64）算术（ARM32 / Thumb-2 / RISC-V32 用双字 32 位
       指令对 + 栈槽实现 `add`/`sub`/`mul`/比较/转换，寄存器分配器区分
-      32/64 位值的溢出单元；ARM32 / RISC-V32 另有 `divmod`/`shl`/`shr`，
-      Thumb-2 的除法支持 2 的幂常量（移位/掩码强度削减））
+      32/64 位值的溢出单元；RISC-V32 另有通用 `divmod`/`shl`/`shr`，
+      ARM32 与 Thumb-2 的 64 位变量移位也已补齐（`cmp n,#32` 分两段；
+      ARM32 用 A32 条件执行后缀拼接，Thumb-2 用新增的函数内局部标签 +
+      T1 条件分支绕开——编码逐条对照 clang 钉进单测）；
+      ARM32 / Thumb-2 的除法支持 2 的幂常量（移位/掩码强度削减））
 - [x] `comptime` 的结构体字面量：`HirLiteral::Composite` 保留字段名/值，
       `comptime fn` 内可构造结构体、读字段、编译期改写字段（`p.x = v`），
       也支持 `comptime Point { .. }.x` 直接取字段；AST 与 HIR 两条求值路径
       均覆盖（`ExprKind::Struct`/`Field` 现携带字段数据，不再被丢弃）
+- [x] wasm 后端补齐结构化控制流与线性内存：`wasm32-wasi` 下 26 个语言用例
+      经 Node 实际运行全部退 0（此前只能"编过"，运行时语义不完整）
+  - [x] 控制流：新增 `block`/`loop`/`if`/`else`/`br`/`br_table`/`unreachable`；
+        每函数在形参后预留一个 i32 `pc` 局部，用 `loop` + 嵌套 `block` +
+        `br_table` 做 CFG 栈调度，回边 φ 复制落在各自前驱边上；函数尾补
+        `unreachable` 让栈多态通过校验（此前 `Goto`/`Branch` 被静默忽略，
+        函数只会顺着第一个块线性跑）
+  - [x] 线性内存与数据段：`Load`/`Store`/`SlotAddr` 落成
+        `i32/i64.loadN`/`storeN`（wasm32 地址先 `i32.wrap_i64`，小位宽再
+        `extend_i32_s/u`）；字符串字面量与"被取地址的局部量"槽组成 Data
+        段（起始 1024，字符串去重、NUL 结尾）——`23_strings`/`24_pointers`
+        在 `wasm32-wasi` 真正跑通
+  - [x] 整数比较结果（i32）统一 `i64.extend_i32_u` 扩展回 i64，修掉
+        "比较结果写进 i64 局部"导致的 `WebAssembly.validate` 失败
+  - [x] 一元浮点指令表整体错位修复（`f32.neg` = 0x8C、`f32.abs` = 0x8B …
+        `f64.neg` = 0x9A、`f64.sqrt` = 0x9F；此前把 `f64.neg` 编成
+        `f32.neg`，模块直接校验失败）；整数取负改用 `× -1`（原先把
+        `x - 0` 当成 `0 - x`，负数静默变正）
+  - [x] 变窄转换按目标位宽截断再扩展（`(x << (64-B)) >> (64-B)`，符号
+        用 `shr_s`、零扩展用新增的 `i64.shr_u`），修掉 `321 as i8` 未取低
+        8 位（此前只按 32 位 wrap+extend）
+  - [x] Function 段每个本地函数用各自的类型下标（此前一律写成第一个本地
+        函数的签名，导致校验按错误形参类型解读局部变量）
+  - [x] wasm 单测补充：一元/二元操作码、Data 段位置与段序
 - [ ] 增量编译、多线程编译
 
 ### v0.8.0（计划中） 📋

@@ -158,6 +158,14 @@ pub enum RelocationKind {
     ArmBranchThumb,
     /// Thumb `cbz` / `cbnz`：8 位半字偏移，落在指令的 [9:2]，且只支持 r0-r3。
     ArmCbzThumb,
+    /// ARM32（A32）`movw rd, #imm16`：绝对取址对的下半（ELF `R_ARM_MOVW_ABS_NC`）。
+    ///
+    /// 立即数取 `(S + A) & 0xffff`，拆成 imm4[19:16] 与 imm12[11:0]。
+    ArmMovwAbs,
+    /// ARM32（A32）`movt rd, #imm16`：绝对取址对的上半（ELF `R_ARM_MOVT_ABS`）。
+    ///
+    /// 立即数取 `(S + A) >> 16`，与 [`RelocationKind::ArmMovwAbs`] 成对。
+    ArmMovtAbs,
     /// Thumb `movw rd, #imm16`：绝对取址对的下半（ELF `R_ARM_THM_MOVW_ABS_NC`）。
     ///
     /// 立即数取 `(S + A) & 0xffff`，散布在 `i`/`imm4`/`imm3`/`imm8` 四处。

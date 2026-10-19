@@ -83,6 +83,9 @@ thread_local! {
     static FLOAT_SLOTS: RefCell<HashMap<u32, (usize, u8)>> = RefCell::new(HashMap::new());
     /// 当前函数为浮点栈槽预留的字节数（驱动序言/尾声的 `sub/add sp`）。
     static FRAME_BYTES: Cell<usize> = const { Cell::new(0) };
+    /// 当前函数的整数常量：值 id -> 常量值。用于把 i64 除以 2 的幂常量
+    /// 强度削减成移位（通用 64 位除法代价过高）。
+    static CONSTS: RefCell<HashMap<u32, i128>> = RefCell::new(HashMap::new());
 }
 
 /// `v` 是否是多字长（i64）值（32 位目标走栈槽 + 双 32 位运算）。
@@ -193,102 +196,171 @@ fn float_slot(v: SsaValue) -> Option<usize> {
     FLOAT_SLOTS.with(|m| m.borrow().get(&v.id()).map(|(s, _)| *s))
 }
 
+/// VFP 寄存器号编码：单精度 `sN` 用 D 号 `N>>1` 加半位 `N&1`，双精度直接用
+/// `dN`。半位在不同指令里落在不同 bit 上，由调用方放到正确位置。
+fn vfp_reg(is_single: bool, n: u8) -> (u32, u32) {
+    if is_single {
+        ((n >> 1) as u32, (n & 1) as u32)
+    } else {
+        (n as u32, 0)
+    }
+}
+
 /// `vldr s<t>, [sp, #off]` / `vldr d<t>, [sp, #off]`：从栈槽装载浮点值到 VFP 寄存器。
 fn emit_vldr(unit: &mut CompilationUnit, is_single: bool, reg: u8, slot: usize) {
-    // VFP load: 0xED900A00 | (cond<<28) | (P=1) | (U=1) | (W=0) | (L=1) | (Rd<<12) | (Rn<<16) | (imm8<<0)
-    // Rn = sp (13), imm8 = slot * 8 / 4 (for single) or slot * 8 / 8 (for double)
-    // We use slot * 2 for single (4-byte aligned), slot for double (8-byte aligned)
-    let imm = if is_single { (slot * 2) as u32 } else { slot as u32 };
-    let base = if is_single { 0xED9D_0A00u32 } else { 0xED9D_0B00u32 };
-    insn(unit, base | ((reg as u32) << 12) | (imm & 0xFF));
+    // VFP load: 0xED9D0A00 | L=1 | U=1 | Rn=sp(13) | Dd[15:12] | 半位[22] | imm8。
+    // 每个浮点槽 8 字节，imm8 以 4 字节为单位，故为 slot*2。
+    let (d, half) = vfp_reg(is_single, reg);
+    let sz = if is_single { 0 } else { 1 << 8 };
+    let imm = ((slot * 2) as u32) & 0xff;
+    insn(unit, 0xED9D_0A00 | sz | (d << 12) | (half << 22) | imm);
 }
 
 /// `vstr s<t>, [sp, #off]` / `vstr d<t>, [sp, #off]`：把 VFP 寄存器存回栈槽。
 fn emit_vstr(unit: &mut CompilationUnit, is_single: bool, reg: u8, slot: usize) {
-    let imm = if is_single { (slot * 2) as u32 } else { slot as u32 };
-    let base = if is_single { 0xED8D_0A00u32 } else { 0xED8D_0B00u32 };
-    insn(unit, base | ((reg as u32) << 12) | (imm & 0xFF));
+    let (d, half) = vfp_reg(is_single, reg);
+    let sz = if is_single { 0 } else { 1 << 8 };
+    let imm = ((slot * 2) as u32) & 0xff;
+    insn(unit, 0xED8D_0A00 | sz | (d << 12) | (half << 22) | imm);
 }
 
-/// 把一个浮点常量装进 VFP 寄存器：先经整数寄存器中转。
+/// `vmov s<t>, r<m>`：核心寄存器 → 单精度 VFP 寄存器。
+fn emit_vmov_core_to_single(unit: &mut CompilationUnit, s: u8, r: u8) {
+    let (d, half) = vfp_reg(true, s);
+    insn(unit, 0xEE00_0A10 | ((r as u32) << 12) | (d << 16) | (half << 7));
+}
+
+/// `vmov r<m>, s<t>`：单精度 VFP 寄存器 → 核心寄存器。
+fn emit_vmov_single_to_core(unit: &mut CompilationUnit, r: u8, s: u8) {
+    let (d, half) = vfp_reg(true, s);
+    insn(unit, 0xEE10_0A10 | ((r as u32) << 12) | (d << 16) | (half << 7));
+}
+
+/// `vmov d<t>, r<m>, r<n>`：两个核心寄存器 → 双精度 VFP 寄存器。
+fn emit_vmov_pair_to_double(unit: &mut CompilationUnit, d: u8, lo: u8, hi: u8) {
+    insn(
+        unit,
+        0xEC40_0B10 | ((lo as u32) << 12) | ((hi as u32) << 16) | d as u32,
+    );
+}
+
+/// 把一个浮点常量装进 VFP 寄存器 s0/d0：先经整数寄存器中转。
 fn emit_float_const(unit: &mut CompilationUnit, bits: u64, width: u8) {
-    // 使用 r12 (SPILL_DST) 作为中转寄存器（不在分配池里）
     emit_mov_imm32(unit, SPILL_DST, bits as u32);
-    if width == 64 {
-        emit_mov_imm32(unit, Reg(9), (bits >> 32) as u32);
-    }
     if width == 32 {
-        // vmsr fpscr, r12; 然后用 vmov s0, r12 也行，但直接用 VMOV 更简单
-        // VMOV (ARM -> VFP): 0xEEE00A40 | (cond<<28) | (Rd<<12) | (Rm<<16) | (opc1<<5) | opc2
-        // 对于单精度：0xEEE00A40 | (t<<12) | (m<<16) | (1<<5) | 0
-        insn(unit, 0xEEE0_0A40 | (0u32 << 12) | (SPILL_DST.bits() as u32) << 16 | (1u32 << 5));
+        emit_vmov_core_to_single(unit, 0, SPILL_DST.bits());
     } else {
-        // 双精度：需要两个整数寄存器
-        // vmov d0, r12, r9 (r12=low, r9=high): 0xEC400A10 | (cond<<28) | (Rt<<12) | (Rt2<<16) | (opc1<<5) | opc2
-        // 实际上是 VMOV (two ARM -> VFP): 0xEC500A10 | (t<<12) | (t2<<16) | (1<<5) | 0
-        // 但更标准的是用 vmov d<d>, r<rt>, r<rt2>
-        // 编码: cond=1110, 1110, 1, 0, 1, 00, Rt2, 1, Rt, 0, 1, opc1=0, Rt3=0... 
-        // 实际上查阅 ARM ARM: VMOV (two ARM registers to two single-precision or one double-precision)
-        // 0xEC400A10 | (t<<12) | (t2<<16) | (1<<5) for double
-        insn(unit, 0xEC40_0A10 | (0u32 << 12) | (SPILL_DST.bits() as u32) << 16 | (Reg(9).bits() as u32) << 8 | (1u32 << 5));
+        emit_mov_imm32(unit, Reg(9), (bits >> 32) as u32);
+        emit_vmov_pair_to_double(unit, 0, SPILL_DST.bits(), Reg(9).bits());
     }
 }
 
-/// VFP 算术指令：`vadd.f32/f64`, `vsub.f32/f64`, `vmul.f32/f64`, `vdiv.f32/f64`
+/// VFP 算术指令：`vadd.f32/f64`, `vsub.f32/f64`, `vmul.f32/f64`, `vdiv.f32/f64`。
+///
+/// `op`：0=add、1=sub、2=mul、3=div；其余字段按 ARM ARM 的 VFP 数据处理的
+/// `opc1`（[23:20]）+ 减法标志（bit6）编码。
 fn emit_vfp_arith(unit: &mut CompilationUnit, is_single: bool, op: u32, rd: u8, rn: u8, rm: u8) {
-    // VFP data processing: 0xEE200A00 | (cond<<28) | (op<<20) | (Rd<<12) | (Rn<<16) | (Rm<<0) | (sz<<6)
-    // op: add=0b0000, sub=0b0001, mul=0b0010, div=0b0111
-    // sz: 0 for single, 1 for double
-    let sz = if is_single { 0 } else { 1 };
-    let cond = 0xE;
-    insn(unit, (cond << 28) | 0xEE20_0A00 | (op << 20) | ((rd as u32) << 12) | ((rn as u32) << 16) | (rm as u32) | ((sz as u32) << 6));
+    let (opc1, bit6) = match op {
+        0 => (0b0011, 0),
+        1 => (0b0011, 1 << 6),
+        2 => (0b0010, 0),
+        _ => (0b1000, 0),
+    };
+    let (rd_d, rd_h) = vfp_reg(is_single, rd);
+    let (rn_d, rn_h) = vfp_reg(is_single, rn);
+    let (rm_d, rm_h) = vfp_reg(is_single, rm);
+    let sz = if is_single { 0 } else { 1 << 8 };
+    insn(
+        unit,
+        0xEE00_0A00
+            | (opc1 << 20)
+            | (rn_h << 7)
+            | (rn_d << 16)
+            | (rd_h << 22)
+            | (rd_d << 12)
+            | sz
+            | bit6
+            | (rm_h << 5)
+            | rm_d,
+    );
 }
 
-/// VFP 取负：`vneg.f32/f64`
+/// VFP 取负：`vneg.f32/f64`。
 fn emit_vneg(unit: &mut CompilationUnit, is_single: bool, rd: u8, rm: u8) {
-    // VFP neg: 0xEE200A00 | (cond<<28) | (op=0b1111<<20) | (Rd<<12) | (Rm<<0) | (sz<<6) | (Rn=0<<16)
-    let sz = if is_single { 0 } else { 1 };
-    let cond = 0xE;
-    insn(unit, (cond << 28) | 0xEE20_0A00 | (0xF << 20) | ((rd as u32) << 12) | ((rm as u32)) | ((sz as u32) << 6));
+    let (rd_d, rd_h) = vfp_reg(is_single, rd);
+    let (rm_d, rm_h) = vfp_reg(is_single, rm);
+    let sz = if is_single { 0 } else { 1 << 8 };
+    insn(
+        unit,
+        0xEEB1_0A40 | sz | (rd_h << 22) | (rd_d << 12) | (rm_h << 5) | rm_d,
+    );
 }
 
-/// VFP 比较：`vcmp.f32/f64` / `vcmpz.f32/f64` + `vmrs apsr_nzcv, fpscr`
+/// VFP 比较：`vcmp.f32/f64` / `vcmpz.f32/f64` + `vmrs apsr_nzcv, fpscr`。
 fn emit_vcmp(unit: &mut CompilationUnit, is_single: bool, rn: u8, rm: u8) {
-    let sz = if is_single { 0 } else { 1 };
-    let cond = 0xE;
-    // vcmp: 0xEE200A00 | (op=0b1010<<20) | (Rn<<16) | (Rm<<0) | (sz<<6)
-    insn(unit, (cond << 28) | 0xEE20_0A00 | (0xA << 20) | ((rn as u32) << 16) | (rm as u32) | ((sz as u32) << 6));
-    // vmrs apsr_nzcv, fpscr: 0xEEF1FA10
+    let (rn_d, rn_h) = vfp_reg(is_single, rn);
+    let (rm_d, rm_h) = vfp_reg(is_single, rm);
+    let sz = if is_single { 0 } else { 1 << 8 };
+    insn(
+        unit,
+        0xEEB4_0A40 | sz | (rn_h << 22) | (rn_d << 12) | (rm_h << 5) | rm_d,
+    );
     insn(unit, 0xEEF1_FA10);
 }
 
-/// VFP 整数到浮点转换：`vcvt.f32.s32` / `vcvt.f64.s32` / `vcvt.f32.u32` / `vcvt.f64.u32`
+/// VFP 整数到浮点转换：`vcvt.f32.s32` / `vcvt.f64.s32` / `vcvt.f32.u32` / `vcvt.f64.u32`。
+/// 整数源必须已在一个 s 寄存器里（调用方先用 `vmov` 送进去）。
 fn emit_vcvt_int_to_fp(unit: &mut CompilationUnit, is_single: bool, signed: bool, rd: u8, rm: u8) {
-    // vcvt: 0xEEBC0AC0 | (cond<<28) | (opc2<<16) | (Rd<<12) | (Rm<<0) | (sz<<6) | (opc1<<5) | (opc3<<7)
-    // signed int -> fp: opc1=0, opc2=0b1010 (signed), opc3=0
-    // unsigned int -> fp: opc1=0, opc2=0b1011 (unsigned), opc3=0
-    let sz = if is_single { 0 } else { 1 };
-    let opc2 = if signed { 0xA } else { 0xB };
-    let cond = 0xE;
-    insn(unit, (cond << 28) | 0xEEBC_0AC0 | (opc2 << 16) | ((rd as u32) << 12) | (rm as u32) | ((sz as u32) << 6));
+    let (rd_d, rd_h) = vfp_reg(is_single, rd);
+    let (rm_d, rm_h) = vfp_reg(true, rm);
+    let sz = if is_single { 0 } else { 1 << 8 };
+    let signed_bit = if signed { 1 << 7 } else { 0 };
+    insn(
+        unit,
+        0xEEB8_0A40
+            | signed_bit
+            | sz
+            | (rd_h << 22)
+            | (rd_d << 12)
+            | (rm_h << 5)
+            | rm_d,
+    );
 }
 
-/// VFP 浮点到整数转换：`vcvt.s32.f32` / `vcvt.s32.f64` / `vcvt.u32.f32` / `vcvt.u32.f64` (向零截断)
-fn emit_vcvt_fp_to_int(unit: &mut CompilationUnit, is_single: bool, signed: bool, rd: u8, rm: u8) {
-    // vcvt (fp -> int): 0xEEBC0AC0 | (cond<<28) | (opc2<<16) | (Rd<<12) | (Rm<<0) | (sz<<6) | (opc1<<5) | (opc3<<7)
-    // opc1=1 (fp->int), opc2=0b1010 (signed), opc2=0b1011 (unsigned), opc3=1 (truncate toward zero)
-    let sz = if is_single { 0 } else { 1 };
-    let opc2 = if signed { 0xA } else { 0xB };
-    let cond = 0xE;
-    insn(unit, (cond << 28) | 0xEEBC_0AC0 | (opc2 << 16) | ((rd as u32) << 12) | (rm as u32) | ((sz as u32) << 6) | (1u32 << 5) | (1u32 << 7));
+/// VFP 浮点到整数转换：`vcvt.s32.f32` / `vcvt.s32.f64` / `vcvt.u32.f32` /
+/// `vcvt.u32.f64`（向零截断）。结果写进一个 s 寄存器，调用方再用 `vmov` 取回。
+fn emit_vcvt_fp_to_int(
+    unit: &mut CompilationUnit,
+    src_is_single: bool,
+    signed: bool,
+    rd: u8,
+    rm: u8,
+) {
+    let (rd_d, rd_h) = vfp_reg(true, rd);
+    let (rm_d, rm_h) = vfp_reg(src_is_single, rm);
+    let sz = if src_is_single { 0 } else { 1 << 8 };
+    let signed_bit = if signed { 1 << 16 } else { 0 };
+    insn(
+        unit,
+        0xEEBC_0AC0
+            | signed_bit
+            | sz
+            | (rd_h << 22)
+            | (rd_d << 12)
+            | (rm_h << 5)
+            | rm_d,
+    );
 }
 
-/// VFP 单双精度互转：`vcvt.f32.f64` / `vcvt.f64.f32`
+/// VFP 单双精度互转：`vcvt.f32.f64` / `vcvt.f64.f32`。
 fn emit_vcvt_fp_to_fp(unit: &mut CompilationUnit, dst_is_single: bool, rd: u8, rm: u8) {
-    // vcvt (fp -> fp): 0xEEBC0AC0 | (cond<<28) | (opc2=0b1111) | (Rd<<12) | (Rm<<0) | (sz<<6) | (opc1=0<<5) | (opc3=1<<7)
-    let sz = if dst_is_single { 0 } else { 1 };
-    let cond = 0xE;
-    insn(unit, (cond << 28) | 0xEEBC_0AC0 | (0xF << 16) | ((rd as u32) << 12) | (rm as u32) | ((sz as u32) << 6) | (1u32 << 7));
+    let (rd_d, rd_h) = vfp_reg(dst_is_single, rd);
+    let (rm_d, rm_h) = vfp_reg(!dst_is_single, rm);
+    let sz = if dst_is_single { 1 << 8 } else { 0 };
+    insn(
+        unit,
+        0xEEB7_0AC0 | sz | (rd_h << 22) | (rd_d << 12) | (rm_h << 5) | rm_d,
+    );
 }
 
 /// 把实参搬进 AAPCS32 的 r0-r3；第 5+ 个整型实参写进**栈上传参区**。
@@ -393,6 +465,10 @@ mod cc {
     pub const LE: u32 = 0b1101;
     /// 无条件。
     pub const AL: u32 = 0b1110;
+    /// 进位清零（无符号"低于"，用于 `n < 32`）。
+    pub const CC: u32 = 0b0011;
+    /// 进位置位（无符号"高于或等于"，用于 `n >= 32`）。
+    pub const CS: u32 = 0b0010;
 }
 
 /// 数据处理操作码。
@@ -572,6 +648,30 @@ fn movw_imm(imm: u16) -> u32 {
     (((imm >> 12) as u32) << 16) | (imm & 0xfff) as u32
 }
 
+/// 把 `.rodata` 符号的**绝对地址**装进 `rd`：`movw` + `movt`，各附一条
+/// 重定位（下半 / 上半）。目标文件交给链接器；自构造映像由
+/// `apply_relocations` 回填。
+fn emit_str_addr(unit: &mut CompilationUnit, rd: Reg, sym: &str) {
+    let start = unit.code.len();
+    emit_movw(unit, rd, 0);
+    unit.relocations.push(Relocation::new(
+        start,
+        start,
+        4,
+        sym,
+        RelocationKind::ArmMovwAbs,
+    ));
+    let hi_start = unit.code.len();
+    emit_movt(unit, rd, 0);
+    unit.relocations.push(Relocation::new(
+        hi_start,
+        hi_start,
+        4,
+        sym,
+        RelocationKind::ArmMovtAbs,
+    ));
+}
+
 /// `op rd, rn, rm`
 fn emit_op3(unit: &mut CompilationUnit, opcode: u32, rd: Reg, rn: Reg, rm: Reg) {
     data_processing(unit, cc::AL, opcode, false, rn, rd, rm.bits() as u32, false);
@@ -684,6 +784,8 @@ fn emit_rsb(unit: &mut CompilationUnit, rd: Reg, rn: Reg) {
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Shift {
     Lsl,
+    /// 逻辑右移。
+    Lsr,
     /// 算术右移。
     Asr,
 }
@@ -692,23 +794,37 @@ impl Shift {
     fn type_code(self) -> u32 {
         match self {
             Shift::Lsl => 0b00,
+            Shift::Lsr => 0b01,
             Shift::Asr => 0b10,
         }
     }
 }
 
-/// 寄存器受控移位：`lsl/asr rd, rm, rs`（rd = rm 移位 rs 位）。
-fn emit_shift_by_reg(unit: &mut CompilationUnit, rd: Reg, rm: Reg, count: Reg, shift: Shift) {
+/// 寄存器受控移位：`lsl<cond>/lsr<cond>/asr<cond> rd, rm, rs`（rd = rm 移位 rs 位）。
+fn emit_shift_by_reg_cond(
+    unit: &mut CompilationUnit,
+    cond: u32,
+    rd: Reg,
+    rm: Reg,
+    count: Reg,
+    shift: Shift,
+) {
     // 基址只置 bit4（寄存器受控移位标志），**不要**把 Rd 烤进基址——
     // 早先写成 0xe1a0_1010，等于 Rd 恒为 1，换任何别的目的寄存器都会错位。
     insn(
         unit,
-        0xe1a0_0010
+        (cond << 28)
+            | 0x01a0_0010
             | (rd.bits() as u32) << 12
             | (count.bits() as u32) << 8
             | shift.type_code() << 5
             | rm.bits() as u32,
     );
+}
+
+/// 寄存器受控移位（无条件）。
+fn emit_shift_by_reg(unit: &mut CompilationUnit, rd: Reg, rm: Reg, count: Reg, shift: Shift) {
+    emit_shift_by_reg_cond(unit, cc::AL, rd, rm, count, shift);
 }
 
 /// `push {r4-r8, lr}`
@@ -903,7 +1019,14 @@ fn emit_phi_copies(unit: &mut CompilationUnit, func: &SsaFunction, succ: usize, 
     for (result, src) in &ds {
         if is_wide(*result) || is_wide(*src) {
             wide_load(unit, *src, SPILL_SRC, SPILL_SRC2);
-            wide_store(unit, *result, SPILL_SRC, SPILL_SRC2);
+            if is_wide(*result) {
+                wide_store(unit, *result, SPILL_SRC, SPILL_SRC2);
+            } else if let Some(ds_) = spill_slot(*result) {
+                store_spill(unit, SPILL_SRC, ds_);
+            } else {
+                let r = alloc_reg(*result);
+                emit_mov_rr(unit, r, SPILL_SRC);
+            }
         } else if let (Some(ds_), Some(ss)) = (spill_slot(*result), spill_slot(*src)) {
             // 溢出 → 溢出：经暂存寄存器栈对栈
             load_spill(unit, SPILL_DST, ss);
@@ -998,16 +1121,77 @@ fn store_spill_hi(unit: &mut CompilationUnit, src: Reg, slot: usize) {
     insn(unit, 0xe58d_0000 | (src.bits() as u32) << 12 | off as u32);
 }
 
+/// `mov<cond> rd, rm, <shift> #amount`（立即数移位）：imm5 在 [11:7]、类型在 [6:5]。
+fn emit_shift_imm_cond(
+    unit: &mut CompilationUnit,
+    cond: u32,
+    shift: Shift,
+    rd: Reg,
+    rm: Reg,
+    amount: u32,
+) {
+    let op2 = ((amount & 0x1f) << 7) | (shift.type_code() << 5) | rm.bits() as u32;
+    insn(
+        unit,
+        (cond << 28) | 0x01a0_0000 | (rd.bits() as u32) << 12 | op2,
+    );
+}
+
+/// `mov rd, rm, <shift> #amount`（立即数移位）。
+fn emit_shift_imm(unit: &mut CompilationUnit, shift: Shift, rd: Reg, rm: Reg, amount: u32) {
+    emit_shift_imm_cond(unit, cc::AL, shift, rd, rm, amount);
+}
+
+/// `orr<cond> rd, rn, rm, <shift> <count>`：带寄存器受控移位的操作数 2 的
+/// `orr`。`data_processing` 会把 operand2 截成 12 位立即数形式，装不下
+/// 寄存器移位字段，所以这里手工拼码。
+fn emit_orr_shifted_reg(
+    unit: &mut CompilationUnit,
+    cond: u32,
+    rd: Reg,
+    rn: Reg,
+    rm: Reg,
+    count: Reg,
+    shift: Shift,
+) {
+    let word = (cond << 28)
+        | 0x0180_0000 // opcode ORR (0b1100 << 21)
+        | (rn.bits() as u32) << 16
+        | (rd.bits() as u32) << 12
+        | (count.bits() as u32) << 8
+        | 1 << 4 // 移位量由寄存器给定（bit4），否则移位字段被忽略
+        | shift.type_code() << 5
+        | rm.bits() as u32;
+    insn(unit, word);
+}
+
+/// `asr rd, rm, #amount`（算术右移立即数）。
+fn emit_asr_imm(unit: &mut CompilationUnit, rd: Reg, rm: Reg, amount: u32) {
+    emit_shift_imm(unit, Shift::Asr, rd, rm, amount);
+}
+
+/// 读出一个"当作 i64 用"的操作数：本身是 i64 就从宽槽读低/高字；只是 32 位
+/// 值（指针、`as i64` 之前的中间值等）就放进 `lo` 并符号扩展出 `hi`。二元
+/// i64 运算的两侧未必都被标成宽——例如指针相减的结果是 i64，但操作数是指针。
 fn wide_load(unit: &mut CompilationUnit, v: SsaValue, lo: Reg, hi: Reg) {
-    let slot = spill_slot(v).expect("i64 值没有宽槽");
-    load_spill(unit, lo, slot);
-    load_spill_hi(unit, hi, slot);
+    if is_wide(v) {
+        let slot = spill_slot(v).expect("i64 值没有宽槽");
+        load_spill(unit, lo, slot);
+        load_spill_hi(unit, hi, slot);
+    } else if let Some(slot) = spill_slot(v) {
+        load_spill(unit, lo, slot);
+        emit_asr_imm(unit, hi, lo, 31);
+    } else {
+        let r = alloc_reg(v);
+        if r != lo {
+            emit_mov_rr(unit, lo, r);
+        }
+        emit_asr_imm(unit, hi, lo, 31);
+    }
 }
 
 fn wide_load2(unit: &mut CompilationUnit, v: SsaValue, lo: Reg, hi: Reg) {
-    let slot = spill_slot(v).expect("i64 值没有宽槽");
-    load_spill(unit, lo, slot);
-    load_spill_hi(unit, hi, slot);
+    wide_load(unit, v, lo, hi);
 }
 
 fn wide_store(unit: &mut CompilationUnit, v: SsaValue, lo: Reg, hi: Reg) {
@@ -1079,10 +1263,7 @@ fn emit_cast_wide(
         wide_load(unit, src, SPILL_SRC, SPILL_SRC2);
         wide_store(unit, result, SPILL_SRC, SPILL_SRC2);
     } else if !from_wide && to_wide {
-        let s = val_reg(unit, src);
-        emit_op3(unit, op::MOV, SPILL_SRC, Reg(0), s);
-        let op2 = (31 << 5) | (Shift::Asr.type_code() << 4) | (s.bits() as u32);
-        insn(unit, 0xe1a0_0000 | (SPILL_SRC2.bits() as u32) << 12 | op2);
+        wide_load(unit, src, SPILL_SRC, SPILL_SRC2);
         wide_store(unit, result, SPILL_SRC, SPILL_SRC2);
     } else {
         wide_load(unit, src, SPILL_SRC, SPILL_SRC2);
@@ -1108,24 +1289,116 @@ fn emit_mul_wide(
     wide_store(unit, result, SPILL_SRC, SPILL_SRC2);
 }
 
-fn emit_divmod_wide(
-    _unit: &mut CompilationUnit,
-    _result: SsaValue,
-    _lhs: SsaValue,
-    _rhs: SsaValue,
-    _is_div: bool,
+/// i64 除以/取余一个 2 的幂常量：通用 64 位除法代价过高，而元素大小、
+/// 对齐等场景的除数几乎都是 2 的幂，用移位/掩码即可（除数须为正）。
+fn emit_divrem_wide_const(
+    unit: &mut CompilationUnit,
+    result: SsaValue,
+    op: SsaBinaryOp,
+    lhs: SsaValue,
+    divisor: i128,
 ) {
-    crate::codegen::unsupported_binary_op(if _is_div { SsaBinaryOp::Div } else { SsaBinaryOp::Rem });
+    let mag = divisor.unsigned_abs();
+    let k = mag.trailing_zeros();
+    if divisor <= 0 || mag != 1u128 << k || k > 31 {
+        crate::codegen::unsupported_binary_op(op);
+    }
+    wide_load(unit, lhs, SPILL_SRC, SPILL_SRC2);
+    if op == SsaBinaryOp::Div {
+        if k > 0 {
+            // 64 位逻辑右移 k 位：lo = (lo >> k) | (hi << (32-k))，hi = hi >> k
+            // （hi 用算术右移，负数除法向下取整，符合语言语义）。
+            emit_shift_imm(unit, Shift::Lsr, SPILL_DST, SPILL_SRC, k);
+            emit_shift_imm(unit, Shift::Lsl, MUL_TMP_A, SPILL_SRC2, 32 - k);
+            emit_op3(unit, op::ORR, SPILL_SRC, SPILL_DST, MUL_TMP_A);
+            emit_asr_imm(unit, SPILL_SRC2, SPILL_SRC2, k);
+        }
+    } else {
+        if k > 0 {
+            emit_mov_imm32(unit, SPILL_DST, mag as u32 - 1);
+            emit_op3(unit, op::AND, SPILL_SRC, SPILL_SRC, SPILL_DST);
+        } else {
+            emit_mov_imm32(unit, SPILL_SRC, 0);
+        }
+        emit_mov_imm32(unit, SPILL_SRC2, 0);
+    }
+    wide_store(unit, result, SPILL_SRC, SPILL_SRC2);
 }
 
 fn emit_shift_wide(
-    _unit: &mut CompilationUnit,
-    _result: SsaValue,
-    _op: SsaBinaryOp,
-    _lhs: SsaValue,
-    _rhs: SsaValue,
+    unit: &mut CompilationUnit,
+    result: SsaValue,
+    op: SsaBinaryOp,
+    lhs: SsaValue,
+    rhs: SsaValue,
 ) {
-    crate::codegen::unsupported_binary_op(_op);
+    // 64 位值由 lo/hi 两个字组成，移位用 `cmp count,#32` 分出两段，再用
+    // ARM 的条件执行把两段接在一起（`cc::CC` = n<32、`cc::CS` = n>=32）。
+    // 寄存器：r9=lo、r10=hi、r11=计数、r12=暂存。
+    let lo = SPILL_SRC;
+    let hi = SPILL_SRC2;
+    let cnt = MUL_TMP_A;
+    let tmp = SPILL_DST;
+    wide_load(unit, lhs, lo, hi);
+    // 移位计数取右操作数的低 32 位（高字进 tmp，忽略）。
+    wide_load(unit, rhs, cnt, tmp);
+    // CMP 置标志：CC 表示 n<32，CS 表示 n>=32。
+    emit_cmp_imm8(unit, cnt, 32);
+    match op {
+        SsaBinaryOp::Shl => {
+            // n<32：hi = (hi << n) | (lo >> (32-n))；lo = lo << n
+            emit_shift_by_reg_cond(unit, cc::CC, hi, hi, cnt, Shift::Lsl);
+            emit_rsb_imm_cond(unit, cc::CC, tmp, cnt, 32);
+            emit_orr_shifted_reg(unit, cc::CC, hi, hi, lo, tmp, Shift::Lsr);
+            emit_shift_by_reg_cond(unit, cc::CC, lo, lo, cnt, Shift::Lsl);
+            // n>=32：hi = lo << (n-32)；lo = 0
+            emit_sub_imm_cond(unit, cc::CS, cnt, cnt, 32);
+            emit_shift_by_reg_cond(unit, cc::CS, hi, lo, cnt, Shift::Lsl);
+            emit_mov_cond(unit, cc::CS, lo, 0);
+        }
+        // 右移一律取算术（与 32 位路径、x86-64 的 sar 一致）。
+        SsaBinaryOp::Shr => {
+            // n<32：lo = (lo >> n) | (hi << (32-n))；hi = hi >>s n
+            emit_shift_by_reg_cond(unit, cc::CC, lo, lo, cnt, Shift::Lsr);
+            emit_rsb_imm_cond(unit, cc::CC, tmp, cnt, 32);
+            emit_orr_shifted_reg(unit, cc::CC, lo, lo, hi, tmp, Shift::Lsl);
+            emit_shift_by_reg_cond(unit, cc::CC, hi, hi, cnt, Shift::Asr);
+            // n>=32：lo = hi >>s (n-32)；hi = 符号位填满
+            emit_sub_imm_cond(unit, cc::CS, cnt, cnt, 32);
+            emit_shift_by_reg_cond(unit, cc::CS, lo, hi, cnt, Shift::Asr);
+            emit_shift_imm_cond(unit, cc::CS, Shift::Asr, hi, hi, 31);
+        }
+        _ => crate::codegen::unsupported_binary_op(op),
+    }
+    wide_store(unit, result, lo, hi);
+}
+
+/// `rsb<cond> rd, rn, #imm`（立即数形式，不置标志）。
+fn emit_rsb_imm_cond(unit: &mut CompilationUnit, cond: u32, rd: Reg, rn: Reg, imm: u8) {
+    data_processing(
+        unit,
+        cond,
+        op::RSB_IMM,
+        false,
+        rn,
+        rd,
+        imm8_operand(0, imm),
+        true,
+    );
+}
+
+/// `sub<cond> rd, rn, #imm`（立即数形式，不置标志）。
+fn emit_sub_imm_cond(unit: &mut CompilationUnit, cond: u32, rd: Reg, rn: Reg, imm: u8) {
+    data_processing(
+        unit,
+        cond,
+        op::SUB,
+        false,
+        rn,
+        rd,
+        imm8_operand(0, imm),
+        true,
+    );
 }
 
 fn block_label(func: &str, id: usize) -> String {
@@ -1448,7 +1721,11 @@ fn emit_instr(unit: &mut CompilationUnit, instr: &SsaInstr) {
                     emit_vstr(unit, *w == 32, 0, slot);
                 }
             }
-            SsaConst::Str(_) => crate::codegen::unsupported_const("string"),
+            SsaConst::Str(text) => {
+                let sym = unit.intern_string(text);
+                emit_str_addr(unit, out_reg(*result), &sym);
+                put_out(unit, *result);
+            }
         },
         SsaInstr::Unary {
             result,
@@ -1468,8 +1745,13 @@ fn emit_instr(unit: &mut CompilationUnit, instr: &SsaInstr) {
                         emit_addsub_wide(unit, *result, *op, *lhs, *rhs)
                     }
                     SsaBinaryOp::Mul => emit_mul_wide(unit, *result, *lhs, *rhs),
-                    SsaBinaryOp::Div => emit_divmod_wide(unit, *result, *lhs, *rhs, true),
-                    SsaBinaryOp::Rem => emit_divmod_wide(unit, *result, *lhs, *rhs, false),
+                    SsaBinaryOp::Div | SsaBinaryOp::Rem => {
+                        let d = CONSTS.with(|c| c.borrow().get(&rhs.id()).copied());
+                        match d {
+                            Some(d) => emit_divrem_wide_const(unit, *result, *op, *lhs, d),
+                            None => crate::codegen::unsupported_binary_op(*op),
+                        }
+                    }
                     SsaBinaryOp::Shl | SsaBinaryOp::Shr => {
                         emit_shift_wide(unit, *result, *op, *lhs, *rhs)
                     }
@@ -1531,7 +1813,13 @@ fn emit_instr(unit: &mut CompilationUnit, instr: &SsaInstr) {
         SsaInstr::Copy { result, src } => {
             if is_wide(*result) || is_wide(*src) {
                 wide_load(unit, *src, SPILL_SRC, SPILL_SRC2);
-                wide_store(unit, *result, SPILL_SRC, SPILL_SRC2);
+                if is_wide(*result) {
+                    wide_store(unit, *result, SPILL_SRC, SPILL_SRC2);
+                } else if let Some(ds) = spill_slot(*result) {
+                    store_spill(unit, SPILL_SRC, ds);
+                } else {
+                    emit_mov_rr(unit, alloc_reg(*result), SPILL_SRC);
+                }
             } else if let (Some(rs), Some(ss)) = (float_slot(*result), float_slot(*src)) {
                 let w = float_width(*result).max(float_width(*src));
                 emit_vldr(unit, w == 32, 0, ss);
@@ -1875,9 +2163,9 @@ fn emit_cast_float(
             let is_single = w == 32;
             let signed = matches!(from, NumTy::Int(_));
             let src_reg = val_reg(unit, src);
-            // 将整数寄存器值移到 VFP
-            // vcvt 需要源在整数寄存器，目的在 VFP
-            emit_vcvt_int_to_fp(unit, is_single, signed, 0, src_reg.bits());
+            // 整数源先搬进 s0，再做 vcvt（转换的源/目的都是 s/d 寄存器）。
+            emit_vmov_core_to_single(unit, 0, src_reg.bits());
+            emit_vcvt_int_to_fp(unit, is_single, signed, 0, 0);
             if let Some(slot) = dst_slot {
                 emit_vstr(unit, is_single, 0, slot);
             }
@@ -1887,9 +2175,10 @@ fn emit_cast_float(
             let src_w = float_width(src);
             let is_single = src_w == 32;
             let signed = matches!(to, NumTy::Int(_));
-            // vcvt.f32.s32 结果在整数寄存器
             emit_vldr(unit, is_single, 0, src_slot.unwrap());
-            emit_vcvt_fp_to_int(unit, is_single, signed, Reg::R0.bits(), 0);
+            // 结果落在 s0，再用 vmov 取回核心寄存器。
+            emit_vcvt_fp_to_int(unit, is_single, signed, 0, 0);
+            emit_vmov_single_to_core(unit, Reg::R0.bits(), 0);
             if let Some(slot) = spill_slot(result) {
                 store_spill(unit, Reg::R0, slot);
             } else {
@@ -2124,7 +2413,7 @@ mod tests {
     }
 
     /// 汇编器实测值（`clang -target armv7a-none-eabi -march=armv7ve` + objdump）。
-    const REF: [(&str, u32); 13] = [
+    const REF: [(&str, u32); 18] = [
         ("sdiv r1,r4,r7", 0xE711_F714),
         ("udiv r3,r5,r8", 0xE733_F815),
         ("mul r1,r4,r7", 0xE001_0794),
@@ -2138,6 +2427,11 @@ mod tests {
         ("rsb r1,r4,#0", 0xE264_1000),
         ("movw r1,#0x1234", 0xE301_1234),
         ("movt r1,#0x5678", 0xE345_1678),
+        ("asr r0,r1,#31", 0xE1A0_0FC1),
+        ("lsr r12,r9,#2", 0xE1A0_C129),
+        ("lsl r11,r10,#30", 0xE1A0_BF0A),
+        ("orr r9,r12,r11", 0xE18C_900B),
+        ("and r9,r9,r12", 0xE009_900C),
     ];
 
     #[test]
@@ -2206,11 +2500,268 @@ mod tests {
                 emit_movt(&mut u, r(1), 0x5678);
                 u.code
             }),
+            ("asr r0,r1,#31", {
+                let mut u = empty_unit();
+                emit_asr_imm(&mut u, r(0), r(1), 31);
+                u.code
+            }),
+            ("lsr r12,r9,#2", {
+                let mut u = empty_unit();
+                emit_shift_imm(&mut u, Shift::Lsr, r(12), r(9), 2);
+                u.code
+            }),
+            ("lsl r11,r10,#30", {
+                let mut u = empty_unit();
+                emit_shift_imm(&mut u, Shift::Lsl, r(11), r(10), 30);
+                u.code
+            }),
+            ("orr r9,r12,r11", {
+                let mut u = empty_unit();
+                emit_op3(&mut u, op::ORR, r(9), r(12), r(11));
+                u.code
+            }),
+            ("and r9,r9,r12", {
+                let mut u = empty_unit();
+                emit_op3(&mut u, op::AND, r(9), r(9), r(12));
+                u.code
+            }),
         ];
         for (label, code) in cases {
             let word = u32::from_le_bytes(code[..4].try_into().unwrap());
             let expect = REF.iter().find(|(n, _)| *n == label).unwrap().1;
             assert_eq!(word, expect, "{label}");
+        }
+    }
+
+    /// 64 位变量移位的编码逐条对照 clang
+    /// （`clang -target armv7-none-eabi -c` + objdump）。两段式
+    /// （n<32 / n>=32）靠条件执行拼接，任何一条编错都会静默算错。
+    #[test]
+    fn wide_shift_encodings_match_gnu_assembler_output() {
+        let r = |n: u8| Reg(n);
+        let word = |u: &CompilationUnit| u32::from_le_bytes(u.code[..4].try_into().unwrap());
+        // 左移
+        let cases: Vec<(&str, u32, CompilationUnit)> = vec![
+            ("lsllo r10,r10,r11", 0x31A0_AB1A, {
+                let mut u = empty_unit();
+                emit_shift_by_reg_cond(&mut u, cc::CC, r(10), r(10), r(11), Shift::Lsl);
+                u
+            }),
+            ("rsblo r12,r11,#32", 0x326B_C020, {
+                let mut u = empty_unit();
+                emit_rsb_imm_cond(&mut u, cc::CC, r(12), r(11), 32);
+                u
+            }),
+            ("orrlo r10,r10,r9,lsr r12", 0x318A_AC39, {
+                let mut u = empty_unit();
+                emit_orr_shifted_reg(&mut u, cc::CC, r(10), r(10), r(9), r(12), Shift::Lsr);
+                u
+            }),
+            ("lsllo r9,r9,r11", 0x31A0_9B19, {
+                let mut u = empty_unit();
+                emit_shift_by_reg_cond(&mut u, cc::CC, r(9), r(9), r(11), Shift::Lsl);
+                u
+            }),
+            ("subhs r11,r11,#32", 0x224B_B020, {
+                let mut u = empty_unit();
+                emit_sub_imm_cond(&mut u, cc::CS, r(11), r(11), 32);
+                u
+            }),
+            ("lslhs r10,r9,r11", 0x21A0_AB19, {
+                let mut u = empty_unit();
+                emit_shift_by_reg_cond(&mut u, cc::CS, r(10), r(9), r(11), Shift::Lsl);
+                u
+            }),
+            ("movhs r9,#0", 0x23A0_9000, {
+                let mut u = empty_unit();
+                emit_mov_cond(&mut u, cc::CS, r(9), 0);
+                u
+            }),
+            // 算术右移
+            ("lsrlo r9,r9,r11", 0x31A0_9B39, {
+                let mut u = empty_unit();
+                emit_shift_by_reg_cond(&mut u, cc::CC, r(9), r(9), r(11), Shift::Lsr);
+                u
+            }),
+            ("orrlo r9,r9,r10,lsl r12", 0x3189_9C1A, {
+                let mut u = empty_unit();
+                emit_orr_shifted_reg(&mut u, cc::CC, r(9), r(9), r(10), r(12), Shift::Lsl);
+                u
+            }),
+            ("asrlo r10,r10,r11", 0x31A0_AB5A, {
+                let mut u = empty_unit();
+                emit_shift_by_reg_cond(&mut u, cc::CC, r(10), r(10), r(11), Shift::Asr);
+                u
+            }),
+            ("asrhs r9,r10,r11", 0x21A0_9B5A, {
+                let mut u = empty_unit();
+                emit_shift_by_reg_cond(&mut u, cc::CS, r(9), r(10), r(11), Shift::Asr);
+                u
+            }),
+            ("asrhs r10,r10,#31", 0x21A0_AFCA, {
+                let mut u = empty_unit();
+                emit_shift_imm_cond(&mut u, cc::CS, Shift::Asr, r(10), r(10), 31);
+                u
+            }),
+        ];
+        for (label, expect, u) in cases {
+            assert_eq!(word(&u), expect, "{label}");
+        }
+    }
+
+    /// VFP 编码逐条对照 clang（`armv7a-none-eabi -mfpu=vfpv3-d16` + objdump）。
+    #[test]
+    fn vfp_encodings_match_gnu_assembler_output() {
+        let word = |u: &CompilationUnit| u32::from_le_bytes(u.code[..4].try_into().unwrap());
+        let cases: Vec<(&str, u32, CompilationUnit)> = vec![
+            ("vldr s0,[sp,#8]", 0xED9D_0A02, {
+                let mut u = empty_unit();
+                emit_vldr(&mut u, true, 0, 1);
+                u
+            }),
+            ("vldr d0,[sp,#8]", 0xED9D_0B02, {
+                let mut u = empty_unit();
+                emit_vldr(&mut u, false, 0, 1);
+                u
+            }),
+            ("vldr s15,[sp,#0]", 0xEDDD_7A00, {
+                let mut u = empty_unit();
+                emit_vldr(&mut u, true, 15, 0);
+                u
+            }),
+            ("vstr s15,[sp,#0]", 0xEDCD_7A00, {
+                let mut u = empty_unit();
+                emit_vstr(&mut u, true, 15, 0);
+                u
+            }),
+            ("vstr d0,[sp,#8]", 0xED8D_0B02, {
+                let mut u = empty_unit();
+                emit_vstr(&mut u, false, 0, 1);
+                u
+            }),
+            ("vmov s0,r12", 0xEE00_CA10, {
+                let mut u = empty_unit();
+                emit_vmov_core_to_single(&mut u, 0, 12);
+                u
+            }),
+            ("vmov r3,s0", 0xEE10_3A10, {
+                let mut u = empty_unit();
+                emit_vmov_single_to_core(&mut u, 3, 0);
+                u
+            }),
+            ("vmov d0,r12,r9", 0xEC49_CB10, {
+                let mut u = empty_unit();
+                emit_vmov_pair_to_double(&mut u, 0, 12, 9);
+                u
+            }),
+            ("vadd.f32 s0,s0,s1", 0xEE30_0A20, {
+                let mut u = empty_unit();
+                emit_vfp_arith(&mut u, true, 0, 0, 0, 1);
+                u
+            }),
+            ("vsub.f32 s0,s0,s1", 0xEE30_0A60, {
+                let mut u = empty_unit();
+                emit_vfp_arith(&mut u, true, 1, 0, 0, 1);
+                u
+            }),
+            ("vmul.f32 s0,s0,s1", 0xEE20_0A20, {
+                let mut u = empty_unit();
+                emit_vfp_arith(&mut u, true, 2, 0, 0, 1);
+                u
+            }),
+            ("vdiv.f32 s0,s0,s1", 0xEE80_0A20, {
+                let mut u = empty_unit();
+                emit_vfp_arith(&mut u, true, 3, 0, 0, 1);
+                u
+            }),
+            ("vadd.f64 d0,d0,d1", 0xEE30_0B01, {
+                let mut u = empty_unit();
+                emit_vfp_arith(&mut u, false, 0, 0, 0, 1);
+                u
+            }),
+            ("vsub.f64 d0,d0,d1", 0xEE30_0B41, {
+                let mut u = empty_unit();
+                emit_vfp_arith(&mut u, false, 1, 0, 0, 1);
+                u
+            }),
+            ("vmul.f64 d0,d0,d1", 0xEE20_0B01, {
+                let mut u = empty_unit();
+                emit_vfp_arith(&mut u, false, 2, 0, 0, 1);
+                u
+            }),
+            ("vdiv.f64 d0,d0,d1", 0xEE80_0B01, {
+                let mut u = empty_unit();
+                emit_vfp_arith(&mut u, false, 3, 0, 0, 1);
+                u
+            }),
+            ("vneg.f32 s5,s6", 0xEEF1_2A43, {
+                let mut u = empty_unit();
+                emit_vneg(&mut u, true, 5, 6);
+                u
+            }),
+            ("vneg.f64 d0,d0", 0xEEB1_0B40, {
+                let mut u = empty_unit();
+                emit_vneg(&mut u, false, 0, 0);
+                u
+            }),
+            ("vcmp.f32 s2,s3", 0xEEB4_1A61, {
+                let mut u = empty_unit();
+                emit_vcmp(&mut u, true, 2, 3);
+                u
+            }),
+            ("vcmp.f64 d1,d2", 0xEEB4_1B42, {
+                let mut u = empty_unit();
+                emit_vcmp(&mut u, false, 1, 2);
+                u
+            }),
+            ("vcvt.f32.s32 s0,s0", 0xEEB8_0AC0, {
+                let mut u = empty_unit();
+                emit_vcvt_int_to_fp(&mut u, true, true, 0, 0);
+                u
+            }),
+            ("vcvt.f32.u32 s0,s0", 0xEEB8_0A40, {
+                let mut u = empty_unit();
+                emit_vcvt_int_to_fp(&mut u, true, false, 0, 0);
+                u
+            }),
+            ("vcvt.f64.s32 d0,s0", 0xEEB8_0BC0, {
+                let mut u = empty_unit();
+                emit_vcvt_int_to_fp(&mut u, false, true, 0, 0);
+                u
+            }),
+            ("vcvt.f32.s32 s0,s5", 0xEEB8_0AE2, {
+                let mut u = empty_unit();
+                emit_vcvt_int_to_fp(&mut u, true, true, 0, 5);
+                u
+            }),
+            ("vcvt.s32.f32 s0,s0", 0xEEBD_0AC0, {
+                let mut u = empty_unit();
+                emit_vcvt_fp_to_int(&mut u, true, true, 0, 0);
+                u
+            }),
+            ("vcvt.u32.f32 s0,s0", 0xEEBC_0AC0, {
+                let mut u = empty_unit();
+                emit_vcvt_fp_to_int(&mut u, true, false, 0, 0);
+                u
+            }),
+            ("vcvt.s32.f64 s0,d0", 0xEEBD_0BC0, {
+                let mut u = empty_unit();
+                emit_vcvt_fp_to_int(&mut u, false, true, 0, 0);
+                u
+            }),
+            ("vcvt.f32.f64 s0,d0", 0xEEB7_0BC0, {
+                let mut u = empty_unit();
+                emit_vcvt_fp_to_fp(&mut u, true, 0, 0);
+                u
+            }),
+            ("vcvt.f64.f32 d0,s0", 0xEEB7_0AC0, {
+                let mut u = empty_unit();
+                emit_vcvt_fp_to_fp(&mut u, false, 0, 0);
+                u
+            }),
+        ];
+        for (label, expect, unit) in cases {
+            assert_eq!(word(&unit), expect, "{label}");
         }
     }
 
@@ -2432,6 +2983,21 @@ fn check_register_pressure(func: &SsaFunction) {
     WIDE_VALUES.with(|w| {
         w.borrow_mut().clear();
         w.borrow_mut().extend(wide.iter().copied());
+    });
+    CONSTS.with(|c| {
+        let mut map = c.borrow_mut();
+        map.clear();
+        for block in &func.blocks {
+            for instr in &block.instrs {
+                if let SsaInstr::Const {
+                    result,
+                    value: SsaConst::Int(i),
+                } = instr
+                {
+                    map.insert(result.id(), *i);
+                }
+            }
+        }
     });
     REG_MAP.with(|m| {
         let mut map = m.borrow_mut();
