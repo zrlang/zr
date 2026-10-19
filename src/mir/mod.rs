@@ -94,6 +94,9 @@ pub enum MirInstr {
     /// `template` 是模板字符串，`operands` 包含输入和输出操作数。
     /// 这是一个语句（无结果值），但有副作用，不可被消除或重排。
     Asm {
+        /// 结果变量名（用于 SSA，虽然汇编本身不产生值，但 SSA 形式需要名字）。
+        name: String,
+        /// 模板字符串，如 `"add {0}, {1}"`。
         template: String,
         /// 输出操作数：`out(reg) expr` -> (constraint, expr)
         outputs: Vec<(String, MirValue)>,
