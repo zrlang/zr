@@ -10,6 +10,7 @@ use crate::mir::{
     MirBasicBlock, MirBinaryOp, MirFunction, MirInstr, MirParam, MirTerminator, MirUnaryOp,
     MirValue, NumTy,
 };
+use crate::parser::AsmOperand;
 use crate::typeck::hir::{self, HirBlock, HirConst, HirExpr, HirFunction, HirStmt};
 use std::collections::{HashMap, HashSet};
 
@@ -164,13 +165,6 @@ fn lower_expr(b: &mut Builder, expr: &HirExpr) -> MirValue {
                         .instrs
                         .push(MirInstr::Store(addr, v, ty));
                     MirValue::Unit
-                }
-                _ => {
-                    let target = format!("t{}", b.temp_id());
-                    b.current_block_mut()
-                        .instrs
-                        .push(MirInstr::Assign(target.clone(), v));
-                    MirValue::Var(target)
                 }
             }
         }
@@ -381,6 +375,22 @@ fn lower_expr(b: &mut Builder, expr: &HirExpr) -> MirValue {
             Index(recv, idx) => lower_index_addr(b, recv, idx, &place.ty),
             _ => MirValue::Unit,
         },
+        hir::ExprKind::Asm { template, outputs: _, inputs } => {
+            // 内联汇编：评估输入操作数，发射 Asm 指令
+            // 输出操作数是写入位置，不需要评估表达式（它们是目标位置）
+            // 输入操作数需要评估
+            let mut inputs = Vec::new();
+            for inp in inputs {
+                let v = lower_expr(b, &inp.expr);
+                inputs.push((inp.constraint.clone(), v));
+            }
+            b.current_block_mut().instrs.push(MirInstr::Asm {
+                template: template.clone(),
+                outputs: Vec::new(), // 输出位置在代码生成时确定
+                inputs,
+            });
+            MirValue::Unit
+        }
         _ => {
             // 其他表达式（Match/For/Struct 等）骨架阶段降级为占位
             MirValue::Unit

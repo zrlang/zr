@@ -1090,6 +1090,10 @@ fn emit_instr(unit: &mut CompilationUnit, instr: &SsaInstr) {
                 emit_lea_slot(unit, alloc_reg(*result), slot);
             }
         }
+        SsaInstr::Asm { .. } => {
+            // 内联汇编：暂不支持，占位
+            todo!("inline asm codegen for x86_64");
+        }
         SsaInstr::Var { .. } => {
             // Var 是 φ 合并前的引用，运行时无需动作
         }

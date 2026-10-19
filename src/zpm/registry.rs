@@ -300,11 +300,44 @@ fn send_response(stream: &mut TcpStream, status: u16, status_text: &str, body: &
 /// 注册中心客户端。
 pub struct RegistryClient {
     base_url: String,
+    token: Option<String>,
 }
 
 impl RegistryClient {
     pub fn new(base_url: impl Into<String>) -> Self {
-        Self { base_url: base_url.into() }
+        Self { base_url: base_url.into(), token: None }
+    }
+
+    /// 设置认证 token。
+    pub fn with_token(&mut self, token: impl Into<String>) {
+        self.token = Some(token.into());
+    }
+
+    fn request(&self, method: &str, path: &str, body: Option<String>) -> std::io::Result<String> {
+        let host = self
+            .base_url
+            .trim_start_matches("http://")
+            .trim_start_matches("https://")
+            .to_string();
+        let mut stream = TcpStream::connect(host)?;
+        let auth_header = self.token.as_ref().map(|t| format!("Authorization: Bearer {t}\r\n")).unwrap_or_default();
+        let body_bytes = body.unwrap_or_default();
+        let request = format!(
+            "{} {} HTTP/1.1\r\nHost: {}\r\n{auth_header}Content-Length: {}\r\nConnection: close\r\n\r\n{}",
+            method,
+            path,
+            self.base_url,
+            body_bytes.len(),
+            body_bytes
+        );
+        stream.write_all(request.as_bytes())?;
+        let mut response = String::new();
+        stream.read_to_string(&mut response)?;
+        if let Some(idx) = response.find("\r\n\r\n") {
+            Ok(response[idx + 4..].to_string())
+        } else {
+            Ok(response)
+        }
     }
 
     /// 列出所有包。
@@ -317,23 +350,74 @@ impl RegistryClient {
         self.get(&format!("/api/v1/crates/{}", name))
     }
 
-    fn get(&self, path: &str) -> std::io::Result<String> {
+    /// 获取特定版本信息。
+    pub fn get_version(&self, name: &str, version: &str) -> std::io::Result<String> {
+        self.get(&format!("/api/v1/crates/{}/{}", name, version))
+    }
+
+    /// 获取版本依赖。
+    pub fn get_deps(&self, name: &str, version: &str) -> std::io::Result<String> {
+        self.get(&format!("/api/v1/crates/{}/{}/deps", name, version))
+    }
+
+    /// 下载包 tarball。
+    pub fn download(&self, name: &str, version: &str) -> std::io::Result<Vec<u8>> {
         let host = self
             .base_url
             .trim_start_matches("http://")
             .trim_start_matches("https://")
             .to_string();
         let mut stream = TcpStream::connect(host)?;
-        let request = format!("GET {} HTTP/1.1\r\nHost: {}\r\nConnection: close\r\n\r\n", path, self.base_url);
+        let auth_header = self.token.as_ref().map(|t| format!("Authorization: Bearer {}\r\n", t)).unwrap_or_default();
+        let path = format!("/api/v1/crates/{}/{}/download", name, version);
+        let request = format!(
+            "GET {} HTTP/1.1\r\nHost: {}\r\n{auth_header}Connection: close\r\n\r\n",
+            path, self.base_url
+        );
         stream.write_all(request.as_bytes())?;
-        let mut response = String::new();
-        stream.read_to_string(&mut response)?;
-        // 跳过响应头
-        if let Some(idx) = response.find("\r\n\r\n") {
-            Ok(response[idx + 4..].to_string())
+        let mut response = Vec::new();
+        stream.read_to_end(&mut response)?;
+        if let Some(idx) = response.windows(4).position(|w| w == b"\r\n\r\n") {
+            Ok(response[idx + 4..].to_vec())
         } else {
             Ok(response)
         }
+    }
+
+    /// 发布新版本。
+    pub fn publish(&self, name: &str, version: &str, artifact: &[u8]) -> std::io::Result<String> {
+        self.put(&format!("/api/v1/crates/{}/{}", name, version), artifact)
+    }
+
+    fn get(&self, path: &str) -> std::io::Result<String> {
+        self.request("GET", path, None)
+    }
+
+    fn put(&self, path: &str, body: &[u8]) -> std::io::Result<String> {
+        self.request("PUT", path, Some(String::from_utf8_lossy(body).to_string()))
+    }
+
+    /// 搜索包（支持关键词查询）。
+    pub fn search(&self, query: &str, limit: usize) -> std::io::Result<String> {
+        let path = format!("/api/v1/crates?q={}&limit={}", urlencoding::encode(query), limit);
+        self.get(&path)
+    }
+}
+
+mod urlencoding {
+    pub fn encode(s: &str) -> String {
+        let mut out = String::with_capacity(s.len() * 3);
+        for c in s.chars() {
+            match c {
+                'A'..='Z' | 'a'..='z' | '0'..='9' | '-' | '_' | '.' | '~' => out.push(c),
+                ' ' => out.push('+'),
+                _ => {
+                    out.push('%');
+                    out.push_str(&format!("{:02X}", c as u32));
+                }
+            }
+        }
+        out
     }
 }
 

@@ -324,6 +324,11 @@ fn uses(instr: &SsaInstr, out: &mut Vec<SsaValue>) {
             out.push(*value);
         }
         SsaInstr::SlotAddr { .. } => {}
+        SsaInstr::Asm { inputs, .. } => {
+            for (_, v) in inputs {
+                out.push(*v);
+            }
+        }
     }
 }
 
@@ -1357,6 +1362,8 @@ fn set_result(instr: SsaInstr, new: SsaValue) -> SsaInstr {
         SsaInstr::SlotAddr { local, .. } => SsaInstr::SlotAddr { result: new, local },
         // Store 没有结果值；本函数只应被"有结果"的指令调用。原样重建即可。
         SsaInstr::Store { ptr, value, ty } => SsaInstr::Store { ptr, value, ty },
+        // Asm 没有结果值；本函数只处理有结果的指令。原样重建即可。
+        SsaInstr::Asm { .. } => instr,
     }
 }
 

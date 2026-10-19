@@ -19,6 +19,8 @@
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
+use crate::zpm::registry::{RegistryClient, RegistryState};
+
 /// 项目清单。
 #[derive(Debug, Clone, Default)]
 pub struct Manifest {
@@ -68,12 +70,41 @@ pub fn run(args: &[String]) -> Result<bool, String> {
             Ok(true)
         }
         "add" => {
-            let (name, path) = two_args(rest)?;
-            let mut m = Manifest::load(".")?;
-            m.dependencies.insert(name.clone(), path.clone());
-            m.save()?;
-            println!("added {name} -> {path}");
-            Ok(true)
+            if let Some(arg) = rest.first() {
+                if arg.contains('@') {
+                    let parts: Vec<&str> = arg.split('@').collect();
+                    if parts.len() == 2 {
+                        let name = parts[0];
+                        let version = parts[1];
+                        let registry_url = std::env::var("ZR_REGISTRY").unwrap_or_else(|_| "http://localhost:8080".into());
+                        let client = RegistryClient::new(registry_url);
+                        let artifact = client.download(name, version)
+                            .map_err(|e| format!("download failed: {e}"))?;
+                        let dep_path = format!("registry/{name}-{version}");
+                        let dep_dir = PathBuf::from(".").join(&dep_path);
+                        std::fs::create_dir_all(&dep_dir)
+                            .map_err(|e| format!("create dep dir failed: {e}"))?;
+                        std::fs::write(dep_dir.join("libout.o"), artifact)
+                            .map_err(|e| format!("write artifact failed: {e}"))?;
+                        let mut m = Manifest::load(".")?;
+                        m.dependencies.insert(name.to_string(), dep_path);
+                        m.save()?;
+                        println!("added {name}@{version} from registry");
+                        Ok(true)
+                    } else {
+                        Err("invalid format, use name@version".into())
+                    }
+                } else {
+                    let (name, path) = two_args(rest)?;
+                    let mut m = Manifest::load(".")?;
+                    m.dependencies.insert(name.clone(), path.clone());
+                    m.save()?;
+                    println!("added {name} -> {path}");
+                    Ok(true)
+                }
+            } else {
+                Err("expected <name> or <name>@<version>".into())
+            }
         }
         "remove" => {
             let (name, _) = two_args(rest)?;
@@ -125,8 +156,88 @@ pub fn run(args: &[String]) -> Result<bool, String> {
             );
             Ok(true)
         }
+        "search" => {
+            let query = rest.first().map(String::as_str).unwrap_or("");
+            let limit: usize = rest.get(1).and_then(|s| s.parse().ok()).unwrap_or(10);
+            let registry_url = std::env::var("ZR_REGISTRY").unwrap_or_else(|_| "http://localhost:8080".into());
+            let client = RegistryClient::new(registry_url);
+            let result = client.search(query, limit)
+                .map_err(|e| format!("search failed: {e}"))?;
+            println!("{}", result);
+            Ok(true)
+        }
+        "publish" => {
+            let (name, version) = two_args(rest)?;
+            let registry_url = std::env::var("ZR_REGISTRY").unwrap_or_else(|_| "http://localhost:8080".into());
+            let token = std::env::var("ZR_TOKEN").ok();
+            let mut client = RegistryClient::new(registry_url);
+            if let Some(t) = token {
+                client.with_token(t);
+            }
+            let artifact = build_artifact(&name, &version)?;
+            let result = client.publish(&name, &version, &artifact)
+                .map_err(|e| format!("publish failed: {e}"))?;
+            println!("published {name} {version}: {}", result);
+            Ok(true)
+        }
+        "fetch" => {
+            let (name, version) = two_args(rest)?;
+            let registry_url = std::env::var("ZR_REGISTRY").unwrap_or_else(|_| "http://localhost:8080".into());
+            let client = RegistryClient::new(registry_url);
+            let artifact = client.download(&name, &version)
+                .map_err(|e| format!("download failed: {e}"))?;
+            let dep_path = format!("registry/{name}-{version}");
+            let dep_dir = PathBuf::from(".").join(&dep_path);
+            std::fs::create_dir_all(&dep_dir)
+                .map_err(|e| format!("create dep dir failed: {e}"))?;
+            std::fs::write(dep_dir.join("libout.o"), artifact)
+                .map_err(|e| format!("write artifact failed: {e}"))?;
+            println!("fetched {name}@{version} to {dep_path}");
+            Ok(true)
+        }
         _ => Ok(false),
     }
+}
+
+fn build_artifact(name: &str, version: &str) -> Result<Vec<u8>, String> {
+    // 创建临时目录构建包
+    let tmp = std::env::temp_dir().join(format!("zr-publish-{}-{}", name, version));
+    if tmp.exists() {
+        std::fs::remove_dir_all(&tmp).ok();
+    }
+    std::fs::create_dir_all(&tmp).map_err(|e| format!("create tmp dir failed: {e}"))?;
+    
+    // 写入清单
+    let manifest = format!(
+        "name = \"{}\"\nversion = \"{}\"\nedition = \"2024\"\n",
+        name, version
+    );
+    std::fs::write(tmp.join("zr.toml"), manifest)
+        .map_err(|e| format!("write manifest failed: {e}"))?;
+    
+    // 写入源码（假设有 src/main.zr）
+    std::fs::create_dir_all(tmp.join("src")).map_err(|e| format!("create src failed: {e}"))?;
+    std::fs::write(tmp.join("src/main.zr"), "// library code\n")
+        .map_err(|e| format!("write main failed: {e}"))?;
+    
+    // 构建
+    let zr = std::env::current_exe().map_err(|e| format!("cannot locate zr: {e}"))?;
+    let out = tmp.join("target/libout.o");
+    std::fs::create_dir_all(tmp.join("target")).map_err(|e| format!("create target failed: {e}"))?;
+    let status = std::process::Command::new(&zr)
+        .arg(tmp.join("src/main.zr"))
+        .arg("--no-incremental")
+        .arg("-c")
+        .arg("-o")
+        .arg(&out)
+        .status()
+        .map_err(|e| format!("cannot run zr: {e}"))?;
+    if !status.success() {
+        return Err("build failed".into());
+    }
+    
+    // 读取产物
+    std::fs::read(&out).map_err(|e| format!("read artifact failed: {e}"))
 }
 
 fn two_args(rest: &[String]) -> Result<(String, String), String> {

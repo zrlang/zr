@@ -80,6 +80,9 @@ pub fn print_module(module: &SsaModule) {
                     super::SsaInstr::Var { result, name } => {
                         println!("%{} = var {}", result.id(), name)
                     }
+                    super::SsaInstr::Asm { .. } => {
+                        println!("; asm!()")
+                    }
                 }
             }
             print!("    ");

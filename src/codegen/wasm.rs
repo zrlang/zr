@@ -1042,6 +1042,9 @@ fn infer_float_widths(func: &SsaFunction) -> HashMap<u32, u8> {
                             changed = true;
                         }
                     }
+                    SsaInstr::Asm { .. } => {
+                        // 内联汇编：无浮点结果，不需要标记浮点宽度
+                    }
                     _ => {}
                 }
             }

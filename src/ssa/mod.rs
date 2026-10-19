@@ -119,6 +119,16 @@ pub enum SsaInstr {
     },
     /// 取局部变量栈槽地址：`result = &slot{local}`。
     SlotAddr { result: SsaValue, local: u32 },
+    /// 内联汇编：`asm!("template", in(reg) x, out(reg) y)`。
+    ///
+    /// 这是一个语句（无结果值），但有副作用，不可被消除或重排。
+    Asm {
+        template: String,
+        /// 输出操作数：`out(reg) expr` -> (constraint, expr)
+        outputs: Vec<(String, SsaValue)>,
+        /// 输入操作数：`in(reg) expr` -> (constraint, expr)
+        inputs: Vec<(String, SsaValue)>,
+    },
     /// 变量引用（用于 φ 函数合并前的原始变量）。
     Var { result: SsaValue, name: String },
 }
@@ -569,6 +579,14 @@ fn convert_function(func: &mir::MirFunction) -> SsaFunction {
                     });
                     // Store 不定义任何变量，也不压栈。
                 }
+            mir::MirInstr::Asm { name, template: _, outputs: _, inputs } => {
+                // 内联汇编：评估输入操作数，结果名为 name
+                for (_, v) in inputs {
+                    let _ = materialize(v, &mut instrs, &mut stacks, &next_value);
+                }
+                stacks.entry(name.clone()).or_default().push(alloc());
+                pushed.push(name.clone());
+            }
             }
         }
 
@@ -944,9 +962,9 @@ fn defined_name_set(block: &mir::MirBasicBlock) -> HashSet<String> {
             | mir::MirInstr::Await(n, _)
             | mir::MirInstr::Cast(n, ..)
             | mir::MirInstr::Load(n, ..)
-            | mir::MirInstr::SlotAddr(n, _) => Some(n.clone()),
-            // Store 不定义名字。
-            mir::MirInstr::Store(..) => None,
+            | mir::MirInstr::SlotAddr(n, _)
+            // Store、Asm 不定义名字。
+            | mir::MirInstr::Store(..) => None,
         })
         .collect()
 }
@@ -1033,6 +1051,7 @@ fn used_before_def(block: &mir::MirBasicBlock) -> Vec<String> {
             mir::MirInstr::Cast(n, ..) => Some(n),
             mir::MirInstr::Load(n, ..) => Some(n),
             mir::MirInstr::SlotAddr(n, _) => Some(n),
+            mir::MirInstr::Asm { .. } => Some(n),
             // Store 无定义。
             mir::MirInstr::Store(..) => None,
         };
@@ -1078,6 +1097,7 @@ fn defined_names(block: &mir::MirBasicBlock) -> Vec<String> {
             mir::MirInstr::Cast(n, ..) => Some(n),
             mir::MirInstr::Load(n, ..) => Some(n),
             mir::MirInstr::SlotAddr(n, _) => Some(n),
+            mir::MirInstr::Asm { .. } => None,
             mir::MirInstr::Store(..) => None,
         };
         if let Some(n) = name {

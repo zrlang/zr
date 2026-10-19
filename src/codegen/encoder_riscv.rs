@@ -1108,7 +1108,7 @@ fn assign_float_slots(func: &SsaFunction) -> usize {
                             for v in [result, lhs, rhs] {
                                 if mark(v, w, &mut floats) {
                                     changed = true;
-                                }
+}
                             }
                         } else {
                             // 比较的结果是 bool，但操作数可能都是浮点：两边互相传播
@@ -1202,8 +1202,10 @@ fn assign_float_slots(func: &SsaFunction) -> usize {
                             changed = true;
                         }
                     }
+                    SsaInstr::Asm { .. } => {
+                        // 内联汇编：无浮点结果，不需要标记浮点宽度
+                    }
                     _ => {}
-                }
             }
         }
         if !changed {
@@ -1222,6 +1224,7 @@ fn assign_float_slots(func: &SsaFunction) -> usize {
         }
     });
     count
+}
 }
 
 /// 发射一条 SSA 指令。
@@ -1345,6 +1348,10 @@ fn emit_instr(unit: &mut CompilationUnit, instr: &SsaInstr, wide: bool) {
             let rp = val_reg(unit, *ptr);
             let rs = val_reg2(unit, *value);
             emit_store_mem(unit, rp, rs, *ty, wide);
+        }
+        SsaInstr::Asm { .. } => {
+            // 内联汇编：暂不支持，占位
+            todo!("inline asm codegen for riscv");
         }
     }
 }

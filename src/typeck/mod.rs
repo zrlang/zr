@@ -1495,7 +1495,11 @@ impl TypeChecker {
                     let _ = self.check_expr(&i.expr, &Ty::Infer(InferId(0)));
                 }
                 return Ok(HirExpr {
-                    kind: ExprKind::Asm,
+                    kind: ExprKind::Asm {
+                        template: asm.template.clone(),
+                        outputs: asm.outputs.clone(),
+                        inputs: asm.inputs.clone(),
+                    },
                     ty: Ty::Unit,
                     span,
                 });

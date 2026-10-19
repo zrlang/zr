@@ -62,6 +62,13 @@ struct Formatter {
     started: bool,
     /// 上一个记号的源码行号。
     prev_end_line: usize,
+    /// 当前处于函数参数列表 / struct 字段 / enum 变体列表的深度。
+    /// 用于判断是否允许 trailing comma。
+    in_param_list_depth: usize,
+    /// 是否刚输出过左括号 `(`, `[`, `{`，用于判断是否为首个元素。
+    just_after_open_delim: bool,
+    /// 是否在 match arm 中（输出了 `=>` 后等待分支体）。
+    in_match_arm: bool,
 }
 
 impl Formatter {
@@ -80,6 +87,9 @@ impl Formatter {
             prev_blank: true,
             started: false,
             prev_end_line: 0,
+            in_param_list_depth: 0,
+            just_after_open_delim: false,
+            in_match_arm: false,
         }
     }
 
@@ -204,6 +214,48 @@ impl Formatter {
         if matches!(kind, TokenKind::RBrace) {
             self.indent = self.indent.saturating_sub(1);
         }
+
+        // 跟踪参数列表深度：进入函数参数/struct字段/enum变体列表
+        if matches!(kind, TokenKind::LParen | TokenKind::LBracket | TokenKind::LBrace) {
+            // 检查是否是函数参数列表（前面是 fn/struct/enum 或在 where 之后）
+            let is_param_list = matches!(
+                self.prev,
+                Some(TokenKind::KwFn)
+                    | Some(TokenKind::KwStruct)
+                    | Some(TokenKind::KwEnum)
+                    | Some(TokenKind::KwWhere)
+                    | Some(TokenKind::Arrow)
+                    | Some(TokenKind::KwType)
+                    | Some(TokenKind::KwImpl)
+            );
+            if is_param_list {
+                self.in_param_list_depth += 1;
+            }
+            self.just_after_open_delim = true;
+        }
+
+        // 处理逗号：在参数列表中，逗号后加空格；如果是 trailing comma（后面紧跟右括号），保留
+        if matches!(kind, TokenKind::Comma) {
+            if self.in_param_list_depth > 0 {
+                self.line.push_str(", ");
+            } else {
+                self.line.push(',');
+            }
+            // match arm 中的逗号：断行
+            if self.in_match_arm {
+                self.flush_line();
+                self.in_match_arm = false;
+            }
+            self.prev = Some(kind);
+            self.prev_is_prefix = false;
+            self.just_after_open_delim = false;
+            return;
+        }
+
+        // 处理右括号：可能结束参数列表（不含 RBrace，已单独处理）
+        let closing_param_list = self.in_param_list_depth > 0
+            && matches!(kind, TokenKind::RParen | TokenKind::RBracket);
+
         let sep = self.separator_before(&kind);
         if !self.line.is_empty() && sep {
             self.line.push(' ');
@@ -215,16 +267,40 @@ impl Formatter {
         self.prev_is_prefix =
             is_prefix_op(&kind) && !self.prev.as_ref().map(ends_expression).unwrap_or(true);
 
-        match kind {
-            // 行尾记号：立刻断行；`{` 之后进入一层缩进
-            TokenKind::Semicolon => self.flush_line(),
-            TokenKind::LBrace => {
-                self.flush_line();
-                self.indent += 1;
+        // 闭括号要先刷新当前行，然后再退一层缩进；顺序反了会导致最后一行缩进不对。
+        if matches!(kind, TokenKind::RBrace) {
+            self.flush_line();
+            self.indent = self.indent.saturating_sub(1);
+        } else {
+            match kind {
+                // 行尾记号：立刻断行；`{` 之后进入一层缩进
+                TokenKind::Semicolon => self.flush_line(),
+                TokenKind::LBrace => {
+                    self.flush_line();
+                    self.indent += 1;
+                }
+                TokenKind::RBrace => {} // 已在上面处理
+                TokenKind::Rocket => {
+                    // 进入 match arm：标记在 match arm 中，不在此处断行
+                    // 模式和 `=>` 保持在同一行，分支体跟在后面
+                    self.in_match_arm = true;
+                }
+                _ => {}
             }
-            TokenKind::RBrace => self.flush_line(),
-            _ => {}
+
+            // match arm 结束：逗号后断行
+if self.in_match_arm && matches!(kind, TokenKind::Comma) {
+                self.flush_line();
+                self.in_match_arm = false;
+            }
+        }  // 闭合 else 块
+
+        if closing_param_list {
+            if self.in_param_list_depth > 0 {
+                self.in_param_list_depth -= 1;
+            }
         }
+        self.just_after_open_delim = false;
         self.prev = Some(kind);
     }
 
@@ -261,11 +337,19 @@ impl Formatter {
         ) {
             return false;
         }
+        // `=>` 在 match arm 中：前后各一个空格
+        if matches!(kind, TokenKind::Rocket) {
+            return true;
+        }
+        // `=>` 之后不需要空格（表达式紧跟） - 改为需要空格
+        // if matches!(prev, TokenKind::Rocket) {
+        //     return false;
+        // }
         // 前缀运算符后面直接跟操作数
         if self.prev_is_prefix {
             return false;
         }
-        // 调用与分组：��数 / 右括号 / 控制关键字后��� `(` 贴左
+        // 调用与分组：操作数 / 右括号 / 控制关键字后的 `(` 贴左
         if matches!(kind, TokenKind::LParen)
             && (ends_expression(prev)
                 || matches!(
@@ -519,5 +603,19 @@ mod tests {
         let got = fmt("fn main() {\n    return 0;\n}\n\n\n");
         assert!(got.ends_with("}\n"));
         assert!(!got.ends_with("\n\n"));
+    }
+
+    #[test]
+    fn formats_match_arms() {
+        let got = fmt("fn main()->i32{match 1{1=>2,2=>3,_=>0}}");
+        assert!(got.contains("1 => 2"), "match arm spacing: {got}");
+        assert!(got.contains("2 => 3"), "match arm spacing: {got}");
+        assert!(got.contains("_ => 0"), "match arm spacing: {got}");
+    }
+
+    #[test]
+    fn trailing_comma_in_fn_params() {
+        let got = fmt("fn foo(a:i32,b:i32,)->i32{return a+b;}");
+        assert!(got.contains("a: i32, b: i32,"), "trailing comma in params: {got}");
     }
 }

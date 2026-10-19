@@ -1458,6 +1458,10 @@ fn emit_instr(unit: &mut CompilationUnit, instr: &SsaInstr) {
                 emit_store_mem(unit, p, v, *ty);
             }
         }
+        SsaInstr::Asm { .. } => {
+            // 内联汇编：暂不支持，占位
+            todo!("inline asm codegen for thumb");
+        }
     }
 }
 

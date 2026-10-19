@@ -89,6 +89,17 @@ pub enum MirInstr {
     /// 内存。这里把它固定到一块栈槽，读写走 `Load`/`Store`，`&x` 得到
     /// 槽的地址。`local` 是局部变量 id（`LocalId.0`）。
     SlotAddr(String, u32),
+    /// 内联汇编：`asm!("template", in(reg) x, out(reg) y)`。
+    ///
+    /// `template` 是模板字符串，`operands` 包含输入和输出操作数。
+    /// 这是一个语句（无结果值），但有副作用，不可被消除或重排。
+    Asm {
+        template: String,
+        /// 输出操作数：`out(reg) expr` -> (constraint, expr)
+        outputs: Vec<(String, MirValue)>,
+        /// 输入操作数：`in(reg) expr` -> (constraint, expr)
+        inputs: Vec<(String, MirValue)>,
+    },
 }
 
 /// 数值类型（只保留后端真正需要的部分）。

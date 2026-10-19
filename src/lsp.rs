@@ -137,6 +137,9 @@ impl Server {
             "textDocument/formatting" => {
                 id.map(|i| result_response(i, self.on_formatting(&params)))
             }
+            "textDocument/completion" => {
+                id.map(|i| result_response(i, self.on_completion(&params)))
+            }
             // 未知方法：按 LSP 规范回 MethodNotFound，不要让客户端一直等
             _ => id.map(|i| error_response(&i, -32601, &format!("unsupported method `{method}`"))),
         };
@@ -156,6 +159,7 @@ impl Server {
                         ("definitionProvider", Json::Bool(true)),
                         ("hoverProvider", Json::Bool(true)),
                         ("documentFormattingProvider", Json::Bool(true)),
+                        ("completionProvider", Json::Bool(true)),
                         // 增量同步：只发改动的部分，文本由客户端算好后整段送来
                         (
                             "textDocumentSync",
@@ -175,6 +179,47 @@ impl Server {
                 ),
             ]),
         )
+    }
+
+    fn on_completion(&self, params: &Json) -> Json {
+        let (Some(uri), Some(pos)) = (doc_uri(params), position_of(params)) else {
+            return Json::Arr(vec![]);
+        };
+        let Some(text) = self.docs.get(&uri) else {
+            return Json::Arr(vec![]);
+        };
+        let Some(prefix) = word_at(text, pos.0, pos.1) else {
+            return Json::Arr(vec![]);
+        };
+        let syms = symbols_of(text);
+        let items: Vec<Json> = syms
+            .into_iter()
+            .filter(|s| s.name.starts_with(&prefix))
+            .map(|s| {
+                let kind = match s.kind {
+                    kind::FUNCTION => 3, // CompletionItemKind.Function
+                    kind::CONSTANT => 14, // CompletionItemKind.Constant
+                    kind::STRUCT => 7,   // CompletionItemKind.Struct
+                    kind::ENUM => 13,    // CompletionItemKind.Enum
+                    kind::PARAMETER => 9, // CompletionItemKind.Variable
+                    _ => 1,              // CompletionItemKind.Text
+                };
+                Json::obj(vec![
+                    ("label", Json::str(&s.name)),
+                    ("kind", Json::int(kind)),
+                    ("detail", Json::str(match s.kind {
+                        kind::FUNCTION => "fn",
+                        kind::CONSTANT => "const",
+                        kind::STRUCT => "struct",
+                        kind::ENUM => "enum",
+                        kind::PARAMETER => "param",
+                        _ => "symbol",
+                    })),
+                    ("sortText", Json::str(&s.name)),
+                ])
+            })
+            .collect();
+        Json::Arr(items)
     }
 
     fn on_did_open(&mut self, params: &Json) {

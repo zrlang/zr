@@ -31,6 +31,7 @@ mod parser;
 mod pkg;
 mod ssa;
 mod typeck;
+mod zpm;
 
 use std::env;
 use std::path::Path;
@@ -94,8 +95,6 @@ fn run_fmt(cmd: &Cli, path: &str) -> ExitCode {
 }
 
 /// 记号序列（去掉注释与 EOF），用于验证格式化没有改变语义单元。
-
-/// 记号序列（去掉注释与 EOF），用于验证格式化没有改变语义单元。
 fn code_tokens(src: &str) -> Vec<lexer::TokenKind> {
     lexer::Lexer::new(src)
         .tokenize()
@@ -113,6 +112,50 @@ fn code_tokens(src: &str) -> Vec<lexer::TokenKind> {
 }
 
 const SERVER_LSP_VERSION: &str = env!("CARGO_PKG_VERSION");
+
+/// `zr build <file.zr>`：编译生成可执行文件（类似 `go build`）。
+fn run_build(cmd: &Cli, input: &str) -> ExitCode {
+    // build 与普通编译流程一致，只是输出信息不同
+    match compile(input, cmd) {
+        Ok(out_path) => {
+            eprintln!("zr: built {} -> {} ({})", input, out_path.display(), cmd.opt_level.name());
+            ExitCode::SUCCESS
+        }
+        Err(e) => {
+            eprintln!("zr: {e}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+/// `zr run <file.zr> [-- <args...>]`：编译并运行（类似 `go run`）。
+fn run_run(cmd: &Cli, input: &str) -> ExitCode {
+    match compile(input, cmd) {
+        Ok(out_path) => {
+            // 运行编译产物
+            let mut command = std::process::Command::new(&out_path);
+            command.args(&cmd.run_args);
+            match command.status() {
+                Ok(status) => {
+                    if status.success() {
+                        ExitCode::SUCCESS
+                    } else {
+                        eprintln!("zr: process exited with {}", status);
+                        ExitCode::FAILURE
+                    }
+                }
+                Err(e) => {
+                    eprintln!("zr: failed to run {}: {}", out_path.display(), e);
+                    ExitCode::FAILURE
+                }
+            }
+        }
+        Err(e) => {
+            eprintln!("zr: {e}");
+            ExitCode::FAILURE
+        }
+    }
+}
 
 fn main() -> ExitCode {
     // 语法树递归下降、类型检查、MIR 降级都是深递归。默认 8 MiB 线程栈
@@ -199,6 +242,30 @@ fn real_main() -> ExitCode {
         };
     }
 
+    // `zr build`：编译生成可执行文件（类似 `go build`）。
+    if cmd.build {
+        let input = match cmd.input.as_deref() {
+            Some(p) => p,
+            None => {
+                eprintln!("zr: build requires an input file");
+                return ExitCode::from(2);
+            }
+        };
+        return run_build(&cmd, input);
+    }
+
+    // `zr run`：编译并运行（类似 `go run`）。
+    if cmd.run {
+        let input = match cmd.input.as_deref() {
+            Some(p) => p,
+            None => {
+                eprintln!("zr: run requires an input file");
+                return ExitCode::from(2);
+            }
+        };
+        return run_run(&cmd, input);
+    }
+
     let input = match cmd.input.as_deref() {
         Some(p) => p,
         None => {
@@ -278,6 +345,12 @@ struct Cli {
     fmt: bool,
     /// `zr fmt --check`：只检查是否为规范格式，不写回文件。
     fmt_check: bool,
+    /// `zr build`：编译但不运行（类似 `go build`）。
+    build: bool,
+    /// `zr run`：编译并运行（类似 `go run`）。
+    run: bool,
+    /// `zr run` 传递给程序的参数（`--` 之后的参数）。
+    run_args: Vec<String>,
 }
 
 impl Cli {
@@ -325,6 +398,8 @@ impl Cli {
                     cli.pkg = Some(args[i + 1..].to_vec());
                     return Ok(cli);
                 }
+                "build" => cli.build = true,
+                "run" => cli.run = true,
                 "fmt" | "format" => cli.fmt = true,
                 "--check" => cli.fmt_check = true,
                 "-c" => cli.no_link = true,
@@ -341,6 +416,11 @@ impl Cli {
                 "-O3" => cli.opt_level = OptLevel::O3,
                 "-Oz" => cli.opt_level = OptLevel::Oz,
                 "-g" | "--debug" => cli.debug_info = true,
+                "--" => {
+                    // `--` 后的所有参数传给程序运行
+                    cli.run_args = args[i + 1..].iter().cloned().collect();
+                    break;
+                }
                 s if s.starts_with('-') => return Err(format!("unknown argument '{s}'")),
                 _ => {
                     if cli.input.is_some() {
@@ -351,9 +431,9 @@ impl Cli {
             }
             i += 1;
         }
-        // 无输入文件时默认显示帮助——但 `clean` / `fmt --check` 这类
+        // 无输入文件时默认显示帮助——但 `clean` / `fmt --check` / `build` / `run` 这类
         // 子命令本来就不需要输入文件，不能被这个默认值吃掉。
-        if cli.input.is_none() && !cli.clean_cache && !(cli.fmt && cli.fmt_check) {
+        if cli.input.is_none() && !cli.clean_cache && !(cli.fmt && cli.fmt_check) && !cli.build && !cli.run {
             cli.help = true;
         }
         // 没给 `-o` 就用输入文件名当输出名。少了这一步输出路径是空串，
@@ -372,11 +452,15 @@ fn print_pkg_usage() {
     println!();
     println!("    init                    Create a zr.toml in the current directory");
     println!("    add <name> <path>       Add a path dependency");
+    println!("    add <name>@<version>    Add a dependency from registry");
     println!("    remove <name>           Remove a dependency");
     println!("    list                    List dependencies");
     println!("    tree                    Print the dependency graph");
     println!("    build                   Build all dependencies in order");
     println!("    clean                   Remove build artifacts");
+    println!("    search <query> [limit]  Search packages in registry");
+    println!("    publish <name> <version> Publish package to registry");
+    println!("    fetch <name> <version>  Fetch package from registry");
 }
 
 fn print_usage(prog: &str) {
@@ -384,6 +468,16 @@ fn print_usage(prog: &str) {
     println!();
     println!("USAGE:");
     println!("    {prog} [OPTIONS] <INPUT.zr>");
+    println!("    {prog} build [OPTIONS] <INPUT.zr>");
+    println!("    {prog} run [OPTIONS] <INPUT.zr> [-- <ARGS...>]");
+    println!();
+    println!("COMMANDS:");
+    println!("    build           Compile to executable (like go build)");
+    println!("    run             Compile and run (like go run)");
+    println!("    fmt             Format source code");
+    println!("    pkg             Package manager");
+    println!("    lsp             Start language server");
+    println!("    clean           Clean incremental cache");
     println!();
     println!("OPTIONS:");
     println!("    -o <file>           Output file");
@@ -889,6 +983,9 @@ fn emit_llvm_ir(target: &Target, module: &ssa::SsaModule) -> String {
                     }
                     SsaInstr::Var { result, name } => {
                         out.push_str(&format!("  ; var {} -> %{}\n", name, result.id()));
+                    }
+                    SsaInstr::Asm { .. } => {
+                        out.push_str("  ; asm!()\n");
                     }
                 }
             }
