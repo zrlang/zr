@@ -4,7 +4,7 @@
 > 一门为系统编程而生的现代编程语言。
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](./LICENSE)
-[![Version](https://img.shields.io/badge/version-0.5.0-blue.svg)](./Cargo.toml)
+[![Version](https://img.shields.io/badge/version-0.7.0-blue.svg)](./Cargo.toml)
 [![Build](https://img.shields.io/badge/build-passing-brightgreen.svg)]()
 
 ---
@@ -284,6 +284,7 @@ cargo test                 # 全部：单元测试 + tests/cases 下的语言用
 | `23_strings` | 字符串字面量落 `.rodata`、去重、按地址比较、`str` 作实参跨调用 |
 | `24_pointers` | 字符串按字节索引 `s[i]`、取址 `&x`/`&mut x`、解引用读写 `*p`/`*p = v`（可变性校验）、指针索引 `p[i]`、指针算术 `p + n`/`n + p`/`p - q`、地址被取的局部量与循环/φ 交互、i8 符号扩展 |
 | `25_match` | 运行期 `match`：字面量臂（含负数 `-5`、bool 双字面量穷尽、char）、或模式 `1 \| 2`、guard `if`、绑定臂 `v` |
+| `26_comptime_struct` | 编译期结构体字面量、字段读写（`p.x = v`）、`comptime Point { .. }.x`、嵌套与 AST/HIR 两条求值路径 |
 
 除此之外，`tests/zr_language.rs` 里还有一个**只在宿主目标**跑的用例
 `extern_c_write_prints_string_literal`：声明 `extern "C" { fn zr_write(...); }`
@@ -992,6 +993,7 @@ zr 编译器采用经典的多阶段架构：
 - [x] `comptime` 编译期求值
   - [x] `comptime fn`：递归、编译期循环、`break`、复合赋值
   - [x] `const` 右值内联（`const SIZE: i32 = fact(5)`）
+  - [x] 结构体字面量与字段访问（构造、读字段、编译期改写 `p.x = v`）
   - [x] 终止性双闸：递归深度上限 + 求值步数预算
 - [x] 属性系统
   - [x] `#[inline(always)]` / `#[inline(never)]` 驱动内联决策
@@ -1049,8 +1051,17 @@ zr 编译器采用经典的多阶段架构：
       模型）：算术 / 比较（IEEE754 无序取假）/ 取负、int↔f32↔f64 转换
       （`as` 按向零截断）、跨函数浮点实参（整数/浮点按 psABI 分别计数）
       经 fa0-fa7 与返回值 fa0、循环 φ 电位累加；19/20/21 全绿
-- [ ] ARM32 / wasm 后端的浮点指令选择（这些目标对浮点程序**报错**
-      而非静默按整数编码）
+- [x] ARM32 后端的浮点指令选择（VFP：`vldr`/`vstr`/`vadd`/`vsub`/`vmul`/`vdiv`/
+      `vneg`/`vcmp`/`vcvt`，浮点槽不占整数寄存器分配器，实参/返回值按 AAPCS32
+      走 `s0`-`s15`/`d0`-`d7` 与 `s0`/`d0`；浮点标记按常量、二元/一元、转换、
+      调用返回值、`Copy`/`Phi` 双向传播迭代到不动点，`19_float`/`20_f32`
+      均可交叉编译到 `arm-none-eabi`）
+- [x] wasm 后端的浮点指令选择（`f32`/`f64` 常量与算术/比较/取负、转换用
+      `f32.convert_i64_s`/`i64.trunc_f64_s`/`f32.demote_f64`/`f64.promote_f32`
+      等，不再用取负占位；函数形参/返回值与局部变量按推断出的 f32/f64 位宽
+      声明，`addf` 之类跨函数浮点调用发出 `f32.add` 而非 `i64.add`）
+- [x] 修增量编译缓存键：`--wat` 与二进制产物此前共用同一指纹，编译过
+      `--wat` 后再编同名输出会命中缓存拿到 WAT 文本；指纹现已纳入该开关
 - [x] 字符串字面量落到 `.rodata`（去重、NUL 结尾，取址即取指针）
   - [x] 取址：x86-64 `lea reg,[rip+disp]`（`R_X86_64_PC32` / `X86_64_RELOC_SIGNED` /
         `IMAGE_REL_AMD64_REL32`）、AArch64 `adrp`+`add :lo12:`
@@ -1063,7 +1074,7 @@ zr 编译器采用经典的多阶段架构：
 - [x] `extern "C"` 声明接通运行时（`zr_write` / `zr_read` / `zr_exit` …）
   - [x] 外部函数声明并入函数表，参与类型检查与名称解析，调用点发未定义符号给平台链接器
   - [x] 可把字符串字面量交给 `zr_write` 输出（宿主目标经 `clang`+`libzrrt.a`）
-  - [ ] std 里的 `extern`（`std/core.zr`）随标准库编译接通
+  - [x] std 里的 `extern`（`std/core.zr`）随标准库编译接通
 - [x] 指针 / 字符串的取址、解引用与索引（最小 SSA 内存模型）
   - [x] 新指令 `Load` / `Store` / `SlotAddr`（MIR + SSA），按位宽区分有无符号
         （x86-64 `movzx`/`movsx`/`movsxd`，AArch64 `ldrb`/`ldrsb`/`ldr`…）
@@ -1078,7 +1089,7 @@ zr 编译器采用经典的多阶段架构：
   - [x] 浮点值的取址 / 解引用显式报错（后端不支持，避免"能编过但算错"）
   - [x] 解析修复：块状表达式（`if`/`while`/`for`/`loop`/`match`/`{ }`）不再作为
         二元运算的左侧——否则 `if c { }` 后跟 `*p = v` 会被误解析为乘法
-  - [ ] `str` 的真正切片表示（ptr+len）：目前 `s[i]` 无边界检查，越界是 UB
+  - [x] `str` 的真正切片表示（ptr+len）：字符串字面量携带长度，MIR/SSA 传递 ptr+len
 - [x] `match` 的运行期语义（脱糖成 if/else 链）
   - [x] 之前 `match` 只过类型检查、运行期静默算错；现在 `classify(1)` 这类
         用例真的能对上分支
@@ -1091,7 +1102,7 @@ zr 编译器采用经典的多阶段架构：
         会重复执行）；枚举 payload / tuple / 结构体 / 范围模式报"未支持"
   - [x] 或模式解析修复：早先解析器丢弃 `3 | 4` 的第二个分支（4 静默落进
         `_`，是"能编过但算错"）；现在收集为 `Pattern::Or` 展开为多条分支
-  - [x] `comptime` 的 `match` / 结构体字面量仍待做（本条只覆盖运行期）
+  - [x] `comptime` 的 `match` 支持（脱糖为 if/else 后在编译期求值）
 - [x] ARM32 / RISC-V 指针 / 内存访问（`Load`/`Store`/`SlotAddr`、指针算术、
       `s[i]`）——仅剩个别用例被字符串/宽整数特性挡住，指针机制本身已可用
       （`24_pointers` 的差距来自其中的 `isize`/str 字面量，而非内存访问）
@@ -1099,8 +1110,13 @@ zr 编译器采用经典的多阶段架构：
       RISC-V64 都用线性扫描把装不下的值溢出到栈槽（AArch64 用 x16/x17 暂存、
       x18 兼 φ 中转；ARM32 用 r9/r10/r12；溢出槽开在槽区下方）
 - [ ] 更多架构（wasm64 / Thumb-2）与平台（FreeBSD / Android / iOS）
-- [ ] 32 位目标的多字长（i64）算术
-- [ ] `comptime` 的 `match` / 结构体字面量（HIR 目前丢弃这些节点的数据）
+- [x] 32 位目标的多字长（i64）算术（ARM32 / RISC-V32 用双字 32 位指令对
+      + 栈槽实现 `add`/`sub`/`mul`/`divmod`/`shl`/`shr`/比较，寄存器分配器
+      区分 32/64 位值的溢出单元）
+- [x] `comptime` 的结构体字面量：`HirLiteral::Composite` 保留字段名/值，
+      `comptime fn` 内可构造结构体、读字段、编译期改写字段（`p.x = v`），
+      也支持 `comptime Point { .. }.x` 直接取字段；AST 与 HIR 两条求值路径
+      均覆盖（`ExprKind::Struct`/`Field` 现携带字段数据，不再被丢弃）
 - [ ] 增量编译、多线程编译
 
 ### v0.8.0（计划中） 📋

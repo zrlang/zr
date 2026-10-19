@@ -1221,10 +1221,9 @@ impl TypeChecker {
             }
             Expression::Field(receiver, name, _) => {
                 let recv = self.check_expr(receiver, &Ty::Infer(InferId(0)))?;
-                let (ty, idx) = self.check_field_access(&recv.ty, name, span)?;
-                let _ = idx;
+                let (ty, _idx) = self.check_field_access(&recv.ty, name, span)?;
                 return Ok(HirExpr {
-                    kind: ExprKind::Field(Box::new(recv)),
+                    kind: ExprKind::Field(Box::new(recv), name.clone()),
                     ty,
                     span,
                 });
@@ -1956,6 +1955,7 @@ impl TypeChecker {
             }
         };
         let mut seen = HashSet::new();
+        let mut checked: Vec<(String, HirExpr)> = Vec::with_capacity(fields.len());
         for (name, expr) in fields {
             let field_idx = field_tys.iter().position(|(n, _)| n == name);
             let idx = match field_idx {
@@ -1978,7 +1978,8 @@ impl TypeChecker {
             }
             seen.insert(name.clone());
             let fty = &field_tys[idx].1;
-            let _ = self.check_expr(expr, fty)?;
+            let checked_expr = self.check_expr(expr, fty)?;
+            checked.push((name.clone(), checked_expr));
         }
         // 检查是否有未初始化的字段（结构体字面量要求全部初始化）
         for (name, _) in &field_tys {
@@ -1992,7 +1993,7 @@ impl TypeChecker {
             }
         }
         Ok(HirExpr {
-            kind: ExprKind::Struct,
+            kind: ExprKind::Struct(checked),
             ty: Ty::Named(def_id, Vec::new()),
             span,
         })
@@ -2672,7 +2673,7 @@ impl TypeChecker {
     fn check_assignable(&self, expr: &HirExpr) -> Result<()> {
         match &expr.kind {
             ExprKind::Local(_) => Ok(()),
-            ExprKind::Field(inner) => self.check_assignable(inner),
+            ExprKind::Field(inner, _) => self.check_assignable(inner),
             // `*p = v` / `p[i] = v`：先验证写入目标本身可写。
             ExprKind::Deref(inner) => {
                 self.require_mutable_place(inner)?;
@@ -2833,6 +2834,36 @@ impl TypeChecker {
                     "value `{name}` cannot be used in compile-time context"
                 ))
                 .with_span(*span))
+            }
+
+            // `comptime Point { x: 1, y: 2 }`：字段按书写顺序求值。
+            Expression::StructInit(_, fields, _) => {
+                let mut items = Vec::with_capacity(fields.len());
+                for (name, e) in fields {
+                    items.push((name.clone(), *self.eval_const_expr(e)?));
+                }
+                Ok(Box::new(HirLiteral::Composite(items)))
+            }
+
+            // `comptime p.x`：对编译期聚合值取字段。
+            Expression::Field(base, name, span) => {
+                let value = *self.eval_const_expr(base)?;
+                match value {
+                    HirLiteral::Composite(items) => items
+                        .into_iter()
+                        .find(|(n, _)| n == name)
+                        .map(|(_, v)| Box::new(v))
+                        .ok_or_else(|| {
+                            CompileError::internal(format!(
+                                "no field `{name}` in compile-time struct value"
+                            ))
+                            .with_span(*span)
+                        }),
+                    _ => Err(CompileError::internal(
+                        "field access on a non-struct compile-time value",
+                    )
+                    .with_span(*span)),
+                }
             }
 
             _ => Err(CompileError::internal(
@@ -3472,7 +3503,7 @@ fn substitute_local(e: &mut hir::HirExpr, target: LocalId, with: &hir::HirExpr) 
         }
         ExprKind::Unary(_, v)
         | ExprKind::Assign(v, _)
-        | ExprKind::Field(v)
+        | ExprKind::Field(v, _)
         | ExprKind::Deref(v)
         | ExprKind::AddrOf(v)
         | ExprKind::Await(v)
@@ -3501,6 +3532,11 @@ fn substitute_local(e: &mut hir::HirExpr, target: LocalId, with: &hir::HirExpr) 
         ExprKind::Loop(body) => walk_block(body, target, with),
         ExprKind::Block(b) => walk_block(b, target, with),
         ExprKind::Index(_, v) => substitute_local(v, target, with),
+        ExprKind::Struct(fields) => {
+            for (_, f) in fields {
+                substitute_local(f, target, with);
+            }
+        }
         ExprKind::Comptime(_)
         | ExprKind::Literal(_)
         | ExprKind::Local(_)
@@ -3514,7 +3550,6 @@ fn substitute_local(e: &mut hir::HirExpr, target: LocalId, with: &hir::HirExpr) 
         | ExprKind::Throw
         | ExprKind::Array
         | ExprKind::Tuple
-        | ExprKind::Struct
         | ExprKind::Closure
         | ExprKind::Asm
         | ExprKind::Yield
@@ -3654,6 +3689,9 @@ fn const_literal_ty(lit: &HirLiteral) -> Ty {
         HirLiteral::Bool(_) => Ty::Bool,
         HirLiteral::Char(_) => Ty::Char,
         HirLiteral::String(_) => Ty::Str,
+        // 聚合值没有可反推的命名类型；正常路径下结构体字面量的类型
+        // 由 `check_struct_init` 给出，不会走到这里。
+        HirLiteral::Composite(_) => Ty::Unit,
     }
 }
 

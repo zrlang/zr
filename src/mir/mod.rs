@@ -145,8 +145,8 @@ pub enum MirValue {
     Unit,
     /// 命名局部变量 / 参数。
     Var(String),
-    /// 编译期字符串。
-    Str(String),
+    /// 编译期字符串（内容 + 长度）。
+    Str { content: String, len: usize },
 }
 
 /// MIR 二元运算。

@@ -177,8 +177,8 @@ pub enum ExprKind {
         args: Vec<HirExpr>,
         result: LocalId,
     },
-    /// 字段访问（含元组索引）。
-    Field(Box<HirExpr>),
+    /// 字段访问（含元组索引）。字段名在类型检查时解析，编译期求值靠它取值。
+    Field(Box<HirExpr>, String),
     /// 解引用。
     Deref(Box<HirExpr>),
     /// 取地址（`&place`）。操作数必须保留：MIR 要靠它算出被取址的位置。
@@ -219,8 +219,8 @@ pub enum ExprKind {
     Array,
     /// 元组字面量。
     Tuple,
-    /// 结构体字面量（字段顺序已按定义重排）。
-    Struct,
+    /// 结构体字面量：字段按源码书写顺序保存。
+    Struct(Vec<(String, HirExpr)>),
     /// Lambda / 闭包（已确定捕获列表与类型）。
     Closure,
     /// 类型转换 `Cast(操作数, 目标类型)`。
@@ -252,6 +252,10 @@ pub enum HirLiteral {
     String(String),
     Char(char),
     Bool(bool),
+    /// 聚合值（编译期结构体字面量）：字段按书写顺序的 `(名字, 值)`。
+    ///
+    /// 只在编译期求值内部存在；若它逃逸到 MIR，说明结构体没有被折叠掉。
+    Composite(Vec<(String, HirLiteral)>),
 }
 
 impl PartialEq for HirLiteral {
@@ -262,6 +266,12 @@ impl PartialEq for HirLiteral {
             (HirLiteral::String(a), HirLiteral::String(b)) => a == b,
             (HirLiteral::Char(a), HirLiteral::Char(b)) => a == b,
             (HirLiteral::Bool(a), HirLiteral::Bool(b)) => a == b,
+            (HirLiteral::Composite(a), HirLiteral::Composite(b)) => {
+                a.len() == b.len()
+                    && a.iter()
+                        .zip(b.iter())
+                        .all(|((na, va), (nb, vb))| na == nb && va == vb)
+            }
             _ => false,
         }
     }

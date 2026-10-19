@@ -1,0 +1,65 @@
+//=============================================================================
+// tests/cases/26_comptime_struct.zr — 编译期结构体字面量与字段访问
+//
+// 覆盖：`comptime fn` 内部构造结构体、读取字段、编译期改写字段
+// (`p.x = v`)，以及 `comptime Point { .. }.field` 直接取字段。
+//
+// 这是回归用例。此前 HIR/AST 求值器都不认识结构体字面量与字段表达式，
+// 任何在 comptime 里构造结构体并读字段的代码都会报
+// "expression is not a compile-time constant"。
+//=============================================================================
+
+struct Point {
+    x: i32,
+    y: i32,
+}
+
+// 构造 + 读字段
+comptime fn sum_point() -> i32 {
+    let p = Point { x: 3, y: 4 };
+    return p.x + p.y;
+}
+
+// 字段值依赖形参
+comptime fn scaled(s: i32) -> i32 {
+    let p = Point { x: s, y: s * 2 };
+    return p.x * 10 + p.y;
+}
+
+// 编译期改写字段
+comptime fn mutated() -> i32 {
+    let mut p = Point { x: 1, y: 2 };
+    p.x = 40;
+    return p.x + p.y;
+}
+
+// 嵌套：字段值本身来自另一个结构体
+comptime fn nested() -> i32 {
+    let inner = Point { x: 5, y: 6 };
+    let outer = Point { x: inner.x, y: inner.y + 1 };
+    return outer.x * 100 + outer.y;
+}
+
+// 直接对结构体字面量取字段
+const PX: i32 = comptime Point { x: 8, y: 9 }.x;
+
+fn main() -> i32 {
+    // --- comptime 调用（AST 求值路径）---
+    if comptime sum_point() != 7 { return 1; }
+    if comptime scaled(5) != 60 { return 2; }
+    if comptime mutated() != 42 { return 3; }
+    if comptime nested() != 507 { return 4; }
+
+    // --- 普通函数体里调用 comptime fn（HIR 折叠路径）---
+    let v = sum_point();
+    if v != 7 { return 5; }
+    let m = mutated();
+    if m != 42 { return 6; }
+    let n = nested();
+    if n != 507 { return 7; }
+
+    // --- 结构体字面量直接取字段 ---
+    if PX != 8 { return 8; }
+
+    return 0;
+}

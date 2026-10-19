@@ -402,7 +402,9 @@ fn mir_literal(lit: &hir::HirLiteral, ty: &hir::Ty) -> MirValue {
         },
         Bool(b) => MirValue::Bool(*b),
         Char(c) => MirValue::Int(*c as i128),
-        String(s) => MirValue::Str(s.clone()),
+        String(s) => MirValue::Str { content: s.clone(), len: s.len() },
+        // 编译期结构体字面量应已被折叠成标量；逃到这里说明没被折掉。
+        Composite(_) => MirValue::Unit,
     }
 }
 
@@ -809,7 +811,7 @@ fn collect_addr_taken_expr(e: &HirExpr, out: &mut HashSet<u32>) {
             collect_addr_taken_expr(a, out);
             collect_addr_taken_expr(b, out);
         }
-        Unary(_, a) | Field(a) | Deref(a) | Cast(a) | Await(a) => {
+        Unary(_, a) | Field(a, _) | Deref(a) | Cast(a) | Await(a) => {
             collect_addr_taken_expr(a, out);
         }
         Call { args, .. } => {

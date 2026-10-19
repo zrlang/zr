@@ -412,7 +412,18 @@ impl Parser {
     }
 
     /// 解析一个块 `{ ... }`，不消费闭合大括号。
+    ///
+    /// 进入块内恢复结构体字面量：`no_struct_literal` 只用于消解
+    /// `if cond { .. }` 顶层的歧义，块内部的 `let p = P { .. }` 不该被禁用。
     fn parse_block_contents(&mut self) -> Result<Block> {
+        let saved = self.no_struct_literal;
+        self.no_struct_literal = false;
+        let result = self.parse_block_contents_inner();
+        self.no_struct_literal = saved;
+        result
+    }
+
+    fn parse_block_contents_inner(&mut self) -> Result<Block> {
         let mut stmts = Vec::new();
         let mut tail: Option<Box<Expression>> = None;
         while !self.check(&TokenKind::RBrace) && !self.check(&TokenKind::Eof) {
@@ -451,9 +462,17 @@ impl Parser {
     }
 
     /// 解析完整块 `{ ... }`，消费闭合大括号。
+    ///
+    /// 进入块内要恢复结构体字面量：`no_struct_literal` 只用于消解
+    /// `if cond { .. }` 这类顶层歧义，块内部（如 `if comptime { let p = P { .. }; }`）
+    /// 再禁用会让合法的结构体字面量报"expected ';' after binding"。
     fn parse_block(&mut self) -> Result<Block> {
         self.consume(&TokenKind::LBrace, "expected '{' to start block")?;
-        let blk = self.parse_block_contents()?;
+        let saved = self.no_struct_literal;
+        self.no_struct_literal = false;
+        let blk = self.parse_block_contents();
+        self.no_struct_literal = saved;
+        let blk = blk?;
         self.consume(&TokenKind::RBrace, "expected '}' to close block")?;
         Ok(blk)
     }

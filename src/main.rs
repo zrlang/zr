@@ -427,12 +427,13 @@ thread_local! {
 /// 那比不缓存糟糕得多。
 fn build_salt(cmd: &Cli, target: &Target, input: &str) -> String {
     format!(
-        "v{}|{}|{:?}|{}|{}|{}",
+        "v{}|{}|{:?}|{}|{}|{}|{}",
         env!("CARGO_PKG_VERSION"),
         target.triple(),
         cmd.opt_level,
         cmd.debug_info,
         if cmd.no_link { "c" } else { "link" },
+        if cmd.wat { "wat" } else { "bin" },
         input
     )
 }

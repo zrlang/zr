@@ -14,7 +14,10 @@
 use std::collections::HashMap;
 
 use crate::codegen::target::Arch;
-use crate::ssa::{SsaBinaryOp, SsaConst, SsaFunction, SsaInstr, SsaModule, SsaUnaryOp, SsaValue};
+use crate::mir::NumTy;
+use crate::ssa::{
+    SsaBinaryOp, SsaConst, SsaFunction, SsaInstr, SsaModule, SsaTerminator, SsaUnaryOp, SsaValue,
+};
 
 // ==================================================================
 // 公共类型
@@ -25,6 +28,8 @@ use crate::ssa::{SsaBinaryOp, SsaConst, SsaFunction, SsaInstr, SsaModule, SsaUna
 pub enum WasmType {
     I32,
     I64,
+    F32,
+    F64,
 }
 
 impl WasmType {
@@ -33,14 +38,18 @@ impl WasmType {
         match self {
             WasmType::I32 => "i32",
             WasmType::I64 => "i64",
+            WasmType::F32 => "f32",
+            WasmType::F64 => "f64",
         }
     }
 
-    /// 二进制编码（`0x7F` / `0x7E`）。
+    /// 二进制编码。
     fn code(self) -> u8 {
         match self {
             WasmType::I32 => 0x7f,
             WasmType::I64 => 0x7e,
+            WasmType::F32 => 0x7d,
+            WasmType::F64 => 0x7c,
         }
     }
 }
@@ -55,11 +64,15 @@ pub enum WasmInstr {
     LocalSet(u32),
     /// 64 位常量（zr 的整数一律按 i64 建模，与原生后端一致）。
     I64Const(i64),
+    /// 32 位浮点常量。
+    F32Const(f32),
+    /// 64 位浮点常量。
+    F64Const(f64),
     /// `i32.eqz`：逻辑非（结果为 i32）。
     I32Eqz,
     /// 二元运算，参数为值类型。
     Binary(WasmType, WasmBinaryOp),
-    /// 一元运算：`i32.wrap_i64` / `i64.extend_i32_s` / `i64.extend_i32_u`。
+    /// 一元运算：`i32.wrap_i64` / `i64.extend_i32_s` / `i64.extend_i32_u` / `f32.neg` / `f64.neg` / `f32.abs` / `f64.abs` 等。
     Unary(WasmUnaryOp),
     /// `call funcidx`。
     Call(u32),
@@ -75,6 +88,54 @@ pub enum WasmUnaryOp {
     ExtendI32S,
     /// `i64.extend_i32_u`：按 32 位零扩展到 64 位。
     ExtendI32U,
+    /// `f32.neg`：单精度取负。
+    F32Neg,
+    /// `f64.neg`：双精度取负。
+    F64Neg,
+    /// `f32.abs`：单精度绝对值。
+    F32Abs,
+    /// `f64.abs`：双精度绝对值。
+    F64Abs,
+    /// `f32.sqrt`：单精度平方根。
+    F32Sqrt,
+    /// `f64.sqrt`：双精度平方根。
+    F64Sqrt,
+    /// `f32.ceil`：单精度向上取整。
+    F32Ceil,
+    /// `f64.ceil`：双精度向上取整。
+    F64Ceil,
+    /// `f32.floor`：单精度向下取整。
+    F32Floor,
+    /// `f64.floor`：双精度向下取整。
+    F64Floor,
+    /// `f32.trunc`：单精度截断。
+    F32Trunc,
+    /// `f64.trunc`：双精度截断。
+    F64Trunc,
+    /// `f32.nearest`：单精度四舍五入。
+    F32Nearest,
+    /// `f64.nearest`：双精度四舍五入。
+    F64Nearest,
+    /// `i64.trunc_f32_s`：单精度浮点转有符号 64 位整数。
+    I64TruncF32S,
+    /// `i64.trunc_f32_u`：单精度浮点转无符号 64 位整数。
+    I64TruncF32U,
+    /// `i64.trunc_f64_s`：双精度浮点转有符号 64 位整数。
+    I64TruncF64S,
+    /// `i64.trunc_f64_u`：双精度浮点转无符号 64 位整数。
+    I64TruncF64U,
+    /// `f32.convert_i64_s`：有符号 64 位整数转单精度浮点。
+    F32ConvertI64S,
+    /// `f32.convert_i64_u`：无符号 64 位整数转单精度浮点。
+    F32ConvertI64U,
+    /// `f64.convert_i64_s`：有符号 64 位整数转双精度浮点。
+    F64ConvertI64S,
+    /// `f64.convert_i64_u`：无符号 64 位整数转双精度浮点。
+    F64ConvertI64U,
+    /// `f32.demote_f64`：双精度转单精度。
+    F32DemoteF64,
+    /// `f64.promote_f32`：单精度转双精度。
+    F64PromoteF32,
 }
 
 impl WasmUnaryOp {
@@ -84,18 +145,63 @@ impl WasmUnaryOp {
             WasmUnaryOp::WrapI64ToI32 => "i32.wrap_i64",
             WasmUnaryOp::ExtendI32S => "i64.extend_i32_s",
             WasmUnaryOp::ExtendI32U => "i64.extend_i32_u",
+            WasmUnaryOp::F32Neg => "f32.neg",
+            WasmUnaryOp::F64Neg => "f64.neg",
+            WasmUnaryOp::F32Abs => "f32.abs",
+            WasmUnaryOp::F64Abs => "f64.abs",
+            WasmUnaryOp::F32Sqrt => "f32.sqrt",
+            WasmUnaryOp::F64Sqrt => "f64.sqrt",
+            WasmUnaryOp::F32Ceil => "f32.ceil",
+            WasmUnaryOp::F64Ceil => "f64.ceil",
+            WasmUnaryOp::F32Floor => "f32.floor",
+            WasmUnaryOp::F64Floor => "f64.floor",
+            WasmUnaryOp::F32Trunc => "f32.trunc",
+            WasmUnaryOp::F64Trunc => "f64.trunc",
+            WasmUnaryOp::F32Nearest => "f32.nearest",
+            WasmUnaryOp::F64Nearest => "f64.nearest",
+            WasmUnaryOp::I64TruncF32S => "i64.trunc_f32_s",
+            WasmUnaryOp::I64TruncF32U => "i64.trunc_f32_u",
+            WasmUnaryOp::I64TruncF64S => "i64.trunc_f64_s",
+            WasmUnaryOp::I64TruncF64U => "i64.trunc_f64_u",
+            WasmUnaryOp::F32ConvertI64S => "f32.convert_i64_s",
+            WasmUnaryOp::F32ConvertI64U => "f32.convert_i64_u",
+            WasmUnaryOp::F64ConvertI64S => "f64.convert_i64_s",
+            WasmUnaryOp::F64ConvertI64U => "f64.convert_i64_u",
+            WasmUnaryOp::F32DemoteF64 => "f32.demote_f64",
+            WasmUnaryOp::F64PromoteF32 => "f64.promote_f32",
         }
     }
 
     /// 二进制操作码。
     fn code(self) -> u8 {
         match self {
-            // i32.wrap_i64 = 0xA7
             WasmUnaryOp::WrapI64ToI32 => 0xA7,
-            // i64.extend_i32_s = 0xAC
             WasmUnaryOp::ExtendI32S => 0xAC,
-            // i64.extend_i32_u = 0xAD
             WasmUnaryOp::ExtendI32U => 0xAD,
+            WasmUnaryOp::F32Neg => 0x8B,
+            WasmUnaryOp::F64Neg => 0x8C,
+            WasmUnaryOp::F32Abs => 0x8D,
+            WasmUnaryOp::F64Abs => 0x8E,
+            WasmUnaryOp::F32Sqrt => 0x8F,
+            WasmUnaryOp::F64Sqrt => 0x90,
+            WasmUnaryOp::F32Ceil => 0x91,
+            WasmUnaryOp::F64Ceil => 0x92,
+            WasmUnaryOp::F32Floor => 0x93,
+            WasmUnaryOp::F64Floor => 0x94,
+            WasmUnaryOp::F32Trunc => 0x95,
+            WasmUnaryOp::F64Trunc => 0x96,
+            WasmUnaryOp::F32Nearest => 0x97,
+            WasmUnaryOp::F64Nearest => 0x98,
+            WasmUnaryOp::I64TruncF32S => 0xAE,
+            WasmUnaryOp::I64TruncF32U => 0xAF,
+            WasmUnaryOp::I64TruncF64S => 0xB0,
+            WasmUnaryOp::I64TruncF64U => 0xB1,
+            WasmUnaryOp::F32ConvertI64S => 0xB4,
+            WasmUnaryOp::F32ConvertI64U => 0xB5,
+            WasmUnaryOp::F64ConvertI64S => 0xB9,
+            WasmUnaryOp::F64ConvertI64U => 0xBA,
+            WasmUnaryOp::F32DemoteF64 => 0xB6,
+            WasmUnaryOp::F64PromoteF32 => 0xBB,
         }
     }
 }
@@ -103,6 +209,7 @@ impl WasmUnaryOp {
 /// 二元运算符。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WasmBinaryOp {
+    // 整数运算
     Add,
     Sub,
     Mul,
@@ -119,6 +226,23 @@ pub enum WasmBinaryOp {
     GtS,
     LeS,
     GeS,
+    // 浮点运算
+    FAdd,
+    FSub,
+    FMul,
+    FDiv,
+    // 浮点比较
+    FEq,
+    FNe,
+    FLt,
+    FGt,
+    FLe,
+    FGe,
+    // 浮点最小/最大
+    FMin,
+    FMax,
+    // 浮点复制符号
+    FCopysign,
 }
 
 impl WasmBinaryOp {
@@ -128,6 +252,8 @@ impl WasmBinaryOp {
         let suffix = match ty {
             WasmType::I32 => "i32",
             WasmType::I64 => "i64",
+            WasmType::F32 => "f32",
+            WasmType::F64 => "f64",
         };
         let op = match self {
             Add => "add",
@@ -146,6 +272,19 @@ impl WasmBinaryOp {
             GtS => "gt_s",
             LeS => "le_s",
             GeS => "ge_s",
+            FAdd => "add",
+            FSub => "sub",
+            FMul => "mul",
+            FDiv => "div",
+            FEq => "eq",
+            FNe => "ne",
+            FLt => "lt",
+            FGt => "gt",
+            FLe => "le",
+            FGe => "ge",
+            FMin => "min",
+            FMax => "max",
+            FCopysign => "copysign",
         };
         format!("{suffix}.{op}")
     }
@@ -154,6 +293,7 @@ impl WasmBinaryOp {
     fn code(self) -> u8 {
         use WasmBinaryOp::*;
         match self {
+            // Integer ops
             Eq => 0x46,
             Ne => 0x47,
             LtS => 0x48,
@@ -170,6 +310,20 @@ impl WasmBinaryOp {
             Xor => 0x73,
             Shl => 0x74,
             ShrS => 0x75,
+            // Float ops (type is encoded in the opcode prefix)
+            FAdd => 0x92,
+            FSub => 0x93,
+            FMul => 0x94,
+            FDiv => 0x95,
+            FEq => 0x5B,
+            FNe => 0x5C,
+            FLt => 0x5D,
+            FGt => 0x5E,
+            FLe => 0x5F,
+            FGe => 0x60,
+            FMin => 0x99,
+            FMax => 0x9A,
+            FCopysign => 0x9B,
         }
     }
 }
@@ -402,6 +556,8 @@ impl WasmInstr {
             WasmInstr::LocalGet(i) => format!("local.get {i}"),
             WasmInstr::LocalSet(i) => format!("local.set {i}"),
             WasmInstr::I64Const(v) => format!("i64.const {v}"),
+            WasmInstr::F32Const(f) => format!("f32.const {f}"),
+            WasmInstr::F64Const(f) => format!("f64.const {f}"),
             WasmInstr::I32Eqz => "i32.eqz".to_string(),
             WasmInstr::Binary(ty, op) => op.wat(*ty),
             WasmInstr::Unary(op) => op.wat().to_string(),
@@ -414,8 +570,16 @@ impl WasmInstr {
 impl WasmFunction {
     /// 从 SSA 函数构建 WASM 函数。
     pub fn from_ssa(func: &SsaFunction) -> Self {
-        let params = vec![WasmType::I64; func.params.len()];
-        let results = vec![WasmType::I64];
+        let float_widths = infer_float_widths(func);
+        let wasm_ty = |id: u32| match float_widths.get(&id) {
+            Some(32) => WasmType::F32,
+            Some(_) => WasmType::F64,
+            None => WasmType::I64,
+        };
+
+        let params: Vec<WasmType> = func.params.iter().map(|p| wasm_ty(p.id())).collect();
+        // 返回类型取最后一个 `Return` 值；找不到浮点信息时退回 i64。
+        let results = vec![return_wasm_ty(func, &wasm_ty)];
 
         let mut local_map: HashMap<u32, u32> = HashMap::new();
         let mut locals: Vec<WasmType> = Vec::new();
@@ -428,6 +592,12 @@ impl WasmFunction {
 
         let mut body = Vec::new();
         let mut pending_calls: Vec<(usize, String)> = Vec::new();
+        let mut value_ty_map: HashMap<u32, WasmType> = HashMap::new();
+
+        // 预设参数类型
+        for p in &func.params {
+            value_ty_map.insert(p.id(), wasm_ty(p.id()));
+        }
 
         for block in &func.blocks {
             for instr in &block.instrs {
@@ -440,18 +610,48 @@ impl WasmFunction {
                         ..
                     } => {
                         let idx =
-                            ensure_local(result, &mut local_map, &mut locals, &mut next_local);
-                        // 值统一按 i64 局部变量存放，所以窄化转换就是
-                        // "截到 32 位，再按目标的有无符号扩展回 64 位"——
-                        // 和原生后端的 movsx / movzx 是同一件事。
-                        body.push(WasmInstr::LocalGet(ensure_local(
-                            src,
-                            &mut local_map,
-                            &mut locals,
-                            &mut next_local,
-                        )));
+                            ensure_local(result, &mut local_map, &mut locals, &mut next_local, &float_widths);
+                        let src_idx = ensure_local(src, &mut local_map, &mut locals, &mut next_local, &float_widths);
+                        body.push(WasmInstr::LocalGet(src_idx));
                         if from.is_float() || to.is_float() {
-                            crate::codegen::unsupported_cast(*from, *to);
+                            // 浮点转换
+                            match (from, to) {
+                                // int -> float
+                                (NumTy::Int(_) | NumTy::Uint(_), NumTy::Float(w)) => {
+                                    let signed = matches!(from, NumTy::Int(_));
+                                    let is_f32 = *w == 32;
+                                    body.push(WasmInstr::Unary(match (is_f32, signed) {
+                                        (true, true) => WasmUnaryOp::F32ConvertI64S,
+                                        (true, false) => WasmUnaryOp::F32ConvertI64U,
+                                        (false, true) => WasmUnaryOp::F64ConvertI64S,
+                                        (false, false) => WasmUnaryOp::F64ConvertI64U,
+                                    }));
+                                }
+                                // float -> int
+                                (NumTy::Float(src_w), NumTy::Int(_) | NumTy::Uint(_)) => {
+                                    let signed = matches!(to, NumTy::Int(_));
+                                    let is_f32 = *src_w == 32;
+                                    body.push(WasmInstr::Unary(match (is_f32, signed) {
+                                        (true, true) => WasmUnaryOp::I64TruncF32S,
+                                        (true, false) => WasmUnaryOp::I64TruncF32U,
+                                        (false, true) => WasmUnaryOp::I64TruncF64S,
+                                        (false, false) => WasmUnaryOp::I64TruncF64U,
+                                    }));
+                                }
+                                // float -> float (f32 <-> f64)
+                                (NumTy::Float(from_w), NumTy::Float(to_w)) => {
+                                    let dst_is_f32 = *to_w == 32;
+                                    let src_is_f32 = *from_w == 32;
+                                    if src_is_f32 != dst_is_f32 {
+                                        if dst_is_f32 {
+                                            body.push(WasmInstr::Unary(WasmUnaryOp::F32DemoteF64));
+                                        } else {
+                                            body.push(WasmInstr::Unary(WasmUnaryOp::F64PromoteF32));
+                                        }
+                                    }
+                                }
+                                _ => crate::codegen::unsupported_cast(*from, *to),
+                            }
                         } else {
                             let (bits, signed) = match to {
                                 crate::mir::NumTy::Int(w) => (*w, true),
@@ -468,17 +668,38 @@ impl WasmFunction {
                             }
                         }
                         body.push(WasmInstr::LocalSet(idx));
+                        let result_ty = match to {
+                            NumTy::Int(_) | NumTy::Uint(_) => WasmType::I64,
+                            NumTy::Float(w) => if *w == 32 { WasmType::F32 } else { WasmType::F64 },
+                            _ => WasmType::I64,
+                        };
+                        value_ty_map.insert(result.id(), result_ty);
                     }
                     SsaInstr::Const { result, value } => {
                         let idx =
-                            ensure_local(result, &mut local_map, &mut locals, &mut next_local);
+                            ensure_local(result, &mut local_map, &mut locals, &mut next_local, &float_widths);
                         match value {
-                            SsaConst::Int(i) => body.push(WasmInstr::I64Const(*i as i64)),
-                            // bool / unit 在 wasm 里就是 i64 0/1；
-                            // 浮点与字符串暂未在 wasm 后端实现
-                            SsaConst::Bool(b) => body.push(WasmInstr::I64Const(i64::from(*b))),
-                            SsaConst::Unit => body.push(WasmInstr::I64Const(0)),
-                            SsaConst::Float(..) => crate::codegen::unsupported_const("float"),
+                            SsaConst::Int(i) => {
+                                body.push(WasmInstr::I64Const(*i as i64));
+                                value_ty_map.insert(result.id(), WasmType::I64);
+                            }
+                            SsaConst::Bool(b) => {
+                                body.push(WasmInstr::I64Const(i64::from(*b)));
+                                value_ty_map.insert(result.id(), WasmType::I64);
+                            }
+                            SsaConst::Unit => {
+                                body.push(WasmInstr::I64Const(0));
+                                value_ty_map.insert(result.id(), WasmType::I64);
+                            }
+                            SsaConst::Float(bits, w) => {
+                                if *w == 32 {
+                                    body.push(WasmInstr::F32Const(f32::from_bits(*bits as u32)));
+                                    value_ty_map.insert(result.id(), WasmType::F32);
+                                } else {
+                                    body.push(WasmInstr::F64Const(f64::from_bits(*bits)));
+                                    value_ty_map.insert(result.id(), WasmType::F64);
+                                }
+                            }
                             SsaConst::Str(_) => crate::codegen::unsupported_const("string"),
                         }
                         body.push(WasmInstr::LocalSet(idx));
@@ -489,17 +710,33 @@ impl WasmFunction {
                         operand,
                     } => {
                         let idx =
-                            ensure_local(result, &mut local_map, &mut locals, &mut next_local);
-                        emit_value_ref(*operand, &local_map, &mut body);
+                            ensure_local(result, &mut local_map, &mut locals, &mut next_local, &float_widths);
+                        let operand_idx = ensure_local(operand, &mut local_map, &mut locals, &mut next_local, &float_widths);
+                        body.push(WasmInstr::LocalGet(operand_idx));
+                        let op_ty = wasm_value_ty(operand, &value_ty_map);
                         match op {
                             SsaUnaryOp::Not => body.push(WasmInstr::I32Eqz),
                             SsaUnaryOp::Neg => {
-                                body.push(WasmInstr::I64Const(0));
-                                body.push(WasmInstr::Binary(WasmType::I64, WasmBinaryOp::Sub));
+                                if op_ty == WasmType::F32 {
+                                    body.push(WasmInstr::Unary(WasmUnaryOp::F32Neg));
+                                    value_ty_map.insert(result.id(), WasmType::F32);
+                                } else if op_ty == WasmType::F64 {
+                                    body.push(WasmInstr::Unary(WasmUnaryOp::F64Neg));
+                                    value_ty_map.insert(result.id(), WasmType::F64);
+                                } else {
+                                    body.push(WasmInstr::I64Const(0));
+                                    body.push(WasmInstr::Binary(WasmType::I64, WasmBinaryOp::Sub));
+                                    value_ty_map.insert(result.id(), WasmType::I64);
+                                }
                             }
                             SsaUnaryOp::BitNot => {
-                                body.push(WasmInstr::I64Const(-1));
-                                body.push(WasmInstr::Binary(WasmType::I64, WasmBinaryOp::Xor));
+                                if op_ty == WasmType::F32 || op_ty == WasmType::F64 {
+                                    crate::codegen::unsupported_const("float bitnot");
+                                } else {
+                                    body.push(WasmInstr::I64Const(-1));
+                                    body.push(WasmInstr::Binary(WasmType::I64, WasmBinaryOp::Xor));
+                                    value_ty_map.insert(result.id(), WasmType::I64);
+                                }
                             }
                         }
                         body.push(WasmInstr::LocalSet(idx));
@@ -509,50 +746,62 @@ impl WasmFunction {
                         op,
                         lhs,
                         rhs,
-                        ..
+                        ty,
                     } => {
                         let idx =
-                            ensure_local(result, &mut local_map, &mut locals, &mut next_local);
-                        emit_value_ref(*lhs, &local_map, &mut body);
-                        emit_value_ref(*rhs, &local_map, &mut body);
-                        body.push(WasmInstr::Binary(WasmType::I64, wasm_binop(*op)));
+                            ensure_local(result, &mut local_map, &mut locals, &mut next_local, &float_widths);
+                        let lhs_idx = ensure_local(lhs, &mut local_map, &mut locals, &mut next_local, &float_widths);
+                        let rhs_idx = ensure_local(rhs, &mut local_map, &mut locals, &mut next_local, &float_widths);
+                        body.push(WasmInstr::LocalGet(lhs_idx));
+                        body.push(WasmInstr::LocalGet(rhs_idx));
+                        let lhs_ty = wasm_value_ty(lhs, &value_ty_map);
+                        let rhs_ty = wasm_value_ty(rhs, &value_ty_map);
+                        let (mut res_ty, wasm_op) = wasm_binop(*op, lhs_ty, rhs_ty);
+                        // 操作数类型未知时（例如未标注的形参），用 SSA 的结果类型兜底
+                        if res_ty == WasmType::I64 {
+                            if let NumTy::Float(w) = ty {
+                                res_ty = if *w == 32 { WasmType::F32 } else { WasmType::F64 };
+                            }
+                        }
+                        body.push(WasmInstr::Binary(res_ty, wasm_op));
                         body.push(WasmInstr::LocalSet(idx));
+                        value_ty_map.insert(result.id(), res_ty);
                     }
                     SsaInstr::Call {
                         result,
                         callee,
                         args,
-                        ..
+                        ty: _,
                     } => {
                         for a in args {
                             emit_value_ref(*a, &local_map, &mut body);
                         }
-                        // 先占位，函数下标要等所有函数登记完才能确定
                         pending_calls.push((body.len(), callee.clone()));
                         body.push(WasmInstr::Call(0));
                         let idx =
-                            ensure_local(result, &mut local_map, &mut locals, &mut next_local);
+                            ensure_local(result, &mut local_map, &mut locals, &mut next_local, &float_widths);
                         body.push(WasmInstr::LocalSet(idx));
+                        value_ty_map.insert(result.id(), wasm_ty(result.id()));
                     }
                     SsaInstr::Copy { result, src } => {
                         emit_value_ref(*src, &local_map, &mut body);
                         let idx =
-                            ensure_local(result, &mut local_map, &mut locals, &mut next_local);
+                            ensure_local(result, &mut local_map, &mut locals, &mut next_local, &float_widths);
                         body.push(WasmInstr::LocalSet(idx));
+                        let src_ty = wasm_value_ty(src, &value_ty_map);
+                        value_ty_map.insert(result.id(), src_ty);
                     }
                     SsaInstr::Phi { result, .. } => {
-                        ensure_local(result, &mut local_map, &mut locals, &mut next_local);
+                        ensure_local(result, &mut local_map, &mut locals, &mut next_local, &float_widths);
                     }
                     SsaInstr::Var { result, .. } => {
-                        ensure_local(result, &mut local_map, &mut locals, &mut next_local);
+                        ensure_local(result, &mut local_map, &mut locals, &mut next_local, &float_widths);
                     }
-                    // 指针 / 内存访问：wasm 后端尚未实现。
                     SsaInstr::Load { .. } | SsaInstr::Store { .. } | SsaInstr::SlotAddr { .. } => {
                         crate::codegen::unsupported_const("pointer/memory access")
                     }
                 }
             }
-            // 终结符
             if let crate::ssa::SsaTerminator::Return(v) = &block.term {
                 match v {
                     Some(val) => emit_value_ref(*val, &local_map, &mut body),
@@ -582,26 +831,277 @@ impl WasmFunction {
     }
 }
 
+/// 推断 SSA 值是否为浮点及其位宽。
+///
+/// SSA 的形参没有类型标注，只能从使用点反推：浮点二元运算、转换、
+/// 常量、调用返回值，以及 `Copy`/`Phi` 的双向传播。反复迭代到不动点，
+/// 这样 `a + b` 里的形参即使先经过 `Copy` 也能被识别出来。
+fn infer_float_widths(func: &SsaFunction) -> HashMap<u32, u8> {
+    let mut floats: HashMap<u32, u8> = HashMap::new();
+    let width_of =
+        |v: &SsaValue, map: &HashMap<u32, u8>| -> u8 { map.get(&v.id()).copied().unwrap_or(0) };
+
+    loop {
+        let mut changed = false;
+        let mut mark = |v: &SsaValue, w: u8, map: &mut HashMap<u32, u8>| -> bool {
+            match map.get(&v.id()) {
+                Some(old) if *old >= w => false,
+                _ => {
+                    map.insert(v.id(), w);
+                    true
+                }
+            }
+        };
+
+        for block in &func.blocks {
+            for instr in &block.instrs {
+                match instr {
+                    SsaInstr::Const {
+                        result,
+                        value: SsaConst::Float(_, w),
+                    } => {
+                        if mark(result, *w, &mut floats) {
+                            changed = true;
+                        }
+                    }
+                    SsaInstr::Binary {
+                        result,
+                        ty,
+                        lhs,
+                        rhs,
+                        ..
+                    } => {
+                        if ty.is_float() {
+                            let w = match *ty {
+                                NumTy::Float(w) => w,
+                                _ => 64,
+                            };
+                            for v in [result, lhs, rhs] {
+                                if mark(v, w, &mut floats) {
+                                    changed = true;
+                                }
+                            }
+                        } else {
+                            // bool 比较：从已知的一侧把位宽传给另一侧
+                            let lw = width_of(lhs, &floats);
+                            let rw = width_of(rhs, &floats);
+                            let (unknown, w) = match (lw, rw) {
+                                (w, 0) if w > 0 => (rhs, w),
+                                (0, w) if w > 0 => (lhs, w),
+                                _ => continue,
+                            };
+                            if mark(unknown, w, &mut floats) {
+                                changed = true;
+                            }
+                        }
+                    }
+                    SsaInstr::Unary {
+                        result, operand, ..
+                    } => {
+                        if floats.contains_key(&result.id()) {
+                            let w = width_of(result, &floats);
+                            if w > 0 && mark(operand, w, &mut floats) {
+                                changed = true;
+                            }
+                        }
+                        if floats.contains_key(&operand.id()) {
+                            let w = width_of(operand, &floats);
+                            if w > 0 && mark(result, w, &mut floats) {
+                                changed = true;
+                            }
+                        }
+                    }
+                    SsaInstr::Call { result, ty, .. } => {
+                        if ty.is_float() {
+                            let w = match *ty {
+                                NumTy::Float(w) => w,
+                                _ => 64,
+                            };
+                            if mark(result, w, &mut floats) {
+                                changed = true;
+                            }
+                        }
+                    }
+                    SsaInstr::Cast {
+                        result,
+                        src,
+                        from,
+                        to,
+                    } => {
+                        if to.is_float() {
+                            let w = match *to {
+                                NumTy::Float(w) => w,
+                                _ => 64,
+                            };
+                            if mark(result, w, &mut floats) {
+                                changed = true;
+                            }
+                        }
+                        if from.is_float() {
+                            let w = match *from {
+                                NumTy::Float(w) => w,
+                                _ => 64,
+                            };
+                            if mark(src, w, &mut floats) {
+                                changed = true;
+                            }
+                        }
+                    }
+                    SsaInstr::Copy { result, src } => {
+                        if floats.contains_key(&src.id()) {
+                            let w = width_of(src, &floats);
+                            if mark(result, w, &mut floats) {
+                                changed = true;
+                            }
+                        }
+                        if floats.contains_key(&result.id()) {
+                            let w = width_of(result, &floats);
+                            if mark(src, w, &mut floats) {
+                                changed = true;
+                            }
+                        }
+                    }
+                    SsaInstr::Phi {
+                        result, incoming, ..
+                    } if incoming.iter().any(|(_, v)| floats.contains_key(&v.id())) => {
+                        let w = incoming
+                            .iter()
+                            .map(|(_, v)| width_of(v, &floats))
+                            .max()
+                            .unwrap_or(64);
+                        if mark(result, w, &mut floats) {
+                            changed = true;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+    floats
+}
+
+/// 函数返回值的 WASM 类型：扫描所有 `Return`，有浮点信息就用浮点类型。
+fn return_wasm_ty(func: &SsaFunction, wasm_ty: &impl Fn(u32) -> WasmType) -> WasmType {
+    for block in &func.blocks {
+        if let SsaTerminator::Return(Some(v)) = &block.term {
+            let ty = wasm_ty(v.id());
+            if ty != WasmType::I64 {
+                return ty;
+            }
+        }
+    }
+    WasmType::I64
+}
+
+/// 推断 SSA 值的 WASM 类型（基于 SSA 值的类型信息）。
+fn wasm_value_ty(v: &SsaValue, ty_map: &HashMap<u32, WasmType>) -> WasmType {
+    ty_map.get(&v.id()).copied().unwrap_or(WasmType::I64)
+}
+
 /// 映射 SSA 二元运算到 wasm 运算。
-fn wasm_binop(op: SsaBinaryOp) -> WasmBinaryOp {
+fn wasm_binop(op: SsaBinaryOp, lhs_ty: WasmType, rhs_ty: WasmType) -> (WasmType, WasmBinaryOp) {
     use SsaBinaryOp::*;
     match op {
-        Add => WasmBinaryOp::Add,
-        Sub => WasmBinaryOp::Sub,
-        Mul => WasmBinaryOp::Mul,
-        Div => WasmBinaryOp::DivS,
-        Rem => WasmBinaryOp::RemS,
-        And | BitAnd => WasmBinaryOp::And,
-        Or | BitOr => WasmBinaryOp::Or,
-        BitXor => WasmBinaryOp::Xor,
-        Shl => WasmBinaryOp::Shl,
-        Shr => WasmBinaryOp::ShrS,
-        Eq => WasmBinaryOp::Eq,
-        Ne => WasmBinaryOp::Ne,
-        Lt => WasmBinaryOp::LtS,
-        Gt => WasmBinaryOp::GtS,
-        Le => WasmBinaryOp::LeS,
-        Ge => WasmBinaryOp::GeS,
+        Add => {
+            if lhs_ty == WasmType::F32 || rhs_ty == WasmType::F32 {
+                (WasmType::F32, WasmBinaryOp::FAdd)
+            } else if lhs_ty == WasmType::F64 || rhs_ty == WasmType::F64 {
+                (WasmType::F64, WasmBinaryOp::FAdd)
+            } else {
+                (WasmType::I64, WasmBinaryOp::Add)
+            }
+        }
+        Sub => {
+            if lhs_ty == WasmType::F32 || rhs_ty == WasmType::F32 {
+                (WasmType::F32, WasmBinaryOp::FSub)
+            } else if lhs_ty == WasmType::F64 || rhs_ty == WasmType::F64 {
+                (WasmType::F64, WasmBinaryOp::FSub)
+            } else {
+                (WasmType::I64, WasmBinaryOp::Sub)
+            }
+        }
+        Mul => {
+            if lhs_ty == WasmType::F32 || rhs_ty == WasmType::F32 {
+                (WasmType::F32, WasmBinaryOp::FMul)
+            } else if lhs_ty == WasmType::F64 || rhs_ty == WasmType::F64 {
+                (WasmType::F64, WasmBinaryOp::FMul)
+            } else {
+                (WasmType::I64, WasmBinaryOp::Mul)
+            }
+        }
+        Div => {
+            if lhs_ty == WasmType::F32 || rhs_ty == WasmType::F32 {
+                (WasmType::F32, WasmBinaryOp::FDiv)
+            } else if lhs_ty == WasmType::F64 || rhs_ty == WasmType::F64 {
+                (WasmType::F64, WasmBinaryOp::FDiv)
+            } else {
+                (WasmType::I64, WasmBinaryOp::DivS)
+            }
+        }
+        Rem => (WasmType::I64, WasmBinaryOp::RemS),
+        And | BitAnd => (WasmType::I64, WasmBinaryOp::And),
+        Or | BitOr => (WasmType::I64, WasmBinaryOp::Or),
+        BitXor => (WasmType::I64, WasmBinaryOp::Xor),
+        Shl => (WasmType::I64, WasmBinaryOp::Shl),
+        Shr => (WasmType::I64, WasmBinaryOp::ShrS),
+        Eq => {
+            if lhs_ty == WasmType::F32 || rhs_ty == WasmType::F32 {
+                (WasmType::I32, WasmBinaryOp::FEq)
+            } else if lhs_ty == WasmType::F64 || rhs_ty == WasmType::F64 {
+                (WasmType::I32, WasmBinaryOp::FEq)
+            } else {
+                (WasmType::I32, WasmBinaryOp::Eq)
+            }
+        }
+        Ne => {
+            if lhs_ty == WasmType::F32 || rhs_ty == WasmType::F32 {
+                (WasmType::I32, WasmBinaryOp::FNe)
+            } else if lhs_ty == WasmType::F64 || rhs_ty == WasmType::F64 {
+                (WasmType::I32, WasmBinaryOp::FNe)
+            } else {
+                (WasmType::I32, WasmBinaryOp::Ne)
+            }
+        }
+        Lt => {
+            if lhs_ty == WasmType::F32 || rhs_ty == WasmType::F32 {
+                (WasmType::I32, WasmBinaryOp::FLt)
+            } else if lhs_ty == WasmType::F64 || rhs_ty == WasmType::F64 {
+                (WasmType::I32, WasmBinaryOp::FLt)
+            } else {
+                (WasmType::I32, WasmBinaryOp::LtS)
+            }
+        }
+        Gt => {
+            if lhs_ty == WasmType::F32 || rhs_ty == WasmType::F32 {
+                (WasmType::I32, WasmBinaryOp::FGt)
+            } else if lhs_ty == WasmType::F64 || rhs_ty == WasmType::F64 {
+                (WasmType::I32, WasmBinaryOp::FGt)
+            } else {
+                (WasmType::I32, WasmBinaryOp::GtS)
+            }
+        }
+        Le => {
+            if lhs_ty == WasmType::F32 || rhs_ty == WasmType::F32 {
+                (WasmType::I32, WasmBinaryOp::FLe)
+            } else if lhs_ty == WasmType::F64 || rhs_ty == WasmType::F64 {
+                (WasmType::I32, WasmBinaryOp::FLe)
+            } else {
+                (WasmType::I32, WasmBinaryOp::LeS)
+            }
+        }
+        Ge => {
+            if lhs_ty == WasmType::F32 || rhs_ty == WasmType::F32 {
+                (WasmType::I32, WasmBinaryOp::FGe)
+            } else if lhs_ty == WasmType::F64 || rhs_ty == WasmType::F64 {
+                (WasmType::I32, WasmBinaryOp::FGe)
+            } else {
+                (WasmType::I32, WasmBinaryOp::GeS)
+            }
+        }
     }
 }
 
@@ -684,11 +1184,17 @@ fn ensure_local(
     map: &mut HashMap<u32, u32>,
     locals: &mut Vec<WasmType>,
     next: &mut u32,
+    float_widths: &HashMap<u32, u8>,
 ) -> u32 {
     *map.entry(value.id()).or_insert_with(|| {
         let i = *next;
         *next += 1;
-        locals.push(WasmType::I64);
+        let ty = match float_widths.get(&value.id()) {
+            Some(32) => WasmType::F32,
+            Some(_) => WasmType::F64,
+            None => WasmType::I64,
+        };
+        locals.push(ty);
         i
     })
 }
@@ -863,10 +1369,23 @@ fn encode_instr(instr: &WasmInstr, out: &mut Vec<u8>) {
             out.push(0x42);
             sleb(*v, out);
         }
+        WasmInstr::F32Const(f) => {
+            out.push(0x43);
+            out.extend_from_slice(&f.to_le_bytes());
+        }
+        WasmInstr::F64Const(f) => {
+            out.push(0x44);
+            out.extend_from_slice(&f.to_le_bytes());
+        }
         WasmInstr::I32Eqz => out.push(0x45),
         WasmInstr::Binary(ty, op) => {
+            // 浮点操作码需要类型前缀
+            match ty {
+                WasmType::F32 => out.push(0xD2), // f32 prefix
+                WasmType::F64 => out.push(0xD3), // f64 prefix
+                _ => {}
+            }
             out.push(op.code());
-            let _ = ty; // 操作码本身已隐含类型
         }
         WasmInstr::Unary(op) => out.push(op.code()),
         WasmInstr::Call(idx) => {

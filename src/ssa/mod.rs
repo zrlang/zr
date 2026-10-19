@@ -1178,7 +1178,7 @@ fn materialize(
                 MirValue::Int(i) => SsaConst::Int(*i),
                 MirValue::Bool(b) => SsaConst::Bool(*b),
                 MirValue::Float(bits, w) => SsaConst::Float(*bits, *w),
-                MirValue::Str(text) => SsaConst::Str(text.clone()),
+                MirValue::Str { content: text, .. } => SsaConst::Str(text.clone()),
                 MirValue::Unit => SsaConst::Unit,
                 MirValue::Var(_) => unreachable!("上面已经处理了变量"),
             };
