@@ -195,20 +195,31 @@ pub fn allocate_registers(
     //
     // 例外：实地越过某次 `call` 的形参**不能**钉住——实参寄存器全是
     // caller-save，`call` 的被调用方会覆盖它们。这样的形参让常规分配
-    // 走 callee-save / 溢出。
-    let pin = pin_params.min(func.params.len()).min(pool_size);
+    // 走 callee-save / 溢出。多字长（i64）形参同样不钉：它占两个实参
+    // 寄存器、以 8 字节栈槽保存，由后端在序言里搬进槽。
     let mut pinned: HashSet<u32> = HashSet::new();
-    for (gi, &p) in func.params.iter().enumerate().take(pin) {
+    let mut gi = 0usize;
+    for &p in &func.params {
+        if gi >= pin_params || gi >= pool_size {
+            break;
+        }
         let pv = p.id();
+        if wide.contains(&pv) {
+            gi += 2;
+            continue;
+        }
         let Some(&(start, end)) = intervals.get(&pv) else {
+            gi += 1;
             continue; // 没用到的形参没有活跃区间，钉不钉都行
         };
         let spans_call = !callee_save.is_empty() && calls.iter().any(|&c| start < c && c < end);
         if spans_call {
+            gi += 1;
             continue;
         }
         out.map.insert(pv, L::Reg(gi));
         pinned.insert(pv);
+        gi += 1;
     }
 
     // 按起点排序；同起点时终点短的先放（更容易共用）。

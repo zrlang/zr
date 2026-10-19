@@ -158,6 +158,14 @@ pub enum RelocationKind {
     ArmBranchThumb,
     /// Thumb `cbz` / `cbnz`：8 位半字偏移，落在指令的 [9:2]，且只支持 r0-r3。
     ArmCbzThumb,
+    /// Thumb `movw rd, #imm16`：绝对取址对的下半（ELF `R_ARM_THM_MOVW_ABS_NC`）。
+    ///
+    /// 立即数取 `(S + A) & 0xffff`，散布在 `i`/`imm4`/`imm3`/`imm8` 四处。
+    ThumbMovwAbs,
+    /// Thumb `movt rd, #imm16`：绝对取址对的上半（ELF `R_ARM_THM_MOVT_ABS`）。
+    ///
+    /// 立即数取 `(S + A) >> 16`，与 [`RelocationKind::ThumbMovwAbs`] 成对。
+    ThumbMovtAbs,
     /// RISC-V：21 位字对齐偏移（`jal`，ELF `R_RISCV_JAL`）。
     RiscVJal,
     /// RISC-V：13 位半字对齐偏移（条件分支，ELF `R_RISCV_BRANCH`）。

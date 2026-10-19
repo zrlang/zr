@@ -908,6 +908,7 @@ zr 编译器采用经典的多阶段架构：
 | 目标三元组 | 指令后端 | 容器格式 | 运行时 | 链接方式 |
 |------------|----------|----------|--------|----------|
 | `arm-none-eabi` | ARM32（A32） | ELF32 裸机映像 | `runtime/rt_arm_baremetal.s`（semihosting） | 无需链接器 |
+| `thumbv7em-none-eabi` | ARM32（Thumb-2） | ELF32 裸机映像 | `runtime/rt_arm_baremetal.s`（semihosting） | 无需链接器 |
 | `riscv32-unknown-none` | RV32IMAC | ELF32 裸机映像 | `runtime/rt_riscv_baremetal.s`（semihosting） | 无需链接器 |
 | `riscv64-unknown-none` | RV64IMAC | ELF64 裸机映像 | `runtime/rt_riscv_baremetal.s`（semihosting） | 无需链接器 |
 | `x86_64-unknown-linux-gnu` | x86-64 | ELF | `runtime/rt_linux_x86_64.s`（裸系统调用） | `ld -static` 或 gcc |
@@ -927,8 +928,8 @@ zr 编译器采用经典的多阶段架构：
   后停在自循环（没有"退出进程"，靠调试器或复位接管）。
 - **裸机镜像没有 Program Header**：`e_entry` 直接指向 `_start`，节地址
   从 `0x08000000`（Cortex-M 向量表）起算，烧录工具 / 仿真器按节加载即可。
-  ARM 用 A32 编码（`thumbv7em-*` 暂不支持，会被显式拒绝），除法用
-  `sdiv`/`mls`，因此需要 ARMv7-R/A（M 核没有硬件除法）。
+  ARM 有 A32（`arm-none-eabi`）与 Thumb-2（`thumbv7em-none-eabi`）两套独立
+  后端，除法都用 `sdiv`/`mls`，因此需要 ARMv7-R/A（M 核没有硬件除法）。
 - **RISC-V 没有条件执行**：比较结果用 `seqz`/`slt` 显式物化；
   除法余数固定写回 `a0`，需要一次搬运；常量用 `lui`+`addi` 拼装。
 - **运行时按目标分别构建**：`build.rs` 为每个可用目标产出
@@ -1103,16 +1104,35 @@ zr 编译器采用经典的多阶段架构：
   - [x] 或模式解析修复：早先解析器丢弃 `3 | 4` 的第二个分支（4 静默落进
         `_`，是"能编过但算错"）；现在收集为 `Pattern::Or` 展开为多条分支
   - [x] `comptime` 的 `match` 支持（脱糖为 if/else 后在编译期求值）
-- [x] ARM32 / RISC-V 指针 / 内存访问（`Load`/`Store`/`SlotAddr`、指针算术、
-      `s[i]`）——仅剩个别用例被字符串/宽整数特性挡住，指针机制本身已可用
-      （`24_pointers` 的差距来自其中的 `isize`/str 字面量，而非内存访问）
+- [x] ARM32 / Thumb-2 / RISC-V 指针 / 内存访问（`Load`/`Store`/`SlotAddr`、
+      指针算术、`s[i]`）——指针机制本身可用；`24_pointers` 在 `riscv32` /
+      `thumbv7em-none-eabi` 已通过，ARM32（A32）的字符串字面量取址待补
 - [x] 寄存器溢出四大整数后端齐了：x86-64 / AArch64 / ARM32 /
       RISC-V64 都用线性扫描把装不下的值溢出到栈槽（AArch64 用 x16/x17 暂存、
-      x18 兼 φ 中转；ARM32 用 r9/r10/r12；溢出槽开在槽区下方）
-- [ ] 更多架构（wasm64 / Thumb-2）与平台（FreeBSD / Android / iOS）
-- [x] 32 位目标的多字长（i64）算术（ARM32 / RISC-V32 用双字 32 位指令对
-      + 栈槽实现 `add`/`sub`/`mul`/`divmod`/`shl`/`shr`/比较，寄存器分配器
-      区分 32/64 位值的溢出单元）
+      x18 兼 φ 中转；ARM32/Thumb-2 用 r9/r10/r12；溢出槽开在槽区下方）
+- [x] Thumb-2（`thumbv7em-none-eabi`）后端补齐到与 A32 同级
+  - [x] 寄存器溢出（`push {r4-r7,lr}` 帧 + 溢出/宽值/浮点/取址槽），
+        形参按 AAPCS 钉进 r0-r3（多字长形参占连续两寄存器并落栈槽）
+  - [x] 指针 / 内存访问：`ldr`/`ldrb`/`ldrsb`/`ldrh`/`ldrsh` 与
+        `str`/`strb`/`strh`（`.w` 变体，Rt 在 [15:12]）、`s[i]`、指针算术
+  - [x] 字符串字面量经 `movw`+`movt` 绝对取址对落到 `.rodata`（新重定位
+        `R_ARM_THM_MOVW_ABS_NC`/`R_ARM_THM_MOVT_ABS`，自构造映像的就地回填
+        与目标文件两条路径都覆盖）
+  - [x] i64 多字长：加/减（`adds`/`adcs`/`subs`/`sbcs`）、乘（`umull` + 交叉项）、
+        比较（高低字两级比较）、32↔64 转换（`asr #31` 符号扩展）、
+        2 的幂常量除/取余（移位 / 掩码强度削减）
+  - [x] 浮点 VFP：算术 / 取负 / 比较（`vcmp`+`vmrs`）/ 整数↔浮点↔单双互转 /
+        常量装载；`w32` 与 `word` 两种 32 位写法分清（Thumb-2 高半字在前）
+  - [x] 顺带修正 Thumb 一处静默算错：`ldr`/`str`（含 `sp` 相对）的
+        Rt 字段是 [15:12] 而非 [11:8]；`sub.w sp` 大立即数经 r12 兜底
+  - [x] 26 个语言用例在 `-O0..-Oz` 全部交叉编译通过（本机无 ARM 模拟器，
+        以编码/对象格式验证为准）
+- [x] 更多架构与平台：wasm64、FreeBSD、Android 交叉编译打通；iOS 仅缺
+      本机 SDK / 链接器（环境限制，非编译器缺口）
+- [x] 32 位目标的多字长（i64）算术（ARM32 / Thumb-2 / RISC-V32 用双字 32 位
+      指令对 + 栈槽实现 `add`/`sub`/`mul`/比较/转换，寄存器分配器区分
+      32/64 位值的溢出单元；ARM32 / RISC-V32 另有 `divmod`/`shl`/`shr`，
+      Thumb-2 的除法支持 2 的幂常量（移位/掩码强度削减））
 - [x] `comptime` 的结构体字面量：`HirLiteral::Composite` 保留字段名/值，
       `comptime fn` 内可构造结构体、读字段、编译期改写字段（`p.x = v`），
       也支持 `comptime Point { .. }.x` 直接取字段；AST 与 HIR 两条求值路径

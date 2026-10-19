@@ -35,6 +35,8 @@ pub fn reloc_field_size(kind: RelocationKind) -> usize {
         | RelocationKind::ArmCallThumb
         | RelocationKind::ArmBranchThumb
         | RelocationKind::ArmCbzThumb
+        | RelocationKind::ThumbMovwAbs
+        | RelocationKind::ThumbMovtAbs
         | RelocationKind::RiscVJal
         | RelocationKind::RiscVBranch
         | RelocationKind::RiscVHi20
@@ -56,6 +58,8 @@ pub fn elf_reloc_type(arch: crate::codegen::target::Arch, kind: RelocationKind) 
         (Arch::Arm32, RelocationKind::ArmCallThumb) => 28, // R_ARM_THM_CALL
         (Arch::Arm32, RelocationKind::ArmBranchThumb) => 30, // R_ARM_THM_JUMP24
         (Arch::Arm32, RelocationKind::ArmCbzThumb) => 31, // R_ARM_THM_JUMP8
+        (Arch::Arm32Thumb, RelocationKind::ThumbMovwAbs) => 47, // R_ARM_THM_MOVW_ABS_NC
+        (Arch::Arm32Thumb, RelocationKind::ThumbMovtAbs) => 48, // R_ARM_THM_MOVT_ABS
         (Arch::RiscV32 | Arch::RiscV64, RelocationKind::RiscVJal) => 17, // R_RISCV_JAL
         (Arch::RiscV32 | Arch::RiscV64, RelocationKind::RiscVBranch) => 16, // R_RISCV_BRANCH
         (Arch::RiscV32 | Arch::RiscV64, RelocationKind::RiscVHi20) => 26, // R_RISCV_HI20
@@ -276,6 +280,25 @@ pub fn apply_relocations(unit: &mut CompilationUnit, text_base: u64, rodata_base
                             .copy_from_slice(&hw2.to_le_bytes());
                     }
                 }
+            }
+            RelocationKind::ThumbMovwAbs | RelocationKind::ThumbMovtAbs => {
+                // `movw`/`movt` 绝对取址对：`movw` 装 (S+A) 低 16 位、
+                // `movt` 装高 16 位。imm16 的位散布在四个字段：
+                //   i    = imm16[11]   → [10]      imm4 = imm16[15:12] → [3:0]
+                //   imm3 = imm16[10:8] → [30:28]   imm8 = imm16[7:0]   → [23:16]
+                let full = target as u32;
+                let imm16 = match reloc.kind {
+                    RelocationKind::ThumbMovwAbs => full & 0xffff,
+                    _ => full >> 16,
+                };
+                let i = ((imm16 >> 11) & 1) << 10;
+                let imm4 = (imm16 >> 12) & 0xf;
+                let imm3 = ((imm16 >> 8) & 7) << 28;
+                let imm8 = (imm16 & 0xff) << 16;
+                patch_word(&mut unit.code, reloc, |word| {
+                    const MASK: u32 = !((1 << 10) | 0xf | (7 << 28) | (0xff << 16));
+                    (word & MASK) | i | imm4 | imm3 | imm8
+                });
             }
             RelocationKind::ArmBranch24 => {
                 // ARM：A32 执行分支时读到的 PC 是"当前指令地址 + 8"
