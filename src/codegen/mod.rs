@@ -257,29 +257,6 @@ impl CompilationUnit {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn intern_string_deduplicates_and_nul_terminates() {
-        let mut u = CompilationUnit::new();
-        let a = u.intern_string("hello");
-        let b = u.intern_string("world");
-        let c = u.intern_string("hello");
-        assert_eq!(a, ".Lstr0");
-        assert_eq!(b, ".Lstr1");
-        assert_eq!(c, a, "相同文本应共享同一个符号");
-        assert_eq!(u.rodata, b"hello\0world\0");
-
-        let s0 = u.symbols.iter().find(|s| s.name == ".Lstr0").unwrap();
-        assert_eq!(s0.section, SymbolSection::Rodata);
-        assert_eq!((s0.offset, s0.size), (0, 6));
-        let s1 = u.symbols.iter().find(|s| s.name == ".Lstr1").unwrap();
-        assert_eq!((s1.offset, s1.size), (6, 6));
-    }
-}
-
 /// 把一个 SSA 模块编译为机器码。
 ///
 /// `target` 决定指令后端（x86-64 / aarch64 / …）与入口桩的调用约定。
@@ -830,9 +807,19 @@ pub fn unsupported_binary_op(op: crate::ssa::SsaBinaryOp) -> ! {
 
 /// 目标后端没有内联汇编支持时，明确报错并终止。
 pub fn unsupported_inline_asm(target: &str) -> ! {
-    eprintln!(
-        "zr: error: inline assembly (`asm!`) is not implemented for the {target} target"
-    );
+    eprintln!("zr: error: inline assembly (`asm!`) is not implemented for the {target} target");
+    std::process::exit(1);
+}
+
+/// 目标后端没有数组 SIMD 指令选择支持时，明确报错并终止。
+pub fn unsupported_simd(target: &str) -> ! {
+    eprintln!("zr: error: SIMD array operations are not implemented for the {target} target");
+    std::process::exit(1);
+}
+
+/// 目标后端还没有函数指针/间接调用支持。
+pub fn unsupported_function_pointer(target: &str) -> ! {
+    eprintln!("zr: error: function pointers and indirect calls are not implemented for the {target} target");
     std::process::exit(1);
 }
 
@@ -860,5 +847,28 @@ pub fn num_ty_name(t: crate::mir::NumTy) -> &'static str {
         Float(32) => "f32",
         Float(_) => "f64",
         Bool => "bool",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn intern_string_deduplicates_and_nul_terminates() {
+        let mut u = CompilationUnit::new();
+        let a = u.intern_string("hello");
+        let b = u.intern_string("world");
+        let c = u.intern_string("hello");
+        assert_eq!(a, ".Lstr0");
+        assert_eq!(b, ".Lstr1");
+        assert_eq!(c, a, "相同文本应共享同一个符号");
+        assert_eq!(u.rodata, b"hello\0world\0");
+
+        let s0 = u.symbols.iter().find(|s| s.name == ".Lstr0").unwrap();
+        assert_eq!(s0.section, SymbolSection::Rodata);
+        assert_eq!((s0.offset, s0.size), (0, 6));
+        let s1 = u.symbols.iter().find(|s| s.name == ".Lstr1").unwrap();
+        assert_eq!((s1.offset, s1.size), (6, 6));
     }
 }

@@ -384,9 +384,7 @@ fn emit_shift_imm(
     rs1: Reg,
     shamt: i64,
 ) {
-    let word = ((((arith & 0x20) | ((shamt >> 5) as u32 & 1)) as u32) << 5
-        | ((shamt & 0x1f) as u32))
-        << 20
+    let word = (((arith & 0x20) | ((shamt >> 5) as u32 & 1)) << 5 | ((shamt & 0x1f) as u32)) << 20
         | (rs1.bits() as u32) << 15
         | (funct3 & 7) << 12
         | (rd.bits() as u32) << 7
@@ -581,19 +579,34 @@ fn mem_access(ty: NumTy) -> (usize, bool) {
 /// i64 values live in 8-byte stack slots (spill slot * 8 + low/high word).
 fn load_spill_hi(unit: &mut CompilationUnit, dst: Reg, slot: usize) {
     let off = (SPILL_BASE.with(|c| c.get()) + slot * 8 + 4) as i32;
-    debug_assert!((-2048..=2047).contains(&off), "溢出槽高字偏移超出 lw 立即数范围");
+    debug_assert!(
+        (-2048..=2047).contains(&off),
+        "溢出槽高字偏移超出 lw 立即数范围"
+    );
     insn(
         unit,
-        ((off as u32 & 0xfff) << 20) | (Reg::SP.bits() as u32) << 15 | (3 << 12) | (dst.bits() as u32) << 7 | 0x03,
+        ((off as u32 & 0xfff) << 20)
+            | (Reg::SP.bits() as u32) << 15
+            | (3 << 12)
+            | (dst.bits() as u32) << 7
+            | 0x03,
     );
 }
 
 fn store_spill_hi(unit: &mut CompilationUnit, src: Reg, slot: usize) {
     let off = (SPILL_BASE.with(|c| c.get()) + slot * 8 + 4) as i32;
-    debug_assert!((-2048..=2047).contains(&off), "溢出槽高字偏移超出 sw 立即数范围");
+    debug_assert!(
+        (-2048..=2047).contains(&off),
+        "溢出槽高字偏移超出 sw 立即数范围"
+    );
     insn(
         unit,
-        (((off as u32 & 0xfff) >> 5) << 25) | (src.bits() as u32) << 20 | (Reg::SP.bits() as u32) << 15 | (3 << 12) | ((off as u32 & 0x1f) << 7) | 0x23,
+        (((off as u32 & 0xfff) >> 5) << 25)
+            | (src.bits() as u32) << 20
+            | (Reg::SP.bits() as u32) << 15
+            | (3 << 12)
+            | ((off as u32 & 0x1f) << 7)
+            | 0x23,
     );
 }
 
@@ -660,21 +673,33 @@ fn emit_compare_wide(
     emit_slt(unit, SPILL_DST, SPILL_DST, SPILL_SRC2);
     // 64-bit comparison: (a_hi < b_hi) || (a_hi == b_hi && a_lo < b_lo)
     // Simplified: compare as signed 64-bit
-    emit_slt(unit, SPILL_SRC, SPILL_SRC, PHI_TMP);  // placeholder - need proper implementation
-    // For now use existing compare on low word then handle high word
+    emit_slt(unit, SPILL_SRC, SPILL_SRC, PHI_TMP); // placeholder - need proper implementation
+                                                   // For now use existing compare on low word then handle high word
     emit_compare_wide_simple(unit, result, op, SPILL_SRC, PHI_TMP);
 }
 
 /// Simplified 32-bit comparison for i64 high word (placeholder)
-fn emit_compare_wide_simple(unit: &mut CompilationUnit, result: SsaValue, op: SsaBinaryOp, a: Reg, b: Reg) {
+fn emit_compare_wide_simple(
+    unit: &mut CompilationUnit,
+    result: SsaValue,
+    op: SsaBinaryOp,
+    a: Reg,
+    b: Reg,
+) {
     let dst = out_reg(result);
     match op {
         SsaBinaryOp::Eq => emit_seqz(unit, dst, a), // placeholder
         SsaBinaryOp::Ne => emit_snez(unit, dst, a), // placeholder
         SsaBinaryOp::Lt => emit_slt(unit, dst, a, b),
         SsaBinaryOp::Gt => emit_slt(unit, dst, b, a),
-        SsaBinaryOp::Le => { emit_slt(unit, dst, b, a); emit_xori(unit, dst, dst, 1); }
-        SsaBinaryOp::Ge => { emit_slt(unit, dst, a, b); emit_xori(unit, dst, dst, 1); }
+        SsaBinaryOp::Le => {
+            emit_slt(unit, dst, b, a);
+            emit_xori(unit, dst, dst, 1);
+        }
+        SsaBinaryOp::Ge => {
+            emit_slt(unit, dst, a, b);
+            emit_xori(unit, dst, dst, 1);
+        }
         _ => {}
     }
     put_out(unit, result);
@@ -709,12 +734,7 @@ fn emit_cast_wide(
 }
 
 /// i64 乘法（暂不支持）
-fn emit_mul_wide(
-    _unit: &mut CompilationUnit,
-    _result: SsaValue,
-    _lhs: SsaValue,
-    _rhs: SsaValue,
-) {
+fn emit_mul_wide(_unit: &mut CompilationUnit, _result: SsaValue, _lhs: SsaValue, _rhs: SsaValue) {
     crate::codegen::unsupported_binary_op(SsaBinaryOp::Mul);
 }
 
@@ -726,7 +746,11 @@ fn emit_divmod_wide(
     _rhs: SsaValue,
     is_div: bool,
 ) {
-    crate::codegen::unsupported_binary_op(if is_div { SsaBinaryOp::Div } else { SsaBinaryOp::Rem });
+    crate::codegen::unsupported_binary_op(if is_div {
+        SsaBinaryOp::Div
+    } else {
+        SsaBinaryOp::Rem
+    });
 }
 
 /// i64 移位（暂不支持）
@@ -1037,28 +1061,30 @@ pub fn emit_function(target: &Target, unit: &mut CompilationUnit, func: &SsaFunc
 /// 扫出所有被取地址的局部变量，各分配一个栈槽（编号从 `base` 起）。
 /// 返回槽数；`LOCAL_SLOTS` 保存局部变量 → 槽号的映射。
 fn assign_local_slots(func: &SsaFunction, base: usize) -> usize {
-    let mut ids: Vec<u32> = Vec::new();
+    // 同一个 local id 可能出现多次；取最大的槽需求。
+    let mut locals: Vec<(u32, u32)> = Vec::new();
     for block in &func.blocks {
         for instr in &block.instrs {
-            if let SsaInstr::SlotAddr { local, .. } = instr {
-                if !ids.contains(local) {
-                    ids.push(*local);
+            if let SsaInstr::SlotAddr { local, size, .. } = instr {
+                match locals.iter_mut().find(|(id, _)| id == local) {
+                    Some((_, s)) => *s = (*s).max(*size),
+                    None => locals.push((*local, *size)),
                 }
             }
         }
     }
-    ids.sort_unstable();
-    let count = ids.len();
+    locals.sort_unstable_by_key(|(id, _)| *id);
+    let mut slots = 0usize;
     LOCAL_SLOTS.with(|m| {
         let mut map = m.borrow_mut();
         map.clear();
-        for (i, id) in ids.into_iter().enumerate() {
-            map.insert(id, base + i);
+        for (id, size) in locals {
+            map.insert(id, base + slots);
+            slots += (size.max(8) as usize).div_ceil(8);
         }
     });
-    count
+    slots
 }
-
 /// 扫出一个函数里所有浮点值，给每个值分配专属栈槽，返回槽数。
 ///
 /// 与 AArch64 后端同一套不动点算法（移植）：浮点"性"必须穿过 `Copy` 与
@@ -1109,7 +1135,7 @@ fn assign_float_slots(func: &SsaFunction) -> usize {
                             for v in [result, lhs, rhs] {
                                 if mark(v, w, &mut floats) {
                                     changed = true;
-}
+                                }
                             }
                         } else {
                             // 比较的结果是 bool，但操作数可能都是浮点：两边互相传播
@@ -1203,6 +1229,7 @@ fn assign_float_slots(func: &SsaFunction) -> usize {
                             changed = true;
                         }
                     }
+                    SsaInstr::SimdBinary { .. } => crate::codegen::unsupported_simd("riscv"),
                     SsaInstr::Asm { .. } => {
                         // 内联汇编：无浮点结果，不需要标记浮点宽度
                     }
@@ -1231,6 +1258,7 @@ fn assign_float_slots(func: &SsaFunction) -> usize {
 /// 发射一条 SSA 指令。
 fn emit_instr(unit: &mut CompilationUnit, instr: &SsaInstr, wide: bool) {
     match instr {
+        SsaInstr::SimdBinary { .. } => crate::codegen::unsupported_simd("riscv"),
         SsaInstr::Const { result, value } => match value {
             SsaConst::Int(i) => {
                 let v = *i;
@@ -1326,7 +1354,7 @@ fn emit_instr(unit: &mut CompilationUnit, instr: &SsaInstr, wide: bool) {
         }
         SsaInstr::Var { .. } => {}
         // 被取地址的局部变量的栈槽地址：`addi rd, sp, 8*slot`。
-        SsaInstr::SlotAddr { result, local } => {
+        SsaInstr::SlotAddr { result, local, .. } => {
             let slot = LOCAL_SLOTS.with(|m| m.borrow().get(local).copied().unwrap_or(0));
             let offset = (slot * 8) as i32;
             if offset > 2040 {
@@ -1351,6 +1379,9 @@ fn emit_instr(unit: &mut CompilationUnit, instr: &SsaInstr, wide: bool) {
         }
         SsaInstr::Asm { .. } => {
             crate::codegen::unsupported_inline_asm("riscv");
+        }
+        SsaInstr::FuncAddr { .. } | SsaInstr::CallIndirect { .. } => {
+            crate::codegen::unsupported_function_pointer("riscv");
         }
     }
 }
@@ -1779,6 +1810,41 @@ pub fn emit_start_wrapper(target: &Target, unit: &mut CompilationUnit) {
     });
     unit.entry = target.entry_symbol().to_string();
 }
+/// 寄存器分配。
+///
+/// 与 AArch64 同构：先用线性扫描给每个值定寄存器，`alloc_reg` 按结果走；
+/// 活跃值超过可分配寄存器数时溢出到栈槽（x86-64 同款语义），读取点经
+/// 暂存寄存器装载。
+fn check_register_pressure(func: &SsaFunction) {
+    // 跨调用存活的值只放被调用者保存的 s0-s11，否则 `jal` 返回后内容就没了。
+    // 多字长（i64）值走栈槽，不占寄存器池。
+    let wide = crate::codegen::regalloc::assign_int_widths(func);
+    let alloc = crate::codegen::regalloc::allocate_registers(
+        func,
+        ALLOCATABLE.len(),
+        &CALLEE_SAVE,
+        ARG_REGS.len(),
+        &wide,
+    );
+    REG_MAP.with(|m| {
+        let mut map = m.borrow_mut();
+        map.clear();
+        for (&v, loc) in &alloc.map {
+            if let crate::codegen::regalloc::Location::Reg(i) = loc {
+                map.insert(v, *i);
+            }
+        }
+    });
+    SPILL_SLOTS.with(|m| {
+        let mut slots = m.borrow_mut();
+        slots.clear();
+        for (&v, loc) in &alloc.map {
+            if let crate::codegen::regalloc::Location::Stack(i) = loc {
+                slots.insert(v, *i);
+            }
+        }
+    });
+}
 
 #[cfg(test)]
 mod tests {
@@ -1948,9 +2014,9 @@ mod tests {
             "sll 的 funct7 应为 0，实际：{words:08x?}"
         );
         // 操作数必须来自两个 SSA 值各自的分配寄存器
-        let rd = u32::from((word >> 7) & 0x1f);
-        let rs1 = u32::from((word >> 15) & 0x1f);
-        let rs2 = u32::from((word >> 20) & 0x1f);
+        let rd = (word >> 7) & 0x1f;
+        let rs1 = (word >> 15) & 0x1f;
+        let rs2 = (word >> 20) & 0x1f;
         assert_eq!(rd, alloc_reg(dst).bits() as u32, "目的寄存器：{words:08x?}");
         assert_eq!(rs1, alloc_reg(lhs).bits() as u32, "被移位值：{words:08x?}");
         assert_eq!(rs2, alloc_reg(rhs).bits() as u32, "移位量：{words:08x?}");
@@ -2266,39 +2332,4 @@ mod tests {
             0x00B5_2023
         );
     }
-}
-/// 寄存器分配。
-///
-/// 与 AArch64 同构：先用线性扫描给每个值定寄存器，`alloc_reg` 按结果走；
-/// 活跃值超过可分配寄存器数时溢出到栈槽（x86-64 同款语义），读取点经
-/// 暂存寄存器装载。
-fn check_register_pressure(func: &SsaFunction) {
-    // 跨调用存活的值只放被调用者保存的 s0-s11，否则 `jal` 返回后内容就没了。
-    // 多字长（i64）值走栈槽，不占寄存器池。
-    let wide = crate::codegen::regalloc::assign_int_widths(func);
-    let alloc = crate::codegen::regalloc::allocate_registers(
-        func,
-        ALLOCATABLE.len(),
-        &CALLEE_SAVE,
-        ARG_REGS.len(),
-        &wide,
-    );
-    REG_MAP.with(|m| {
-        let mut map = m.borrow_mut();
-        map.clear();
-        for (&v, loc) in &alloc.map {
-            if let crate::codegen::regalloc::Location::Reg(i) = loc {
-                map.insert(v, *i);
-            }
-        }
-    });
-    SPILL_SLOTS.with(|m| {
-        let mut slots = m.borrow_mut();
-        slots.clear();
-        for (&v, loc) in &alloc.map {
-            if let crate::codegen::regalloc::Location::Stack(i) = loc {
-                slots.insert(v, *i);
-            }
-        }
-    });
 }

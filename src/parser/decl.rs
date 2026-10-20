@@ -694,7 +694,7 @@ impl Parser {
             vec![]
         };
         self.consume(&TokenKind::LBrace, "expected '{'")?;
-        let mut _items = Vec::new();
+        let mut methods = Vec::new();
         let mut _assoc_types = Vec::new();
         while !self.check(&TokenKind::RBrace) && !self.is_at_end() {
             if self.match_kind(&TokenKind::KwType) {
@@ -707,13 +707,14 @@ impl Parser {
                 };
                 let is_async = self.match_kind(&TokenKind::KwAsync);
                 self.consume(&TokenKind::KwFn, "expected 'fn'")?;
-                _items.push(self.parse_function(visibility, vec![], is_async, false)?);
+                methods.push(self.parse_function(visibility, vec![], is_async, false)?);
             }
         }
         self.consume(&TokenKind::RBrace, "expected '}'")?;
         Ok(ImplBlock {
             target,
             trait_type,
+            methods,
             where_clause,
             span,
         })

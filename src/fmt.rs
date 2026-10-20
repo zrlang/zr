@@ -216,7 +216,10 @@ impl Formatter {
         }
 
         // 跟踪参数列表深度：进入函数参数/struct字段/enum变体列表
-        if matches!(kind, TokenKind::LParen | TokenKind::LBracket | TokenKind::LBrace) {
+        if matches!(
+            kind,
+            TokenKind::LParen | TokenKind::LBracket | TokenKind::LBrace
+        ) {
             // 检查是否是函数参数列表（前面是 fn/struct/enum 或在 where 之后）
             let is_param_list = matches!(
                 self.prev,
@@ -253,8 +256,8 @@ impl Formatter {
         }
 
         // 处理右括号：可能结束参数列表（不含 RBrace，已单独处理）
-        let closing_param_list = self.in_param_list_depth > 0
-            && matches!(kind, TokenKind::RParen | TokenKind::RBracket);
+        let closing_param_list =
+            self.in_param_list_depth > 0 && matches!(kind, TokenKind::RParen | TokenKind::RBracket);
 
         let sep = self.separator_before(&kind);
         if !self.line.is_empty() && sep {
@@ -289,16 +292,14 @@ impl Formatter {
             }
 
             // match arm 结束：逗号后断行
-if self.in_match_arm && matches!(kind, TokenKind::Comma) {
+            if self.in_match_arm && matches!(kind, TokenKind::Comma) {
                 self.flush_line();
                 self.in_match_arm = false;
             }
-        }  // 闭合 else 块
+        } // 闭合 else 块
 
-        if closing_param_list {
-            if self.in_param_list_depth > 0 {
-                self.in_param_list_depth -= 1;
-            }
+        if closing_param_list && self.in_param_list_depth > 0 {
+            self.in_param_list_depth -= 1;
         }
         self.just_after_open_delim = false;
         self.prev = Some(kind);
@@ -616,6 +617,9 @@ mod tests {
     #[test]
     fn trailing_comma_in_fn_params() {
         let got = fmt("fn foo(a:i32,b:i32,)->i32{return a+b;}");
-        assert!(got.contains("a: i32, b: i32,"), "trailing comma in params: {got}");
+        assert!(
+            got.contains("a: i32, b: i32,"),
+            "trailing comma in params: {got}"
+        );
     }
 }

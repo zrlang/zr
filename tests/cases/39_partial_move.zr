@@ -1,0 +1,90 @@
+//=============================================================================
+// tests/cases/39_partial_move.zr — Drop 结构体的字段级部分移动
+//
+// 覆盖：移出一个 Drop 字段后其余字段仍析构、嵌套路径、作为实参移动、数组
+// 元素移动，以及移出后重新赋值该字段。
+//=============================================================================
+
+struct Res {
+    id: i32,
+    log: &mut i32,
+}
+
+impl Drop for Res {
+    fn drop(&mut self) {
+        *self.log = *self.log * 10 + self.id;
+    }
+}
+
+struct Holder {
+    a: Res,
+    b: Res,
+}
+
+struct Outer {
+    inner: Holder,
+    tail: Res,
+}
+
+fn consume(r: Res) {
+    return;
+}
+
+fn main() -> i32 {
+    let mut log: i32 = 0;
+
+    {
+        let h = Holder {
+            a: Res { id: 1, log: &mut log },
+            b: Res { id: 2, log: &mut log },
+        };
+        let a = h.a;
+    }
+    if log != 12 { return 1; }
+
+    log = 0;
+    {
+        let o = Outer {
+            inner: Holder {
+                a: Res { id: 1, log: &mut log },
+                b: Res { id: 2, log: &mut log },
+            },
+            tail: Res { id: 3, log: &mut log },
+        };
+        let x = o.inner.b;
+    }
+    if log != 213 { return 2; }
+
+    log = 0;
+    {
+        let h = Holder {
+            a: Res { id: 1, log: &mut log },
+            b: Res { id: 2, log: &mut log },
+        };
+        consume(h.a);
+    }
+    if log != 12 { return 3; }
+
+    log = 0;
+    {
+        let arr = [
+            Res { id: 1, log: &mut log },
+            Res { id: 2, log: &mut log },
+        ];
+        let x = arr[0];
+    }
+    if log != 12 { return 4; }
+
+    log = 0;
+    {
+        let mut h = Holder {
+            a: Res { id: 1, log: &mut log },
+            b: Res { id: 2, log: &mut log },
+        };
+        let a = h.a;
+        h.a = Res { id: 3, log: &mut log };
+    }
+    if log != 132 { return 5; }
+
+    return 0;
+}

@@ -26,7 +26,9 @@ use crate::codegen::{
     CompilationUnit, Relocation, RelocationKind, Symbol, SymbolKind, SymbolSection,
 };
 use crate::mir::NumTy;
-use crate::ssa::{SsaBinaryOp, SsaConst, SsaFunction, SsaInstr, SsaTerminator, SsaUnaryOp, SsaValue};
+use crate::ssa::{
+    SsaBinaryOp, SsaConst, SsaFunction, SsaInstr, SsaTerminator, SsaUnaryOp, SsaValue,
+};
 
 /// 通用寄存器 r0–r15。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -161,9 +163,9 @@ fn word(unit: &mut CompilationUnit, w: u32) {
 
 /// `movw rd, #imm16`（T1）。
 fn movw(unit: &mut CompilationUnit, rd: Reg, imm: u16) {
-    let imm4 = ((imm >> 12) & 0xf) as u16;
-    let i = ((imm >> 11) & 1) as u16;
-    let imm3 = ((imm >> 8) & 0x7) as u16;
+    let imm4 = (imm >> 12) & 0xf;
+    let i = (imm >> 11) & 1;
+    let imm3 = (imm >> 8) & 0x7;
     let imm8 = imm & 0xffu16;
     w32(
         unit,
@@ -174,9 +176,9 @@ fn movw(unit: &mut CompilationUnit, rd: Reg, imm: u16) {
 
 /// `movt rd, #imm16`（T1）。与 `movw` 只差 hw1 的一个常量位。
 fn movt(unit: &mut CompilationUnit, rd: Reg, imm: u16) {
-    let imm4 = ((imm >> 12) & 0xf) as u16;
-    let i = ((imm >> 11) & 1) as u16;
-    let imm3 = ((imm >> 8) & 0x7) as u16;
+    let imm4 = (imm >> 12) & 0xf;
+    let i = (imm >> 11) & 1;
+    let imm3 = (imm >> 8) & 0x7;
     let imm8 = imm & 0xffu16;
     w32(
         unit,
@@ -469,13 +471,19 @@ fn put_out(unit: &mut CompilationUnit, v: SsaValue) {
 
 /// `ldr.w rt, [sp, #off]`（off 必须 4 字节对齐且 < 4096）。
 fn ldr_sp_imm(unit: &mut CompilationUnit, rt: Reg, off: u32) {
-    debug_assert!(off % 4 == 0 && off < 4096, "sp 相对装载偏移越界: {off}");
+    debug_assert!(
+        off.is_multiple_of(4) && off < 4096,
+        "sp 相对装载偏移越界: {off}"
+    );
     w32(unit, 0xf8d0 | 13, (rt.bits() << 12) | (off as u16 & 0xfff));
 }
 
 /// `str.w rt, [sp, #off]`。
 fn str_sp_imm(unit: &mut CompilationUnit, rt: Reg, off: u32) {
-    debug_assert!(off % 4 == 0 && off < 4096, "sp 相对存储偏移越界: {off}");
+    debug_assert!(
+        off.is_multiple_of(4) && off < 4096,
+        "sp 相对存储偏移越界: {off}"
+    );
     w32(unit, 0xf8c0 | 13, (rt.bits() << 12) | (off as u16 & 0xfff));
 }
 
@@ -500,7 +508,7 @@ fn sub_sp_imm(unit: &mut CompilationUnit, bytes: u32) {
     if bytes == 0 {
         return;
     }
-    if bytes % 4 == 0 && bytes <= 508 {
+    if bytes.is_multiple_of(4) && bytes <= 508 {
         hw(unit, 0xb080 | (bytes / 4) as u16);
     } else {
         mov_imm32(unit, SPILL_DST, bytes);
@@ -513,7 +521,7 @@ fn add_sp_imm(unit: &mut CompilationUnit, bytes: u32) {
     if bytes == 0 {
         return;
     }
-    if bytes % 4 == 0 && bytes <= 508 {
+    if bytes.is_multiple_of(4) && bytes <= 508 {
         hw(unit, 0xb000 | (bytes / 4) as u16);
     } else {
         mov_imm32(unit, SPILL_DST, bytes);
@@ -574,14 +582,22 @@ fn emit_store_mem(unit: &mut CompilationUnit, rn: Reg, rm: Reg, ty: NumTy) {
 /// `vldr s/d, [sp, #slot*8]`。
 fn emit_vldr(unit: &mut CompilationUnit, is_single: bool, reg: u8, slot: usize) {
     let imm = (slot * 2) as u32; // 偏移 = slot*8，imm8 缩放 4
-    let base = if is_single { 0xED9D_0A00u32 } else { 0xED9D_0B00u32 };
+    let base = if is_single {
+        0xED9D_0A00u32
+    } else {
+        0xED9D_0B00u32
+    };
     word(unit, base | ((reg as u32) << 12) | (imm & 0xFF));
 }
 
 /// `vstr s/d, [sp, #slot*8]`。
 fn emit_vstr(unit: &mut CompilationUnit, is_single: bool, reg: u8, slot: usize) {
     let imm = (slot * 2) as u32;
-    let base = if is_single { 0xED8D_0A00u32 } else { 0xED8D_0B00u32 };
+    let base = if is_single {
+        0xED8D_0A00u32
+    } else {
+        0xED8D_0B00u32
+    };
     word(unit, base | ((reg as u32) << 12) | (imm & 0xFF));
 }
 
@@ -621,7 +637,7 @@ fn emit_vcmp(unit: &mut CompilationUnit, is_single: bool) {
 
 /// 整数 -> 浮点：`vmov s0, rCore` 再 `vcvt.f{32,64}.{s,u}32`。
 fn emit_vcvt_int_to_fp(unit: &mut CompilationUnit, is_single: bool, signed: bool, core: Reg) {
-    word(unit, 0xEE00_0A10 | ((core.0 as u32) << 16)); // vmov s0, rCore
+    word(unit, 0xEE00_0A10 | (core.0 << 16)); // vmov s0, rCore
     let w = match (is_single, signed) {
         (true, true) => 0xEEB8_0AC0,
         (true, false) => 0xEEB8_0A40,
@@ -640,27 +656,31 @@ fn emit_vcvt_fp_to_int(unit: &mut CompilationUnit, is_single: bool, signed: bool
         (false, false) => 0xEEBC_0BC0,
     };
     word(unit, w);
-    word(unit, 0xEE10_0A10 | ((core.0 as u32) << 16)); // vmov rCore, s0
+    word(unit, 0xEE10_0A10 | (core.0 << 16)); // vmov rCore, s0
 }
 
 /// 单双精度互转：`vcvt.f32.f64` 或 `vcvt.f64.f32`。
 fn emit_vcvt_fp_to_fp(unit: &mut CompilationUnit, dst_is_single: bool) {
-    word(unit, if dst_is_single { 0xEEB7_0BC0 } else { 0xEEB7_0AC0 });
+    word(
+        unit,
+        if dst_is_single {
+            0xEEB7_0BC0
+        } else {
+            0xEEB7_0AC0
+        },
+    );
 }
 
 /// 把浮点常量装进 s0/d0（经整数寄存器中转）。
 fn emit_float_const(unit: &mut CompilationUnit, bits: u64, width: u8) {
     if width == 32 {
         mov_imm32(unit, SPILL_DST, bits as u32);
-        word(unit, 0xEE00_0A10 | ((SPILL_DST.0 as u32) << 16)); // vmov s0, r12
+        word(unit, 0xEE00_0A10 | (SPILL_DST.0 << 16)); // vmov s0, r12
     } else {
         mov_imm32(unit, SPILL_DST, bits as u32);
         mov_imm32(unit, MUL_TMP, (bits >> 32) as u32);
         // vmov d0, r12(low), r11(high)
-        word(
-            unit,
-            0xEC40_0B10 | ((MUL_TMP.0 as u32) << 16) | ((SPILL_DST.0 as u32) << 12),
-        );
+        word(unit, 0xEC40_0B10 | (MUL_TMP.0 << 16) | (SPILL_DST.0 << 12));
     }
 }
 
@@ -856,7 +876,7 @@ fn emit_mul_wide(unit: &mut CompilationUnit, result: SsaValue, lhs: SsaValue, rh
     let slot = spill_slot(result).expect("i64 乘法没有宽槽");
     wide_load_any(unit, lhs, SPILL_SRC, SPILL_SRC2); // a_lo=r9, a_hi=r10
     wide_load_any(unit, rhs, MUL_TMP, SPILL_DST); // b_lo=r11, b_hi=r12
-    // 先把 a_lo 暂存到结果槽（后面 lo 乘积会覆写 r9）。
+                                                  // 先把 a_lo 暂存到结果槽（后面 lo 乘积会覆写 r9）。
     store_spill(unit, SPILL_SRC, slot);
     // r9 = a_lo * b_hi
     muldiv(unit, 0b0000, SPILL_SRC, SPILL_SRC, SPILL_DST);
@@ -1190,8 +1210,16 @@ fn emit_branch_if_nonzero(
 
 /// 把实参搬进 AAPCS 寄存器；第 5+ 个整型实参写进栈传参区，返回其字节数。
 fn emit_call_args(unit: &mut CompilationUnit, args: &[SsaValue]) -> u32 {
-    let float_args: Vec<SsaValue> = args.iter().copied().filter(|a| float_slot(*a).is_some()).collect();
-    let int_args: Vec<SsaValue> = args.iter().copied().filter(|a| float_slot(*a).is_none()).collect();
+    let float_args: Vec<SsaValue> = args
+        .iter()
+        .copied()
+        .filter(|a| float_slot(*a).is_some())
+        .collect();
+    let int_args: Vec<SsaValue> = args
+        .iter()
+        .copied()
+        .filter(|a| float_slot(*a).is_none())
+        .collect();
 
     // 栈上传参：每个占 8 字节。
     let mut stack = 0u32;
@@ -1422,7 +1450,7 @@ fn emit_instr(unit: &mut CompilationUnit, instr: &SsaInstr) {
             }
         }
         SsaInstr::Var { .. } => {}
-        SsaInstr::SlotAddr { result, local } => {
+        SsaInstr::SlotAddr { result, local, .. } => {
             let slot = LOCAL_SLOTS.with(|m| m.borrow().get(local).copied().unwrap_or(0));
             let off = slot * 8 + SPILL_BASE.get();
             add_rd_sp_imm(unit, out_reg(*result), off as u32);
@@ -1459,8 +1487,12 @@ fn emit_instr(unit: &mut CompilationUnit, instr: &SsaInstr) {
                 emit_store_mem(unit, p, v, *ty);
             }
         }
+        SsaInstr::SimdBinary { .. } => crate::codegen::unsupported_simd("thumb"),
         SsaInstr::Asm { .. } => {
             crate::codegen::unsupported_inline_asm("thumbv7em");
+        }
+        SsaInstr::FuncAddr { .. } | SsaInstr::CallIndirect { .. } => {
+            crate::codegen::unsupported_function_pointer("thumbv7em");
         }
     }
 }
@@ -1625,28 +1657,30 @@ fn assign_float_slots(func: &SsaFunction) -> usize {
 
 /// 被取地址的局部变量 -> 栈槽编号，返回槽数；映射存进 `LOCAL_SLOTS`。
 fn assign_local_slots(func: &SsaFunction, base: usize) -> usize {
-    let mut ids: Vec<u32> = Vec::new();
+    // 同一个 local id 可能出现多次；取最大的槽需求。
+    let mut locals: Vec<(u32, u32)> = Vec::new();
     for block in &func.blocks {
         for instr in &block.instrs {
-            if let SsaInstr::SlotAddr { local, .. } = instr {
-                if !ids.contains(local) {
-                    ids.push(*local);
+            if let SsaInstr::SlotAddr { local, size, .. } = instr {
+                match locals.iter_mut().find(|(id, _)| id == local) {
+                    Some((_, s)) => *s = (*s).max(*size),
+                    None => locals.push((*local, *size)),
                 }
             }
         }
     }
-    ids.sort_unstable();
-    let count = ids.len();
+    locals.sort_unstable_by_key(|(id, _)| *id);
+    let mut slots = 0usize;
     LOCAL_SLOTS.with(|m| {
         let mut map = m.borrow_mut();
         map.clear();
-        for (i, id) in ids.into_iter().enumerate() {
-            map.insert(id, base + i);
+        for (id, size) in locals {
+            map.insert(id, base + slots);
+            slots += (size.max(8) as usize).div_ceil(8);
         }
     });
-    count
+    slots
 }
-
 fn successors(block: &crate::ssa::SsaBasicBlock) -> Vec<usize> {
     match &block.term {
         SsaTerminator::Goto(t) => vec![*t],
@@ -2304,7 +2338,13 @@ mod tests {
 
         setup();
         let mut u = empty_unit();
-        emit_shift_wide(&mut u, SsaValue(3), SsaBinaryOp::Shl, SsaValue(1), SsaValue(2));
+        emit_shift_wide(
+            &mut u,
+            SsaValue(3),
+            SsaBinaryOp::Shl,
+            SsaValue(1),
+            SsaValue(2),
+        );
         assert_eq!(
             halfwords(&u),
             [
@@ -2331,7 +2371,13 @@ mod tests {
 
         setup();
         let mut u = empty_unit();
-        emit_shift_wide(&mut u, SsaValue(3), SsaBinaryOp::Shr, SsaValue(1), SsaValue(2));
+        emit_shift_wide(
+            &mut u,
+            SsaValue(3),
+            SsaBinaryOp::Shr,
+            SsaValue(1),
+            SsaValue(2),
+        );
         assert_eq!(
             halfwords(&u)[..13],
             [

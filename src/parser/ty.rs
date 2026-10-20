@@ -94,9 +94,8 @@ impl Parser {
         if self.match_kind(&TokenKind::Star) {
             let mutability = if self.match_kind(&TokenKind::KwMut) {
                 crate::parser::ast::Mutability::Mutable
-            } else if self.match_kind(&TokenKind::KwConst) {
-                crate::parser::ast::Mutability::Immutable
             } else {
+                self.match_kind(&TokenKind::KwConst);
                 crate::parser::ast::Mutability::Immutable
             };
             let inner = self.parse_type_bp(20)?;

@@ -1,0 +1,81 @@
+//=============================================================================
+// tests/cases/34_tuple_struct.zr — 元组结构体
+//
+// 覆盖：定义、构造 `Pair(1, 2)`、`.0` / `.1` 读写、嵌套元组结构体、
+// 关联函数、方法接收者、按值传参/返回，以及元组结构体的 Drop。
+//=============================================================================
+
+struct Point(i32, i32);
+
+struct Wrapper(Point, i32);
+
+impl Point {
+    fn new(x: i32, y: i32) -> Point {
+        return Point(x, y);
+    }
+
+    fn sum(&self) -> i32 {
+        return self.0 + self.1;
+    }
+
+    fn shift(&mut self, d: i32) -> i32 {
+        self.0 = self.0 + d;
+        return self.sum();
+    }
+
+    fn offset(self, dx: i32, dy: i32) -> Point {
+        return Point(self.0 + dx, self.1 + dy);
+    }
+}
+
+fn make() -> Point {
+    return Point(3, 4);
+}
+
+fn total(w: Wrapper) -> i32 {
+    return w.0.sum() + w.1;
+}
+
+struct Guard(i32, &mut i32);
+
+impl Drop for Guard {
+    fn drop(&mut self) {
+        *self.1 = *self.1 * 10 + self.0;
+    }
+}
+
+fn main() -> i32 {
+    let p = Point(1, 2);
+    if p.0 != 1 || p.1 != 2 { return 1; }
+
+    let mut q = Point(4, 5);
+    q.0 = 6;
+    if q.0 != 6 || q.1 != 5 { return 2; }
+
+    let s = Point::new(7, 8);
+    if s.sum() != 15 { return 3; }
+
+    let mut u = Point(1, 1);
+    if u.shift(4) != 6 { return 4; }
+    if u.0 != 5 { return 5; }
+
+    let w = Wrapper(Point(8, 9), 10);
+    if w.0.0 != 8 || w.0.1 != 9 { return 6; }
+    if total(w) != 27 { return 7; }
+
+    let m = make();
+    if m.0 != 3 || m.1 != 4 { return 8; }
+
+    let moved = p.offset(10, 20);
+    if moved.0 != 11 || moved.1 != 22 { return 9; }
+    if p.0 != 1 { return 10; }
+
+    let mut x = 0;
+    {
+        let g = Guard(7, &mut x);
+        if g.0 != 7 { return 11; }
+    }
+    if x != 7 { return 12; }
+
+    return 0;
+}

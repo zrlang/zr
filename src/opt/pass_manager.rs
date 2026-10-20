@@ -44,9 +44,11 @@ fn is_pure(instr: &SsaInstr) -> bool {
     !matches!(
         instr,
         SsaInstr::Call { .. }
+            | SsaInstr::CallIndirect { .. }
             | SsaInstr::Load { .. }
             | SsaInstr::Store { .. }
             | SsaInstr::Asm { .. }
+            | SsaInstr::SimdBinary { .. }
     )
 }
 
@@ -321,13 +323,30 @@ fn uses(instr: &SsaInstr, out: &mut Vec<SsaValue>) {
             }
         }
         SsaInstr::Call { args, .. } => out.extend(args.iter().copied()),
+        SsaInstr::FuncAddr { .. } => {}
+        SsaInstr::CallIndirect { callee, args, .. } => {
+            out.push(*callee);
+            out.extend(args.iter().copied());
+        }
         SsaInstr::Load { ptr, .. } => out.push(*ptr),
         SsaInstr::Store { ptr, value, .. } => {
             out.push(*ptr);
             out.push(*value);
         }
         SsaInstr::SlotAddr { .. } => {}
-        SsaInstr::Asm { outputs, inputs, .. } => {
+        SsaInstr::SimdBinary {
+            lhs,
+            rhs,
+            out: out_addr,
+            ..
+        } => {
+            out.push(*lhs);
+            out.push(*rhs);
+            out.push(*out_addr);
+        }
+        SsaInstr::Asm {
+            outputs, inputs, ..
+        } => {
             // 输出操作数是"写回地址"，指令执行时同样要读取。
             for (_, addr, _) in outputs {
                 out.push(*addr);
@@ -461,6 +480,7 @@ pub fn eliminate_common_subexpr(module: SsaModule) -> SsaModule {
 /// 这里用 [`crate::ssa::dominator_tree`] 求 idom，再判断支配集合——
 /// 早先版本用"RPO 里处理得早"当支配的近似，会把兄弟分支上的值当成
 /// 支配值，替换后生成错代码（`if` 的两个分支互为兄弟，必然中招）。
+#[allow(clippy::needless_range_loop)]
 pub fn global_value_numbering(module: SsaModule) -> SsaModule {
     let mut module = module;
     for func in &mut module.functions {
@@ -798,11 +818,14 @@ fn propagate_constants(func: &mut SsaFunction) {
                     // 调用可能改全局状态；`Var` 是占位；Load/SlotAddr 的结果
                     // 不是编译期常量；Store 没有结果（副作用不是本 pass 管的）。
                     SsaInstr::Call { .. }
+                    | SsaInstr::FuncAddr { .. }
+                    | SsaInstr::CallIndirect { .. }
                     | SsaInstr::Var { .. }
                     | SsaInstr::Load { .. }
                     | SsaInstr::SlotAddr { .. }
                     | SsaInstr::Store { .. }
-                    | SsaInstr::Asm { .. } => {
+                    | SsaInstr::Asm { .. }
+                    | SsaInstr::SimdBinary { .. } => {
                         if let Some(r) = instr.result() {
                             if set_lattice(&mut lattice, r, Lattice::Top) {
                                 changed = true;
@@ -820,7 +843,7 @@ fn propagate_constants(func: &mut SsaFunction) {
                     then_block,
                     else_block,
                 } => {
-                    let taken = match lookup(&lattice, *cond) {
+                    match lookup(&lattice, *cond) {
                         Lattice::Const(c) => match c.as_int() {
                             Some(v) => {
                                 if v != 0 {
@@ -833,8 +856,7 @@ fn propagate_constants(func: &mut SsaFunction) {
                         },
                         // 未知：两个后继都可达。
                         _ => vec![*then_block, *else_block],
-                    };
-                    taken
+                    }
                 }
                 _ => Vec::new(),
             };
@@ -881,8 +903,8 @@ fn propagate_constants(func: &mut SsaFunction) {
             }
         }
     }
-    for bi in 0..n {
-        for (ii, value) in std::mem::take(&mut rewrite[bi]) {
+    for (bi, items) in rewrite.iter_mut().enumerate() {
+        for (ii, value) in std::mem::take(items) {
             let instr = &mut func.blocks[bi].instrs[ii];
             let result = instr.result().expect("写回表里的指令一定有结果");
             *instr = SsaInstr::Const { result, value };
@@ -890,8 +912,8 @@ fn propagate_constants(func: &mut SsaFunction) {
     }
 
     // 分支条件恒定 → 换成无条件跳转。
-    for bi in 0..n {
-        if !reachable[bi] {
+    for (bi, &is_reachable) in reachable.iter().enumerate() {
+        if !is_reachable {
             continue;
         }
         let cond = match &func.blocks[bi].term {
@@ -1299,6 +1321,16 @@ fn replace_operand(instr: &mut SsaInstr, from: SsaValue, to: SsaValue) {
                 }
             }
         }
+        SsaInstr::CallIndirect { callee, args, .. } => {
+            if *callee == from {
+                *callee = to;
+            }
+            for a in args.iter_mut() {
+                if *a == from {
+                    *a = to;
+                }
+            }
+        }
         SsaInstr::Copy { src, .. } => {
             if *src == from {
                 *src = to;
@@ -1362,16 +1394,32 @@ fn set_result(instr: SsaInstr, new: SsaValue) -> SsaInstr {
             args,
             ty,
         },
+        SsaInstr::FuncAddr { target, .. } => SsaInstr::FuncAddr {
+            result: new,
+            target,
+        },
+        SsaInstr::CallIndirect {
+            callee, args, ty, ..
+        } => SsaInstr::CallIndirect {
+            result: new,
+            callee,
+            args,
+            ty,
+        },
         SsaInstr::Load { ptr, ty, .. } => SsaInstr::Load {
             result: new,
             ptr,
             ty,
         },
-        SsaInstr::SlotAddr { local, .. } => SsaInstr::SlotAddr { result: new, local },
+        SsaInstr::SlotAddr { local, size, .. } => SsaInstr::SlotAddr {
+            result: new,
+            local,
+            size,
+        },
         // Store 没有结果值；本函数只应被"有结果"的指令调用。原样重建即可。
         SsaInstr::Store { ptr, value, ty } => SsaInstr::Store { ptr, value, ty },
-        // Asm 没有结果值；本函数只处理有结果的指令。原样重建即可。
-        SsaInstr::Asm { .. } => instr,
+        // Asm / SimdBinary 没有结果值；本函数只处理有结果的指令。
+        SsaInstr::Asm { .. } | SsaInstr::SimdBinary { .. } => instr,
     }
 }
 

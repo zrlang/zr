@@ -719,7 +719,7 @@ fn describe(kind: &ExprKind) -> &'static str {
         ExprKind::Defer => "`defer`",
         ExprKind::Try => "`try`",
         ExprKind::Throw => "`throw`",
-        ExprKind::Array => "an array literal",
+        ExprKind::Array(..) => "an array literal",
         ExprKind::Tuple => "a tuple literal",
         ExprKind::Struct(_) => "a struct literal",
         ExprKind::Closure => "a closure",
@@ -985,11 +985,28 @@ impl<'a> AstEvaluator<'a> {
                 }
             },
 
-            // 结构体字面量：字段按书写顺序求值。
-            ast::Expression::StructInit(_, fields, _) => {
-                let mut items = Vec::with_capacity(fields.len());
+            // 结构体字面量：字段按书写顺序求值；`..base` 的缺失字段从
+            // 编译期 base 聚合值继承。
+            ast::Expression::StructInit(_, fields, base, _) => {
+                let mut items = if let Some(base) = base {
+                    match self.value_of(base, env)? {
+                        HirLiteral::Composite(items) => items,
+                        _ => {
+                            return Err(ComptimeError::new(
+                                "struct update base is not a compile-time struct value",
+                            ))
+                        }
+                    }
+                } else {
+                    Vec::new()
+                };
                 for (name, e) in fields {
-                    items.push((name.clone(), self.value_of(e, env)?));
+                    let value = self.value_of(e, env)?;
+                    if let Some(slot) = items.iter_mut().find(|(n, _)| n == name) {
+                        slot.1 = value;
+                    } else {
+                        items.push((name.clone(), value));
+                    }
                 }
                 val!(HirLiteral::Composite(items))
             }
@@ -998,17 +1015,16 @@ impl<'a> AstEvaluator<'a> {
             ast::Expression::Field(base, name, _) => {
                 let v = self.value_of(base, env)?;
                 match v {
-                    HirLiteral::Composite(items) => match items
-                        .into_iter()
-                        .find(|(n, _)| n == name)
-                    {
-                        Some((_, value)) => val!(value),
-                        None => {
-                            return Err(ComptimeError::new(format!(
-                                "no field `{name}` in compile-time struct value"
-                            )))
+                    HirLiteral::Composite(items) => {
+                        match items.into_iter().find(|(n, _)| n == name) {
+                            Some((_, value)) => val!(value),
+                            None => {
+                                return Err(ComptimeError::new(format!(
+                                    "no field `{name}` in compile-time struct value"
+                                )))
+                            }
                         }
-                    },
+                    }
                     other => {
                         return Err(ComptimeError::new(format!(
                             "field access on {} is not supported in compile-time evaluation",
@@ -1071,12 +1087,9 @@ impl<'a> AstEvaluator<'a> {
                 // `p.x = v`：就地改写编译期聚合值的字段。
                 if let ast::Expression::Field(base, field_name, _) = lhs.as_ref() {
                     if let ast::Expression::Variable(base_name, _) = base.as_ref() {
-                        if let Some(slot) =
-                            env.iter_mut().rev().find(|(n, _)| n == base_name)
-                        {
+                        if let Some(slot) = env.iter_mut().rev().find(|(n, _)| n == base_name) {
                             if let HirLiteral::Composite(items) = &mut slot.1 {
-                                if let Some(entry) =
-                                    items.iter_mut().find(|(n, _)| n == field_name)
+                                if let Some(entry) = items.iter_mut().find(|(n, _)| n == field_name)
                                 {
                                     entry.1 = combined.clone();
                                     return Ok(AstFlow::Value(Some(combined)));
@@ -1366,7 +1379,10 @@ fn describe_ast(e: &crate::parser::ast::Expression) -> &'static str {
 fn children_mut(expr: &mut HirExpr) -> Vec<&mut HirExpr> {
     match &mut expr.kind {
         ExprKind::Binary(_, a, b) | ExprKind::Assign(a, b) => vec![a, b],
-        ExprKind::Unary(_, a) | ExprKind::Field(a, _) | ExprKind::Deref(a) | ExprKind::AddrOf(a) => {
+        ExprKind::Unary(_, a)
+        | ExprKind::Field(a, _)
+        | ExprKind::Deref(a)
+        | ExprKind::AddrOf(a) => {
             vec![a]
         }
         ExprKind::Struct(fields) => fields.iter_mut().map(|(_, e)| e).collect(),

@@ -1,0 +1,56 @@
+//=============================================================================
+// tests/cases/40_drop_temp_nested.zr — 嵌套表达式中的 Drop 临时量
+//
+// 覆盖：字段访问产生的临时结构体、二元表达式中的多个临时量逆序析构、
+// if 分支、return 表达式和函数尾表达式。
+//=============================================================================
+
+struct Res {
+    id: i32,
+    log: &mut i32,
+}
+
+impl Drop for Res {
+    fn drop(&mut self) {
+        *self.log = *self.log * 10 + self.id;
+    }
+}
+
+fn nested_return(log: &mut i32) -> i32 {
+    return Res { id: 9, log }.id;
+}
+
+fn tail_expr(log: &mut i32) -> i32 {
+    Res { id: 10, log }.id
+}
+
+fn main() -> i32 {
+    let mut log: i32 = 0;
+
+    let x = Res { id: 1, log: &mut log }.id;
+    if x != 1 || log != 1 { return 1; }
+
+    let y = { Res { id: 2, log: &mut log }; 7 };
+    if y != 7 || log != 12 { return 2; }
+
+    let z = if true {
+        Res { id: 3, log: &mut log }.id
+    } else {
+        0
+    };
+    if z != 3 || log != 123 { return 3; }
+
+    let w = Res { id: 4, log: &mut log }.id + Res { id: 5, log: &mut log }.id;
+    if w != 9 || log != 12354 { return 4; }
+
+    Res { id: 6, log: &mut log }.id;
+    if log != 123546 { return 5; }
+
+    let r = nested_return(&mut log);
+    if r != 9 || log != 1235469 { return 6; }
+
+    let t = tail_expr(&mut log);
+    if t != 10 || log != 12354700 { return 7; }
+
+    return 0;
+}

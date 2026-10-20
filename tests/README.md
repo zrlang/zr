@@ -42,6 +42,26 @@ cargo test --test zr_language
 | `21_literal_suffixes.zr` | 字面量类型后缀（`1u8` / `7i8` / `2.5f32` …） |
 | `22_call_preserve.zr` | 跨调用存活的值必须被保住（callee-save / 形参并行搬运） |
 | `23_strings.zr`      | 字符串字面量落 `.rodata`、去重、按地址比较、`str` 作实参跨调用 |
+| `24_pointers.zr`     | 指针解引用 / 索引、取址、指针算术与字符串按字节索引 |
+| `25_match.zr`        | `match` 字面量 / 绑定 / 或模式 / guard 的运行期语义 |
+| `26_comptime_struct.zr` | 编译期结构体字面量、字段读取与改写 |
+| `27_inline_asm.zr`   | 内联汇编（x86-64 整数子集）输入/输出操作数与编码 |
+| `28_arrays.zr`       | 定长数组：字面量、`[v; N]`、索引、数组参数、逐元素运算 |
+| `29_async.zr`        | 受限 async/await：状态机、挂起/恢复、`async fn main` |
+| `30_drop.zr`         | 用户 `Drop`：作用域/返回/循环析构、移动与字段递归析构 |
+| `31_fn_ptr.zr`       | 一等函数指针：取址、参数/返回值/字段/数组、运行时间接调用（x86-64） |
+| `32_fn_ptr_async.zr` | async 状态机中的函数指针与间接调用 |
+| `33_methods.zr`      | 具名结构体 `impl` 方法、关联函数、`&self`/`&mut self`/`self` |
+| `34_tuple_struct.zr` | 元组结构体：构造、`.0`/`.1`、嵌套、方法、Drop |
+| `35_struct_update.zr` | 结构体更新 `..base`：部分覆盖、字段 base、连续更新 |
+| `36_drop_array.zr` | Drop 数组：索引顺序、元素赋值、结构体数组、字段数组、按值传参 |
+| `37_struct_array.zr` | 结构体数组：元素读写、按值传参/返回、副本值语义 |
+| `38_drop_temp.zr` | 未绑定 Drop 临时量：表达式语句立即析构 |
+| `39_partial_move.zr` | Drop 部分移动：字段、嵌套路径、实参、数组元素、重新赋值 |
+| `40_drop_temp_nested.zr` | 嵌套 Drop 临时量：字段访问、二元表达式、if、return、尾表达式 |
+| `41_return_drop_array.zr` | Drop 数组按值返回：return、尾表达式、参数转发、调用方析构 |
+| `42_temp_partial_move.zr` | 临时结构体部分移动：普通/嵌套字段、整个 Drop 字段、剩余字段析构 |
+| `43_return_drop_struct.zr` | 同步 Drop 结构体按值返回：return、尾表达式、参数转发 |
 
 ## 尚未覆盖（编译器还不支持）
 
@@ -52,7 +72,7 @@ Rust Book 的其余章节目前一个都测不了，因为对应特性尚未实�
 |----------------|----------|
 | 控制流：`for` | `for x in a..b` 的 `..` 表达式仍解析成标识符 |
 | 所有权 / 借用 / 引用 / 切片 | 借用检查与引用语义未实现 |
-| 结构体与枚举 | `struct` 能声明，但字段读取返回错值；`enum` 未实现 |
+| 枚举 | `enum` 未实现（具名结构体与字段访问已覆盖） |
 | 浮点（仅 ARM32 / Thumb / RISC-V / wasm） | x86-64 与 aarch64 已支持；其余后端遇到浮点字面量会**明确报错**（不再静默发射 0） |
 | 字符串字面量（仅 ARM32 / Thumb / RISC-V / wasm） | x86-64 与 aarch64 已落 `.rodata`（可取址、按地址比较），并可通过 `extern "C"` 调用运行时的 `zr_write` 输出；其余后端遇到字符串字面量会**明确报错**。尚无解引用 / 索引（需要 SSA 内存模型） |
 | 模式匹配（`match` / `if let` / 解构） | `match` 未降低到 MIR |

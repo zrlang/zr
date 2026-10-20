@@ -65,8 +65,10 @@ impl Parser {
 
     /// 解析整个编译单元。
     pub fn parse(&mut self) -> Result<Program> {
-        let mut program = Program::default();
-        program.attrs = self.parse_inner_attrs()?;
+        let mut program = Program {
+            attrs: self.parse_inner_attrs()?,
+            ..Program::default()
+        };
 
         while !self.is_at_end() {
             let item = self.parse_module_item()?;
@@ -704,6 +706,14 @@ mod tests {
     fn parse_impl_block() {
         let p = parse_ok("impl<T> Vec<T> { fn push(&mut self, v: T) {} }");
         assert_eq!(p.impls.len(), 1);
+    }
+
+    #[test]
+    fn parse_impl_methods() {
+        let p = parse_ok("impl Drop for Foo { fn drop(&mut self) { } }");
+        assert_eq!(p.impls.len(), 1);
+        assert_eq!(p.impls[0].methods.len(), 1);
+        assert_eq!(p.impls[0].methods[0].name, "drop");
     }
 
     #[test]

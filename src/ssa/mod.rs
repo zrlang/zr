@@ -79,6 +79,15 @@ pub enum SsaInstr {
         args: Vec<SsaValue>,
         ty: mir::NumTy,
     },
+    /// 函数地址：`result = &target`。
+    FuncAddr { result: SsaValue, target: String },
+    /// 通过函数指针调用：`result = callee(args...)`。
+    CallIndirect {
+        result: SsaValue,
+        callee: SsaValue,
+        args: Vec<SsaValue>,
+        ty: mir::NumTy,
+    },
     /// φ 函数：`result = φ(p0: v0, p1: v1, ...)`。
     ///
     /// 放在有多个前驱的合流块开头，把各前驱末尾的值合并成一个新版本。
@@ -118,7 +127,21 @@ pub enum SsaInstr {
         ty: mir::NumTy,
     },
     /// 取局部变量栈槽地址：`result = &slot{local}`。
-    SlotAddr { result: SsaValue, local: u32 },
+    SlotAddr {
+        result: SsaValue,
+        local: u32,
+        /// 该槽至少需要的字节数（数组字面量会大于 8）。
+        size: u32,
+    },
+    /// 数组逐元素 SIMD 运算：`*out = *lhs <op> *rhs`。
+    SimdBinary {
+        lhs: SsaValue,
+        op: SsaBinaryOp,
+        rhs: SsaValue,
+        out: SsaValue,
+        ty: mir::NumTy,
+        lanes: u32,
+    },
     /// 内联汇编：`asm!("template", in(reg) x, out(reg) y)`。
     ///
     /// 这是一个语句（无结果值），但有副作用，不可被消除或重排。
@@ -224,12 +247,15 @@ impl SsaInstr {
             SsaInstr::Copy { result, .. } => Some(*result),
             SsaInstr::Cast { result, .. } => Some(*result),
             SsaInstr::Call { result, .. } => Some(*result),
+            SsaInstr::FuncAddr { result, .. } => Some(*result),
+            SsaInstr::CallIndirect { result, .. } => Some(*result),
             SsaInstr::Load { result, .. } => Some(*result),
             SsaInstr::SlotAddr { result, .. } => Some(*result),
             SsaInstr::Var { result, .. } => Some(*result),
             // 存储没有结果值（但仍有副作用）。
             SsaInstr::Store { .. } => None,
             SsaInstr::Asm { .. } => None,
+            SsaInstr::SimdBinary { .. } => None,
         }
     }
 }
@@ -325,11 +351,11 @@ fn convert_function(func: &mir::MirFunction) -> SsaFunction {
     let idom = mir_dominator_tree(n, &preds, &succs);
     // DF(x) = { y | y 有 >=2 个前驱，且 x ∈ preds(y) }
     let mut df: HashMap<usize, Vec<usize>> = HashMap::new();
-    for y in 0..n {
-        if preds[y].len() < 2 {
+    for (y, ps) in preds.iter().enumerate() {
+        if ps.len() < 2 {
             continue;
         }
-        for &x in &preds[y] {
+        for &x in ps {
             df.entry(x).or_default().push(y);
         }
     }
@@ -338,8 +364,8 @@ fn convert_function(func: &mir::MirFunction) -> SsaFunction {
     //
     // 每条回边（latch -> header 且 header 支配 latch）确定一个自然循环。
     let mut loops: Vec<(usize, HashSet<usize>)> = Vec::new();
-    for latch in 0..n {
-        for &h in &succs[latch] {
+    for (latch, ss) in succs.iter().enumerate() {
+        for &h in ss {
             if h >= n || !mir_dominates(&idom, h, latch) {
                 continue;
             }
@@ -544,7 +570,35 @@ fn convert_function(func: &mir::MirFunction) -> SsaFunction {
                     stacks.entry(name.clone()).or_default().push(res);
                     pushed.push(name.clone());
                 }
-                mir::MirInstr::Await(name, future) => {
+                mir::MirInstr::FuncAddr(name, target) => {
+                    let res = alloc();
+                    instrs.push(SsaInstr::FuncAddr {
+                        result: res,
+                        target: target.clone(),
+                    });
+                    stacks.entry(name.clone()).or_default().push(res);
+                    pushed.push(name.clone());
+                }
+                mir::MirInstr::CallIndirect(name, callee, args, ty) => {
+                    let callee = materialize(callee, &mut instrs, &mut stacks, &next_value);
+                    let mut ssa_args = Vec::with_capacity(args.len());
+                    for a in args {
+                        ssa_args.push(materialize(a, &mut instrs, &mut stacks, &next_value));
+                    }
+                    let res = alloc();
+                    instrs.push(SsaInstr::CallIndirect {
+                        result: res,
+                        callee,
+                        args: ssa_args,
+                        ty: *ty,
+                    });
+                    stacks.entry(name.clone()).or_default().push(res);
+                    pushed.push(name.clone());
+                }
+                mir::MirInstr::Suspend => {
+                    // 状态机降级在 MIR 阶段完成；同步 `yield` 是空操作。
+                }
+                mir::MirInstr::Await(name, future, _) => {
                     // `await` 对后端是透明的（协程由运行时调度），所以不产生
                     // 新值：future 本身就是结果。
                     let res = materialize(future, &mut instrs, &mut stacks, &next_value);
@@ -562,11 +616,12 @@ fn convert_function(func: &mir::MirFunction) -> SsaFunction {
                     stacks.entry(name.clone()).or_default().push(res);
                     pushed.push(name.clone());
                 }
-                mir::MirInstr::SlotAddr(name, local) => {
+                mir::MirInstr::SlotAddr(name, local, size) => {
                     let res = alloc();
                     instrs.push(SsaInstr::SlotAddr {
                         result: res,
                         local: *local,
+                        size: *size,
                     });
                     stacks.entry(name.clone()).or_default().push(res);
                     pushed.push(name.clone());
@@ -581,33 +636,53 @@ fn convert_function(func: &mir::MirFunction) -> SsaFunction {
                     });
                     // Store 不定义任何变量，也不压栈。
                 }
-            mir::MirInstr::Asm {
-                name: _,
-                template,
-                outputs,
-                inputs,
-            } => {
-                let ssa_outputs = outputs
-                    .iter()
-                    .map(|(c, v, ty)| {
-                        let v = materialize(v, &mut instrs, &mut stacks, &next_value);
-                        (c.clone(), v, *ty)
-                    })
-                    .collect();
-                let ssa_inputs = inputs
-                    .iter()
-                    .map(|(c, v, ty)| {
-                        let v = materialize(v, &mut instrs, &mut stacks, &next_value);
-                        (c.clone(), v, *ty)
-                    })
-                    .collect();
-                instrs.push(SsaInstr::Asm {
-                    template: template.clone(),
-                    outputs: ssa_outputs,
-                    inputs: ssa_inputs,
-                });
-                // 汇编语句本身没有值；`name` 只供 SSA 定义点记录使用。
-            }
+                mir::MirInstr::SimdBinary {
+                    lhs,
+                    op,
+                    rhs,
+                    out,
+                    ty,
+                    lanes,
+                } => {
+                    let l = materialize(lhs, &mut instrs, &mut stacks, &next_value);
+                    let r = materialize(rhs, &mut instrs, &mut stacks, &next_value);
+                    let o = materialize(out, &mut instrs, &mut stacks, &next_value);
+                    instrs.push(SsaInstr::SimdBinary {
+                        lhs: l,
+                        op: convert_binary_op(*op),
+                        rhs: r,
+                        out: o,
+                        ty: *ty,
+                        lanes: *lanes,
+                    });
+                }
+                mir::MirInstr::Asm {
+                    name: _,
+                    template,
+                    outputs,
+                    inputs,
+                } => {
+                    let ssa_outputs = outputs
+                        .iter()
+                        .map(|(c, v, ty)| {
+                            let v = materialize(v, &mut instrs, &mut stacks, &next_value);
+                            (c.clone(), v, *ty)
+                        })
+                        .collect();
+                    let ssa_inputs = inputs
+                        .iter()
+                        .map(|(c, v, ty)| {
+                            let v = materialize(v, &mut instrs, &mut stacks, &next_value);
+                            (c.clone(), v, *ty)
+                        })
+                        .collect();
+                    instrs.push(SsaInstr::Asm {
+                        template: template.clone(),
+                        outputs: ssa_outputs,
+                        inputs: ssa_inputs,
+                    });
+                    // 汇编语句本身没有值；`name` 只供 SSA 定义点记录使用。
+                }
             }
         }
 
@@ -661,7 +736,7 @@ fn convert_function(func: &mir::MirFunction) -> SsaFunction {
     }
 
     // 把 φ 插到各块开头
-    for b in 0..out_blocks.len() {
+    for (b, block) in out_blocks.iter_mut().enumerate() {
         let Some(made) = phi_results.get(&b) else {
             continue;
         };
@@ -674,8 +749,8 @@ fn convert_function(func: &mir::MirFunction) -> SsaFunction {
                 incoming,
             });
         }
-        head.append(&mut out_blocks[b].instrs);
-        out_blocks[b].instrs = head;
+        head.append(&mut block.instrs);
+        block.instrs = head;
     }
 
     SsaFunction {
@@ -980,13 +1055,17 @@ fn defined_name_set(block: &mir::MirBasicBlock) -> HashSet<String> {
             | mir::MirInstr::Binary(n, ..)
             | mir::MirInstr::Unary(n, ..)
             | mir::MirInstr::Call(n, ..)
-            | mir::MirInstr::Await(n, _)
+            | mir::MirInstr::FuncAddr(n, ..)
+            | mir::MirInstr::CallIndirect(n, ..)
+            | mir::MirInstr::Await(n, _, _)
             | mir::MirInstr::Cast(n, ..)
             | mir::MirInstr::Load(n, ..)
-            | mir::MirInstr::SlotAddr(n, _)
+            | mir::MirInstr::SlotAddr(n, ..)
             | mir::MirInstr::Asm { name: n, .. } => Some(n),
-            // Store 不定义名字。
-            mir::MirInstr::Store(..) => None,
+            // Store / SIMD 写内存，不定义名字。
+            mir::MirInstr::Store(..)
+            | mir::MirInstr::SimdBinary { .. }
+            | mir::MirInstr::Suspend => None,
         })
         .cloned()
         .collect()
@@ -1052,10 +1131,16 @@ fn used_before_def(block: &mir::MirBasicBlock) -> Vec<String> {
             }
             mir::MirInstr::Unary(_, _, a) => mir_value_names(a),
             mir::MirInstr::Call(_, _, args, _) => args.iter().flat_map(mir_value_names).collect(),
-            mir::MirInstr::Await(_, v) => mir_value_names(v),
+            mir::MirInstr::CallIndirect(_, callee, args, _) => {
+                let mut v = mir_value_names(callee);
+                v.extend(args.iter().flat_map(mir_value_names));
+                v
+            }
+            mir::MirInstr::FuncAddr(..) => Vec::new(),
+            mir::MirInstr::Await(_, v, _) => mir_value_names(v),
             mir::MirInstr::Cast(_, v, ..) => mir_value_names(v),
             mir::MirInstr::Load(_, addr, _) => mir_value_names(addr),
-            mir::MirInstr::SlotAddr(..) => Vec::new(),
+            mir::MirInstr::SlotAddr(..) | mir::MirInstr::Suspend => Vec::new(),
             mir::MirInstr::Store(addr, value, _) => {
                 let mut v = mir_value_names(addr);
                 v.extend(mir_value_names(value));
@@ -1065,6 +1150,12 @@ fn used_before_def(block: &mir::MirBasicBlock) -> Vec<String> {
                 .iter()
                 .flat_map(|(_, v, _)| mir_value_names(v))
                 .collect(),
+            mir::MirInstr::SimdBinary { lhs, rhs, out, .. } => {
+                let mut v = mir_value_names(lhs);
+                v.extend(mir_value_names(rhs));
+                v.extend(mir_value_names(out));
+                v
+            }
         };
         note_read(reads, &defined, &mut out);
 
@@ -1074,13 +1165,17 @@ fn used_before_def(block: &mir::MirBasicBlock) -> Vec<String> {
             mir::MirInstr::Binary(n, ..) => Some(n),
             mir::MirInstr::Unary(n, ..) => Some(n),
             mir::MirInstr::Call(n, ..) => Some(n),
-            mir::MirInstr::Await(n, _) => Some(n),
+            mir::MirInstr::FuncAddr(n, ..) => Some(n),
+            mir::MirInstr::CallIndirect(n, ..) => Some(n),
+            mir::MirInstr::Await(n, _, _) => Some(n),
             mir::MirInstr::Cast(n, ..) => Some(n),
             mir::MirInstr::Load(n, ..) => Some(n),
-            mir::MirInstr::SlotAddr(n, _) => Some(n),
+            mir::MirInstr::SlotAddr(n, ..) => Some(n),
             mir::MirInstr::Asm { name, .. } => Some(name),
-            // Store 无定义。
-            mir::MirInstr::Store(..) => None,
+            // Store / SIMD 无定义。
+            mir::MirInstr::Store(..)
+            | mir::MirInstr::SimdBinary { .. }
+            | mir::MirInstr::Suspend => None,
         };
         if let Some(n) = name {
             if !defined.contains(n) {
@@ -1120,11 +1215,15 @@ fn defined_names(block: &mir::MirBasicBlock) -> Vec<String> {
             mir::MirInstr::Binary(n, ..) => Some(n),
             mir::MirInstr::Unary(n, ..) => Some(n),
             mir::MirInstr::Call(n, ..) => Some(n),
-            mir::MirInstr::Await(n, _) => Some(n),
+            mir::MirInstr::FuncAddr(n, ..) => Some(n),
+            mir::MirInstr::CallIndirect(n, ..) => Some(n),
+            mir::MirInstr::Await(n, _, _) => Some(n),
             mir::MirInstr::Cast(n, ..) => Some(n),
             mir::MirInstr::Load(n, ..) => Some(n),
-            mir::MirInstr::SlotAddr(n, _) => Some(n),
-            mir::MirInstr::Asm { .. } => None,
+            mir::MirInstr::SlotAddr(n, ..) => Some(n),
+            mir::MirInstr::Asm { .. }
+            | mir::MirInstr::SimdBinary { .. }
+            | mir::MirInstr::Suspend => None,
             mir::MirInstr::Store(..) => None,
         };
         if let Some(n) = name {
@@ -1412,6 +1511,11 @@ pub fn instr_uses(instr: &SsaInstr, out: &mut Vec<SsaValue>) {
             }
         }
         SsaInstr::Call { args, .. } => out.extend(args.iter().copied()),
+        SsaInstr::FuncAddr { .. } => {}
+        SsaInstr::CallIndirect { callee, args, .. } => {
+            out.push(*callee);
+            out.extend(args.iter().copied());
+        }
         SsaInstr::Load { ptr, .. } => out.push(*ptr),
         // 存储读地址与值；地址是 uses，存储的值也是 uses。
         SsaInstr::Store { ptr, value, .. } => {
@@ -1419,6 +1523,16 @@ pub fn instr_uses(instr: &SsaInstr, out: &mut Vec<SsaValue>) {
             out.push(*value);
         }
         SsaInstr::SlotAddr { .. } => {}
+        SsaInstr::SimdBinary {
+            lhs,
+            rhs,
+            out: out_addr,
+            ..
+        } => {
+            out.push(*lhs);
+            out.push(*rhs);
+            out.push(*out_addr);
+        }
         SsaInstr::Asm {
             outputs, inputs, ..
         } => {

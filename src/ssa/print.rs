@@ -54,6 +54,23 @@ pub fn print_module(module: &SsaModule) {
                         let a: Vec<String> = args.iter().map(|v| format!("%{}", v.id())).collect();
                         println!("%{} = call {}({})", result.id(), callee, a.join(", "));
                     }
+                    super::SsaInstr::FuncAddr { result, target } => {
+                        println!("%{} = &{}", result.id(), target)
+                    }
+                    super::SsaInstr::CallIndirect {
+                        result,
+                        callee,
+                        args,
+                        ..
+                    } => {
+                        let a: Vec<String> = args.iter().map(|v| format!("%{}", v.id())).collect();
+                        println!(
+                            "%{} = call_indirect %{}({})",
+                            result.id(),
+                            callee.id(),
+                            a.join(", ")
+                        );
+                    }
                     super::SsaInstr::Phi {
                         result,
                         name,
@@ -74,11 +91,29 @@ pub fn print_module(module: &SsaModule) {
                     super::SsaInstr::Store { ptr, value, ty } => {
                         println!("store {:?} %{} -> %{}", ty, value.id(), ptr.id())
                     }
-                    super::SsaInstr::SlotAddr { result, local } => {
+                    super::SsaInstr::SlotAddr { result, local, .. } => {
                         println!("%{} = &slot{}", result.id(), local)
                     }
                     super::SsaInstr::Var { result, name } => {
                         println!("%{} = var {}", result.id(), name)
+                    }
+                    super::SsaInstr::SimdBinary {
+                        lhs,
+                        op,
+                        rhs,
+                        out,
+                        ty,
+                        lanes,
+                    } => {
+                        println!(
+                            "simd {:?} {:?} x{} %{} %{} -> %{}",
+                            ty,
+                            op,
+                            lanes,
+                            lhs.id(),
+                            rhs.id(),
+                            out.id()
+                        )
                     }
                     super::SsaInstr::Asm {
                         template,

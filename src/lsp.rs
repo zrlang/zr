@@ -197,24 +197,27 @@ impl Server {
             .filter(|s| s.name.starts_with(&prefix))
             .map(|s| {
                 let kind = match s.kind {
-                    kind::FUNCTION => 3, // CompletionItemKind.Function
+                    kind::FUNCTION => 3,  // CompletionItemKind.Function
                     kind::CONSTANT => 14, // CompletionItemKind.Constant
-                    kind::STRUCT => 7,   // CompletionItemKind.Struct
-                    kind::ENUM => 13,    // CompletionItemKind.Enum
+                    kind::STRUCT => 7,    // CompletionItemKind.Struct
+                    kind::ENUM => 13,     // CompletionItemKind.Enum
                     kind::PARAMETER => 9, // CompletionItemKind.Variable
-                    _ => 1,              // CompletionItemKind.Text
+                    _ => 1,               // CompletionItemKind.Text
                 };
                 Json::obj(vec![
                     ("label", Json::str(&s.name)),
                     ("kind", Json::int(kind)),
-                    ("detail", Json::str(match s.kind {
-                        kind::FUNCTION => "fn",
-                        kind::CONSTANT => "const",
-                        kind::STRUCT => "struct",
-                        kind::ENUM => "enum",
-                        kind::PARAMETER => "param",
-                        _ => "symbol",
-                    })),
+                    (
+                        "detail",
+                        Json::str(match s.kind {
+                            kind::FUNCTION => "fn",
+                            kind::CONSTANT => "const",
+                            kind::STRUCT => "struct",
+                            kind::ENUM => "enum",
+                            kind::PARAMETER => "param",
+                            _ => "symbol",
+                        }),
+                    ),
                     ("sortText", Json::str(&s.name)),
                 ])
             })

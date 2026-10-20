@@ -1,0 +1,49 @@
+//=============================================================================
+// tests/cases/35_struct_update.zr — 结构体更新语法 `..base`
+//
+// 覆盖：部分字段覆盖、全量复制、字段位置作为 base、连续更新，以及 base
+// 本身保持不变（值语义）。
+//=============================================================================
+
+struct Config {
+    a: i32,
+    b: i32,
+    c: i32,
+    d: i32,
+}
+
+struct Holder {
+    cfg: Config,
+}
+
+fn rebuild() -> Config {
+    let base = Config { a: 1, b: 2, c: 3, d: 4 };
+    return Config { b: 20, d: 40, ..base };
+}
+
+fn main() -> i32 {
+    let base = Config { a: 1, b: 2, c: 3, d: 4 };
+
+    let c = Config { b: 20, ..base };
+    if c.a != 1 || c.b != 20 || c.c != 3 || c.d != 4 { return 1; }
+    if base.b != 2 || base.d != 4 { return 2; }
+
+    let copy = Config { ..c };
+    if copy.a != 1 || copy.b != 20 || copy.c != 3 || copy.d != 4 { return 3; }
+
+    let h = Holder { cfg: base };
+    let from_field = Config { a: 9, ..h.cfg };
+    if from_field.a != 9 || from_field.b != 2 { return 4; }
+    if from_field.c != 3 || from_field.d != 4 { return 5; }
+    if h.cfg.a != 1 { return 6; }
+
+    let chained = Config { c: 30, ..from_field };
+    if chained.a != 9 || chained.b != 2 { return 7; }
+    if chained.c != 30 || chained.d != 4 { return 8; }
+    if from_field.c != 3 { return 9; }
+
+    let r = rebuild();
+    if r.a != 1 || r.b != 20 || r.c != 3 || r.d != 40 { return 10; }
+
+    return 0;
+}

@@ -1,0 +1,62 @@
+//=============================================================================
+// tests/cases/41_return_drop_array.zr — 按值返回 Drop 数组
+//
+// 覆盖：`return` 局部数组、函数尾表达式数组、按值转发参数，以及调用方作用
+// 域结束时的唯一一次析构。
+//=============================================================================
+
+struct Res {
+    id: i32,
+    log: &mut i32,
+}
+
+impl Drop for Res {
+    fn drop(&mut self) {
+        *self.log = *self.log * 10 + self.id;
+    }
+}
+
+fn make(log: &mut i32) -> [Res; 2] {
+    let a = [Res { id: 1, log }, Res { id: 2, log }];
+    return a;
+}
+
+fn make_tail(log: &mut i32) -> [Res; 2] {
+    [Res { id: 3, log }, Res { id: 4, log }]
+}
+
+fn pass(a: [Res; 2]) -> [Res; 2] {
+    return a;
+}
+
+fn pass_tail(a: [Res; 2]) -> [Res; 2] {
+    a
+}
+
+fn main() -> i32 {
+    let mut log: i32 = 0;
+
+    {
+        let a = make(&mut log);
+    }
+    if log != 12 { return 1; }
+
+    {
+        make_tail(&mut log);
+    }
+    if log != 1234 { return 2; }
+
+    {
+        let a = [Res { id: 5, log: &mut log }, Res { id: 6, log: &mut log }];
+        let b = pass(a);
+    }
+    if log != 123456 { return 3; }
+
+    {
+        let a = [Res { id: 7, log: &mut log }, Res { id: 8, log: &mut log }];
+        let b = pass_tail(a);
+    }
+    if log != 12345678 { return 4; }
+
+    return 0;
+}

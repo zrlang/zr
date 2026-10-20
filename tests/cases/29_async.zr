@@ -1,0 +1,118 @@
+async fn sum_to(n: i32) -> i32 {
+    let mut i = 0;
+    let mut total = 0;
+    while i < n {
+        total = total + i;
+        i = i + 1;
+    }
+    return total;
+}
+
+async fn twice(x: i32) -> i32 {
+    return x * 2;
+}
+
+async fn outer(x: i32) -> i32 {
+    let y = twice(x).await;
+    return y + 1;
+}
+
+async fn add(a: i32, b: i32) -> i32 {
+    return a + b;
+}
+
+async fn negate_twice(x: i32) -> i32 {
+    let mut y = x;
+    if y > 0 {
+        y = 0 - y;
+    }
+    return y;
+}
+
+async fn half(x: f32) -> f32 {
+    return x / 2.0;
+}
+
+async fn with_array(x: i32) -> i32 {
+    let a: [i32; 3] = [1, 2, 3];
+    let y = twice(x).await;
+    return y + a[0];
+}
+
+async fn with_pointer(x: i32) -> i32 {
+    let mut y = x;
+    let p: *mut i32 = &mut y;
+    *p = *p + 1;
+    return y;
+}
+
+async fn with_asm(x: i32, y: i32) -> i32 {
+    let mut z: i32 = 0;
+    asm!("mov {0}, {1}\nadd {0}, {2}", out(reg) z, in(reg) x, in(reg) y);
+    return z;
+}
+
+fn future_twice(x: i32) -> impl Future {
+    let fut = twice(x);
+    return fut;
+}
+
+fn future_twice_wrap(x: i32) -> impl Future {
+    return future_twice(x);
+}
+
+async fn main() -> i32 {
+    let a = sum_to(5).await;
+    if a != 10 {
+        return 1;
+    }
+    let b = twice(21).await;
+    if b != 42 {
+        return 2;
+    }
+    let c = outer(20).await;
+    if c != 41 {
+        return 3;
+    }
+    let d = add(19, 23).await;
+    if d != 42 {
+        return 4;
+    }
+    let e = negate_twice(7).await;
+    if e != -7 {
+        return 5;
+    }
+    let f = negate_twice(-3).await;
+    if f != -3 {
+        return 6;
+    }
+    let fut = twice(20);
+    let g = fut.await;
+    if g != 40 {
+        return 7;
+    }
+    let h = half(84.0).await;
+    if h != 42.0 {
+        return 8;
+    }
+    let i = with_array(20).await;
+    if i != 41 {
+        return 9;
+    }
+    let j = with_pointer(41).await;
+    if j != 42 {
+        return 10;
+    }
+    let k = with_asm(20, 22).await;
+    if k != 42 {
+        return 11;
+    }
+    let never_awaited = twice(1);
+    let never_awaited_wrap = future_twice(1);
+    let mut n = 0;
+    while n < 3 {
+        let per_iteration = twice(n);
+        n = n + 1;
+    }
+    return 0;
+}

@@ -76,9 +76,11 @@ pub fn run(args: &[String]) -> Result<bool, String> {
                     if parts.len() == 2 {
                         let name = parts[0];
                         let version = parts[1];
-                        let registry_url = std::env::var("ZR_REGISTRY").unwrap_or_else(|_| "http://localhost:8080".into());
+                        let registry_url = std::env::var("ZR_REGISTRY")
+                            .unwrap_or_else(|_| "http://localhost:8080".into());
                         let client = RegistryClient::new(registry_url);
-                        let artifact = client.download(name, version)
+                        let artifact = client
+                            .download(name, version)
                             .map_err(|e| format!("download failed: {e}"))?;
                         let dep_path = format!("registry/{name}-{version}");
                         let dep_dir = PathBuf::from(".").join(&dep_path);
@@ -159,37 +161,42 @@ pub fn run(args: &[String]) -> Result<bool, String> {
         "search" => {
             let query = rest.first().map(String::as_str).unwrap_or("");
             let limit: usize = rest.get(1).and_then(|s| s.parse().ok()).unwrap_or(10);
-            let registry_url = std::env::var("ZR_REGISTRY").unwrap_or_else(|_| "http://localhost:8080".into());
+            let registry_url =
+                std::env::var("ZR_REGISTRY").unwrap_or_else(|_| "http://localhost:8080".into());
             let client = RegistryClient::new(registry_url);
-            let result = client.search(query, limit)
+            let result = client
+                .search(query, limit)
                 .map_err(|e| format!("search failed: {e}"))?;
             println!("{}", result);
             Ok(true)
         }
         "publish" => {
             let (name, version) = two_args(rest)?;
-            let registry_url = std::env::var("ZR_REGISTRY").unwrap_or_else(|_| "http://localhost:8080".into());
+            let registry_url =
+                std::env::var("ZR_REGISTRY").unwrap_or_else(|_| "http://localhost:8080".into());
             let token = std::env::var("ZR_TOKEN").ok();
             let mut client = RegistryClient::new(registry_url);
             if let Some(t) = token {
                 client.with_token(t);
             }
             let artifact = build_artifact(&name, &version)?;
-            let result = client.publish(&name, &version, &artifact)
+            let result = client
+                .publish(&name, &version, &artifact)
                 .map_err(|e| format!("publish failed: {e}"))?;
             println!("published {name} {version}: {}", result);
             Ok(true)
         }
         "fetch" => {
             let (name, version) = two_args(rest)?;
-            let registry_url = std::env::var("ZR_REGISTRY").unwrap_or_else(|_| "http://localhost:8080".into());
+            let registry_url =
+                std::env::var("ZR_REGISTRY").unwrap_or_else(|_| "http://localhost:8080".into());
             let client = RegistryClient::new(registry_url);
-            let artifact = client.download(&name, &version)
+            let artifact = client
+                .download(&name, &version)
                 .map_err(|e| format!("download failed: {e}"))?;
             let dep_path = format!("registry/{name}-{version}");
             let dep_dir = PathBuf::from(".").join(&dep_path);
-            std::fs::create_dir_all(&dep_dir)
-                .map_err(|e| format!("create dep dir failed: {e}"))?;
+            std::fs::create_dir_all(&dep_dir).map_err(|e| format!("create dep dir failed: {e}"))?;
             std::fs::write(dep_dir.join("libout.o"), artifact)
                 .map_err(|e| format!("write artifact failed: {e}"))?;
             println!("fetched {name}@{version} to {dep_path}");
@@ -206,7 +213,7 @@ fn build_artifact(name: &str, version: &str) -> Result<Vec<u8>, String> {
         std::fs::remove_dir_all(&tmp).ok();
     }
     std::fs::create_dir_all(&tmp).map_err(|e| format!("create tmp dir failed: {e}"))?;
-    
+
     // 写入清单
     let manifest = format!(
         "name = \"{}\"\nversion = \"{}\"\nedition = \"2024\"\n",
@@ -214,16 +221,17 @@ fn build_artifact(name: &str, version: &str) -> Result<Vec<u8>, String> {
     );
     std::fs::write(tmp.join("zr.toml"), manifest)
         .map_err(|e| format!("write manifest failed: {e}"))?;
-    
+
     // 写入源码（假设有 src/main.zr）
     std::fs::create_dir_all(tmp.join("src")).map_err(|e| format!("create src failed: {e}"))?;
     std::fs::write(tmp.join("src/main.zr"), "// library code\n")
         .map_err(|e| format!("write main failed: {e}"))?;
-    
+
     // 构建
     let zr = std::env::current_exe().map_err(|e| format!("cannot locate zr: {e}"))?;
     let out = tmp.join("target/libout.o");
-    std::fs::create_dir_all(tmp.join("target")).map_err(|e| format!("create target failed: {e}"))?;
+    std::fs::create_dir_all(tmp.join("target"))
+        .map_err(|e| format!("create target failed: {e}"))?;
     let status = std::process::Command::new(&zr)
         .arg(tmp.join("src/main.zr"))
         .arg("--no-incremental")
@@ -235,7 +243,7 @@ fn build_artifact(name: &str, version: &str) -> Result<Vec<u8>, String> {
     if !status.success() {
         return Err("build failed".into());
     }
-    
+
     // 读取产物
     std::fs::read(&out).map_err(|e| format!("read artifact failed: {e}"))
 }
@@ -389,7 +397,6 @@ fn build_all(m: &Manifest) -> Result<(), String> {
     fn visit(
         name: &str,
         dir: &Path,
-        root: &Path,
         order: &mut Vec<(String, PathBuf)>,
         done: &mut std::collections::HashSet<PathBuf>,
         stack: &mut Vec<String>,
@@ -414,7 +421,7 @@ fn build_all(m: &Manifest) -> Result<(), String> {
             // `<外层>/../base`，指到项目外面去了，构建顺序也就乱了。
             let dep_root = dep.root();
             for (dep_name, dep_path) in &dep.dependencies {
-                visit(dep_name, &dep_root.join(dep_path), root, order, done, stack)?;
+                visit(dep_name, &dep_root.join(dep_path), order, done, stack)?;
             }
         }
         stack.pop();
@@ -424,14 +431,7 @@ fn build_all(m: &Manifest) -> Result<(), String> {
 
     let mut stack = Vec::new();
     for (name, path) in &m.dependencies {
-        visit(
-            name,
-            &root.join(path),
-            &root,
-            &mut order,
-            &mut done,
-            &mut stack,
-        )?;
+        visit(name, &root.join(path), &mut order, &mut done, &mut stack)?;
     }
 
     let zr = std::env::current_exe().map_err(|e| format!("cannot locate zr: {e}"))?;

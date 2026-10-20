@@ -12,10 +12,12 @@
 //! - 临时值有显式编号，便于后续 SSA 化。
 //! - 保留 drop 语义与借用区间（骨架阶段为占位）。
 
+pub mod async_lower;
 pub mod builder;
 pub mod test_harness;
 
-use crate::typeck::hir::HirModule;
+use crate::typeck::hir::{self, HirModule};
+use std::collections::HashMap;
 
 /// 一个 MIR 模块。
 #[derive(Debug, Clone, Default)]
@@ -29,6 +31,10 @@ pub struct MirFunction {
     pub name: String,
     pub params: Vec<MirParam>,
     pub blocks: Vec<MirBasicBlock>,
+    /// 是否由 `async fn` 降级而来。
+    pub is_async: bool,
+    /// 形参的数值类型（下标与 `params` 一致）。
+    pub param_types: Vec<NumTy>,
     /// `#[inline(never)]`：优化器不许把这个函数自动内联进调用点。
     pub inline_never: bool,
     /// `#[inline(always)]`：优化器必须把这个函数内联进调用点。
@@ -67,13 +73,20 @@ pub enum MirInstr {
     Unary(String, MirUnaryOp, MirValue),
     /// await 点：暂停当前协程，等待 future 就绪。
     /// `name = await future`。
-    Await(String, MirValue),
+    Await(String, MirValue, NumTy),
+    /// 显式让出点（`yield expr`）。异步函数里由状态机降级为 Pending；
+    /// 同步函数里是空操作。
+    Suspend,
     /// 函数调用 `name = callee(args...)`。
     /// `name = callee(args...)`，末位是返回值的类型。
     ///
     /// 返回类型必须显式带上：后端要靠它判断返回值是不是浮点（走 xmm0 还是
     /// rax）。IR 的浮点常量不带位宽，没法事后从值反推。
     Call(String, String, Vec<MirValue>, NumTy),
+    /// 函数地址：`name = &func`。第二个字段是符号名。
+    FuncAddr(String, String),
+    /// 通过函数指针调用：`name = callee(args...)`，`callee` 是运行期地址。
+    CallIndirect(String, MirValue, Vec<MirValue>, NumTy),
     /// 类型转换 `name = value as to`。
     ///
     /// 之前 MIR 里根本没有这个指令：`x as i32` 在类型检查阶段就被丢掉
@@ -88,7 +101,19 @@ pub enum MirInstr {
     /// 局部变量被取地址（`&x`）后就不能再住在寄存器里——它的"身份"是一块
     /// 内存。这里把它固定到一块栈槽，读写走 `Load`/`Store`，`&x` 得到
     /// 槽的地址。`local` 是局部变量 id（`LocalId.0`）。
-    SlotAddr(String, u32),
+    /// 局部变量栈槽地址：`(结果名, 局部 id, 槽字节数)`。
+    SlotAddr(String, u32, u32),
+    /// 数组逐元素 SIMD 运算：`*out = *lhs <op> *rhs`（一次处理 128 位）。
+    SimdBinary {
+        lhs: MirValue,
+        op: MirBinaryOp,
+        rhs: MirValue,
+        out: MirValue,
+        /// 元素类型（用于选择 packed 指令）。
+        ty: NumTy,
+        /// 一次运算的元素个数。
+        lanes: u32,
+    },
     /// 内联汇编：`asm!("template", in(reg) x, out(reg) y)`。
     ///
     /// `template` 是模板字符串，`operands` 包含输入和输出操作数。
@@ -203,6 +228,11 @@ pub enum MirUnaryOp {
 /// 2. 把 HIR 表达式逐条降级为 MIR 指令，控制结构脱糖为终结器。
 pub fn lower(hir: &HirModule) -> MirModule {
     let mut functions = Vec::with_capacity(hir.functions.len());
+    let fn_params: HashMap<String, Vec<hir::Ty>> = hir
+        .functions
+        .iter()
+        .map(|f| (f.name.clone(), f.params.iter().map(|p| p.ty.clone()).collect()))
+        .collect();
 
     for func in &hir.functions {
         if let Some(body) = &func.body {
@@ -211,11 +241,15 @@ pub fn lower(hir: &HirModule) -> MirModule {
                 body,
                 &hir.def_names,
                 &hir.consts,
+                &hir.type_defs,
+                &hir.drop_impls,
+                &fn_params,
             ));
         }
     }
 
     let mut module = MirModule { functions };
+    async_lower::lower_module(&mut module);
     // `#[test]`：用合成的测试桩替换掉用户写的 `main`
     let names: Vec<String> = hir
         .functions

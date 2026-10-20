@@ -1,0 +1,19 @@
+// bench_fib.zr — recursive Fibonacci.
+//
+// fib(32) = 2178309. The result is checked so the call cannot be discarded.
+
+fn fib(n: i32) -> i32 {
+    if n < 2 {
+        return n;
+    }
+    return fib(n - 1) + fib(n - 2);
+}
+
+fn main() -> i32 {
+    let want: i32 = 2178309;
+    let got = fib(32);
+    if got != want {
+        return 1;
+    }
+    return 0;
+}

@@ -150,16 +150,16 @@ impl<T, U> Mappable for Vec<T> {
 async fn echo(conn: &mut Connection) -> Result<(), IoError> {
     let mut buf = [0u8; 1024];
     loop {
-        let n = await conn.read(&mut buf);
+        let n = conn.read(&mut buf).await;
         if n == 0 { break; }
-        await conn.write(&buf[0..n]);
+        conn.write(&buf[0..n]).await;
     }
     Result::Ok(())
 }
 
 /// 并发地等待多个 Future
 async fn fastest(a: Future<String>, b: Future<String>) -> String {
-    await race(a, b)   // 谁先就绪就用谁
+    race(a, b).await   // 谁先就绪就用谁
 }
 ```
 
@@ -386,30 +386,73 @@ fn sum(values: []const i32) -> i32 { ... }
 ### 结构体
 
 ```rust
-// 元组结构体
-pub struct Point(f64, f64);
-
 // 具名字段结构体
 pub struct Rectangle {
     pub width:  f64,
     pub height: f64,
 }
 
-// 方法
-impl Rectangle {
-    pub fn area(self) -> f64 {
-        self.width * self.height
-    }
-
-    pub fn scale(self: &mut Rectangle, factor: f64) {
-        self.width  *= factor;
-        self.height *= factor;
+// 析构器（内建 Drop trait，无需先声明）
+impl Drop for Rectangle {
+    fn drop(&mut self) {
+        // 离开作用域时自动调用；之后字段按声明顺序析构
     }
 }
 
-// 结构体更新语法
-let bigger = Rectangle { width: 100, ..smaller };
+let r = Rectangle { width: 100, height: 50 };
+let copy = r;   // 值语义：复制字段存储
 ```
+
+当前运行时支持具名字段结构体的构造、字段读写、嵌套、按值传参/返回、
+作用域析构，以及 `impl` 方法调用：
+
+```rust
+impl Rectangle {
+    fn area(&self) -> f64 { self.width * self.height }
+    fn widen(&mut self, n: f64) { self.width = self.width + n; }
+    fn new(w: f64, h: f64) -> Rectangle { Rectangle { width: w, height: h } }
+}
+
+let mut r = Rectangle::new(10.0, 5.0);
+r.widen(2.0);
+let a = r.area();   // 60
+```
+
+支持 `&self` / `&mut self` / `self` receiver、关联函数 `Type::method`、方法
+互调与结构体字段作为接收者。字段优先于同名方法，因此函数指针字段仍可直接
+调用。元组结构体同样支持构造、`.0` / `.1` 访问、嵌套、方法与 Drop；结构体
+更新语法 `..base` 也已接通（base 必须是位置表达式，含 Drop 的类型暂不支持）。
+trait 对象的动态分派仍属于后续目标。`Drop::drop` 仍是编译器唯一会自动调用
+的用户方法。
+
+析构跟踪支持结构体字段和常量数组下标的**部分移动**（如 `let a = h.a`）：
+移出的子树由新绑定负责析构，原值跳过该子树、其余字段照常析构。从直接
+实现 `Drop` 的类型中移出 Drop 字段会在类型检查阶段拒绝；动态下标暂采取
+保守策略（整个局部量视为已移动）。同步函数
+可按值返回/转发 Drop **结构体**与 Drop **数组**，调用方负责最终析构；异步
+函数仍暂不支持按值返回 Drop 结构体或数组。表达式语句、`return`、函数尾
+表达式和 `if` 分支中
+产生的 Drop 右值会在所属语句/函数结束时逆序析构；被绑定、写入字段或作为
+实参传出的临时量按移动处理。数组局部量、数组字段以及“结构体数组”已按元素
+递归析构，顺序与 Rust 一致（数组按索引、结构体按字段声明顺序）。从临时
+结构体中部分移动 Drop 字段时，临时量的对应子树按移动处理，其余字段仍在
+语句结束时析构。
+
+### 函数指针
+
+```rust
+fn add(a: i32, b: i32) -> i32 { a + b }
+
+fn apply(f: fn(i32, i32) -> i32, a: i32, b: i32) -> i32 {
+    f(a, b)
+}
+
+let f: fn(i32, i32) -> i32 = add;
+let r = apply(f, 20, 22);   // 42
+```
+
+函数指针可以作为参数、返回值、结构体字段或数组元素；x86-64 后端支持运行期
+间接调用。其它后端当前会明确报错，而不是生成错误的调用。
 
 ### 枚举
 
@@ -572,23 +615,61 @@ struct Point { x: f64, y: f64 }
 
 ### 异步
 
+当前编译器实现了 Rust 风格的受限异步降级：`async fn` 调用只创建堆上的
+future 帧，`await` 负责 poll；异步函数内部 await 子 future 时若未就绪，
+父状态机会挂起并在恢复后继续轮询。标量、数组及被取地址的局部量都保存在
+堆帧中，可跨挂起点存活；含内联汇编的异步函数也会正常拆分状态机。
+
+```rust
+async fn count(n: i32) -> i32 {
+    let mut i = 0;
+    let mut sum = 0;
+    while i < n {
+        sum = sum + i;
+        i = i + 1;
+    }
+    return sum;
+}
+
+async fn double(x: i32) -> i32 {
+    return x * 2;
+}
+
+async fn main() -> i32 {
+    let a = count(5).await;   // 入口执行器负责轮询 async main
+    let fut = double(a);
+    return fut.await;         // future 可先保存再 await
+}
+```
+
+`.await` 是后缀运算符，且只能出现在 `async fn` 内；`async fn main` 的入口
+执行器会驱动 future 到 Ready。未 await 且未转义的 future 会在最后一次使用后
+提前释放（循环中每轮回收），函数返回点再兜底清理；同一释放点的多个 future
+按产生顺序逆序释放。被 `return`、传参或写入内存的 future 视为所有权转义，
+由接收方负责。丢弃挂起中的 future 会按状态递归释放其子 future。普通函数可以
+用 `-> impl Future` 返回同一个异步函数产生的 future；调用点的 await、Drop
+和所有权传播与直接调用 async fn 一致。future 帧由编译器管理，用户结构体则
+通过 `impl Drop` 在作用域结束、`return`、`break`/`continue` 和每轮循环结束时
+按逆序析构；包含 Drop 字段的嵌套结构体会递归析构字段。完整的 `std::async`
+执行器、通道与 `spawn` 仍属于 v1.0 目标。
+
 ```rust
 // async 函数返回 Future
 async fn fetch(url: &str) -> Result<Response, Error> {
-    let conn = await connect(url)?;
-    let req  = await conn.send_request()?;
-    await req.read_response()
+    let conn = connect(url).await?;
+    let req  = conn.send_request().await?;
+    req.read_response().await
 }
 
 // 并发组合子
-let (a, b) = await join(task1, task2);          // 等待全部
-let first  = await race(task1, task2);          // 等待最快
-let all    = await try_join_all(tasks);         // 任一失败即失败
+let (a, b) = join(task1, task2).await;          // 等待全部
+let first  = race(task1, task2).await;          // 等待最快
+let all    = try_join_all(tasks).await;         // 任一失败即失败
 
 // 通道
 let (tx, rx) = channel<i32>(16);
 spawn(producer(tx));
-let value = await rx.recv();
+let value = rx.recv().await;
 ```
 
 ---
@@ -610,6 +691,22 @@ let s2 = s1;              // 所有权转移到 s2
 // println(s1);           // ❌ 编译错误：s1 已失效
 
 let s3 = s2.clone();      // 显式克隆，深拷贝
+```
+
+结构体可以实现内建 `Drop`：
+
+```rust
+struct Guard { fd: i32 }
+
+impl Drop for Guard {
+    fn drop(&mut self) {
+        close(self.fd);
+    }
+}
+
+{
+    let g = Guard { fd: open("log.txt") };
+}   // 离开块时自动调用 Guard::drop
 ```
 
 ### 借用检查
@@ -706,7 +803,27 @@ asm!("movd xmm0, {1}\nmovd xmm1, {2}\npaddd xmm0, xmm1\nmovd {0}, xmm0",
 ```
 
 当前范围：x86-64 的整数与常用 SSE/SSE2 指令、寄存器/立即数操作数；尚未提供
-`inout`/内存约束与自动向量化。其它后端遇到 `asm!` 会给出明确的"未实现"错误。
+`inout`/内存约束。其它后端遇到 `asm!` 会给出明确的"未实现"错误。
+
+### 定长数组与自动向量化
+
+定长数组是一等值（当前实现为指向元素存储的地址）：
+
+```rust
+let a: [i32; 4] = [1, 2, 3, 4];
+let b: [i32; 4] = [10, 20, 30, 40];
+let c: [i32; 4] = a + b;          // 逐元素加法
+let zeros: [i32; 3] = [7; 3];    // 重复字面量
+```
+
+- 索引读写、数组作为函数参数、`[v; N]` 均已支持；元素按声明位宽存取。
+- 128 位整数/浮点数组（`[i32;4]`、`[f32;4]`、`[i64;2]`、`[f64;2]`）的
+  `+ - * /` 与位运算在 x86-64 上自动选择 SSE/SSE2 packed 指令。
+- 其它长度/元素类型退回逐元素标量展开；非 x86-64 后端遇到数组 SIMD
+  会明确报"未实现"。
+- 数组是值语义：`let b = a`、赋值和传参都会复制元素存储；修改副本不影响
+  原数组。同步函数返回数组时由调用方提供返回槽，返回后仍然有效。
+- 已知限制：`async fn` 暂不支持按值返回数组（会在类型检查阶段报错）。
 
 ---
 
@@ -1224,7 +1341,49 @@ zr 编译器采用经典的多阶段架构：
 - [x] SIMD 指令选择（x86-64 SSE/SSE2 基础）
   - [x] `xmm0`-`xmm15`、`movd/movq` 与 GPR ↔ XMM 搬运
   - [x] `addps/paddd/pxor/movdqa/pslld` 等打包浮点/整数指令编码
-  - [x] 通过 `asm!` 直接发射 SIMD 指令；自动向量化留待 v0.9
+  - [x] 通过 `asm!` 直接发射 SIMD 指令
+- [x] 定长数组
+  - [x] 字面量、`[v; N]`、索引读写、数组参数、按元素位宽存取
+  - [x] 逐元素二元运算；128 位数组在 x86-64 上自动向量化（SSE/SSE2）
+  - [x] 浮点数组元素的 Load/Store（`movss/movsd`）
+  - [x] 数组按值拷贝语义（赋值/传参）与安全返回槽
+- [x] 运行时结构体
+  - [x] 具名字段构造、字段读写、嵌套结构体
+  - [x] 按值复制、传参、同步返回槽
+  - [x] `impl` 方法与关联函数（`&self` / `&mut self` / `self`）
+  - [x] 方法互调、字段优先于同名方法（函数指针字段仍可调用）
+  - [x] 结构体更新语法 `..base`（base 限位置表达式）
+- [x] 用户 Drop trait
+  - [x] 作用域结束、`return`、`break`/`continue` 与每轮循环析构
+  - [x] 局部量逆序析构、嵌套字段递归析构
+  - [x] Drop 数组/结构体按值返回、按值转发参数（同步）
+  - [ ] 异步函数按值返回 Drop 结构体/数组
+  - [x] 数组局部量/字段/结构体数组的元素递归析构
+  - [x] 表达式语句级 Drop 临时量
+  - [x] 结构体字段 / 常量数组下标的 Drop 部分移动
+  - [x] 语句、`return`、尾表达式与 `if` 分支中的 Drop 临时量
+  - [x] 从临时结构体中部分移动 Drop 字段
+  - [x] 拒绝从直接实现 Drop 的类型移出 Drop 字段
+  - [ ] 动态下标的精确部分移动跟踪
+  - [x] 元组结构体：构造、`.0` / `.1` 字段、嵌套、方法与 Drop
+- [x] 一等函数指针（x86-64）
+  - [x] `fn(T, ...) -> R` 类型、函数名取址、变量/参数/返回值
+  - [x] 结构体字段与数组中的函数指针、运行期间接调用
+  - [x] 其它后端遇到函数指针时明确报错
+- [x] 受限异步降级（Rust Future/poll 模型）
+  - [x] `async fn` 拆成 future 构造器 + `__poll` 状态机，堆帧保存挂起点
+  - [x] Rust 风格后缀 `.await`（仅限 `async fn`）；Pending 时挂起父状态机并传播
+  - [x] `async fn main` 支持；入口执行器轮询到 Ready 后返回结果
+  - [x] 子 future 返回 Pending 时挂起父状态机，恢复后继续轮询
+  - [x] 标量、数组与取地址局部量（含浮点）跨挂起点保存/恢复
+  - [x] 含内联汇编的异步函数正常拆分状态机
+  - [x] `let fut = f(); fut.await;` 的 future 别名
+  - [x] 未 await 且未转义 future 的返回点释放
+  - [x] 挂起 future 的递归 Drop（按状态释放子 future）
+  - [x] 活跃性驱动的局部/循环作用域释放
+  - [x] 普通函数返回 future 的所有权传播（静态单一来源）
+  - [x] future 释放顺序确定性（同一活跃性点按产生顺序逆序）
+  - [ ] 完整执行器（动态 future 来源仍需任务队列与动态 poll 调度）
 
 ### v1.0.0（目标） 🎯
 - [ ] API 稳定

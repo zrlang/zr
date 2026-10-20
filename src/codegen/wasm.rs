@@ -97,9 +97,15 @@ pub enum WasmInstr {
     /// `br_table`：按栈顶索引跳转（`targets` 为各索引对应的深度，`default` 为越界回退）。
     BrTable(Vec<u32>, u32),
     /// 从线性内存加载：`(addr) -> value`。
-    Load { op: MemOp, addr64: bool },
+    Load {
+        op: MemOp,
+        addr64: bool,
+    },
     /// 存入线性内存：`(addr, value) -> ()`。
-    Store { op: MemOp, addr64: bool },
+    Store {
+        op: MemOp,
+        addr64: bool,
+    },
 }
 
 /// 一次线性内存访问的形态：字节宽度、整数窄访问是否符号扩展、是否浮点。
@@ -335,41 +341,221 @@ impl WasmBinaryOp {
         if ty == WasmType::F32 || ty == WasmType::F64 {
             let f64 = ty == WasmType::F64;
             return match self {
-                FAdd => if f64 { 0xA0 } else { 0x92 },
-                FSub => if f64 { 0xA1 } else { 0x93 },
-                FMul => if f64 { 0xA2 } else { 0x94 },
-                FDiv => if f64 { 0xA3 } else { 0x95 },
-                FMin => if f64 { 0xA4 } else { 0x96 },
-                FMax => if f64 { 0xA5 } else { 0x97 },
-                FCopysign => if f64 { 0xA6 } else { 0x98 },
-                FEq => if f64 { 0x61 } else { 0x5B },
-                FNe => if f64 { 0x62 } else { 0x5C },
-                FLt => if f64 { 0x63 } else { 0x5D },
-                FGt => if f64 { 0x64 } else { 0x5E },
-                FLe => if f64 { 0x65 } else { 0x5F },
-                FGe => if f64 { 0x66 } else { 0x60 },
+                FAdd => {
+                    if f64 {
+                        0xA0
+                    } else {
+                        0x92
+                    }
+                }
+                FSub => {
+                    if f64 {
+                        0xA1
+                    } else {
+                        0x93
+                    }
+                }
+                FMul => {
+                    if f64 {
+                        0xA2
+                    } else {
+                        0x94
+                    }
+                }
+                FDiv => {
+                    if f64 {
+                        0xA3
+                    } else {
+                        0x95
+                    }
+                }
+                FMin => {
+                    if f64 {
+                        0xA4
+                    } else {
+                        0x96
+                    }
+                }
+                FMax => {
+                    if f64 {
+                        0xA5
+                    } else {
+                        0x97
+                    }
+                }
+                FCopysign => {
+                    if f64 {
+                        0xA6
+                    } else {
+                        0x98
+                    }
+                }
+                FEq => {
+                    if f64 {
+                        0x61
+                    } else {
+                        0x5B
+                    }
+                }
+                FNe => {
+                    if f64 {
+                        0x62
+                    } else {
+                        0x5C
+                    }
+                }
+                FLt => {
+                    if f64 {
+                        0x63
+                    } else {
+                        0x5D
+                    }
+                }
+                FGt => {
+                    if f64 {
+                        0x64
+                    } else {
+                        0x5E
+                    }
+                }
+                FLe => {
+                    if f64 {
+                        0x65
+                    } else {
+                        0x5F
+                    }
+                }
+                FGe => {
+                    if f64 {
+                        0x66
+                    } else {
+                        0x60
+                    }
+                }
                 _ => unreachable!("整数运算不作用于浮点类型"),
             };
         }
         let i64 = ty == WasmType::I64;
         match self {
-            Eq => if i64 { 0x51 } else { 0x46 },
-            Ne => if i64 { 0x52 } else { 0x47 },
-            LtS => if i64 { 0x53 } else { 0x48 },
-            GtS => if i64 { 0x55 } else { 0x4a },
-            LeS => if i64 { 0x57 } else { 0x4c },
-            GeS => if i64 { 0x59 } else { 0x4e },
-            Add => if i64 { 0x7c } else { 0x6a },
-            Sub => if i64 { 0x7d } else { 0x6b },
-            Mul => if i64 { 0x7e } else { 0x6c },
-            DivS => if i64 { 0x7f } else { 0x6d },
-            RemS => if i64 { 0x81 } else { 0x6f },
-            And => if i64 { 0x83 } else { 0x71 },
-            Or => if i64 { 0x84 } else { 0x72 },
-            Xor => if i64 { 0x85 } else { 0x73 },
-            Shl => if i64 { 0x86 } else { 0x74 },
-            ShrS => if i64 { 0x87 } else { 0x75 },
-            ShrU => if i64 { 0x88 } else { 0x76 },
+            Eq => {
+                if i64 {
+                    0x51
+                } else {
+                    0x46
+                }
+            }
+            Ne => {
+                if i64 {
+                    0x52
+                } else {
+                    0x47
+                }
+            }
+            LtS => {
+                if i64 {
+                    0x53
+                } else {
+                    0x48
+                }
+            }
+            GtS => {
+                if i64 {
+                    0x55
+                } else {
+                    0x4a
+                }
+            }
+            LeS => {
+                if i64 {
+                    0x57
+                } else {
+                    0x4c
+                }
+            }
+            GeS => {
+                if i64 {
+                    0x59
+                } else {
+                    0x4e
+                }
+            }
+            Add => {
+                if i64 {
+                    0x7c
+                } else {
+                    0x6a
+                }
+            }
+            Sub => {
+                if i64 {
+                    0x7d
+                } else {
+                    0x6b
+                }
+            }
+            Mul => {
+                if i64 {
+                    0x7e
+                } else {
+                    0x6c
+                }
+            }
+            DivS => {
+                if i64 {
+                    0x7f
+                } else {
+                    0x6d
+                }
+            }
+            RemS => {
+                if i64 {
+                    0x81
+                } else {
+                    0x6f
+                }
+            }
+            And => {
+                if i64 {
+                    0x83
+                } else {
+                    0x71
+                }
+            }
+            Or => {
+                if i64 {
+                    0x84
+                } else {
+                    0x72
+                }
+            }
+            Xor => {
+                if i64 {
+                    0x85
+                } else {
+                    0x73
+                }
+            }
+            Shl => {
+                if i64 {
+                    0x86
+                } else {
+                    0x74
+                }
+            }
+            ShrS => {
+                if i64 {
+                    0x87
+                } else {
+                    0x75
+                }
+            }
+            ShrU => {
+                if i64 {
+                    0x88
+                } else {
+                    0x76
+                }
+            }
             _ => unreachable!("浮点运算需要浮点类型"),
         }
     }
@@ -456,18 +642,24 @@ impl WasmModule {
                     }
                 }
             }
-            // 本函数里每个被取地址的局部变量各留 8 字节槽（零初始化）。
-            let mut slots: HashMap<u32, i64> = HashMap::new();
+            // 本函数里每个被取地址的局部变量按声明的字节数留槽（零初始化）。
+            let mut sizes: Vec<(u32, u32)> = Vec::new();
             for block in &func.blocks {
                 for instr in &block.instrs {
-                    if let SsaInstr::SlotAddr { local, .. } = instr {
-                        slots.entry(*local).or_insert_with(|| {
-                            let addr = data.len() as i64;
-                            data.extend_from_slice(&[0u8; 8]);
-                            addr
-                        });
+                    if let SsaInstr::SlotAddr { local, size, .. } = instr {
+                        match sizes.iter_mut().find(|(id, _)| id == local) {
+                            Some((_, s)) => *s = (*s).max(*size),
+                            None => sizes.push((*local, *size)),
+                        }
                     }
                 }
+            }
+            let mut slots: HashMap<u32, i64> = HashMap::new();
+            for (local, size) in sizes {
+                let addr = data.len() as i64;
+                let bytes = (size.max(8) as usize).div_ceil(8) * 8;
+                data.extend(std::iter::repeat_n(0u8, bytes));
+                slots.insert(local, addr);
             }
             slot_maps.push(slots);
         }
@@ -662,7 +854,11 @@ impl WasmModule {
 
         // ---- Data 段（活跃数据段，偏移 0）----
         if !self.data.is_empty() {
-            write_section(&mut out, 11, &encode_data_section(&self.data, self.data_addr64));
+            write_section(
+                &mut out,
+                11,
+                &encode_data_section(&self.data, self.data_addr64),
+            );
         }
         out
     }
@@ -1044,6 +1240,7 @@ fn infer_float_widths(func: &SsaFunction) -> HashMap<u32, u8> {
                             changed = true;
                         }
                     }
+                    SsaInstr::SimdBinary { .. } => crate::codegen::unsupported_simd("wasm32"),
                     SsaInstr::Asm { .. } => {
                         // 内联汇编：无浮点结果，不需要标记浮点宽度
                     }
@@ -1093,22 +1290,92 @@ fn wasm_binop(op: SsaBinaryOp, lhs_ty: WasmType, rhs_ty: WasmType) -> (WasmType,
     let ft = float_ty.unwrap_or(WasmType::I64);
     let is_f = float_ty.is_some();
     match op {
-        Add => (ft, if is_f { WasmBinaryOp::FAdd } else { WasmBinaryOp::Add }),
-        Sub => (ft, if is_f { WasmBinaryOp::FSub } else { WasmBinaryOp::Sub }),
-        Mul => (ft, if is_f { WasmBinaryOp::FMul } else { WasmBinaryOp::Mul }),
-        Div => (ft, if is_f { WasmBinaryOp::FDiv } else { WasmBinaryOp::DivS }),
+        Add => (
+            ft,
+            if is_f {
+                WasmBinaryOp::FAdd
+            } else {
+                WasmBinaryOp::Add
+            },
+        ),
+        Sub => (
+            ft,
+            if is_f {
+                WasmBinaryOp::FSub
+            } else {
+                WasmBinaryOp::Sub
+            },
+        ),
+        Mul => (
+            ft,
+            if is_f {
+                WasmBinaryOp::FMul
+            } else {
+                WasmBinaryOp::Mul
+            },
+        ),
+        Div => (
+            ft,
+            if is_f {
+                WasmBinaryOp::FDiv
+            } else {
+                WasmBinaryOp::DivS
+            },
+        ),
         Rem => (WasmType::I64, WasmBinaryOp::RemS),
         And | BitAnd => (WasmType::I64, WasmBinaryOp::And),
         Or | BitOr => (WasmType::I64, WasmBinaryOp::Or),
         BitXor => (WasmType::I64, WasmBinaryOp::Xor),
         Shl => (WasmType::I64, WasmBinaryOp::Shl),
         Shr => (WasmType::I64, WasmBinaryOp::ShrS),
-        Eq => (ft, if is_f { WasmBinaryOp::FEq } else { WasmBinaryOp::Eq }),
-        Ne => (ft, if is_f { WasmBinaryOp::FNe } else { WasmBinaryOp::Ne }),
-        Lt => (ft, if is_f { WasmBinaryOp::FLt } else { WasmBinaryOp::LtS }),
-        Gt => (ft, if is_f { WasmBinaryOp::FGt } else { WasmBinaryOp::GtS }),
-        Le => (ft, if is_f { WasmBinaryOp::FLe } else { WasmBinaryOp::LeS }),
-        Ge => (ft, if is_f { WasmBinaryOp::FGe } else { WasmBinaryOp::GeS }),
+        Eq => (
+            ft,
+            if is_f {
+                WasmBinaryOp::FEq
+            } else {
+                WasmBinaryOp::Eq
+            },
+        ),
+        Ne => (
+            ft,
+            if is_f {
+                WasmBinaryOp::FNe
+            } else {
+                WasmBinaryOp::Ne
+            },
+        ),
+        Lt => (
+            ft,
+            if is_f {
+                WasmBinaryOp::FLt
+            } else {
+                WasmBinaryOp::LtS
+            },
+        ),
+        Gt => (
+            ft,
+            if is_f {
+                WasmBinaryOp::FGt
+            } else {
+                WasmBinaryOp::GtS
+            },
+        ),
+        Le => (
+            ft,
+            if is_f {
+                WasmBinaryOp::FLe
+            } else {
+                WasmBinaryOp::LeS
+            },
+        ),
+        Ge => (
+            ft,
+            if is_f {
+                WasmBinaryOp::FGe
+            } else {
+                WasmBinaryOp::GeS
+            },
+        ),
     }
 }
 
@@ -1258,6 +1525,7 @@ fn emit_ssa_instr(
         None => WasmType::I64,
     };
     match instr {
+        SsaInstr::SimdBinary { .. } => crate::codegen::unsupported_simd("wasm32"),
         SsaInstr::Cast {
             result,
             src,
@@ -1405,7 +1673,11 @@ fn emit_ssa_instr(
             // 操作数类型未知时（例如未标注的形参），用 SSA 的结果类型兜底
             if op_ty == WasmType::I64 {
                 if let NumTy::Float(w) = ty {
-                    op_ty = if *w == 32 { WasmType::F32 } else { WasmType::F64 };
+                    op_ty = if *w == 32 {
+                        WasmType::F32
+                    } else {
+                        WasmType::F64
+                    };
                 }
             }
             body.push(WasmInstr::Binary(op_ty, wasm_op));
@@ -1439,7 +1711,7 @@ fn emit_ssa_instr(
             // `Var` 只是名字占位。这里只需保证槽位存在。
             ensure_local(result, local_map, locals, next_local, float_widths);
         }
-        SsaInstr::SlotAddr { result, local } => {
+        SsaInstr::SlotAddr { result, local, .. } => {
             let addr = slots.get(local).copied().unwrap_or(0);
             body.push(WasmInstr::I64Const(addr));
             let idx = ensure_local(result, local_map, locals, next_local, float_widths);
@@ -1480,6 +1752,9 @@ fn emit_ssa_instr(
         }
         SsaInstr::Asm { .. } => {
             crate::codegen::unsupported_inline_asm("wasm32");
+        }
+        SsaInstr::FuncAddr { .. } | SsaInstr::CallIndirect { .. } => {
+            crate::codegen::unsupported_function_pointer("wasm32");
         }
     }
 }
@@ -1657,7 +1932,7 @@ fn encode_limits(min: u32, max: Option<u32>, memory64: bool) -> Vec<u8> {
             uleb(u64::from(max), &mut out);
         }
         None => {
-            out.push(0x00 | mem64);
+            out.push(mem64);
             uleb(u64::from(min), &mut out);
         }
     }

@@ -1,0 +1,59 @@
+//=============================================================================
+// tests/cases/43_return_drop_struct.zr — 同步函数按值返回 Drop 结构体
+//
+// 覆盖：`return` 局部量、尾表达式、参数转发，以及调用方只析构一次。
+//=============================================================================
+
+struct Res {
+    id: i32,
+    log: &mut i32,
+}
+
+impl Drop for Res {
+    fn drop(&mut self) {
+        *self.log = *self.log * 10 + self.id;
+    }
+}
+
+fn make(log: &mut i32) -> Res {
+    let r = Res { id: 1, log };
+    return r;
+}
+
+fn make_tail(log: &mut i32) -> Res {
+    Res { id: 2, log }
+}
+
+fn pass(r: Res) -> Res {
+    return r;
+}
+
+fn pass_tail(r: Res) -> Res {
+    r
+}
+
+fn main() -> i32 {
+    let mut log: i32 = 0;
+
+    {
+        let r = make(&mut log);
+    }
+    if log != 1 { return 1; }
+
+    {
+        make_tail(&mut log);
+    }
+    if log != 12 { return 2; }
+
+    {
+        let r = pass(Res { id: 3, log: &mut log });
+    }
+    if log != 123 { return 3; }
+
+    {
+        let r = pass_tail(Res { id: 4, log: &mut log });
+    }
+    if log != 1234 { return 4; }
+
+    return 0;
+}

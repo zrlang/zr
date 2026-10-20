@@ -4,8 +4,8 @@
 
 #![allow(dead_code)]
 
-pub mod registry;
 pub mod build_scripts;
+pub mod registry;
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
@@ -23,7 +23,11 @@ pub struct Version {
 
 impl Version {
     pub fn new(major: u64, minor: u64, patch: u64) -> Self {
-        Self { major, minor, patch }
+        Self {
+            major,
+            minor,
+            patch,
+        }
     }
 
     /// 解析版本字符串 `1.2.3`。
@@ -85,7 +89,8 @@ impl VersionRange {
             return Version::parse(rest).map(VersionRange::Lte);
         }
         if let Some(rest) = s.strip_prefix('>') {
-            return Version::parse(rest).map(|v| VersionRange::Gte(Version::new(v.major, v.minor, v.patch + 1)));
+            return Version::parse(rest)
+                .map(|v| VersionRange::Gte(Version::new(v.major, v.minor, v.patch + 1)));
         }
         if let Some(rest) = s.strip_prefix('<') {
             return Version::parse(rest).map(VersionRange::Lte);
@@ -101,13 +106,10 @@ impl VersionRange {
             VersionRange::Gte(target) => v >= target,
             VersionRange::Lte(target) => v <= target,
             VersionRange::Caret(base) => {
-                v.major == base.major
-                    && (v.minor, v.patch) >= (base.minor, base.patch)
+                v.major == base.major && (v.minor, v.patch) >= (base.minor, base.patch)
             }
             VersionRange::Tilde(base) => {
-                v.major == base.major
-                    && v.minor == base.minor
-                    && v.patch >= base.patch
+                v.major == base.major && v.minor == base.minor && v.patch >= base.patch
             }
             VersionRange::And(a, b) => a.contains(v) && b.contains(v),
         }
@@ -186,7 +188,10 @@ pub struct Resolution {
 #[derive(Debug, Clone)]
 pub enum ResolveError {
     /// 没有找到满足约束的版本。
-    NoVersion { package: PackageName, range: VersionRange },
+    NoVersion {
+        package: PackageName,
+        range: VersionRange,
+    },
     /// 依赖冲突。
     Conflict(String),
     /// 包不存在。
@@ -237,10 +242,7 @@ impl<'a> Resolver<'a> {
                 continue;
             }
 
-            let range = constraints
-                .get(&pkg)
-                .cloned()
-                .unwrap_or(VersionRange::Any);
+            let range = constraints.get(&pkg).cloned().unwrap_or(VersionRange::Any);
 
             // 找到满足约束的最高版本
             let candidates: Vec<Version> = self
@@ -314,11 +316,7 @@ pub struct LockDependency {
 pub const LOCKFILE_VERSION: u32 = 1;
 
 /// 将解析结果转换为锁文件条目。
-pub fn resolution_to_lock(
-    res: &Resolution,
-    registry: &Registry,
-    source: &str,
-) -> Vec<LockEntry> {
+pub fn resolution_to_lock(res: &Resolution, registry: &Registry, source: &str) -> Vec<LockEntry> {
     let mut entries = Vec::new();
     for (name, version) in &res.selected {
         let deps = registry
@@ -365,15 +363,15 @@ pub fn serialize_lock(entries: &[LockEntry]) -> String {
         out.push_str(&format!("source = \"{}\"\n", entry.source));
         out.push_str(&format!("checksum = \"{}\"\n", entry.checksum));
         if !entry.dependencies.is_empty() {
-            out.push_str("\n");
+            out.push('\n');
             for dep in &entry.dependencies {
                 out.push_str("[[package.dependencies]]\n");
                 out.push_str(&format!("name = \"{}\"\n", dep.name));
                 out.push_str(&format!("version = \"{}\"\n", dep.version));
-                out.push_str("\n");
+                out.push('\n');
             }
         }
-        out.push_str("\n");
+        out.push('\n');
     }
     out
 }
@@ -427,7 +425,9 @@ pub fn deserialize_lock(content: &str) -> Vec<LockEntry> {
                         });
                     }
                     "version" if in_deps => {
-                        if let (Some(dep), Some(v)) = (entry.dependencies.last_mut(), Version::parse(value)) {
+                        if let (Some(dep), Some(v)) =
+                            (entry.dependencies.last_mut(), Version::parse(value))
+                        {
                             dep.version = v;
                         }
                     }

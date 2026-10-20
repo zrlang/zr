@@ -1,0 +1,76 @@
+//=============================================================================
+// tests/cases/42_temp_partial_move.zr — 从临时结构体部分移动 Drop 字段
+//
+// 覆盖：普通字段、嵌套字段、整个 Drop 字段移出，以及临时量剩余字段的析构。
+//=============================================================================
+
+struct Res {
+    id: i32,
+    log: &mut i32,
+}
+
+impl Drop for Res {
+    fn drop(&mut self) {
+        *self.log = *self.log * 10 + self.id;
+    }
+}
+
+struct Inner {
+    a: Res,
+    b: Res,
+}
+
+struct Outer {
+    inner: Inner,
+    tail: Res,
+}
+
+fn main() -> i32 {
+    let mut log: i32 = 0;
+
+    {
+        let x = Inner {
+            a: Res { id: 1, log: &mut log },
+            b: Res { id: 2, log: &mut log },
+        }.a;
+    }
+    if log != 21 { return 1; }
+
+    log = 0;
+    {
+        let x = Outer {
+            inner: Inner {
+                a: Res { id: 1, log: &mut log },
+                b: Res { id: 2, log: &mut log },
+            },
+            tail: Res { id: 3, log: &mut log },
+        }.inner.a;
+    }
+    if log != 231 { return 2; }
+
+    log = 0;
+    {
+        let x = Outer {
+            inner: Inner {
+                a: Res { id: 1, log: &mut log },
+                b: Res { id: 2, log: &mut log },
+            },
+            tail: Res { id: 3, log: &mut log },
+        }.tail;
+    }
+    if log != 123 { return 3; }
+
+    log = 0;
+    {
+        let x = Outer {
+            inner: Inner {
+                a: Res { id: 1, log: &mut log },
+                b: Res { id: 2, log: &mut log },
+            },
+            tail: Res { id: 3, log: &mut log },
+        }.inner;
+    }
+    if log != 312 { return 4; }
+
+    return 0;
+}

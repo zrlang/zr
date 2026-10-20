@@ -1,0 +1,102 @@
+//=============================================================================
+// tests/cases/33_methods.zr — 具名结构体的 impl 方法与关联函数
+//
+// `expr.method(args)` 在语法上是 `Call(Field(expr, method), args)`。字段优先
+// （函数指针字段仍然可调用），字段不存在时才解析成 `Type__method`。
+// 覆盖：&self / &mut self / self、关联函数、方法互调、方法链、结构体字段
+// 作为接收者，以及 &self 不会误移动 Drop 类型。
+//=============================================================================
+
+struct Counter {
+    value: i32,
+    step: i32,
+}
+
+impl Counter {
+    fn new(start: i32) -> Counter {
+        return Counter { value: start, step: 1 };
+    }
+
+    fn get(&self) -> i32 {
+        return self.value;
+    }
+
+    fn bump(&mut self) {
+        self.value = self.value + self.step;
+    }
+
+    fn add(&mut self, n: i32) -> i32 {
+        self.value = self.value + n;
+        return self.get();
+    }
+
+    fn with(&self, other: &Counter) -> i32 {
+        return self.value + other.get();
+    }
+
+    fn into_value(self) -> i32 {
+        return self.value;
+    }
+}
+
+struct Pair {
+    c: Counter,
+    d: Counter,
+}
+
+fn make(v: i32) -> Counter {
+    return Counter::new(v);
+}
+
+struct Probe {
+    p: &mut i32,
+    id: i32,
+}
+
+impl Drop for Probe {
+    fn drop(&mut self) {
+        *self.p = *self.p * 10 + self.id;
+    }
+}
+
+impl Probe {
+    fn peek(&self) -> i32 {
+        return self.id;
+    }
+}
+
+fn main() -> i32 {
+    let mut c = Counter::new(10);
+    if c.get() != 10 { return 1; }
+
+    c.bump();
+    if c.get() != 11 { return 2; }
+
+    if c.add(5) != 16 { return 3; }
+    if c.get() != 16 { return 4; }
+
+    let d = Counter::new(100);
+    if c.with(&d) != 116 { return 5; }
+    if d.get() != 100 { return 6; }
+
+    let mut p = Pair {
+        c: Counter::new(1),
+        d: Counter::new(2),
+    };
+    if p.c.get() != 1 || p.d.get() != 2 { return 7; }
+    if p.c.with(&p.d) != 3 { return 8; }
+    if p.c.add(9) != 10 { return 9; }
+    if p.c.get() != 10 { return 10; }
+
+    if make(7).get() != 7 { return 11; }
+    if Counter::new(3).into_value() != 3 { return 12; }
+
+    let mut x = 0;
+    {
+        let r = Probe { p: &mut x, id: 7 };
+        if r.peek() != 7 { return 13; }
+    }
+    if x != 7 { return 14; }
+
+    return 0;
+}

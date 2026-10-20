@@ -356,28 +356,30 @@ fn emit_store_mem(unit: &mut CompilationUnit, base: u8, src: u8, ty: NumTy) {
 
 /// 扫出所有被取地址的局部变量，各分配一个栈槽（排在 `base` 之后）。
 fn assign_local_slots(func: &SsaFunction, base: usize) -> usize {
-    let mut ids: Vec<u32> = Vec::new();
+    // 同一个 local id 可能出现多次；取最大的槽需求。
+    let mut locals: Vec<(u32, u32)> = Vec::new();
     for block in &func.blocks {
         for instr in &block.instrs {
-            if let SsaInstr::SlotAddr { local, .. } = instr {
-                if !ids.contains(local) {
-                    ids.push(*local);
+            if let SsaInstr::SlotAddr { local, size, .. } = instr {
+                match locals.iter_mut().find(|(id, _)| id == local) {
+                    Some((_, s)) => *s = (*s).max(*size),
+                    None => locals.push((*local, *size)),
                 }
             }
         }
     }
-    ids.sort_unstable();
-    let count = ids.len();
+    locals.sort_unstable_by_key(|(id, _)| *id);
+    let mut slots = 0usize;
     LOCAL_SLOTS.with(|m| {
         let mut map = m.borrow_mut();
         map.clear();
-        for (i, id) in ids.into_iter().enumerate() {
-            map.insert(id, base + i);
+        for (id, size) in locals {
+            map.insert(id, base + slots);
+            slots += (size.max(8) as usize).div_ceil(8);
         }
     });
-    count
+    slots
 }
-
 /// 标量浮点二元算术：`fadd/fsub/fmul/fdiv {s|d}<rd>, <rn>, <rm>`。
 ///
 /// `opcode2`：`Mul=0x02`、`Div=0x06`、`Add=0x0A`、`Sub=0x0E`；
@@ -1158,13 +1160,17 @@ fn emit_instr(unit: &mut CompilationUnit, instr: &SsaInstr) {
             let v = val_reg2(unit, *value);
             emit_store_mem(unit, p.bits(), v.bits(), *ty);
         }
-        SsaInstr::SlotAddr { result, local } => {
+        SsaInstr::SlotAddr { result, local, .. } => {
             let slot = LOCAL_SLOTS.with(|m| m.borrow().get(local).copied().unwrap_or(0));
             emit_lea_slot(unit, out_reg(*result).bits(), slot);
             put_out(unit, *result);
         }
+        SsaInstr::SimdBinary { .. } => crate::codegen::unsupported_simd("aarch64"),
         SsaInstr::Asm { .. } => {
             crate::codegen::unsupported_inline_asm("aarch64");
+        }
+        SsaInstr::FuncAddr { .. } | SsaInstr::CallIndirect { .. } => {
+            crate::codegen::unsupported_function_pointer("aarch64");
         }
         // `Var` 只是 SSA 值的命名引用，运行时不产生代码。
         SsaInstr::Var { .. } => {}
@@ -1437,6 +1443,217 @@ pub fn emit_start_wrapper(target: &Target, unit: &mut CompilationUnit) {
         kind: SymbolKind::Function,
     });
     unit.entry = target.entry_symbol().to_string();
+}
+
+/// 扫出一个函数里所有浮点值，给每个值分配专属栈槽，返回槽数。
+///
+/// 浮点"性"必须穿过 `Copy` 与 `Phi` 传播：优化会把 `a + b` 的结果复制走，
+/// 循环里也会有 φ；只认"定义点"会让这些中转值被当成整数去 GPR 里找，然后
+/// 拿到栈槽里的残渣当浮点数用。
+///
+/// 播种与传播合成一个不动点：`Neg` 的播种依赖操作数已是浮点，而操作数的
+/// 浮点性可能要等 `Copy` 传播完才知道，所以每轮都重扫全部指令直到不再变化。
+fn assign_float_slots(func: &SsaFunction, base: usize) -> usize {
+    let mut floats: HashMap<u32, u8> = HashMap::new();
+    let width_of =
+        |v: &SsaValue, map: &HashMap<u32, u8>| -> u8 { map.get(&v.id()).copied().unwrap_or(0) };
+    loop {
+        let mut changed = false;
+        let mark = |v: &SsaValue, w: u8, map: &mut HashMap<u32, u8>| -> bool {
+            match map.get(&v.id()) {
+                // 已知但更窄，保留更宽的那个（f64 优先）
+                Some(old) if *old >= w => false,
+                _ => {
+                    map.insert(v.id(), w);
+                    true
+                }
+            }
+        };
+        for block in &func.blocks {
+            for instr in &block.instrs {
+                match instr {
+                    SsaInstr::Const {
+                        result,
+                        value: SsaConst::Float(_, w),
+                    } => {
+                        if mark(result, *w, &mut floats) {
+                            changed = true;
+                        }
+                    }
+                    SsaInstr::Binary {
+                        result,
+                        ty,
+                        lhs,
+                        rhs,
+                        ..
+                    } => {
+                        if ty.is_float() {
+                            let w = match *ty {
+                                NumTy::Float(w) => w,
+                                _ => 64,
+                            };
+                            for v in [result, lhs, rhs] {
+                                if mark(v, w, &mut floats) {
+                                    changed = true;
+                                }
+                            }
+                        } else {
+                            // 比较的结果是 bool，但操作数可能都是浮点：两边互相传播
+                            let lw = width_of(lhs, &floats);
+                            let rw = width_of(rhs, &floats);
+                            let (unknown, w) = match (lw, rw) {
+                                (w, 0) if w > 0 => (rhs, w),
+                                (0, w) if w > 0 => (lhs, w),
+                                _ => continue,
+                            };
+                            if mark(unknown, w, &mut floats) {
+                                changed = true;
+                            }
+                        }
+                    }
+                    SsaInstr::Unary {
+                        result, operand, ..
+                    } => {
+                        if floats.contains_key(&result.id()) {
+                            let w = width_of(result, &floats);
+                            if w > 0 && mark(operand, w, &mut floats) {
+                                changed = true;
+                            }
+                        }
+                        if floats.contains_key(&operand.id()) {
+                            let w = width_of(operand, &floats);
+                            if w > 0 && mark(result, w, &mut floats) {
+                                changed = true;
+                            }
+                        }
+                    }
+                    SsaInstr::Call { result, ty, .. } => {
+                        if ty.is_float() {
+                            let w = match *ty {
+                                NumTy::Float(w) => w,
+                                _ => 64,
+                            };
+                            if mark(result, w, &mut floats) {
+                                changed = true;
+                            }
+                        }
+                    }
+                    SsaInstr::Cast {
+                        result,
+                        src,
+                        from,
+                        to,
+                    } => {
+                        if to.is_float() {
+                            let w = match *to {
+                                NumTy::Float(w) => w,
+                                _ => 64,
+                            };
+                            if mark(result, w, &mut floats) {
+                                changed = true;
+                            }
+                        }
+                        if from.is_float() {
+                            let w = match *from {
+                                NumTy::Float(w) => w,
+                                _ => 64,
+                            };
+                            if mark(src, w, &mut floats) {
+                                changed = true;
+                            }
+                        }
+                    }
+                    SsaInstr::Copy { result, src } => {
+                        // 前向：源是浮点 -> 结果是浮点
+                        if floats.contains_key(&src.id()) {
+                            let w = width_of(src, &floats);
+                            if mark(result, w, &mut floats) {
+                                changed = true;
+                            }
+                        }
+                        // 反向：结果是浮点 -> 源也是（形参没有类型标注，只能反推）
+                        if floats.contains_key(&result.id()) {
+                            let w = width_of(result, &floats);
+                            if mark(src, w, &mut floats) {
+                                changed = true;
+                            }
+                        }
+                    }
+                    SsaInstr::Phi {
+                        result, incoming, ..
+                    } if incoming.iter().any(|(_, v)| floats.contains_key(&v.id())) => {
+                        let w = incoming
+                            .iter()
+                            .map(|(_, v)| width_of(v, &floats))
+                            .max()
+                            .unwrap_or(64);
+                        if mark(result, w, &mut floats) {
+                            changed = true;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+    let mut ids: Vec<u32> = floats.keys().copied().collect();
+    ids.sort_unstable();
+    let count = ids.len();
+    FLOAT_SLOTS.with(|m| {
+        let mut map = m.borrow_mut();
+        map.clear();
+        for (i, id) in ids.into_iter().enumerate() {
+            let w = floats.get(&id).copied().unwrap_or(64);
+            map.insert(id, (base + i, w));
+        }
+    });
+    count
+}
+
+/// 寄存器压力检查。
+///
+/// 这些后端还没实现溢出（spilling）：活跃值超过可分配寄存器数时，
+/// `alloc_reg` 按编号取模会让同时存活的值抢同一个寄存器，生成**错的**代码。
+/// 宁可在这里明确报错，也不能安静地编出一个算错的程序。
+///
+/// 溢出未见实现时直接报错；否则把线性扫描的分配结果写进 `REG_MAP` 供
+/// `alloc_reg` 使用。x86-64 后端自己实现了溢出，见 `encoder.rs`。
+fn check_register_pressure(func: &SsaFunction) {
+    // 传 callee-save 集合：跨调用存活的值只放 x19..x28，否则 `call` 会破坏它。
+    let alloc = crate::codegen::regalloc::allocate_registers(
+        func,
+        ALLOCATABLE.len(),
+        &CALLEE_SAVE,
+        ARG_REGS.len(),
+        &std::collections::HashSet::new(),
+    );
+    if alloc.spilled > 0 {
+        // 池子装不下的值溢出到栈槽；槽数记进 `SPILL_SLOTS`，槽区高度由
+        // `emit_function` 预留。
+        SPILL_SLOTS.with(|m| {
+            let mut map = m.borrow_mut();
+            map.clear();
+            for (&v, loc) in &alloc.map {
+                if let crate::codegen::regalloc::Location::Stack(i) = loc {
+                    map.insert(v, *i);
+                }
+            }
+        });
+    } else {
+        SPILL_SLOTS.with(|m| m.borrow_mut().clear());
+    }
+    REG_MAP.with(|m| {
+        let mut map = m.borrow_mut();
+        map.clear();
+        for (&v, loc) in &alloc.map {
+            if let crate::codegen::regalloc::Location::Reg(i) = loc {
+                map.insert(v, *i);
+            }
+        }
+    });
 }
 
 #[cfg(test)]
@@ -1850,215 +2067,4 @@ mod tests {
         );
         assert!(!u.code.is_empty());
     }
-}
-
-/// 扫出一个函数里所有浮点值，给每个值分配专属栈槽，返回槽数。
-///
-/// 浮点"性"必须穿过 `Copy` 与 `Phi` 传播：优化会把 `a + b` 的结果复制走，
-/// 循环里也会有 φ；只认"定义点"会让这些中转值被当成整数去 GPR 里找，然后
-/// 拿到栈槽里的残渣当浮点数用。
-///
-/// 播种与传播合成一个不动点：`Neg` 的播种依赖操作数已是浮点，而操作数的
-/// 浮点性可能要等 `Copy` 传播完才知道，所以每轮都重扫全部指令直到不再变化。
-fn assign_float_slots(func: &SsaFunction, base: usize) -> usize {
-    let mut floats: HashMap<u32, u8> = HashMap::new();
-    let width_of =
-        |v: &SsaValue, map: &HashMap<u32, u8>| -> u8 { map.get(&v.id()).copied().unwrap_or(0) };
-    loop {
-        let mut changed = false;
-        let mark = |v: &SsaValue, w: u8, map: &mut HashMap<u32, u8>| -> bool {
-            match map.get(&v.id()) {
-                // 已知但更窄，保留更宽的那个（f64 优先）
-                Some(old) if *old >= w => false,
-                _ => {
-                    map.insert(v.id(), w);
-                    true
-                }
-            }
-        };
-        for block in &func.blocks {
-            for instr in &block.instrs {
-                match instr {
-                    SsaInstr::Const {
-                        result,
-                        value: SsaConst::Float(_, w),
-                    } => {
-                        if mark(result, *w, &mut floats) {
-                            changed = true;
-                        }
-                    }
-                    SsaInstr::Binary {
-                        result,
-                        ty,
-                        lhs,
-                        rhs,
-                        ..
-                    } => {
-                        if ty.is_float() {
-                            let w = match *ty {
-                                NumTy::Float(w) => w,
-                                _ => 64,
-                            };
-                            for v in [result, lhs, rhs] {
-                                if mark(v, w, &mut floats) {
-                                    changed = true;
-                                }
-                            }
-                        } else {
-                            // 比较的结果是 bool，但操作数可能都是浮点：两边互相传播
-                            let lw = width_of(lhs, &floats);
-                            let rw = width_of(rhs, &floats);
-                            let (unknown, w) = match (lw, rw) {
-                                (w, 0) if w > 0 => (rhs, w),
-                                (0, w) if w > 0 => (lhs, w),
-                                _ => continue,
-                            };
-                            if mark(unknown, w, &mut floats) {
-                                changed = true;
-                            }
-                        }
-                    }
-                    SsaInstr::Unary {
-                        result, operand, ..
-                    } => {
-                        if floats.contains_key(&result.id()) {
-                            let w = width_of(result, &floats);
-                            if w > 0 && mark(operand, w, &mut floats) {
-                                changed = true;
-                            }
-                        }
-                        if floats.contains_key(&operand.id()) {
-                            let w = width_of(operand, &floats);
-                            if w > 0 && mark(result, w, &mut floats) {
-                                changed = true;
-                            }
-                        }
-                    }
-                    SsaInstr::Call { result, ty, .. } => {
-                        if ty.is_float() {
-                            let w = match *ty {
-                                NumTy::Float(w) => w,
-                                _ => 64,
-                            };
-                            if mark(result, w, &mut floats) {
-                                changed = true;
-                            }
-                        }
-                    }
-                    SsaInstr::Cast {
-                        result,
-                        src,
-                        from,
-                        to,
-                    } => {
-                        if to.is_float() {
-                            let w = match *to {
-                                NumTy::Float(w) => w,
-                                _ => 64,
-                            };
-                            if mark(result, w, &mut floats) {
-                                changed = true;
-                            }
-                        }
-                        if from.is_float() {
-                            let w = match *from {
-                                NumTy::Float(w) => w,
-                                _ => 64,
-                            };
-                            if mark(src, w, &mut floats) {
-                                changed = true;
-                            }
-                        }
-                    }
-                    SsaInstr::Copy { result, src } => {
-                        // 前向：源是浮点 -> 结果是浮点
-                        if floats.contains_key(&src.id()) {
-                            let w = width_of(src, &floats);
-                            if mark(result, w, &mut floats) {
-                                changed = true;
-                            }
-                        }
-                        // 反向：结果是浮点 -> 源也是（形参没有类型标注，只能反推）
-                        if floats.contains_key(&result.id()) {
-                            let w = width_of(result, &floats);
-                            if mark(src, w, &mut floats) {
-                                changed = true;
-                            }
-                        }
-                    }
-                    SsaInstr::Phi {
-                        result, incoming, ..
-                    } if incoming.iter().any(|(_, v)| floats.contains_key(&v.id())) => {
-                        let w = incoming
-                            .iter()
-                            .map(|(_, v)| width_of(v, &floats))
-                            .max()
-                            .unwrap_or(64);
-                        if mark(result, w, &mut floats) {
-                            changed = true;
-                        }
-                    }
-                    _ => {}
-                }
-            }
-        }
-        if !changed {
-            break;
-        }
-    }
-    let mut ids: Vec<u32> = floats.keys().copied().collect();
-    ids.sort_unstable();
-    let count = ids.len();
-    FLOAT_SLOTS.with(|m| {
-        let mut map = m.borrow_mut();
-        map.clear();
-        for (i, id) in ids.into_iter().enumerate() {
-            let w = floats.get(&id).copied().unwrap_or(64);
-            map.insert(id, (base + i, w));
-        }
-    });
-    count
-}
-
-/// 寄存器压力检查。
-///
-/// 这些后端还没实现溢出（spilling）：活跃值超过可分配寄存器数时，
-/// `alloc_reg` 按编号取模会让同时存活的值抢同一个寄存器，生成**错的**代码。
-/// 宁可在这里明确报错，也不能安静地编出一个算错的程序。
-///
-/// 溢出未见实现时直接报错；否则把线性扫描的分配结果写进 `REG_MAP` 供
-/// `alloc_reg` 使用。x86-64 后端自己实现了溢出，见 `encoder.rs`。
-fn check_register_pressure(func: &SsaFunction) {
-    // 传 callee-save 集合：跨调用存活的值只放 x19..x28，否则 `call` 会破坏它。
-let alloc = crate::codegen::regalloc::allocate_registers(
-        func,
-        ALLOCATABLE.len(),
-        &CALLEE_SAVE,
-        ARG_REGS.len(),
-        &std::collections::HashSet::new(),
-    );
-    if alloc.spilled > 0 {
-        // 池子装不下的值溢出到栈槽；槽数记进 `SPILL_SLOTS`，槽区高度由
-        // `emit_function` 预留。
-        SPILL_SLOTS.with(|m| {
-            let mut map = m.borrow_mut();
-            map.clear();
-            for (&v, loc) in &alloc.map {
-                if let crate::codegen::regalloc::Location::Stack(i) = loc {
-                    map.insert(v, *i);
-                }
-            }
-        });
-    } else {
-        SPILL_SLOTS.with(|m| m.borrow_mut().clear());
-    }
-    REG_MAP.with(|m| {
-        let mut map = m.borrow_mut();
-        map.clear();
-        for (&v, loc) in &alloc.map {
-            if let crate::codegen::regalloc::Location::Reg(i) = loc {
-                map.insert(v, *i);
-            }
-        }
-    });
 }

@@ -118,7 +118,12 @@ fn run_build(cmd: &Cli, input: &str) -> ExitCode {
     // build 与普通编译流程一致，只是输出信息不同
     match compile(input, cmd) {
         Ok(out_path) => {
-            eprintln!("zr: built {} -> {} ({})", input, out_path.display(), cmd.opt_level.name());
+            eprintln!(
+                "zr: built {} -> {} ({})",
+                input,
+                out_path.display(),
+                cmd.opt_level.name()
+            );
             ExitCode::SUCCESS
         }
         Err(e) => {
@@ -418,7 +423,7 @@ impl Cli {
                 "-g" | "--debug" => cli.debug_info = true,
                 "--" => {
                     // `--` 后的所有参数传给程序运行
-                    cli.run_args = args[i + 1..].iter().cloned().collect();
+                    cli.run_args = args[i + 1..].to_vec();
                     break;
                 }
                 s if s.starts_with('-') => return Err(format!("unknown argument '{s}'")),
@@ -433,7 +438,12 @@ impl Cli {
         }
         // 无输入文件时默认显示帮助——但 `clean` / `fmt --check` / `build` / `run` 这类
         // 子命令本来就不需要输入文件，不能被这个默认值吃掉。
-        if cli.input.is_none() && !cli.clean_cache && !(cli.fmt && cli.fmt_check) && !cli.build && !cli.run {
+        if cli.input.is_none()
+            && !cli.clean_cache
+            && !(cli.fmt && cli.fmt_check)
+            && !cli.build
+            && !cli.run
+        {
             cli.help = true;
         }
         // 没给 `-o` 就用输入文件名当输出名。少了这一步输出路径是空串，
@@ -508,9 +518,11 @@ fn time_phase(t0: std::time::Instant, name: &str) {
     }
 }
 
+type StoreCache = (u64, std::path::PathBuf, Vec<(std::path::PathBuf, u64)>);
+
 // 待写入的缓存条目：`compile()` 成功后才真正落盘。
 thread_local! {
-    static CACHE_FOR_STORE: std::cell::RefCell<Option<(u64, std::path::PathBuf, Vec<(std::path::PathBuf, u64)>)>> =
+    static CACHE_FOR_STORE: std::cell::RefCell<Option<StoreCache>> =
         const { std::cell::RefCell::new(None) };
 }
 
@@ -978,11 +990,46 @@ fn emit_llvm_ir(target: &Target, module: &ssa::SsaModule) -> String {
                             ptr.id()
                         ));
                     }
-                    ssa::SsaInstr::SlotAddr { result, local } => {
+                    ssa::SsaInstr::SlotAddr { result, local, .. } => {
                         out.push_str(&format!("  %{} = alloca_slot {}\n", result.id(), local));
                     }
                     SsaInstr::Var { result, name } => {
                         out.push_str(&format!("  ; var {} -> %{}\n", name, result.id()));
+                    }
+                    SsaInstr::SimdBinary {
+                        lhs,
+                        op,
+                        rhs,
+                        out: out_addr,
+                        ty,
+                        lanes,
+                    } => {
+                        out.push_str(&format!(
+                            "  simd {:?} {:?} x{} %{} %{} -> %{}\n",
+                            ty,
+                            op,
+                            lanes,
+                            lhs.id(),
+                            rhs.id(),
+                            out_addr.id()
+                        ));
+                    }
+                    SsaInstr::FuncAddr { result, target } => {
+                        out.push_str(&format!("  %{} = &@{}\n", result.id(), target));
+                    }
+                    SsaInstr::CallIndirect {
+                        result,
+                        callee,
+                        args,
+                        ..
+                    } => {
+                        let a: Vec<String> = args.iter().map(|v| format!("%{}", v.id())).collect();
+                        out.push_str(&format!(
+                            "  %{} = call_indirect %{}({})\n",
+                            result.id(),
+                            callee.id(),
+                            a.join(", ")
+                        ));
                     }
                     SsaInstr::Asm {
                         template,

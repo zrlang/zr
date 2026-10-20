@@ -25,6 +25,15 @@ use crate::typeck::hir::{
 };
 use crate::typeck::infer::InferCtxt;
 
+/// 把数组长度写成一个 HIR 整数字面量，便于类型统一与打印。
+fn const_array_len(n: i128, span: Span) -> hir::ArrayLen {
+    hir::ArrayLen::Const(Box::new(HirExpr {
+        kind: ExprKind::Literal(HirLiteral::Int(n)),
+        ty: Ty::Uint(64),
+        span,
+    }))
+}
+
 /// 整数字面量后缀 → 具体整型。无后缀或未知后缀返回 `None`。
 ///
 /// `usize`/`isize` 目前按 64 位平台字长处理。
@@ -59,10 +68,16 @@ pub struct TypeChecker {
     type_defs: HashMap<DefId, hir::HirTypeDef>,
     /// 函数表。
     functions: HashMap<DefId, hir::HirFunction>,
+    /// 异步函数的 Future 不透明类型 → `Output` 类型。
+    async_outputs: HashMap<DefId, Ty>,
     /// trait 表。
     trait_defs: HashMap<DefId, hir::HirTrait>,
     /// impl 块列表。
     impl_blocks: Vec<hir::HirImpl>,
+    /// impl 方法（名字已被 mangle 成 `Type__method`）→ 目标类型。
+    impl_targets: HashMap<String, AstType>,
+    /// 目标类型 DefId → Drop 析构函数 DefId。
+    drop_impls: HashMap<DefId, DefId>,
     /// 常量表。
     consts: HashMap<DefId, hir::HirConst>,
     /// 静态变量表。
@@ -90,6 +105,8 @@ pub struct TypeChecker {
     locals_by_def: HashMap<DefId, LocalId>,
     /// 当前函数 ID（用于 return 检查）。
     current_function: Option<DefId>,
+    /// 当前函数是否是 `async fn`（`.await` 只能在异步上下文中使用）。
+    current_is_async: bool,
     /// 错误集合（延迟报告，允许错误恢复）。
     errors: Vec<CompileError>,
     /// 导入解析缓存。
@@ -123,8 +140,11 @@ impl Default for TypeChecker {
             def_names: HashMap::new(),
             type_defs: HashMap::new(),
             functions: HashMap::new(),
+            async_outputs: HashMap::new(),
             trait_defs: HashMap::new(),
             impl_blocks: Vec::new(),
+            impl_targets: HashMap::new(),
+            drop_impls: HashMap::new(),
             consts: HashMap::new(),
             statics: HashMap::new(),
             locals: HashMap::new(),
@@ -137,6 +157,7 @@ impl Default for TypeChecker {
             local_scopes: Vec::new(),
             locals_by_def: HashMap::new(),
             current_function: None,
+            current_is_async: false,
             errors: Vec::new(),
             use_aliases: HashMap::new(),
             known_modules: HashSet::new(),
@@ -181,6 +202,22 @@ impl TypeChecker {
     }
 
     pub fn check_program(&mut self, prog: &Program) -> Result<hir::HirModule> {
+        // impl 方法先展开成普通函数（名字 mangle 成 `Type__method`），这样
+        // 现有签名/函数体检查、MIR 降级都能复用同一张函数表。
+        let mut expanded = prog.clone();
+        for ib in &prog.impls {
+            let Some(target_name) = ast_type_name(&ib.target) else {
+                continue;
+            };
+            for method in &ib.methods {
+                let mut m = method.clone();
+                m.name = format!("{target_name}__{}", method.name);
+                self.impl_targets.insert(m.name.clone(), ib.target.clone());
+                expanded.functions.push(m);
+            }
+        }
+        let prog = &expanded;
+
         // ===== 阶段 0：属性预处理 =====
         self.process_attributes(prog)?;
 
@@ -244,11 +281,18 @@ impl TypeChecker {
             return Err(self.errors.remove(0));
         }
 
+        let drop_impls = self
+            .drop_impls
+            .iter()
+            .filter_map(|(ty, func)| self.def_names.get(func).map(|name| (*ty, name.clone())))
+            .collect();
+
         Ok(hir::HirModule {
             functions,
             def_names: self.def_names.clone(),
             type_defs: self.type_defs.clone(),
             consts: self.consts.clone(),
+            drop_impls,
         })
     }
 
@@ -681,8 +725,15 @@ impl TypeChecker {
         for (idx, f) in s.fields.iter().enumerate() {
             let ty = self.ast_to_hir_type(&f.ty)?;
             offsets.alloc(self.infer.size_of(&ty), self.infer.align_of(&ty));
+            // 元组结构体的字段在 AST 里没有名字，这里补成 `"0"`、`"1"`，
+            // 与 `.0` / `.1` 的字段名一致。
+            let name = if f.name.is_empty() {
+                idx.to_string()
+            } else {
+                f.name.clone()
+            };
             fields.push(hir::HirField {
-                name: f.name.clone(),
+                name,
                 ty: ty.clone(),
                 index: idx,
             });
@@ -691,11 +742,9 @@ impl TypeChecker {
         // `#[repr(..)]` 写错了必须报错，不能默默回退到默认布局——
         // 那会让 FFI 结构体的实际布局和调用方以为的不一致。
         let repr = hir_repr(&convert_attrs(&s.attrs))?;
-        if let Some(hir_td) = self.type_defs.get_mut(&def_id) {
-            if let hir::HirTypeDef::Struct(hs) = hir_td {
-                hs.fields = fields;
-                hs.repr = repr;
-            }
+        if let Some(hir::HirTypeDef::Struct(hs)) = self.type_defs.get_mut(&def_id) {
+            hs.fields = fields;
+            hs.repr = repr;
         }
         Ok(())
     }
@@ -742,24 +791,22 @@ impl TypeChecker {
             self.check_int_width(*w as u16)?;
         }
 
-        if let Some(hir_td) = self.type_defs.get_mut(&def_id) {
-            if let hir::HirTypeDef::Enum(he) = hir_td {
-                he.variants = variants;
-                he.repr = e.repr.as_ref().map_or(hir::IntegerRepr::Auto, |t| {
-                    if let AstType::I(w) = t {
-                        match *w {
-                            8 => hir::IntegerRepr::I8,
-                            16 => hir::IntegerRepr::I16,
-                            32 => hir::IntegerRepr::I32,
-                            64 => hir::IntegerRepr::I64,
-                            128 => hir::IntegerRepr::I128,
-                            _ => hir::IntegerRepr::Auto,
-                        }
-                    } else {
-                        hir::IntegerRepr::Auto
+        if let Some(hir::HirTypeDef::Enum(he)) = self.type_defs.get_mut(&def_id) {
+            he.variants = variants;
+            he.repr = e.repr.as_ref().map_or(hir::IntegerRepr::Auto, |t| {
+                if let AstType::I(w) = t {
+                    match *w {
+                        8 => hir::IntegerRepr::I8,
+                        16 => hir::IntegerRepr::I16,
+                        32 => hir::IntegerRepr::I32,
+                        64 => hir::IntegerRepr::I64,
+                        128 => hir::IntegerRepr::I128,
+                        _ => hir::IntegerRepr::Auto,
                     }
-                });
-            }
+                } else {
+                    hir::IntegerRepr::Auto
+                }
+            });
         }
         Ok(())
     }
@@ -781,10 +828,8 @@ impl TypeChecker {
                 index: idx,
             });
         }
-        if let Some(hir_td) = self.type_defs.get_mut(&def_id) {
-            if let hir::HirTypeDef::Union(hu) = hir_td {
-                hu.fields = fields;
-            }
+        if let Some(hir::HirTypeDef::Union(hu)) = self.type_defs.get_mut(&def_id) {
+            hu.fields = fields;
         }
         Ok(())
     }
@@ -818,6 +863,62 @@ impl TypeChecker {
     fn check_impls(&mut self, prog: &Program) -> Result<()> {
         for ib in &prog.impls {
             let target = self.ast_to_hir_type(&ib.target)?;
+            // `Drop` 是编译器内建 trait，不要求用户先声明它。
+            let is_drop = ib
+                .trait_type
+                .as_ref()
+                .and_then(ast_type_name)
+                .is_some_and(|name| name == "Drop");
+            if is_drop {
+                let Some(target_name) = ast_type_name(&ib.target) else {
+                    return Err(CompileError::type_error(
+                        "`impl Drop` 的目标必须是命名结构体".to_string(),
+                    )
+                    .with_span(ib.span));
+                };
+                let Ty::Named(type_id, _) = target else {
+                    return Err(CompileError::type_error(
+                        "`impl Drop` 的目标必须是命名结构体".to_string(),
+                    )
+                    .with_span(ib.span));
+                };
+                if !matches!(
+                    self.type_defs.get(&type_id),
+                    Some(hir::HirTypeDef::Struct(_))
+                ) {
+                    return Err(CompileError::type_error(
+                        "`impl Drop` 的目标必须是命名结构体".to_string(),
+                    )
+                    .with_span(ib.span));
+                }
+                let Some(method) = ib.methods.iter().find(|m| m.name == "drop") else {
+                    return Err(CompileError::type_error(format!(
+                        "`impl Drop for {target_name}` 缺少 `fn drop(&mut self)`"
+                    ))
+                    .with_span(ib.span));
+                };
+                if method.receiver.is_none() || !method.params.is_empty() {
+                    return Err(CompileError::type_error(
+                        "`Drop::drop` 的签名必须是 `fn drop(&mut self)`".to_string(),
+                    )
+                    .with_span(ib.span));
+                }
+                let mangled = format!("{target_name}__drop");
+                let fn_id = self.find_def(&mangled)?;
+                if self.drop_impls.insert(type_id, fn_id).is_some() {
+                    return Err(CompileError::type_error(format!(
+                        "`{target_name}` 已经实现过 Drop"
+                    ))
+                    .with_span(ib.span));
+                }
+                self.impl_blocks.push(hir::HirImpl {
+                    target,
+                    trait_id: None,
+                    where_clause: Vec::new(),
+                    span: ib.span,
+                });
+                continue;
+            }
             let trait_id = if let Some(tt) = &ib.trait_type {
                 match self.ast_to_hir_type(tt)? {
                     Ty::Named(id, _) => Some(id),
@@ -859,7 +960,7 @@ impl TypeChecker {
             let _ = self.eval_const_expr(&c.value);
             if let Some(hc) = self.consts.get_mut(&id) {
                 hc.ty = ty;
-                hc.value = Box::new(value);
+                *hc.value = value;
             }
         }
         Ok(())
@@ -872,7 +973,7 @@ impl TypeChecker {
             let init = self.check_expr(&s.init, &ty)?;
             if let Some(hs) = self.statics.get_mut(&id) {
                 hs.ty = ty;
-                hs.init = Box::new(init);
+                *hs.init = init;
             }
         }
         Ok(())
@@ -882,16 +983,67 @@ impl TypeChecker {
         for f in &prog.functions {
             let id = self.find_def(&f.name)?;
             let mut ret = self.ast_to_hir_type(&f.return_type)?;
+            if f.is_async && matches!(ret, Ty::Array(..)) {
+                return Err(CompileError::type_error(format!(
+                    "async fn `{}` 暂不支持按值返回数组",
+                    f.name
+                )));
+            }
+            if let Ty::Named(id, _) = &ret {
+                if self.drop_impls.contains_key(id) && f.is_async {
+                    return Err(CompileError::type_error(format!(
+                        "async fn `{}` 暂不支持按值返回 Drop 类型",
+                        f.name
+                    )));
+                }
+            }
             // async fn 的返回类型降级为 `impl Future<Output = T>`（不透明类型）
             if f.is_async && !matches!(ret, Ty::Opaque(_)) {
                 let opaque_id = self.alloc_def(format!("async_future_{}", self.next_def));
+                self.async_outputs.insert(opaque_id, ret.clone());
                 ret = Ty::Opaque(opaque_id);
+            }
+            let mut params = self
+                .functions
+                .get(&id)
+                .map(|f| f.params.clone())
+                .unwrap_or_default();
+            if let Some(recv_ty) = self.receiver_ty(f)? {
+                params.insert(
+                    0,
+                    hir::HirParam {
+                        local: self.alloc_local(),
+                        ty: recv_ty,
+                    },
+                );
             }
             if let Some(hf) = self.functions.get_mut(&id) {
                 hf.return_type = ret;
+                hf.params = params;
             }
         }
         Ok(())
+    }
+
+    /// `impl` 方法的 receiver 类型。关联函数（没有 receiver）返回 `None`。
+    fn receiver_ty(&mut self, f: &ast::Function) -> Result<Option<Ty>> {
+        let Some(recv) = &f.receiver else {
+            return Ok(None);
+        };
+        let self_ty = match self.impl_targets.get(&f.name).cloned() {
+            Some(t) => self.ast_to_hir_type(&t)?,
+            None => Ty::Unit,
+        };
+        Ok(Some(match &recv.ty {
+            Some(t) => self.ast_to_hir_type(t)?,
+            None => Ty::Reference(
+                Box::new(self_ty),
+                match recv.mutability {
+                    ast::Mutability::Mutable => hir::Mutability::Mutable,
+                    ast::Mutability::Immutable => hir::Mutability::Immutable,
+                },
+            ),
+        }))
     }
 
     // ==================================================================
@@ -903,34 +1055,27 @@ impl TypeChecker {
         for f in &prog.functions {
             let id = self.find_def(&f.name)?;
             self.current_function = Some(id);
+            self.current_is_async = f.is_async;
             self.scope_stack.clear();
             self.push_scope();
 
-            let ret_ty = self.functions[&id].return_type.clone();
+            // 函数体按 async fn 的真实输出类型检查；对外签名仍是 Future。
+            let declared = self.functions[&id].return_type.clone();
+            let ret_ty = match &declared {
+                Ty::Opaque(opaque) => self.async_outputs.get(opaque).cloned().unwrap_or(declared),
+                _ => declared,
+            };
             self.infer.return_ty = Some(ret_ty.clone());
 
-            // 检查 receiver
-            if let Some(recv) = &f.receiver {
-                let local = self.alloc_local();
-                // 显式接收者类型优先（`self: &mut Self`），否则退回 impl 目标
-                let self_ty = match &recv.ty {
-                    Some(t) => self.ast_to_hir_type(t)?,
-                    None => Ty::Named(id, Vec::new()),
-                };
-                let ty = match recv.mutability {
-                    ast::Mutability::Mutable => {
-                        Ty::Reference(Box::new(self_ty), hir::Mutability::Mutable)
-                    }
-                    ast::Mutability::Immutable => {
-                        Ty::Reference(Box::new(self_ty), hir::Mutability::Immutable)
-                    }
-                };
-                self.locals.insert(local, ty.clone());
-                self.infer.locals.insert(local, ty);
+            // 检查 receiver。impl 方法的目标类型在展开阶段记录；
+            // 方法体里的 `self` 按目标类型绑定，结构体值本身以指针表示。
+            let mut params = Vec::new();
+            if let Some(ty) = self.receiver_ty(f)? {
+                let (_, local) = self.bind_local("self", &ty);
+                params.push(hir::HirParam { local, ty });
             }
 
             // 检查参数
-            let mut params = Vec::new();
             for p in &f.params {
                 let ty = self.ast_to_hir_type(&p.ty)?;
                 // 参数模式本身会负责绑定名字（`n` / `mut n` / 复杂模式）
@@ -1009,6 +1154,7 @@ impl TypeChecker {
                 };
                 let init_hir = if let Some(e) = init {
                     let h = self.check_expr(e, &ty)?;
+                    self.check_partial_move(&h, e.span())?;
                     self.infer
                         .unify(&h.ty, &ty, e.span())
                         .map_err(|e| self.errors.push(e))
@@ -1017,7 +1163,7 @@ impl TypeChecker {
                 } else {
                     None
                 };
-                let hir_pat = self.lower_pattern(&_pat, &ty)?;
+                let hir_pat = self.lower_pattern(_pat, &ty)?;
                 // 非绑定模式（通配 / 字面量 / 元组）没有单个可引用的名字，
                 // 用一个匿名局部占位，保证 `HirStmt::Let` 的形状不变。
                 let local = first_binding(&hir_pat).unwrap_or_else(|| self.alloc_local());
@@ -1039,6 +1185,7 @@ impl TypeChecker {
                 };
                 let init_hir = if let Some(e) = init {
                     let h = self.check_expr(e, &ty)?;
+                    self.check_partial_move(&h, e.span())?;
                     self.infer
                         .unify(&h.ty, &ty, e.span())
                         .map_err(|e| self.errors.push(e))
@@ -1050,7 +1197,7 @@ impl TypeChecker {
                 // 别像以前那样只登记 LocalId：`var y` 的名字必须进作用域，
                 // 否则任何使用都报 "cannot find value y"（var 语句实际上没
                 // 法用）。走 lower_pattern / bind_local，和 let 同一条路。
-                let hir_pat = self.lower_pattern(&_pat, &ty)?;
+                let hir_pat = self.lower_pattern(_pat, &ty)?;
                 let local = first_binding(&hir_pat).unwrap_or_else(|| self.alloc_local());
                 Ok(HirStmt::Var {
                     local,
@@ -1171,6 +1318,7 @@ impl TypeChecker {
             Expression::Assign(lhs, op, rhs, _) => {
                 let l = self.check_expr(lhs, &Ty::Infer(InferId(0)))?;
                 let r = self.check_expr(rhs, &l.ty)?;
+                self.check_partial_move(&r, rhs.span())?;
                 self.check_assignable(&l)?;
                 let (kind, ty) = if matches!(op, ast::AssignOp::Assign) {
                     (ExprKind::Assign(Box::new(l), Box::new(r)), Ty::Unit)
@@ -1210,12 +1358,6 @@ impl TypeChecker {
                         elem
                     }
                 };
-                if matches!(self.infer.resolve(&elem_ty), Ty::Float(_)) {
-                    return Err(CompileError::type_error(
-                        "indexing into floating-point elements is not supported",
-                    )
-                    .with_span(span));
-                }
                 return Ok(HirExpr {
                     kind: ExprKind::Index(Box::new(recv), Box::new(idx)),
                     ty: elem_ty,
@@ -1332,16 +1474,128 @@ impl TypeChecker {
                     span,
                 });
             }
-            Expression::For(_pat, iter, body, _) => {
-                let _it = self.check_expr(iter, &Ty::Infer(InferId(0)))?;
-                let var = self.alloc_local();
-                let var_ty = self.infer.fresh_infer(span);
-                self.locals.insert(var, var_ty.clone());
-                self.infer.locals.insert(var, var_ty.clone());
-                self.scope_stack.last_mut().unwrap().push(var);
-                let _b = self.check_block(body, &Ty::Unit)?;
+            Expression::For(pat, iter, body, _) => {
+                let (start, end, inclusive) = match iter.as_ref() {
+                    Expression::Binary(lhs, ast::BinaryOp::Range, rhs, _) => {
+                        (lhs.as_ref(), rhs.as_ref(), false)
+                    }
+                    Expression::Binary(lhs, ast::BinaryOp::RangeInclusive, rhs, _) => {
+                        (lhs.as_ref(), rhs.as_ref(), true)
+                    }
+                    _ => {
+                        return Err(CompileError::type_error(
+                            "only `for x in start..end` range loops are supported",
+                        )
+                        .with_span(span))
+                    }
+                };
+
+                self.push_scope();
+                // 先确定终点类型，这样 `for i in 0..n_u8` 里的起点字面量
+                // 会跟着 n_u8 推断，而不是先默认成 i32 再报类型不匹配。
+                let end_hir = self.check_expr(end, &Ty::Infer(InferId(0)))?;
+                let elem_ty = self.infer.resolve(&end_hir.ty);
+                if !matches!(elem_ty, Ty::Int(_) | Ty::Uint(_)) {
+                    return Err(CompileError::type_error(
+                        "`for` range bounds must be integers",
+                    )
+                    .with_span(span));
+                }
+                let start_hir = self.check_expr(start, &elem_ty)?;
+                self.infer
+                    .unify(&start_hir.ty, &elem_ty, span)
+                    .map_err(|e| self.errors.push(e))
+                    .ok();
+                let hir_pat = self.lower_pattern(pat, &elem_ty)?;
+                let var = first_binding(&hir_pat).unwrap_or_else(|| {
+                    let id = self.alloc_local();
+                    self.locals.insert(id, elem_ty.clone());
+                    self.infer.locals.insert(id, elem_ty.clone());
+                    id
+                });
+                let body_hir = self.check_block(body, &Ty::Unit)?;
+                self.pop_scope();
+
+                let end_local = self.alloc_local();
+                self.locals.insert(end_local, elem_ty.clone());
+                self.infer.locals.insert(end_local, elem_ty.clone());
+
+                let var_ref = || HirExpr {
+                    kind: ExprKind::Local(var),
+                    ty: elem_ty.clone(),
+                    span,
+                };
+                let cond = HirExpr {
+                    kind: ExprKind::Binary(
+                        if inclusive {
+                            hir::BinaryOp::Le
+                        } else {
+                            hir::BinaryOp::Lt
+                        },
+                        Box::new(var_ref()),
+                        Box::new(HirExpr {
+                            kind: ExprKind::Local(end_local),
+                            ty: elem_ty.clone(),
+                            span,
+                        }),
+                    ),
+                    ty: Ty::Bool,
+                    span,
+                };
+                let inc = HirExpr {
+                    kind: ExprKind::Assign(
+                        Box::new(var_ref()),
+                        Box::new(HirExpr {
+                            kind: ExprKind::Binary(
+                                hir::BinaryOp::Add,
+                                Box::new(var_ref()),
+                                Box::new(HirExpr {
+                                    kind: ExprKind::Literal(hir::HirLiteral::Int(1)),
+                                    ty: elem_ty.clone(),
+                                    span,
+                                }),
+                            ),
+                            ty: elem_ty.clone(),
+                            span,
+                        }),
+                    ),
+                    ty: Ty::Unit,
+                    span,
+                };
+
+                let mut loop_stmts = body_hir.stmts;
+                if let Some(tail) = body_hir.tail {
+                    loop_stmts.push(hir::HirStmt::Expr(tail));
+                }
+                loop_stmts.push(hir::HirStmt::Expr(Box::new(inc.clone())));
+                let mut loop_body = hir::HirBlock {
+                    stmts: loop_stmts,
+                    tail: None,
+                };
+                // `continue` 必须仍然执行自增，否则循环不会前进。把循环体
+                // 里（不跨越内层循环）的 continue 改写成“自增后 continue”。
+                rewrite_for_continue(&mut loop_body, &inc, 0);
+                let while_expr = HirExpr {
+                    kind: ExprKind::While(Box::new(cond), loop_body),
+                    ty: Ty::Unit,
+                    span,
+                };
+
                 return Ok(HirExpr {
-                    kind: ExprKind::For,
+                    kind: ExprKind::Block(hir::HirBlock {
+                        stmts: vec![
+                            hir::HirStmt::Var {
+                                local: var,
+                                init: Some(Box::new(start_hir)),
+                            },
+                            hir::HirStmt::Let {
+                                local: end_local,
+                                init: Some(Box::new(end_hir)),
+                            },
+                            hir::HirStmt::Expr(Box::new(while_expr)),
+                        ],
+                        tail: None,
+                    }),
                     ty: Ty::Unit,
                     span,
                 });
@@ -1377,6 +1631,7 @@ impl TypeChecker {
                 let ret_ty = self.infer.return_ty.clone().unwrap_or(Ty::Unit);
                 let v = if let Some(val) = value {
                     let e = self.check_expr(val, &ret_ty)?;
+                    self.check_partial_move(&e, val.span())?;
                     self.infer.unify(&e.ty, &ret_ty, span).ok();
                     Some(Box::new(e))
                 } else {
@@ -1419,24 +1674,65 @@ impl TypeChecker {
                 });
             }
             Expression::Array(elems, repeat, _) => {
-                if let Some(rep) = repeat {
-                    let elem = self.infer.fresh_infer(span);
-                    let _ = self.check_expr(rep, &Ty::Uint(64));
-                    let first = self.check_expr(&elems[0], &elem)?;
-                    let _ = first;
-                    return Ok(HirExpr {
-                        kind: ExprKind::Array,
-                        ty: Ty::Array(Box::new(elem), hir::ArrayLen::Dynamic),
-                        span,
-                    });
-                }
                 let elem = self.infer.fresh_infer(span);
-                for e in elems {
-                    let _ = self.check_expr(e, &elem)?;
+                let mut hir_elems = Vec::new();
+                if let Some(rep) = repeat {
+                    let n = match &**rep {
+                        Expression::Literal(AstLiteral::Int(n, _), _) => *n,
+                        _ => {
+                            return Err(CompileError::type_error(
+                                "array repeat length must be an integer literal".to_string(),
+                            ))
+                        }
+                    };
+                    if !(0..=1_000_000).contains(&n) {
+                        return Err(CompileError::type_error(
+                            "array repeat length out of supported range".to_string(),
+                        ));
+                    }
+                    let first_expr = elems.first().ok_or_else(|| {
+                        CompileError::type_error("array repeat needs an element".to_string())
+                    })?;
+                    let first = self.check_expr(first_expr, &elem)?;
+                    self.check_partial_move(&first, first_expr.span())?;
+                    for _ in 0..n {
+                        hir_elems.push(first.clone());
+                    }
+                } else {
+                    for e in elems {
+                        let h = self.check_expr(e, &elem)?;
+                        self.check_partial_move(&h, e.span())?;
+                        hir_elems.push(h);
+                    }
+                }
+                let len = hir_elems.len() as i128;
+                let arr_ty = Ty::Array(Box::new(elem), const_array_len(len, span));
+                // 数组字面量自身没有别的地方会把它和标注类型统一，这里必须
+                // 主动 unify：否则 `let a: [i32; 4] = [...]` 里的元素类型
+                // 会停在 Infer，MIR 按 64 位而不是 32 位存元素。
+                let _ = self.infer.unify(&arr_ty, expected, span);
+                let ty = self.infer.resolve(&arr_ty);
+                let resolved_elem = match &ty {
+                    Ty::Array(elem, _) => Some(self.infer.resolve(elem)),
+                    _ => None,
+                };
+                for e in &mut hir_elems {
+                    e.ty = self.infer.resolve(&e.ty);
+                    // 数值字面量要随数组标注类型收窄：`[f32; 4] = [1.5, ..]`
+                    // 里的字面量默认是 f64，不收窄就会按 64 位写进 4 字节槽。
+                    if let (
+                        Some(elem),
+                        ExprKind::Literal(HirLiteral::Int(_) | HirLiteral::Float(_)),
+                    ) = (&resolved_elem, &e.kind)
+                    {
+                        if !matches!(elem, Ty::Infer(_)) {
+                            e.ty = elem.clone();
+                        }
+                    }
                 }
                 return Ok(HirExpr {
-                    kind: ExprKind::Array,
-                    ty: Ty::Array(Box::new(elem), hir::ArrayLen::Dynamic),
+                    kind: ExprKind::Array(hir_elems),
+                    ty,
                     span,
                 });
             }
@@ -1452,8 +1748,8 @@ impl TypeChecker {
                     span,
                 });
             }
-            Expression::StructInit(path, fields, _) => {
-                return self.check_struct_init(path, fields, expected, span);
+            Expression::StructInit(path, fields, base, _) => {
+                return self.check_struct_init(path, fields, base.as_deref(), expected, span);
             }
             Expression::Lambda(params, ret, body, _) => {
                 return self.check_lambda(params, ret.as_ref(), body, expected, span);
@@ -1479,10 +1775,25 @@ impl TypeChecker {
                 });
             }
             Expression::Await(e, _) => {
+                if !self.current_is_async {
+                    return Err(CompileError::type_error(
+                        "`.await` 只能出现在 `async fn` 内部".to_string(),
+                    ));
+                }
                 let inner = self.check_expr(e, &Ty::Infer(InferId(0)))?;
+                // `await` 的结果类型就是 Future 的 `Output`。异步函数签名
+                // 已经把返回类型换成了不透明 Future，这里通过映射找回它。
+                let ty = match &inner.ty {
+                    Ty::Opaque(id) => self
+                        .async_outputs
+                        .get(id)
+                        .cloned()
+                        .unwrap_or(Ty::Infer(InferId(0))),
+                    _ => Ty::Infer(InferId(0)),
+                };
                 return Ok(HirExpr {
                     kind: ExprKind::Await(Box::new(inner)),
-                    ty: Ty::Infer(InferId(0)),
+                    ty,
                     span,
                 });
             }
@@ -1718,6 +2029,163 @@ impl TypeChecker {
         })
     }
 
+    /// 若 `callee` 是元组结构体类型名，返回其 DefId。
+    fn tuple_struct_target(&self, callee: &Expression) -> Option<DefId> {
+        let id = match callee {
+            Expression::Variable(name, _) => self.symbols.get(name).copied()?,
+            Expression::Path(path, _) if path.len() == 1 => {
+                self.symbols.get(&path[0]).copied()?
+            }
+            _ => return None,
+        };
+        let hir::HirTypeDef::Struct(s) = self.type_defs.get(&id)? else {
+            return None;
+        };
+        if s.fields
+            .iter()
+            .enumerate()
+            .all(|(i, f)| f.name == i.to_string())
+        {
+            Some(id)
+        } else {
+            None
+        }
+    }
+
+    fn check_tuple_struct_init(
+        &mut self,
+        type_id: DefId,
+        args: &[ast::Argument],
+        span: ast::Span,
+    ) -> Result<HirExpr> {
+        let hir::HirTypeDef::Struct(s) = self
+            .type_defs
+            .get(&type_id)
+            .cloned()
+            .ok_or_else(|| CompileError::internal("tuple struct missing type definition"))?
+        else {
+            return Err(CompileError::internal("tuple struct is not a struct"));
+        };
+        if args.len() != s.fields.len() {
+            return Err(CompileError::type_error(format!(
+                "tuple struct constructor expects {} arguments, found {}",
+                s.fields.len(),
+                args.len()
+            ))
+            .with_span(span));
+        }
+        let mut fields = Vec::with_capacity(args.len());
+        for (field, arg) in s.fields.iter().zip(args) {
+            let ast::Argument::Pos(expr) = arg else {
+                return Err(CompileError::type_error(
+                    "tuple struct constructor does not accept named arguments",
+                )
+                .with_span(span));
+            };
+            let arg = self.check_expr(expr, &field.ty)?;
+            self.check_partial_move(&arg, expr.span())?;
+            fields.push((field.name.clone(), arg));
+        }
+        Ok(HirExpr {
+            kind: ExprKind::Struct(fields),
+            ty: Ty::Named(type_id, Vec::new()),
+            span,
+        })
+    }
+
+    /// 查字段（不报错）：用于区分 `expr.name(...)` 是字段函数指针调用
+    /// 还是 `impl` 方法调用。引用/指针自动穿透。
+    fn lookup_field(&self, ty: &Ty, name: &str) -> Option<(Ty, FieldIndex)> {
+        match ty {
+            Ty::Named(id, _) => {
+                let hir::HirTypeDef::Struct(s) = self.type_defs.get(id)? else {
+                    return None;
+                };
+                s.fields
+                    .iter()
+                    .find(|f| f.name == name)
+                    .map(|f| (f.ty.clone(), FieldIndex::Named(f.index)))
+            }
+            Ty::Tuple(tys) => {
+                let idx = name.parse::<usize>().ok()?;
+                tys.get(idx).cloned().map(|t| (t, FieldIndex::Pos(idx)))
+            }
+            Ty::Reference(inner, _) | Ty::Pointer(inner, _) => self.lookup_field(inner, name),
+            _ => None,
+        }
+    }
+
+    /// 查 `impl` 方法。方法已展开成普通函数 `Type__method`。
+    fn lookup_method(&self, ty: &Ty, name: &str) -> Option<hir::DefId> {
+        let Ty::Named(id, _) = ty else {
+            if let Ty::Reference(inner, _) | Ty::Pointer(inner, _) = ty {
+                return self.lookup_method(inner, name);
+            }
+            return None;
+        };
+        let target = self.def_names.get(id)?;
+        let mangled = format!("{target}__{name}");
+        if !self.impl_targets.contains_key(&mangled) {
+            return None;
+        }
+        let method = self.symbols.get(&mangled).copied()?;
+        self.functions.get(&method)?;
+        Some(method)
+    }
+
+    fn check_method_call(
+        &mut self,
+        method: hir::DefId,
+        receiver: HirExpr,
+        args: &[ast::Argument],
+        span: ast::Span,
+    ) -> Result<HirExpr> {
+        let sig = self.functions.get(&method).cloned().ok_or_else(|| {
+            CompileError::internal(format!("impl method {:?} missing from function table", method))
+        })?;
+        if sig.params.is_empty() {
+            return Err(CompileError::type_error(
+                "impl method is missing its receiver parameter",
+            )
+            .with_span(span));
+        }
+        let mut hir_args = Vec::with_capacity(args.len() + 1);
+        if !matches!(
+            self.infer.resolve(&sig.params[0].ty),
+            Ty::Reference(..) | Ty::Pointer(..)
+        ) {
+            self.check_partial_move(&receiver, span)?;
+        }
+        hir_args.push(receiver);
+        for (i, arg) in args.iter().enumerate() {
+            let a = match arg {
+                ast::Argument::Pos(e) | ast::Argument::Named(_, e) => e,
+            };
+            let param_ty = sig
+                .params
+                .get(i + 1)
+                .map(|p| p.ty.clone())
+                .unwrap_or(Ty::Infer(InferId(0)));
+            let arg = self.check_expr(a, &param_ty)?;
+            if !matches!(
+                self.infer.resolve(&param_ty),
+                Ty::Reference(..) | Ty::Pointer(..)
+            ) {
+                self.check_partial_move(&arg, a.span())?;
+            }
+            hir_args.push(arg);
+        }
+        Ok(HirExpr {
+            kind: ExprKind::Call {
+                callee: method,
+                args: hir_args,
+                result: self.alloc_local(),
+            },
+            ty: sig.return_type.clone(),
+            span,
+        })
+    }
+
     fn check_call(
         &mut self,
         callee: &Expression,
@@ -1725,8 +2193,40 @@ impl TypeChecker {
         _expected: &Ty,
         span: ast::Span,
     ) -> Result<HirExpr> {
-        let callee_ty = self.infer_expr_ty(callee)?;
-        let callee_hir = self.check_expr(callee, &callee_ty)?;
+        // 元组结构体构造：`Point(1, 2)` 语法上是把类型名当函数调用。
+        if let Some(type_id) = self.tuple_struct_target(callee) {
+            return self.check_tuple_struct_init(type_id, args, span);
+        }
+
+        // `expr.method(args)` 在语法上就是 `Call(Field(expr, method), args)`。
+        // 字段优先：`ops.f(1, 2)` 里的 `f` 是函数指针字段；字段不存在时才
+        // 到 `impl` 方法表里找 `Type__method`。
+        let mut prepared_callee = None;
+        if let Expression::Field(receiver, name, field_span) = callee {
+            let recv_ty = self.infer_expr_ty(receiver)?;
+            let recv = self.check_expr(receiver, &recv_ty)?;
+            let recv_ty = self.infer.resolve(&recv.ty);
+            if self.lookup_field(&recv_ty, name).is_none() {
+                if let Some(method_id) = self.lookup_method(&recv_ty, name) {
+                    return self.check_method_call(method_id, recv, args, span);
+                }
+            } else if let Some((ty, _)) = self.lookup_field(&recv_ty, name) {
+                prepared_callee = Some(HirExpr {
+                    kind: ExprKind::Field(Box::new(recv), name.clone()),
+                    ty,
+                    span: *field_span,
+                });
+            }
+        }
+
+        let callee_ty = match &prepared_callee {
+            Some(c) => c.ty.clone(),
+            None => self.infer_expr_ty(callee)?,
+        };
+        let callee_hir = match prepared_callee {
+            Some(c) => c,
+            None => self.check_expr(callee, &callee_ty)?,
+        };
         let (param_tys, ret_ty) = match &callee_hir.ty {
             Ty::Function { params, ret, .. } => (params.clone(), ret.as_ref().clone()),
             Ty::Infer(_) => {
@@ -1755,28 +2255,31 @@ impl TypeChecker {
                     e
                 }
             };
-            let param_ty = param_tys
-                .get(i)
-                .cloned()
-                .unwrap_or_else(|| Ty::Infer(InferId(0)));
-            hir_args.push(self.check_expr(a, &param_ty)?);
-        }
-        // 被调函数用一个 DefId 指明；间接调用（通过函数指针）暂不支持。
-        let callee_def = match callee_hir.kind {
-            ExprKind::Def(id) => id,
-            _ => {
-                return Err(CompileError::type_error(
-                    "only direct calls to named functions are supported",
-                )
-                .with_span(span));
+            let param_ty = param_tys.get(i).cloned().unwrap_or(Ty::Infer(InferId(0)));
+            let arg = self.check_expr(a, &param_ty)?;
+            if !matches!(
+                self.infer.resolve(&param_ty),
+                Ty::Reference(..) | Ty::Pointer(..)
+            ) {
+                self.check_partial_move(&arg, a.span())?;
             }
-        };
-        Ok(HirExpr {
-            kind: ExprKind::Call {
-                callee: callee_def,
+            hir_args.push(arg);
+        }
+        // 具名函数走直接调用；其余函数类型表达式走运行期函数指针调用。
+        let kind = match callee_hir.kind {
+            ExprKind::Def(id) => ExprKind::Call {
+                callee: id,
                 args: hir_args,
                 result: self.alloc_local(),
             },
+            _ => ExprKind::CallIndirect {
+                callee: Box::new(callee_hir),
+                args: hir_args,
+                result: self.alloc_local(),
+            },
+        };
+        Ok(HirExpr {
+            kind,
             ty: ret_ty,
             span,
         })
@@ -1947,6 +2450,7 @@ impl TypeChecker {
         &mut self,
         path: &[String],
         fields: &[(String, Expression)],
+        base: Option<&Expression>,
         _expected: &Ty,
         span: ast::Span,
     ) -> Result<HirExpr> {
@@ -1964,6 +2468,30 @@ impl TypeChecker {
                 ))
                 .with_span(span))
             }
+        };
+        let target_ty = Ty::Named(def_id, Vec::new());
+        // 结构体更新语法 `..base`：为了不让 base 表达式被重复求值，目前要求
+        // 它是位置表达式（局部量 / 字段 / 索引 / 解引用）。Drop 类型禁止
+        // 更新——逐字段复制会重复析构同一份资源。
+        let base_hir = if let Some(base) = base {
+            if !is_struct_update_place(base) {
+                return Err(CompileError::type_error(
+                    "struct update base must be a place expression \
+                     (a local, field, index, or dereference)",
+                )
+                .with_span(span));
+            }
+            if self.has_drop_glue(&target_ty, 0) {
+                return Err(CompileError::type_error(
+                    "struct update syntax is not supported for types with Drop glue",
+                )
+                .with_span(span));
+            }
+            let base = self.check_expr(base, &target_ty)?;
+            self.infer.unify(&base.ty, &target_ty, span).ok();
+            Some(base)
+        } else {
+            None
         };
         let mut seen = HashSet::new();
         let mut checked: Vec<(String, HirExpr)> = Vec::with_capacity(fields.len());
@@ -1990,35 +2518,91 @@ impl TypeChecker {
             seen.insert(name.clone());
             let fty = &field_tys[idx].1;
             let checked_expr = self.check_expr(expr, fty)?;
+            self.check_partial_move(&checked_expr, expr.span())?;
             checked.push((name.clone(), checked_expr));
         }
-        // 检查是否有未初始化的字段（结构体字面量要求全部初始化）
-        for (name, _) in &field_tys {
-            if !seen.contains(name) {
+        // 未写出的字段：普通字面量要求全部初始化，更新语法则从 base 读取。
+        for (name, fty) in &field_tys {
+            if seen.contains(name) {
+                continue;
+            }
+            let Some(base) = &base_hir else {
                 return Err(CompileError::type_error(format!(
                     "missing field `{}` in struct literal for `{}`",
                     name,
                     path.join("::")
                 ))
                 .with_span(span));
-            }
+            };
+            checked.push((
+                name.clone(),
+                HirExpr {
+                    kind: ExprKind::Field(Box::new(base.clone()), name.clone()),
+                    ty: fty.clone(),
+                    span,
+                },
+            ));
         }
         Ok(HirExpr {
             kind: ExprKind::Struct(checked),
-            ty: Ty::Named(def_id, Vec::new()),
+            ty: target_ty,
             span,
         })
+    }
+
+    /// 移动一个 Drop 字段时，禁止从直接实现 Drop 的类型（或引用/指针后面）
+    /// 移出。Rust 在 E0509/E0507 中同样禁止这类部分移动。
+    fn check_partial_move(&self, expr: &HirExpr, span: ast::Span) -> Result<()> {
+        let ty = self.infer.resolve(&expr.ty);
+        if !self.has_drop_glue(&ty, 0) {
+            return Ok(());
+        }
+        let hir::ExprKind::Field(base, _) = &expr.kind else {
+            return Ok(());
+        };
+        let base_ty = self.infer.resolve(&base.ty);
+        let forbidden = match base_ty {
+            Ty::Reference(..) | Ty::Pointer(..) => true,
+            Ty::Named(id, _) => self.drop_impls.contains_key(&id),
+            _ => false,
+        };
+        if forbidden {
+            return Err(CompileError::type_error(
+                "cannot move a Drop field out of a type that implements Drop \
+                 (or out of borrowed content)",
+            )
+            .with_span(span));
+        }
+        Ok(())
+    }
+
+    /// 类型是否含任何 Drop glue：自身实现 Drop，或成员递归含 Drop。
+    fn has_drop_glue(&self, ty: &Ty, depth: usize) -> bool {
+        if depth > 16 {
+            return true;
+        }
+        match ty {
+            Ty::Named(id, _) => {
+                if self.drop_impls.contains_key(id) {
+                    return true;
+                }
+                let Some(hir::HirTypeDef::Struct(s)) = self.type_defs.get(id) else {
+                    return false;
+                };
+                s.fields.iter().any(|f| self.has_drop_glue(&f.ty, depth + 1))
+            }
+            Ty::Array(elem, _) => self.has_drop_glue(elem, depth + 1),
+            _ => false,
+        }
     }
 
     fn check_field_access(&self, ty: &Ty, name: &str, span: ast::Span) -> Result<(Ty, FieldIndex)> {
         match ty {
             Ty::Named(id, _) => {
-                if let Some(hir_td) = self.type_defs.get(id) {
-                    if let hir::HirTypeDef::Struct(s) = hir_td {
-                        for f in &s.fields {
-                            if f.name == name {
-                                return Ok((f.ty.clone(), FieldIndex::Named(f.index)));
-                            }
+                if let Some(hir::HirTypeDef::Struct(s)) = self.type_defs.get(id) {
+                    for f in &s.fields {
+                        if f.name == name {
+                            return Ok((f.ty.clone(), FieldIndex::Named(f.index)));
                         }
                     }
                 }
@@ -2222,11 +2806,9 @@ impl TypeChecker {
     }
 
     fn field_type(&self, def_id: DefId, name: &str, span: ast::Span) -> Result<Ty> {
-        if let Some(hir_td) = self.type_defs.get(&def_id) {
-            if let hir::HirTypeDef::Struct(s) = hir_td {
-                if let Some(f) = s.fields.iter().find(|f| f.name == name) {
-                    return Ok(f.ty.clone());
-                }
+        if let Some(hir::HirTypeDef::Struct(s)) = self.type_defs.get(&def_id) {
+            if let Some(f) = s.fields.iter().find(|f| f.name == name) {
+                return Ok(f.ty.clone());
             }
         }
         Err(CompileError::name_error(format!("no field `{}`", name)).with_span(span))
@@ -2373,16 +2955,21 @@ impl TypeChecker {
         if path.is_empty() {
             return Err(CompileError::name_error("empty path").with_span(span));
         }
+        // 关联函数 `Type::method` 在展开阶段被 mangle 成 `Type__method`。
+        if path.len() > 1 {
+            let mangled = path.join("__");
+            if let Some(id) = self.symbols.get(&mangled).copied() {
+                return Ok(id);
+            }
+        }
         let first = path[0].clone();
         let id = self.resolve_name(&first, span)?;
         for seg in &path[1..] {
             // 路径继续：查找 id 的成员
-            if let Some(hir_td) = self.type_defs.get(&id) {
-                if let hir::HirTypeDef::Struct(s) = hir_td {
-                    if let Some(f) = s.fields.iter().find(|f| f.name == *seg) {
-                        // 字段不是 DefId，这里仅作占位
-                        let _ = f;
-                    }
+            if let Some(hir::HirTypeDef::Struct(s)) = self.type_defs.get(&id) {
+                if let Some(f) = s.fields.iter().find(|f| f.name == *seg) {
+                    // 字段不是 DefId，这里仅作占位
+                    let _ = f;
                 }
             }
             let _ = seg;
@@ -2560,7 +3147,8 @@ impl TypeChecker {
                     self.infer.fresh_infer(e.span())
                 }
             }
-            Expression::Binary(_, op, _, _) => match op {
+            Expression::Binary(
+                _,
                 ast::BinaryOp::Eq
                 | ast::BinaryOp::Ne
                 | ast::BinaryOp::Lt
@@ -2568,13 +3156,13 @@ impl TypeChecker {
                 | ast::BinaryOp::Le
                 | ast::BinaryOp::Ge
                 | ast::BinaryOp::And
-                | ast::BinaryOp::Or => Ty::Bool,
-                _ => self.infer.fresh_infer(e.span()),
-            },
-            Expression::Unary(op, _, _) => match op {
-                ast::UnaryOp::Not => Ty::Bool,
-                _ => self.infer.fresh_infer(e.span()),
-            },
+                | ast::BinaryOp::Or,
+                _,
+                _,
+            ) => Ty::Bool,
+            Expression::Binary(..) => self.infer.fresh_infer(e.span()),
+            Expression::Unary(ast::UnaryOp::Not, _, _) => Ty::Bool,
+            Expression::Unary(..) => self.infer.fresh_infer(e.span()),
             // `x as T` 的结果类型就是 T，不需要推断。
             //
             // 漏掉这一条会让 `let y = x as f64;` 的 y 落到一个未解决的
@@ -2613,7 +3201,7 @@ impl TypeChecker {
             Expression::Continue(_, _) => Ty::Never,
             Expression::Loop(_, _) => Ty::Never,
             Expression::Throw(_, _) => Ty::Never,
-            Expression::StructInit(path, _, _) => {
+            Expression::StructInit(path, _, _, _) => {
                 let id = self
                     .resolve_path(path, ast::Span::unknown())
                     .unwrap_or(DefId(0));
@@ -2625,13 +3213,20 @@ impl TypeChecker {
                     .map(|e| self.infer_expr_ty(e))
                     .collect::<Result<_>>()?,
             ),
-            Expression::Array(elems, _, _) => {
+            Expression::Array(elems, repeat, _) => {
                 let elem = if let Some(first) = elems.first() {
                     self.infer_expr_ty(first)?
                 } else {
                     self.infer.fresh_infer(e.span())
                 };
-                Ty::Array(Box::new(elem), hir::ArrayLen::Dynamic)
+                let len = repeat
+                    .as_ref()
+                    .and_then(|r| match &**r {
+                        Expression::Literal(AstLiteral::Int(n, _), _) => Some(*n),
+                        _ => None,
+                    })
+                    .unwrap_or(elems.len() as i128);
+                Ty::Array(Box::new(elem), const_array_len(len, e.span()))
             }
             Expression::Lambda(_, ret, _, _) => {
                 let params = Vec::new();
@@ -2847,11 +3442,28 @@ impl TypeChecker {
                 .with_span(*span))
             }
 
-            // `comptime Point { x: 1, y: 2 }`：字段按书写顺序求值。
-            Expression::StructInit(_, fields, _) => {
-                let mut items = Vec::with_capacity(fields.len());
+            // `comptime Point { x: 1, y: 2, ..base }`：字段按书写顺序求值，
+            // 未写出的字段从编译期 base 聚合值继承。
+            Expression::StructInit(_, fields, base, _) => {
+                let mut items = if let Some(base) = base {
+                    match *self.eval_const_expr(base)? {
+                        HirLiteral::Composite(items) => items,
+                        _ => {
+                            return Err(CompileError::internal(
+                                "struct update base is not a compile-time struct value",
+                            ))
+                        }
+                    }
+                } else {
+                    Vec::new()
+                };
                 for (name, e) in fields {
-                    items.push((name.clone(), *self.eval_const_expr(e)?));
+                    let value = *self.eval_const_expr(e)?;
+                    if let Some(slot) = items.iter_mut().find(|(n, _)| n == name) {
+                        slot.1 = value;
+                    } else {
+                        items.push((name.clone(), value));
+                    }
                 }
                 Ok(Box::new(HirLiteral::Composite(items)))
             }
@@ -3234,6 +3846,14 @@ struct OffsetTracker {
     max_align: usize,
 }
 
+/// 语法类型里最末一级名字（`a::b::Foo` → `Foo`）。
+fn ast_type_name(ty: &AstType) -> Option<&str> {
+    match ty {
+        AstType::Named { path, .. } => path.last().map(String::as_str),
+        _ => None,
+    }
+}
+
 impl OffsetTracker {
     fn new() -> Self {
         Self::default()
@@ -3336,6 +3956,11 @@ fn check_overlap(
     trait_defs: &HashMap<DefId, hir::HirTrait>,
 ) -> Result<()> {
     let new_trait = new_impl.trait_id;
+    // 固有 impl（`impl Type`）不是 trait 实现，彼此不构成 coherence 冲突。
+    // 方法重名由函数表/调用解析负责；这里只管 `impl Trait for Type`。
+    if new_trait.is_none() {
+        return Ok(());
+    }
     // 只比较相同 trait 的 impl
     for existing in existing_impls {
         if existing.trait_id != new_trait {
@@ -3391,6 +4016,15 @@ fn is_more_specific(a: &hir::HirImpl, b: &hir::HirImpl) -> bool {
 /// 解引用 / 索引都要拿它定结果类型。这里同时接受 `Pointer` 与
 /// `Reference`：语法上 `&x` 产出引用，而用户显式写的 `*T` 产指针，
 /// 两者在运行期都是同一个"地址"。
+fn is_struct_update_place(e: &Expression) -> bool {
+    match e {
+        Expression::Variable(..) | Expression::Path(..) => true,
+        Expression::Field(base, ..) | Expression::Index(base, ..) => is_struct_update_place(base),
+        Expression::Unary(ast::UnaryOp::Deref, base, _) => is_struct_update_place(base),
+        _ => false,
+    }
+}
+
 fn pointee_of(infer: &InferCtxt<'_>, ty: &Ty) -> Option<Ty> {
     match infer.resolve(ty) {
         Ty::Pointer(t, _) | Ty::Reference(t, _) => Some((*t).clone()),
@@ -3469,6 +4103,88 @@ fn ty_name(ty: &Ty) -> String {
 }
 
 /// 取模式中第一个绑定变量的 `LocalId`。
+
+/// 把 `for` 循环体里的 `continue` 改写成“先执行自增，再 continue”。
+/// `depth > 0` 表示位于内层循环中，那里的 continue 属于内层循环，不能改。
+fn rewrite_for_continue(block: &mut HirBlock, inc: &HirExpr, depth: usize) {
+    for stmt in &mut block.stmts {
+        match stmt {
+            HirStmt::Expr(e) => rewrite_for_continue_expr(e, inc, depth),
+            HirStmt::Let { init, .. } | HirStmt::Var { init, .. } => {
+                if let Some(e) = init {
+                    rewrite_for_continue_expr(e, inc, depth);
+                }
+            }
+            HirStmt::Item => {}
+        }
+    }
+    if let Some(tail) = &mut block.tail {
+        rewrite_for_continue_expr(tail, inc, depth);
+    }
+}
+
+fn rewrite_for_continue_expr(e: &mut HirExpr, inc: &HirExpr, depth: usize) {
+    match &mut e.kind {
+        ExprKind::Continue if depth == 0 => {
+            let cont = HirExpr {
+                kind: ExprKind::Continue,
+                ty: Ty::Never,
+                span: e.span,
+            };
+            e.kind = ExprKind::Block(HirBlock {
+                stmts: vec![HirStmt::Expr(Box::new(inc.clone()))],
+                tail: Some(Box::new(cont)),
+            });
+            e.ty = Ty::Never;
+        }
+        ExprKind::Binary(_, l, r) | ExprKind::Assign(l, r) | ExprKind::Index(l, r) => {
+            rewrite_for_continue_expr(l, inc, depth);
+            rewrite_for_continue_expr(r, inc, depth);
+        }
+        ExprKind::Unary(_, x)
+        | ExprKind::Field(x, _)
+        | ExprKind::Deref(x)
+        | ExprKind::AddrOf(x)
+        | ExprKind::Cast(x) => rewrite_for_continue_expr(x, inc, depth),
+        ExprKind::Call { args, .. } => {
+            for arg in args {
+                rewrite_for_continue_expr(arg, inc, depth);
+            }
+        }
+        ExprKind::CallIndirect { callee, args, .. } => {
+            rewrite_for_continue_expr(callee, inc, depth);
+            for arg in args {
+                rewrite_for_continue_expr(arg, inc, depth);
+            }
+        }
+        ExprKind::Block(b) => rewrite_for_continue(b, inc, depth),
+        ExprKind::If(c, t, el) => {
+            rewrite_for_continue_expr(c, inc, depth);
+            rewrite_for_continue(t, inc, depth);
+            if let Some(el) = el {
+                rewrite_for_continue(el, inc, depth);
+            }
+        }
+        ExprKind::While(c, b) => {
+            rewrite_for_continue_expr(c, inc, depth + 1);
+            rewrite_for_continue(b, inc, depth + 1);
+        }
+        ExprKind::Loop(b) => rewrite_for_continue(b, inc, depth + 1),
+        ExprKind::Return(Some(x)) => rewrite_for_continue_expr(x, inc, depth),
+        ExprKind::Array(elems) => {
+            for elem in elems {
+                rewrite_for_continue_expr(elem, inc, depth);
+            }
+        }
+        ExprKind::Struct(fields) => {
+            for (_, value) in fields {
+                rewrite_for_continue_expr(value, inc, depth);
+            }
+        }
+        _ => {}
+    }
+}
+
 fn first_binding(p: &hir::HirPattern) -> Option<LocalId> {
     match p {
         hir::HirPattern::Binding(local) => Some(*local),
@@ -3529,6 +4245,12 @@ fn substitute_local(e: &mut hir::HirExpr, target: LocalId, with: &hir::HirExpr) 
                 substitute_local(arg, target, with);
             }
         }
+        ExprKind::CallIndirect { callee, args, .. } => {
+            substitute_local(callee, target, with);
+            for arg in args {
+                substitute_local(arg, target, with);
+            }
+        }
         ExprKind::If(cond, then, els) => {
             substitute_local(cond, target, with);
             walk_block(then, target, with);
@@ -3559,7 +4281,7 @@ fn substitute_local(e: &mut hir::HirExpr, target: LocalId, with: &hir::HirExpr) 
         | ExprKind::Defer
         | ExprKind::Try
         | ExprKind::Throw
-        | ExprKind::Array
+        | ExprKind::Array(..)
         | ExprKind::Tuple
         | ExprKind::Closure
         | ExprKind::Asm { .. }
@@ -3907,5 +4629,59 @@ mod mutability_tests {
             .expect("可变指针写入应通过类型检查");
         check("fn main() -> i32 { let x: i32 = 1; let p: *mut i32 = &mut x; p[0] = 42; if p[0] != 42 { return 1; } return 0; }")
             .expect("可变指针索引写入应通过类型检查");
+    }
+}
+
+#[cfg(test)]
+mod drop_move_tests {
+    use super::*;
+    use crate::lexer::Lexer;
+    use crate::parser::Parser;
+
+    fn check(src: &str) -> Result<hir::HirModule> {
+        let tokens = Lexer::new(src).tokenize();
+        let prog = Parser::new(tokens).parse().expect("应能解析成功");
+        TypeChecker::new().check_program(&prog)
+    }
+
+    /// 不能从直接实现 Drop 的类型里移出 Drop 字段（Rust E0509）。
+    #[test]
+    fn rejects_moving_drop_field_out_of_drop_type() {
+        let err = check(
+            r#"
+            struct Leaf { v: i32 }
+            impl Drop for Leaf { fn drop(&mut self) { } }
+            struct Wrap { leaf: Leaf }
+            impl Drop for Wrap { fn drop(&mut self) { } }
+            fn main() -> i32 {
+                let w = Wrap { leaf: Leaf { v: 1 } };
+                let l = w.leaf;
+                return 0;
+            }
+            "#,
+        )
+        .expect_err("应拒绝从 Drop 类型中部分移动 Drop 字段");
+        assert!(
+            err.message.contains("implements Drop"),
+            "actual: {err}"
+        );
+    }
+
+    /// 外层没有直接实现 Drop 时，移出 Drop 字段是允许的。
+    #[test]
+    fn allows_moving_drop_field_out_of_plain_struct() {
+        check(
+            r#"
+            struct Leaf { v: i32 }
+            impl Drop for Leaf { fn drop(&mut self) { } }
+            struct Wrap { leaf: Leaf }
+            fn main() -> i32 {
+                let w = Wrap { leaf: Leaf { v: 1 } };
+                let l = w.leaf;
+                return 0;
+            }
+            "#,
+        )
+        .expect("普通结构体字段应可移出");
     }
 }

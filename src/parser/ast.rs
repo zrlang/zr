@@ -350,8 +350,14 @@ pub enum Expression {
     Array(Vec<Expression>, Option<Box<Expression>>, Span),
     /// 元组字面量：`(1, "a")`。
     Tuple(Vec<Expression>, Span),
-    /// 结构体字面量：`Point { x: 1, y: 2 }`。
-    StructInit(Vec<String>, Vec<(String, Expression)>, Span),
+    /// 结构体字面量：`Point { x: 1, y: 2 }`；最后一个字段可以是
+    /// 结构体更新语法 `..base`。
+    StructInit(
+        Vec<String>,
+        Vec<(String, Expression)>,
+        Option<Box<Expression>>,
+        Span,
+    ),
     /// Lambda / 闭包：`|a, b| a + b`。
     Lambda(Vec<Pattern>, Option<Type>, Block, Span),
     /// `comptime` 块 / 表达式（编译期求值）。
@@ -698,6 +704,7 @@ pub struct AssocType;
 pub struct ImplBlock {
     pub target: Type,             // 实现的目标类型
     pub trait_type: Option<Type>, // `impl Trait for T` 中的 Trait
+    pub methods: Vec<Function>,   // impl 中定义的方法
     pub where_clause: Vec<WherePred>,
     pub span: Span,
 }
@@ -739,7 +746,7 @@ impl Spanned for Expression {
             Expression::Throw(_, s) => *s,
             Expression::Array(_, _, s) => *s,
             Expression::Tuple(_, s) => *s,
-            Expression::StructInit(_, _, s) => *s,
+            Expression::StructInit(_, _, _, s) => *s,
             Expression::Lambda(_, _, _, s) => *s,
             Expression::Comptime(_, s) => *s,
             Expression::Await(_, s) => *s,

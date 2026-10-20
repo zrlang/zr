@@ -1,0 +1,19 @@
+// bench_loop.zr — tight integer loop with a multiplicative checksum.
+//
+// sum((i * 2654435761) % 1000003 for i in 1..=5000000) = 2500006418757.
+
+fn main() -> i32 {
+    let n: i64 = 5000000;
+    let mut i: i64 = 1;
+    let mut acc: i64 = 0;
+
+    while i <= n {
+        acc = acc + (i * 2654435761) % 1000003;
+        i = i + 1;
+    }
+
+    if acc != 2500006418757 {
+        return 1;
+    }
+    return 0;
+}

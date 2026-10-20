@@ -71,27 +71,19 @@ impl RegistryState {
     }
 
     /// 发布新版本。
-    pub fn publish(
-        &mut self,
-        meta: VersionMeta,
-        artifact: Vec<u8>,
-        deps: Vec<(String, String)>,
-    ) {
+    pub fn publish(&mut self, meta: VersionMeta, artifact: Vec<u8>, deps: Vec<(String, String)>) {
         let key = (meta.name.clone(), meta.version.clone());
         self.versions.insert(key.clone(), meta.clone());
         self.artifacts.insert(key.clone(), artifact);
         self.deps.insert(key, deps);
 
         // 更新包元数据
-        let crate_meta = self
-            .crates
-            .entry(meta.name.clone())
-            .or_insert(CrateMeta {
-                name: meta.name.clone(),
-                description: String::new(),
-                latest_version: String::new(),
-                versions: Vec::new(),
-            });
+        let crate_meta = self.crates.entry(meta.name.clone()).or_insert(CrateMeta {
+            name: meta.name.clone(),
+            description: String::new(),
+            latest_version: String::new(),
+            versions: Vec::new(),
+        });
         if !crate_meta.versions.contains(&meta.version) {
             crate_meta.versions.push(meta.version.clone());
         }
@@ -210,7 +202,12 @@ fn route(method: &str, path: &str, state: &Arc<Mutex<RegistryState>>) -> Respons
                     );
                     (200, "OK", json, "application/json")
                 }
-                None => (404, "Not Found", "{\"error\":\"not found\"}".to_string(), "application/json"),
+                None => (
+                    404,
+                    "Not Found",
+                    "{\"error\":\"not found\"}".to_string(),
+                    "application/json",
+                ),
             }
         }
         // GET /api/v1/crates/:name/:version
@@ -224,7 +221,12 @@ fn route(method: &str, path: &str, state: &Arc<Mutex<RegistryState>>) -> Respons
                     );
                     (200, "OK", json, "application/json")
                 }
-                None => (404, "Not Found", "{\"error\":\"not found\"}".to_string(), "application/json"),
+                None => (
+                    404,
+                    "Not Found",
+                    "{\"error\":\"not found\"}".to_string(),
+                    "application/json",
+                ),
             }
         }
         // GET /api/v1/crates/:name/:version/deps
@@ -241,17 +243,30 @@ fn route(method: &str, path: &str, state: &Arc<Mutex<RegistryState>>) -> Respons
                     );
                     (200, "OK", json, "application/json")
                 }
-                None => (404, "Not Found", "{\"error\":\"not found\"}".to_string(), "application/json"),
+                None => (
+                    404,
+                    "Not Found",
+                    "{\"error\":\"not found\"}".to_string(),
+                    "application/json",
+                ),
             }
         }
         // GET /api/v1/crates/:name/:version/download
         ("GET", ["api", "v1", "crates", name, version, "download"]) => {
             let state = state.lock().unwrap();
             match state.download(name, version) {
-                Some(artifact) => {
-                    (200, "OK", String::from_utf8_lossy(artifact).to_string(), "application/x-tar+gzip")
-                }
-                None => (404, "Not Found", "{\"error\":\"not found\"}".to_string(), "application/json"),
+                Some(artifact) => (
+                    200,
+                    "OK",
+                    String::from_utf8_lossy(artifact).to_string(),
+                    "application/x-tar+gzip",
+                ),
+                None => (
+                    404,
+                    "Not Found",
+                    "{\"error\":\"not found\"}".to_string(),
+                    "application/json",
+                ),
             }
         }
         // PUT /api/v1/crates/:name/:version
@@ -266,7 +281,12 @@ fn route(method: &str, path: &str, state: &Arc<Mutex<RegistryState>>) -> Respons
             state.publish(meta, Vec::new(), Vec::new());
             (200, "OK", "{\"ok\":true}".to_string(), "application/json")
         }
-        _ => (404, "Not Found", "{\"error\":\"not found\"}".to_string(), "application/json"),
+        _ => (
+            404,
+            "Not Found",
+            "{\"error\":\"not found\"}".to_string(),
+            "application/json",
+        ),
     }
 }
 
@@ -305,7 +325,10 @@ pub struct RegistryClient {
 
 impl RegistryClient {
     pub fn new(base_url: impl Into<String>) -> Self {
-        Self { base_url: base_url.into(), token: None }
+        Self {
+            base_url: base_url.into(),
+            token: None,
+        }
     }
 
     /// 设置认证 token。
@@ -320,7 +343,11 @@ impl RegistryClient {
             .trim_start_matches("https://")
             .to_string();
         let mut stream = TcpStream::connect(host)?;
-        let auth_header = self.token.as_ref().map(|t| format!("Authorization: Bearer {t}\r\n")).unwrap_or_default();
+        let auth_header = self
+            .token
+            .as_ref()
+            .map(|t| format!("Authorization: Bearer {t}\r\n"))
+            .unwrap_or_default();
         let body_bytes = body.unwrap_or_default();
         let request = format!(
             "{} {} HTTP/1.1\r\nHost: {}\r\n{auth_header}Content-Length: {}\r\nConnection: close\r\n\r\n{}",
@@ -368,7 +395,11 @@ impl RegistryClient {
             .trim_start_matches("https://")
             .to_string();
         let mut stream = TcpStream::connect(host)?;
-        let auth_header = self.token.as_ref().map(|t| format!("Authorization: Bearer {}\r\n", t)).unwrap_or_default();
+        let auth_header = self
+            .token
+            .as_ref()
+            .map(|t| format!("Authorization: Bearer {}\r\n", t))
+            .unwrap_or_default();
         let path = format!("/api/v1/crates/{}/{}/download", name, version);
         let request = format!(
             "GET {} HTTP/1.1\r\nHost: {}\r\n{auth_header}Connection: close\r\n\r\n",
@@ -399,7 +430,11 @@ impl RegistryClient {
 
     /// 搜索包（支持关键词查询）。
     pub fn search(&self, query: &str, limit: usize) -> std::io::Result<String> {
-        let path = format!("/api/v1/crates?q={}&limit={}", urlencoding::encode(query), limit);
+        let path = format!(
+            "/api/v1/crates?q={}&limit={}",
+            urlencoding::encode(query),
+            limit
+        );
         self.get(&path)
     }
 }

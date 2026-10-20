@@ -214,6 +214,8 @@ thread_local! {
         std::cell::RefCell::new(Allocation::default());
     /// 当前函数预留的栈槽数（驱动序言的 `sub rsp`）。
     static FRAME_SLOTS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    /// 间接调用保存函数指针的专用栈槽。
+    static CALL_SLOT: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     /// 浮点值专用的栈槽。
     ///
     /// 浮点走 **XMM**，而整数分配器只认 GPR。与其给分配器加一整套并行的
@@ -478,6 +480,26 @@ fn assign_float_slots(func: &SsaFunction, base: usize) -> usize {
                             // 形参，但形参自己若是浮点而调用方没传浮点，IR
                             // 里就无从得知——这是 `MirParam` 不带类型的代价。
                             let _ = args;
+                        }
+                        // 浮点 Load/Store 的结果/值也必须落进 XMM 栈槽，
+                        // 否则状态机恢复浮点局部量时会把它当整数搬。
+                        SsaInstr::Load { result, ty, .. } if ty.is_float() => {
+                            let w = match *ty {
+                                NumTy::Float(w) => w,
+                                _ => 64,
+                            };
+                            if mark(result, w, &mut floats) {
+                                changed = true;
+                            }
+                        }
+                        SsaInstr::Store { value, ty, .. } if ty.is_float() => {
+                            let w = match *ty {
+                                NumTy::Float(w) => w,
+                                _ => 64,
+                            };
+                            if mark(value, w, &mut floats) {
+                                changed = true;
+                            }
                         }
                         SsaInstr::Cast {
                             result,
@@ -755,6 +777,14 @@ fn reg_into(unit: &mut CompilationUnit, v: SsaValue, dst: Gpr) {
 /// `result = *ptr`。
 fn emit_load(unit: &mut CompilationUnit, result: SsaValue, ptr: SsaValue, ty: NumTy) {
     let p = use_reg(unit, ptr);
+    if let NumTy::Float(width) = ty {
+        let Some(slot) = float_slot(result) else {
+            crate::codegen::unsupported_cast(ty, ty);
+        };
+        emit_sse_mem_op(unit, Some(sse_prefix(width)), 0x10, 0, p);
+        emit_store_float(unit, 0, slot, width);
+        return;
+    }
     let spilled = matches!(location_of(result), Location::Stack(_));
     let d = if spilled {
         SCRATCH_AX
@@ -788,6 +818,14 @@ fn emit_store(unit: &mut CompilationUnit, ptr: SsaValue, value: SsaValue, ty: Nu
             SCRATCH_CX
         }
     };
+    if let NumTy::Float(width) = ty {
+        let Some(slot) = float_slot(value) else {
+            crate::codegen::unsupported_cast(ty, ty);
+        };
+        emit_load_float(unit, 0, slot, width);
+        emit_sse_mem_op(unit, Some(sse_prefix(width)), 0x11, 0, p);
+        return;
+    }
     // 值搬进 rax（完整 64 位搬即可——小端下低字节就是要写的值）。
     reg_into(unit, value, SCRATCH_AX);
     emit_store_mem(unit, p, ty);
@@ -795,28 +833,30 @@ fn emit_store(unit: &mut CompilationUnit, ptr: SsaValue, value: SsaValue, ty: Nu
 
 /// 扫出所有被取地址的局部变量，各分配一个栈槽（排在 `base` 之后）。
 fn assign_local_slots(func: &SsaFunction, base: usize) -> usize {
-    let mut ids: Vec<u32> = Vec::new();
+    // 同一个 local id 可能出现多次；取最大的槽需求。
+    let mut locals: Vec<(u32, u32)> = Vec::new();
     for block in &func.blocks {
         for instr in &block.instrs {
-            if let SsaInstr::SlotAddr { local, .. } = instr {
-                if !ids.contains(local) {
-                    ids.push(*local);
+            if let SsaInstr::SlotAddr { local, size, .. } = instr {
+                match locals.iter_mut().find(|(id, _)| id == local) {
+                    Some((_, s)) => *s = (*s).max(*size),
+                    None => locals.push((*local, *size)),
                 }
             }
         }
     }
-    ids.sort_unstable();
-    let count = ids.len();
+    locals.sort_unstable_by_key(|(id, _)| *id);
+    let mut slots = 0usize;
     LOCAL_SLOTS.with(|m| {
         let mut map = m.borrow_mut();
         map.clear();
-        for (i, id) in ids.into_iter().enumerate() {
-            map.insert(id, base + i);
+        for (id, size) in locals {
+            map.insert(id, base + slots);
+            slots += (size.max(8) as usize).div_ceil(8);
         }
     });
-    count
+    slots
 }
-
 /// 发射一个函数的机器码。
 pub fn emit_function(target: &Target, unit: &mut CompilationUnit, func: &SsaFunction) {
     debug_assert_eq!(
@@ -825,7 +865,7 @@ pub fn emit_function(target: &Target, unit: &mut CompilationUnit, func: &SsaFunc
         "x86-64 后端只能用于 x86_64 目标"
     );
     // 先做活跃区间分析 + 线性扫描，确定每个值落在哪个寄存器
-let alloc = crate::codegen::regalloc::allocate_registers(
+    let alloc = crate::codegen::regalloc::allocate_registers(
         func,
         ALLOCATABLE.len(),
         &X86_64_CALLEE_SAVE,
@@ -838,7 +878,9 @@ let alloc = crate::codegen::regalloc::allocate_registers(
     // 三类槽共用一个帧，序言只需一次 sub rsp。
     let float_slots = assign_float_slots(func, alloc.spilled);
     let local_slots = assign_local_slots(func, alloc.spilled + float_slots);
-    FRAME_SLOTS.with(|c| c.set(alloc.spilled + float_slots + local_slots));
+    let call_slot = alloc.spilled + float_slots + local_slots;
+    CALL_SLOT.with(|c| c.set(call_slot));
+    FRAME_SLOTS.with(|c| c.set(call_slot + 1));
     REG_MAP.with(|m| {
         *m.borrow_mut() = alloc;
     });
@@ -1080,7 +1122,7 @@ fn emit_instr(unit: &mut CompilationUnit, instr: &SsaInstr) {
         }
         SsaInstr::Load { result, ptr, ty } => emit_load(unit, *result, *ptr, *ty),
         SsaInstr::Store { ptr, value, ty } => emit_store(unit, *ptr, *value, *ty),
-        SsaInstr::SlotAddr { result, local } => {
+        SsaInstr::SlotAddr { result, local, .. } => {
             let slot = LOCAL_SLOTS.with(|m| m.borrow().get(local).copied().unwrap_or(0));
             // 结果溢出的值经 rax 写回栈槽。
             if let Location::Stack(s) = location_of(*result) {
@@ -1090,12 +1132,61 @@ fn emit_instr(unit: &mut CompilationUnit, instr: &SsaInstr) {
                 emit_lea_slot(unit, alloc_reg(*result), slot);
             }
         }
+        SsaInstr::SimdBinary {
+            lhs,
+            op,
+            rhs,
+            out,
+            ty,
+            lanes,
+        } => emit_simd_binary(unit, *lhs, *op, *rhs, *out, *ty, *lanes),
         SsaInstr::Asm {
             template,
             outputs,
             inputs,
             ..
         } => emit_inline_asm(unit, template, outputs, inputs),
+        SsaInstr::FuncAddr { result, target } => {
+            let spilled = matches!(location_of(*result), Location::Stack(_));
+            let d = if spilled {
+                SCRATCH_AX
+            } else {
+                alloc_reg(*result)
+            };
+            emit_str_addr(unit, d, target);
+            if spilled {
+                if let Location::Stack(slot) = location_of(*result) {
+                    emit_store_slot(unit, d, slot);
+                }
+            }
+        }
+        SsaInstr::CallIndirect {
+            result,
+            callee,
+            args,
+            ..
+        } => {
+            // 函数指针先落进专用栈槽：实参搬运可能覆盖它所在的寄存器。
+            let c = use_reg(unit, *callee);
+            let call_slot = CALL_SLOT.with(|c| c.get());
+            emit_store_slot(unit, c, call_slot);
+            emit_call_args(unit, args);
+            emit_load_slot(unit, SCRATCH_AX, call_slot);
+            emit_call_reg(unit, SCRATCH_AX);
+            if let Some(slot) = float_slot(*result) {
+                emit_store_float(unit, 0, slot, float_width(*result));
+            } else {
+                match location_of(*result) {
+                    Location::Reg(i) => {
+                        let d = ALLOCATABLE[i];
+                        if d != SCRATCH_AX {
+                            emit_mov_rr(unit, d, SCRATCH_AX);
+                        }
+                    }
+                    Location::Stack(slot) => emit_store_slot(unit, SCRATCH_AX, slot),
+                }
+            }
+        }
         SsaInstr::Var { .. } => {
             // Var 是 φ 合并前的引用，运行时无需动作
         }
@@ -2024,6 +2115,15 @@ fn emit_call(unit: &mut CompilationUnit, target: &str) {
     push_reloc(unit, instr_start, 5, target);
 }
 
+/// `call r64`：`FF /2`。
+fn emit_call_reg(unit: &mut CompilationUnit, target: Gpr) {
+    if target.rex_bit() {
+        emit1(unit, 0x41);
+    }
+    emit1(unit, 0xff);
+    emit1(unit, 0b11_010_000 | target.bits());
+}
+
 /// `jmp rel32`：0xE9 + imm32（需重定位）。
 fn emit_jmp(unit: &mut CompilationUnit, target: &str) {
     let instr_start = unit.code.len();
@@ -2175,7 +2275,6 @@ fn emit_full_alu(unit: &mut CompilationUnit, op: u8, dst: Gpr, src: Gpr) {
     emit1(unit, opcode);
     modrm(unit, 3, src.bits(), dst.bits());
 }
-
 
 // ======================================================================
 // 内联汇编（`asm!`）
@@ -2358,10 +2457,10 @@ fn emit_load_mem_rsp(unit: &mut CompilationUnit, dst: Gpr, disp: i32, ty: NumTy)
 }
 
 /// `op dst, imm32`（`add` / `sub` / `and` / `or` / `xor` / `cmp`）。
-fn emit_alu_imm(unit: &mut CompilationUnit, ext: u8, dst: Gpr, imm: i64, cmp: bool) {
+fn emit_alu_imm(unit: &mut CompilationUnit, ext: u8, dst: Gpr, imm: i64, _cmp: bool) {
     let rex = 0x48u8 | if dst.rex_bit() { 0x01 } else { 0 };
     emit1(unit, rex);
-    emit1(unit, if cmp { 0x81 } else { 0x81 });
+    emit1(unit, 0x81);
     modrm(unit, 3, ext, dst.bits());
     emit4(unit, imm as u32);
 }
@@ -2431,13 +2530,38 @@ fn substitute_template(template: &str, regs: &[Gpr]) -> String {
 }
 
 /// 发射一条 SSE 寄存器-寄存器指令。`prefix` 为 `66` / `F3` / `F2`。
-fn emit_sse_rr(
-    unit: &mut CompilationUnit,
-    prefix: Option<u8>,
-    opcode: u8,
-    dst: u8,
-    src: u8,
-) {
+/// `movss/movsd/movups/movdqa/movdqu` 的内存形式：`op xmm, [base]` / `op [base], xmm`。
+///
+/// `prefix` 是 legacy 前缀（`66`/`F3`/`F2`），无前缀传 `None`。`base` 为
+/// `rsp/r12` 时补 SIB；为 `rbp/r13` 时补 disp8=0。
+fn emit_sse_mem_op(unit: &mut CompilationUnit, prefix: Option<u8>, opcode: u8, xmm: u8, base: Gpr) {
+    let mut rex = 0x40u8;
+    if xmm >= 8 {
+        rex |= 0x04;
+    }
+    if base.rex_bit() {
+        rex |= 0x01;
+    }
+    if let Some(p) = prefix {
+        emit1(unit, p);
+    }
+    if rex != 0x40 {
+        emit1(unit, rex);
+    }
+    emit2(unit, 0x0f, opcode);
+    let b = base.bits();
+    // mod=00 且 rm=5 表示 RIP 相对，`rbp/r13` 都必须改成 disp8=0。
+    let (mod_bits, rm) = if b == 5 { (1, 5) } else { (0, b) };
+    modrm(unit, mod_bits, xmm & 7, rm);
+    if b == 4 {
+        emit1(unit, 0b00_100_100);
+    }
+    if mod_bits == 1 {
+        emit1(unit, 0);
+    }
+}
+
+fn emit_sse_rr(unit: &mut CompilationUnit, prefix: Option<u8>, opcode: u8, dst: u8, src: u8) {
     let mut rex = 0x40u8;
     if dst >= 8 {
         rex |= 0x04;
@@ -2456,7 +2580,14 @@ fn emit_sse_rr(
 }
 
 /// 发射带一个 8 位立即数的 SSE 指令（如 `pslld xmm, imm8`）。
-fn emit_sse_imm(unit: &mut CompilationUnit, prefix: Option<u8>, opcode: u8, ext: u8, dst: u8, imm: u8) {
+fn emit_sse_imm(
+    unit: &mut CompilationUnit,
+    prefix: Option<u8>,
+    opcode: u8,
+    ext: u8,
+    dst: u8,
+    imm: u8,
+) {
     let mut rex = 0x40u8;
     if dst >= 8 {
         rex |= 0x01;
@@ -2586,6 +2717,108 @@ fn sse_shift_opcode(name: &str) -> Option<(u8, u8)> {
 /// 指令（`add` / `sub` / `and` / `or` / `xor` / `cmp` / `test` /
 /// `inc` / `dec` / `neg` / `not` / `imul` / `shl` / `shr` / `sar` /
 /// `push` / `pop` / `int`）。
+/// 数组逐元素 SIMD：从两个地址读 128 位，执行 packed 运算，写回第三个地址。
+fn emit_simd_binary(
+    unit: &mut CompilationUnit,
+    lhs: SsaValue,
+    op: SsaBinaryOp,
+    rhs: SsaValue,
+    out: SsaValue,
+    ty: NumTy,
+    lanes: u32,
+) {
+    let Some((op_prefix, mem_prefix, load_op, store_op, opcode)) = simd_encoding(ty, op) else {
+        crate::codegen::unsupported_simd("x86-64");
+    };
+    let _ = lanes;
+
+    let saved = [Gpr::R8, Gpr::R9, Gpr::R10];
+    for r in saved {
+        emit_push64(unit, r);
+    }
+    // 先把三个地址值压到栈上再统一装载：源寄存器可能正好是 R8/R9/R10，
+    // 直接逐个 mov 会互相覆盖（lhs 写到 R8 时可能踩掉还没读的 rhs）。
+    let mut shift = (saved.len() * 8) as i32;
+    for v in [lhs, rhs, out] {
+        match location_of(v) {
+            Location::Reg(i) => emit_push64(unit, ALLOCATABLE[i]),
+            Location::Stack(slot) => {
+                emit_load_mem_rsp(unit, SCRATCH_CX, shift + (slot as i32) * 8, NumTy::Uint(64));
+                emit_push64(unit, SCRATCH_CX);
+            }
+        }
+        shift += 8;
+    }
+    emit_load_mem_rsp(unit, Gpr::R8, 16, NumTy::Uint(64));
+    emit_load_mem_rsp(unit, Gpr::R9, 8, NumTy::Uint(64));
+    emit_load_mem_rsp(unit, Gpr::R10, 0, NumTy::Uint(64));
+
+    emit_sse_mem_op(unit, mem_prefix, load_op, 0, Gpr::R8);
+    emit_sse_mem_op(unit, mem_prefix, load_op, 1, Gpr::R9);
+    emit_sse_rr(unit, op_prefix, opcode, 0, 1);
+    emit_sse_mem_op(unit, mem_prefix, store_op, 0, Gpr::R10);
+
+    for _ in 0..3 {
+        emit_pop64(unit, SCRATCH_AX);
+    }
+    for r in saved.into_iter().rev() {
+        emit_pop64(unit, r);
+    }
+}
+
+/// `(运算前缀, 访存前缀, 加载 opcode, 存储 opcode, packed 运算 opcode)`。
+type SimdEncoding = (Option<u8>, Option<u8>, u8, u8, u8);
+
+/// 选择 packed 运算对应的指令编码。
+fn simd_encoding(ty: NumTy, op: SsaBinaryOp) -> Option<SimdEncoding> {
+    use SsaBinaryOp::*;
+    match ty {
+        NumTy::Float(32) => {
+            let opcode = match op {
+                Add => 0x58,
+                Sub => 0x5c,
+                Mul => 0x59,
+                Div => 0x5e,
+                _ => return None,
+            };
+            Some((None, None, 0x10, 0x11, opcode))
+        }
+        NumTy::Float(64) => {
+            let opcode = match op {
+                Add => 0x58,
+                Sub => 0x5c,
+                Mul => 0x59,
+                Div => 0x5e,
+                _ => return None,
+            };
+            Some((Some(0x66), Some(0x66), 0x10, 0x11, opcode))
+        }
+        NumTy::Int(32) | NumTy::Uint(32) => {
+            let opcode = match op {
+                Add => 0xfe,
+                Sub => 0xfa,
+                BitAnd => 0xdb,
+                BitOr => 0xeb,
+                BitXor => 0xef,
+                _ => return None,
+            };
+            Some((Some(0x66), Some(0xf3), 0x6f, 0x7f, opcode))
+        }
+        NumTy::Int(64) | NumTy::Uint(64) => {
+            let opcode = match op {
+                Add => 0xd4,
+                Sub => 0xfb,
+                BitAnd => 0xdb,
+                BitOr => 0xeb,
+                BitXor => 0xef,
+                _ => return None,
+            };
+            Some((Some(0x66), Some(0xf3), 0x6f, 0x7f, opcode))
+        }
+        _ => None,
+    }
+}
+
 fn emit_inline_asm(
     unit: &mut CompilationUnit,
     template: &str,
@@ -2633,17 +2866,18 @@ fn emit_inline_asm(
 
     // 栈槽在 push 之后整体下移 `saved.len() * 8`。
     let frame_shift = (saved.len() * 8) as i32;
-    let load_operand = |unit: &mut CompilationUnit, dst: Gpr, v: SsaValue, ty: NumTy| match location_of(v) {
-        Location::Reg(i) => {
-            let src = ALLOCATABLE[i];
-            if src != dst {
-                emit_mov_rr(unit, dst, src);
+    let load_operand =
+        |unit: &mut CompilationUnit, dst: Gpr, v: SsaValue, ty: NumTy| match location_of(v) {
+            Location::Reg(i) => {
+                let src = ALLOCATABLE[i];
+                if src != dst {
+                    emit_mov_rr(unit, dst, src);
+                }
             }
-        }
-        Location::Stack(slot) => {
-            emit_load_mem_rsp(unit, dst, frame_shift + (slot as i32) * 8, ty)
-        }
-    };
+            Location::Stack(slot) => {
+                emit_load_mem_rsp(unit, dst, frame_shift + (slot as i32) * 8, ty)
+            }
+        };
 
     for (i, (_, v, _)) in outputs.iter().enumerate() {
         load_operand(unit, addr_regs[i], *v, NumTy::Uint(64));
@@ -2655,7 +2889,13 @@ fn emit_inline_asm(
 
     let text = substitute_template(template, &operand_regs);
     for line in text.lines() {
-        let line = line.split(';').next().unwrap_or("").split('#').next().unwrap_or("");
+        let line = line
+            .split(';')
+            .next()
+            .unwrap_or("")
+            .split('#')
+            .next()
+            .unwrap_or("");
         let line = line.trim();
         if line.is_empty() {
             continue;
@@ -2752,7 +2992,10 @@ fn emit_inline_asm(
                 }
             }
             "inc" | "dec" | "neg" | "not" => {
-                let dst = args.first().and_then(|a| reg_arg(a)).unwrap_or_else(|| unsupported());
+                let dst = args
+                    .first()
+                    .and_then(|a| reg_arg(a))
+                    .unwrap_or_else(|| unsupported());
                 match mnemonic.as_str() {
                     "inc" => emit_group3(unit, 0xff, 0, dst),
                     "dec" => emit_group3(unit, 0xff, 1, dst),
@@ -2785,7 +3028,10 @@ fn emit_inline_asm(
                 emit1(unit, imm as u8);
             }
             "push" | "pop" => {
-                let r = args.first().and_then(|a| reg_arg(a)).unwrap_or_else(|| unsupported());
+                let r = args
+                    .first()
+                    .and_then(|a| reg_arg(a))
+                    .unwrap_or_else(|| unsupported());
                 if mnemonic == "push" {
                     emit_push64(unit, r);
                 } else {
@@ -2795,7 +3041,9 @@ fn emit_inline_asm(
             "movd" | "movq" if args.len() == 2 => {
                 let (qdst, qsrc) = (xmm_by_name(args[0]), xmm_by_name(args[1]));
                 match (qdst, qsrc, reg_arg(args[0]), reg_arg(args[1])) {
-                    (Some(x), None, _, Some(g)) => emit_mov_gpr_xmm(unit, x, g, mnemonic == "movq", true),
+                    (Some(x), None, _, Some(g)) => {
+                        emit_mov_gpr_xmm(unit, x, g, mnemonic == "movq", true)
+                    }
                     (None, Some(x), Some(g), _) => {
                         emit_mov_gpr_xmm(unit, x, g, mnemonic == "movq", false)
                     }
@@ -2808,14 +3056,26 @@ fn emit_inline_asm(
             }
             _ if sse_shift_opcode(&mnemonic).is_some() => {
                 let (ext, opc) = sse_shift_opcode(&mnemonic).unwrap();
-                let dst = args.first().and_then(|a| xmm_by_name(a)).unwrap_or_else(|| unsupported());
-                let imm = args.get(1).and_then(|a| parse_imm(a)).unwrap_or_else(|| unsupported());
+                let dst = args
+                    .first()
+                    .and_then(|a| xmm_by_name(a))
+                    .unwrap_or_else(|| unsupported());
+                let imm = args
+                    .get(1)
+                    .and_then(|a| parse_imm(a))
+                    .unwrap_or_else(|| unsupported());
                 emit_sse_imm(unit, Some(0x66), opc, ext, dst, imm as u8);
             }
             _ if sse_rr_opcode(&mnemonic).is_some() => {
                 let (prefix, opc) = sse_rr_opcode(&mnemonic).unwrap();
-                let dst = args.first().and_then(|a| xmm_by_name(a)).unwrap_or_else(|| unsupported());
-                let src = args.get(1).and_then(|a| xmm_by_name(a)).unwrap_or_else(|| unsupported());
+                let dst = args
+                    .first()
+                    .and_then(|a| xmm_by_name(a))
+                    .unwrap_or_else(|| unsupported());
+                let src = args
+                    .get(1)
+                    .and_then(|a| xmm_by_name(a))
+                    .unwrap_or_else(|| unsupported());
                 emit_sse_rr(unit, prefix, opc, dst, src);
             }
             _ => unsupported(),

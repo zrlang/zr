@@ -1,0 +1,48 @@
+// bench_sieve.zr — sieve of Eratosthenes over a 256-byte stack array.
+//
+// Uses the language-level fixed-size array `[u8; 256]` and plain indexing.
+//
+// There are 54 primes <= 255. After 20000 rounds the accumulated count is
+// 54 * 20000 = 1080000.
+
+fn main() -> i32 {
+    let mut p: [u8; 256] = [1; 256];
+    let n: i64 = 256;
+    let rounds: i64 = 20000;
+    let mut total: i64 = 0;
+    let mut r: i64 = 0;
+    while r < rounds {
+        let mut i: i64 = 0;
+        while i < n {
+            p[i] = 1;
+            i = i + 1;
+        }
+        p[0] = 0;
+        p[1] = 0;
+        i = 2;
+        while i * i < n {
+            if p[i] == 1 {
+                let mut j: i64 = i * i;
+                while j < n {
+                    p[j] = 0;
+                    j = j + i;
+                }
+            }
+            i = i + 1;
+        }
+        i = 0;
+        let mut count: i64 = 0;
+        while i < n {
+            if p[i] == 1 {
+                count = count + 1;
+            }
+            i = i + 1;
+        }
+        total = total + count;
+        r = r + 1;
+    }
+    if total != 1080000 { return 1; }
+    if p[2] != 1 { return 2; }
+    if p[4] != 0 { return 3; }
+    return 0;
+}

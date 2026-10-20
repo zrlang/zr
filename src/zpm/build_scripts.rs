@@ -109,15 +109,20 @@ impl Sandbox {
         let start = std::time::Instant::now();
 
         // 检查脚本路径是否在允许的目录内
-        let in_allowed = self.config.allowed_dirs.iter().any(|dir| {
-            script_path.starts_with(dir)
-        });
+        let in_allowed = self
+            .config
+            .allowed_dirs
+            .iter()
+            .any(|dir| script_path.starts_with(dir));
         if !in_allowed && !self.config.allowed_dirs.is_empty() {
             return SandboxResult {
                 success: false,
                 exit_code: -1,
                 stdout: String::new(),
-                stderr: format!("build script path not in allowed directories: {:?}", script_path),
+                stderr: format!(
+                    "build script path not in allowed directories: {:?}",
+                    script_path
+                ),
                 duration: start.elapsed(),
             };
         }
@@ -204,7 +209,9 @@ pub struct BuildCache {
 
 impl BuildCache {
     pub fn new(cache_dir: impl Into<PathBuf>) -> Self {
-        Self { cache_dir: cache_dir.into() }
+        Self {
+            cache_dir: cache_dir.into(),
+        }
     }
 
     /// 计算输入文件的哈希（简化版：修改时间 + 大小）。

@@ -1,0 +1,41 @@
+//=============================================================================
+// tests/cases/38_drop_temp.zr — 未绑定的 Drop 临时量
+//
+// 覆盖：表达式语句产生的结构体临时量立即析构；块尾值、位置表达式不重复
+// 析构。
+//=============================================================================
+
+struct Res {
+    id: i32,
+    log: &mut i32,
+}
+
+impl Drop for Res {
+    fn drop(&mut self) {
+        *self.log = *self.log * 10 + self.id;
+    }
+}
+
+fn main() -> i32 {
+    let mut log: i32 = 0;
+
+    Res { id: 1, log: &mut log };
+    if log != 1 { return 1; }
+
+    {
+        Res { id: 2, log: &mut log };
+    }
+    if log != 12 { return 2; }
+
+    Res { id: 3, log: &mut log };
+    Res { id: 4, log: &mut log };
+    if log != 1234 { return 3; }
+
+    {
+        let r = Res { id: 5, log: &mut log };
+        if r.id != 5 { return 4; }
+    }
+    if log != 12345 { return 5; }
+
+    return 0;
+}

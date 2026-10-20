@@ -89,7 +89,9 @@ pub fn build_harness(test_names: &[String]) -> MirFunction {
 
     MirFunction {
         name: "main".to_string(),
+        is_async: false,
         params: Vec::new(),
+        param_types: Vec::new(),
         blocks,
         inline_never: false,
         inline_always: false,

@@ -1,0 +1,130 @@
+//=============================================================================
+// tests/cases/30_drop.zr — 用户 Drop trait 与作用域析构
+//=============================================================================
+
+struct Res {
+    p: &mut i32,
+    id: i32,
+}
+
+impl Drop for Res {
+    fn drop(&mut self) {
+        *self.p = *self.p * 10 + self.id;
+    }
+}
+
+struct Holder {
+    a: Res,
+    b: Res,
+}
+
+fn consume(r: Res) {
+    if r.id != 9 { asm!("nop"); }
+}
+
+fn forward(r: Res) {
+    let s = r;
+    if *s.p != 0 { asm!("nop"); }
+}
+
+fn early(x: &mut i32) -> i32 {
+    let r = Res { p: x, id: 7 };
+    return 0;
+}
+
+fn main() -> i32 {
+    let mut x = 0;
+    {
+        let r = Res { p: &mut x, id: 1 };
+    }
+    if x != 1 { return 1; }
+
+    x = 0;
+    {
+        let r = Res { p: &mut x, id: 1 };
+        let s = r;
+    }
+    if x != 1 { return 2; }
+
+    x = 0;
+    {
+        let r1 = Res { p: &mut x, id: 1 };
+        let r2 = Res { p: &mut x, id: 2 };
+    }
+    if x != 21 { return 3; }
+
+    x = 0;
+    {
+        let r = Res { p: &mut x, id: 9 };
+        consume(r);
+    }
+    if x != 9 { return 4; }
+
+    x = 0;
+    let v = early(&mut x);
+    if v != 0 { return 5; }
+    if x != 7 { return 6; }
+
+    x = 0;
+    {
+        let h = Holder {
+            a: Res { p: &mut x, id: 1 },
+            b: Res { p: &mut x, id: 2 },
+        };
+        if *h.a.p != 0 { return 7; }
+    }
+    if x != 12 { return 8; }
+
+    x = 0;
+    let mut i = 0;
+    while i < 3 {
+        let r = Res { p: &mut x, id: 1 };
+        i = i + 1;
+        if i == 2 { continue; }
+        if i == 3 { break; }
+    }
+    if x != 111 { return 9; }
+
+    x = 0;
+    {
+        let r1 = Res { p: &mut x, id: 1 };
+        {
+            let r2 = Res { p: &mut x, id: 2 };
+        }
+        if *r1.p != 2 { return 10; }
+    }
+    if x != 21 { return 11; }
+
+    x = 0;
+    {
+        let mut r = Res { p: &mut x, id: 1 };
+        r = Res { p: &mut x, id: 2 };
+    }
+    if x != 12 { return 12; }
+
+    x = 0;
+    {
+        let mut r = Res { p: &mut x, id: 3 };
+        r = r;
+    }
+    if x != 3 { return 13; }
+
+    x = 0;
+    {
+        let mut h = Holder {
+            a: Res { p: &mut x, id: 1 },
+            b: Res { p: &mut x, id: 2 },
+        };
+        h.a = Res { p: &mut x, id: 3 };
+    }
+    if x != 132 { return 14; }
+
+    x = 0;
+    {
+        let r = Res { p: &mut x, id: 4 };
+        forward(r);
+    }
+    if x != 4 { return 15; }
+
+    return 0;
+}

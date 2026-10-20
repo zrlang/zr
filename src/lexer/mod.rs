@@ -351,6 +351,9 @@ impl<'a> Lexer<'a> {
         // 此处 self.pos 指向 start+1
         let num_start = start;
         let mut is_float = false;
+        // `w.0.0` 里的第一个 `0` 紧跟在 `.` 后面，是元组字段下标；
+        // 不能把后续的 `.0` 当成小数点，否则会切成 `Dot FloatLiteral(0.0)`。
+        let field_index = num_start > 0 && self.src[num_start - 1] == '.';
 
         // 处理前缀 0x / 0b / 0o
         let radix: u32 = if self.src.get(num_start) == Some(&'0') {
@@ -375,13 +378,13 @@ impl<'a> Lexer<'a> {
                 self.advance();
                 continue;
             }
-            if radix == 16 && c.is_ascii_hexdigit() {
-                self.advance();
-            } else if (radix == 2 || radix == 8) && c.is_digit(radix) {
+            if (radix == 16 && c.is_ascii_hexdigit())
+                || ((radix == 2 || radix == 8) && c.is_digit(radix))
+            {
                 self.advance();
             } else if radix == 10 && (c.is_ascii_digit() || c == '.') {
                 if c == '.' {
-                    if is_float {
+                    if is_float || field_index {
                         break;
                     }
                     // 看下一个字符是否是数字（排除 `1.` 作为方法调用）
@@ -624,7 +627,7 @@ impl<'a> Lexer<'a> {
                 // \xHH
                 let h1 = self.read_hex_digit();
                 let h2 = self.read_hex_digit();
-                char::from_u32((h1 << 4 | h2) as u32).unwrap_or('\u{FFFD}')
+                char::from_u32(h1 << 4 | h2).unwrap_or('\u{FFFD}')
             }
             'u' => {
                 // \u{XXXX}
@@ -894,6 +897,16 @@ mod tests {
         assert_eq!(t[2].kind, TokenKind::IntLiteral(7, Some("i8".into())));
         assert_eq!(t[3].kind, TokenKind::IntLiteral(255, Some("u8".into())));
         assert_eq!(t[4].kind, TokenKind::FloatLiteral(1.0, Some("f64".into())));
+    }
+
+    #[test]
+    fn tuple_field_chain_is_not_a_float() {
+        let t = Lexer::new("w.0.1").tokenize();
+        assert_eq!(t[0].kind, TokenKind::Ident("w".into()));
+        assert_eq!(t[1].kind, TokenKind::Dot);
+        assert_eq!(t[2].kind, TokenKind::IntLiteral(0, None));
+        assert_eq!(t[3].kind, TokenKind::Dot);
+        assert_eq!(t[4].kind, TokenKind::IntLiteral(1, None));
     }
 
     #[test]

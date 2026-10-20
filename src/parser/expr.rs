@@ -45,6 +45,9 @@ impl Prec {
     const CALL: Self = Self(15);
 }
 
+/// `parse_if` 的结果：条件为真的块、`else` 分支（可能嵌套 `else if`）与源码位置。
+type IfParseResult = (Box<Expression>, Block, Option<Box<Expression>>, Span);
+
 impl Parser {
     /// 解析任意表达式（入口）。
     pub fn parse_expression(&mut self) -> Result<Expression, CompileError> {
@@ -96,7 +99,20 @@ impl Parser {
                 }
                 TokenKind::Dot => {
                     self.advance(); // .
-                    let field = self.consume_ident("expected field name")?;
+                                    // Rust 风格后缀 `.await`，优先级与字段访问一致。
+                    if self.match_kind(&TokenKind::KwAwait) {
+                        left = Expression::Await(Box::new(left), op_span);
+                        continue;
+                    }
+                    // 元组字段 `.0` / `.1`：词法上是点 + 整数字面量。
+                    let field = match &self.peek().kind {
+                        TokenKind::IntLiteral(n, _) => {
+                            let field = n.to_string();
+                            self.advance();
+                            field
+                        }
+                        _ => self.consume_ident("expected field name")?,
+                    };
                     left = Expression::Field(Box::new(left), field, op_span);
                     continue;
                 }
@@ -230,11 +246,7 @@ impl Parser {
 
         // ===== break / continue / return =====
         if self.match_kind(&TokenKind::KwBreak) {
-            let label = if self.peek().kind == TokenKind::Ident(String::new()) {
-                None
-            } else {
-                None
-            };
+            let label = None;
             let value = if self.check_expr_start() {
                 Some(Box::new(self.parse_expression()?))
             } else {
@@ -295,14 +307,7 @@ impl Parser {
         }
 
         // ===== async / await / yield / spawn =====
-        if self.match_kind(&TokenKind::KwAsync) {
-            let expr = self.parse_expression()?;
-            return Ok(Expression::Await(Box::new(expr), span));
-        }
-        if self.match_kind(&TokenKind::KwAwait) {
-            let expr = self.parse_expression()?;
-            return Ok(Expression::Await(Box::new(expr), span));
-        }
+        // `await` 只允许后缀写法（`future.await`），与 Rust 一致。
         if self.match_kind(&TokenKind::KwYield) {
             let expr = self.parse_expression()?;
             return Ok(Expression::Yield(Box::new(expr), span));
@@ -330,9 +335,8 @@ impl Parser {
             self.advance();
             let mutability = if self.match_kind(&TokenKind::KwMut) {
                 Mutability::Mutable
-            } else if self.match_kind(&TokenKind::KwConst) {
-                Mutability::Immutable
             } else {
+                self.match_kind(&TokenKind::KwConst);
                 Mutability::Immutable
             };
             let operand = self.parse_expr_bp(Prec::UNARY)?;
@@ -464,19 +468,22 @@ impl Parser {
             // `no_struct_literal` 额外禁用。
             let looks_like_struct = !self.no_struct_literal
                 && self.check(&TokenKind::LBrace)
-                && self
-                    .peek_n(1)
-                    .map(|t| matches!(t.kind, TokenKind::Ident(_)))
-                    .unwrap_or(false)
-                && self
-                    .peek_n(2)
-                    .map(|t| {
-                        matches!(
-                            t.kind,
-                            TokenKind::Colon | TokenKind::Comma | TokenKind::RBrace
-                        )
-                    })
-                    .unwrap_or(false);
+                && self.peek_n(1).is_some_and(|t| {
+                    // `Type { ..base }` 没有字段名，`{` 后面直接是 `..`。
+                    if matches!(t.kind, TokenKind::DotDot) {
+                        return true;
+                    }
+                    matches!(t.kind, TokenKind::Ident(_))
+                        && self
+                            .peek_n(2)
+                            .map(|t| {
+                                matches!(
+                                    t.kind,
+                                    TokenKind::Colon | TokenKind::Comma | TokenKind::RBrace
+                                )
+                            })
+                            .unwrap_or(false)
+                });
             if looks_like_struct {
                 self.advance(); // {
                 return self.parse_struct_literal(vec![n], span);
@@ -538,9 +545,7 @@ impl Parser {
 
     // ===== 控制流 =====
 
-    fn parse_if(
-        &mut self,
-    ) -> Result<(Box<Expression>, Block, Option<Box<Expression>>, Span), CompileError> {
+    fn parse_if(&mut self) -> Result<IfParseResult, CompileError> {
         let span = self.previous().span;
         let cond = Box::new(self.parse_condition()?);
         let then = self.parse_block()?;
@@ -686,7 +691,13 @@ impl Parser {
         span: Span,
     ) -> Result<Expression, CompileError> {
         let mut fields = Vec::new();
+        let mut base = None;
         while !self.check(&TokenKind::RBrace) && !self.is_at_end() {
+            if self.match_kind(&TokenKind::DotDot) {
+                base = Some(Box::new(self.parse_expression()?));
+                let _ = self.match_kind(&TokenKind::Comma);
+                break;
+            }
             let name = self.consume_ident("expected field name")?;
             // 字段简写：`Point { x, y }` 等价于 `Point { x: x, y: y }`
             let value = if self.match_kind(&TokenKind::Colon) {
@@ -700,7 +711,7 @@ impl Parser {
             }
         }
         self.consume(&TokenKind::RBrace, "expected '}'")?;
-        Ok(Expression::StructInit(path, fields, span))
+        Ok(Expression::StructInit(path, fields, base, span))
     }
 
     /// 解析函数调用参数列表（不含括号）。
@@ -895,6 +906,148 @@ impl Parser {
         self.tokens[self.pos - 2].kind == TokenKind::Comma
     }
 }
+
+// ==================================================================
+// `intrinsic!` 宏解析辅助
+// ==================================================================
+
+impl Parser {
+    /// 解析 `intrinsic!` 宏的第一个"操作"标识符，映射到 IntrinsicKind。
+    ///
+    /// 支持的写法（括号前的标识符）：
+    /// - `size_of` → `IntrinsicKind::SizeOf`
+    /// - `align_of` → `IntrinsicKind::AlignOf`
+    /// - `type_of` → `IntrinsicKind::TypeOf`
+    /// - `offset_of` → `IntrinsicKind::OffsetOf`
+    /// - `bitcast` / `transmute` → `IntrinsicKind::Transmute`
+    /// - `intcast` / `int_cast` → `IntrinsicKind::IntCast`
+    /// - `drop` → `IntrinsicKind::Drop`
+    /// - `forget` → `IntrinsicKind::Forget`
+    /// - `zeroed` → `IntrinsicKind::Zeroed`
+    /// - `yield` → `IntrinsicKind::Yield`
+    /// - `now_ms` → `IntrinsicKind::NowMs`
+    /// - `capture_backtrace` → `IntrinsicKind::CaptureBacktrace`
+    /// - `sum` → `IntrinsicKind::Sum`
+    fn parse_intrinsic_kind(&mut self) -> Result<IntrinsicKind, crate::error::CompileError> {
+        let name = self.consume_ident("expected intrinsic operation after `intrinsic!(`")?;
+        Ok(match name.as_str() {
+            "size_of" | "sizeof" => IntrinsicKind::SizeOf,
+            "align_of" | "alignof" => IntrinsicKind::AlignOf,
+            "type_of" | "typeof" => IntrinsicKind::TypeOf,
+            "offset_of" | "offsetof" => IntrinsicKind::OffsetOf,
+            "bitcast" | "transmute" => IntrinsicKind::Transmute,
+            "intcast" | "int_cast" => IntrinsicKind::IntCast,
+            "drop" => IntrinsicKind::Drop,
+            "forget" => IntrinsicKind::Forget,
+            "zeroed" => IntrinsicKind::Zeroed,
+            "yield" => IntrinsicKind::Yield,
+            "now_ms" | "nowms" => IntrinsicKind::NowMs,
+            "capture_backtrace" | "capture" => IntrinsicKind::CaptureBacktrace,
+            "sum" => IntrinsicKind::Sum,
+            other => {
+                return Err(crate::error::CompileError::type_error(format!(
+                    "unknown intrinsic operation: `{}`",
+                    other
+                )));
+            }
+        })
+    }
+
+    /// 尝试解析一个类型。若当前 token 不是有效的类型开头，则返回 None 且不消耗 token。
+    /// 与 `parse_type` 的区别：失败时不报错、不前进。
+    fn try_parse_type(&mut self) -> Option<Type> {
+        // 通过 peek 判断是否是类型开头：标识符、基础类型关键字、'*'、'&'、'('、'[' 等。
+        use crate::lexer::TokenKind::*;
+        match self.peek().kind {
+            Ident(_) | TyI(_) | TyU(_) | TyF(_) | TyBool | TyStr | TyChar | TyNever | KwVoid
+            | KwAnytype | KwUpperSelf | KwFn | Star | Amp | LParen | LBracket => {
+                self.parse_type().ok()
+            }
+            _ => None,
+        }
+    }
+
+    /// 解析 `asm!(...)` 内联汇编。
+    fn parse_asm(&mut self, span: Span) -> Result<Expression, CompileError> {
+        self.consume(&TokenKind::LParen, "expected '(' after asm!")?;
+
+        // 第一个参数：模板字符串
+        let template = match self.peek().kind.clone() {
+            TokenKind::StringLiteral(s) => {
+                self.advance();
+                s
+            }
+            _ => return Err(self.unexpected(&["string literal"])),
+        };
+
+        let mut outputs = Vec::new();
+        let mut inputs = Vec::new();
+        let mut _options = Vec::new();
+
+        // 解析操作数和选项
+        while self.match_kind(&TokenKind::Comma) {
+            if self.check(&TokenKind::RBrace) || self.check(&TokenKind::RParen) {
+                break;
+            }
+            // 检查是否是 options(...)
+            if self.check(&TokenKind::Ident("options".into())) {
+                self.advance();
+                self.consume(&TokenKind::LParen, "expected '(' after options")?;
+                while !self.check(&TokenKind::RParen) && !self.is_at_end() {
+                    if let TokenKind::Ident(opt) = self.peek().kind.clone() {
+                        _options.push(opt);
+                        self.advance();
+                    } else {
+                        self.advance();
+                    }
+                    self.match_kind(&TokenKind::Comma);
+                }
+                self.consume(&TokenKind::RParen, "expected ')' to close options")?;
+                continue;
+            }
+            // 解析操作数：in/out(reg) expr
+            let is_out = self.check(&TokenKind::Ident("out".into()));
+            let is_in = self.check(&TokenKind::KwIn) || self.check(&TokenKind::Ident("in".into()));
+            if !is_out && !is_in {
+                // 跳过未知参数
+                self.advance();
+                continue;
+            }
+            self.advance(); // in/out
+            self.consume(&TokenKind::LParen, "expected '(' after in/out")?;
+            let constraint = match self.peek().kind.clone() {
+                TokenKind::Ident(c) => {
+                    self.advance();
+                    c
+                }
+                TokenKind::StringLiteral(s) => {
+                    self.advance();
+                    s
+                }
+                _ => return Err(self.unexpected(&["register constraint"])),
+            };
+            self.consume(&TokenKind::RParen, "expected ')' after constraint")?;
+            let expr = self.parse_expression()?;
+            let operand = crate::parser::ast::AsmOperand { constraint, expr };
+            if is_out {
+                outputs.push(operand);
+            } else {
+                inputs.push(operand);
+            }
+        }
+
+        self.consume(&TokenKind::RParen, "expected ')' to close asm!")?;
+
+        Ok(Expression::Asm(
+            crate::parser::ast::AsmExpr {
+                template,
+                outputs,
+                inputs,
+            },
+            span,
+        ))
+    }
+}
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1001,144 +1154,5 @@ mod tests {
     fn match_expression() {
         let e = expr("match x { 1 => 2, _ => 0 }");
         assert!(matches!(e, Expression::Match(_, _, _)));
-    }
-}
-
-// ==================================================================
-// `intrinsic!` 宏解析辅助
-// ==================================================================
-
-impl Parser {
-    /// 解析 `intrinsic!` 宏的第一个"操作"标识符，映射到 IntrinsicKind。
-    ///
-    /// 支持的写法（括号前的标识符）：
-    /// - `size_of` → `IntrinsicKind::SizeOf`
-    /// - `align_of` → `IntrinsicKind::AlignOf`
-    /// - `type_of` → `IntrinsicKind::TypeOf`
-    /// - `offset_of` → `IntrinsicKind::OffsetOf`
-    /// - `bitcast` / `transmute` → `IntrinsicKind::Transmute`
-    /// - `intcast` / `int_cast` → `IntrinsicKind::IntCast`
-    /// - `drop` → `IntrinsicKind::Drop`
-    /// - `forget` → `IntrinsicKind::Forget`
-    /// - `zeroed` → `IntrinsicKind::Zeroed`
-    /// - `yield` → `IntrinsicKind::Yield`
-    /// - `now_ms` → `IntrinsicKind::NowMs`
-    /// - `capture_backtrace` → `IntrinsicKind::CaptureBacktrace`
-    /// - `sum` → `IntrinsicKind::Sum`
-    fn parse_intrinsic_kind(&mut self) -> Result<IntrinsicKind, crate::error::CompileError> {
-        let name = self.consume_ident("expected intrinsic operation after `intrinsic!(`")?;
-        Ok(match name.as_str() {
-            "size_of" | "sizeof" => IntrinsicKind::SizeOf,
-            "align_of" | "alignof" => IntrinsicKind::AlignOf,
-            "type_of" | "typeof" => IntrinsicKind::TypeOf,
-            "offset_of" | "offsetof" => IntrinsicKind::OffsetOf,
-            "bitcast" | "transmute" => IntrinsicKind::Transmute,
-            "intcast" | "int_cast" => IntrinsicKind::IntCast,
-            "drop" => IntrinsicKind::Drop,
-            "forget" => IntrinsicKind::Forget,
-            "zeroed" => IntrinsicKind::Zeroed,
-            "yield" => IntrinsicKind::Yield,
-            "now_ms" | "nowms" => IntrinsicKind::NowMs,
-            "capture_backtrace" | "capture" => IntrinsicKind::CaptureBacktrace,
-            "sum" => IntrinsicKind::Sum,
-            other => {
-                return Err(crate::error::CompileError::type_error(format!(
-                    "unknown intrinsic operation: `{}`",
-                    other
-                )));
-            }
-        })
-    }
-
-    /// 尝试解析一个类型。若当前 token 不是有效的类型开头，则返回 None 且不消耗 token。
-    /// 与 `parse_type` 的区别：失败时不报错、不前进。
-    fn try_parse_type(&mut self) -> Option<Type> {
-        // 通过 peek 判断是否是类型开头：标识符、基础类型关键字、'*'、'&'、'('、'[' 等。
-        use crate::lexer::TokenKind::*;
-        match self.peek().kind {
-            Ident(_) | TyI(_) | TyU(_) | TyF(_) | TyBool | TyStr | TyChar | TyNever | KwVoid
-            | KwAnytype | KwUpperSelf | KwFn | Star | Amp | LParen | LBracket => {
-                self.parse_type().ok()
-            }
-            _ => None,
-        }
-    }
-
-    /// 解析 `asm!(...)` 内联汇编。
-    fn parse_asm(&mut self, span: Span) -> Result<Expression, CompileError> {
-        self.consume(&TokenKind::LParen, "expected '(' after asm!")?;
-
-        // 第一个参数：模板字符串
-        let template = match self.peek().kind.clone() {
-            TokenKind::StringLiteral(s) => {
-                self.advance();
-                s
-            }
-            _ => return Err(self.unexpected(&["string literal"])),
-        };
-
-        let mut outputs = Vec::new();
-        let mut inputs = Vec::new();
-        let mut _options = Vec::new();
-
-        // 解析操作数和选项
-        while self.match_kind(&TokenKind::Comma) {
-            if self.check(&TokenKind::RBrace) || self.check(&TokenKind::RParen) {
-                break;
-            }
-            // 检查是否是 options(...)
-            if self.check(&TokenKind::Ident("options".into())) {
-                self.advance();
-                self.consume(&TokenKind::LParen, "expected '(' after options")?;
-                while !self.check(&TokenKind::RParen) && !self.is_at_end() {
-                    if let TokenKind::Ident(opt) = self.peek().kind.clone() {
-                        _options.push(opt);
-                        self.advance();
-                    } else {
-                        self.advance();
-                    }
-                    self.match_kind(&TokenKind::Comma);
-                }
-                self.consume(&TokenKind::RParen, "expected ')' to close options")?;
-                continue;
-            }
-            // 解析操作数：in/out(reg) expr
-            let is_out = self.check(&TokenKind::Ident("out".into()));
-            let is_in = self.check(&TokenKind::KwIn)
-                || self.check(&TokenKind::Ident("in".into()));
-            if !is_out && !is_in {
-                // 跳过未知参数
-                self.advance();
-                continue;
-            }
-            self.advance(); // in/out
-            self.consume(&TokenKind::LParen, "expected '(' after in/out")?;
-            let constraint = match self.peek().kind.clone() {
-                TokenKind::Ident(c) => {
-                    self.advance();
-                    c
-                }
-                TokenKind::StringLiteral(s) => {
-                    self.advance();
-                    s
-                }
-                _ => return Err(self.unexpected(&["register constraint"])),
-            };
-            self.consume(&TokenKind::RParen, "expected ')' after constraint")?;
-            let expr = self.parse_expression()?;
-            let operand = crate::parser::ast::AsmOperand { constraint, expr };
-            if is_out {
-                outputs.push(operand);
-            } else {
-                inputs.push(operand);
-            }
-        }
-
-        self.consume(&TokenKind::RParen, "expected ')' to close asm!")?;
-
-        Ok(Expression::Asm(
-            crate::parser::ast::AsmExpr { template, outputs, inputs },
-            span,
-        ))
     }
 }

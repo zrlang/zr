@@ -1,0 +1,70 @@
+//=============================================================================
+// tests/cases/36_drop_array.zr — Drop 数组元素
+//
+// 覆盖：数组局部量按索引顺序析构、嵌套结构体数组、结构体字段数组，以及
+// 数组按值传入函数后的所有权转移。
+//=============================================================================
+
+struct Res {
+    id: i32,
+    log: &mut i32,
+}
+
+impl Drop for Res {
+    fn drop(&mut self) {
+        *self.log = *self.log * 10 + self.id;
+    }
+}
+
+struct Pair {
+    a: Res,
+    b: Res,
+}
+
+struct Holder {
+    items: [Res; 2],
+}
+
+fn consume(items: [Res; 2]) {
+    return;
+}
+
+fn main() -> i32 {
+    let mut log: i32 = 0;
+
+    {
+        let arr = [Res { id: 1, log: &mut log }, Res { id: 2, log: &mut log }];
+    }
+    if log != 12 { return 1; }
+
+    log = 0;
+    {
+        let mut arr = [Res { id: 1, log: &mut log }, Res { id: 2, log: &mut log }];
+        arr[0] = Res { id: 3, log: &mut log };
+    }
+    if log != 132 { return 2; }
+
+    log = 0;
+    {
+        let pairs = [
+            Pair { a: Res { id: 1, log: &mut log }, b: Res { id: 2, log: &mut log } },
+            Pair { a: Res { id: 3, log: &mut log }, b: Res { id: 4, log: &mut log } },
+        ];
+    }
+    if log != 1234 { return 3; }
+
+    log = 0;
+    {
+        let h = Holder {
+            items: [Res { id: 5, log: &mut log }, Res { id: 6, log: &mut log }],
+        };
+    }
+    if log != 56 { return 4; }
+
+    log = 0;
+    let moved = [Res { id: 7, log: &mut log }, Res { id: 8, log: &mut log }];
+    consume(moved);
+    if log != 78 { return 5; }
+
+    return 0;
+}

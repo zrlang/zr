@@ -26,6 +26,8 @@ pub struct HirModule {
     /// （常量没有存储，不存在"读一个全局"这种运行时操作）。少了这张表，
     /// `const LIMIT: i32 = 40; if LIMIT != 40 { .. }` 会拿 unit 去比较。
     pub consts: HashMap<DefId, HirConst>,
+    /// 类型 DefId → 用户实现的 Drop 析构函数名。
+    pub drop_impls: HashMap<DefId, String>,
 }
 
 // ======================================================================
@@ -33,7 +35,7 @@ pub struct HirModule {
 // ======================================================================
 
 /// HIR 类型 = 语法类型 + 类型参数替换后的实际类型。
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Default)]
 pub enum Ty {
     /// 原始整数类型。
     Int(u16),
@@ -48,6 +50,7 @@ pub enum Ty {
     /// 字符串切片 `[]const u8`。
     Str,
     /// 空元组 `()`。
+    #[default]
     Unit,
     /// Never 类型 `!`。
     Never,
@@ -82,12 +85,6 @@ pub enum Ty {
     Pin(Box<Ty>),
 }
 
-impl Default for Ty {
-    fn default() -> Self {
-        Ty::Unit
-    }
-}
-
 /// 数组长度。
 #[derive(Debug, Clone)]
 pub enum ArrayLen {
@@ -97,12 +94,35 @@ pub enum ArrayLen {
     Dynamic,
 }
 
-// HirExpr 未实现 PartialEq/Eq/Hash，这里用 Debug 输出做近似实现。
+/// 取数组长度的编译期整数值（只认字面量；复杂常量表达式留给后续版本）。
+pub fn array_len_value(len: &ArrayLen) -> Option<i128> {
+    match len {
+        ArrayLen::Const(e) => match &e.kind {
+            ExprKind::Literal(HirLiteral::Int(n)) => Some(*n),
+            ExprKind::Comptime(lit) => match &**lit {
+                HirLiteral::Int(n) => Some(*n),
+                _ => None,
+            },
+            _ => None,
+        },
+        ArrayLen::Dynamic => None,
+    }
+}
+
 impl PartialEq for ArrayLen {
     fn eq(&self, other: &Self) -> bool {
         match (self, other) {
             (ArrayLen::Dynamic, ArrayLen::Dynamic) => true,
-            (ArrayLen::Const(a), ArrayLen::Const(b)) => format!("{:?}", a) == format!("{:?}", b),
+            (ArrayLen::Const(a), ArrayLen::Const(b)) => {
+                match (
+                    array_len_value(&ArrayLen::Const(a.clone())),
+                    array_len_value(&ArrayLen::Const(b.clone())),
+                ) {
+                    (Some(x), Some(y)) => x == y,
+                    // 不可求值时才退回 Debug 近似比较。
+                    _ => format!("{:?}", a) == format!("{:?}", b),
+                }
+            }
             _ => false,
         }
     }
@@ -114,7 +134,10 @@ impl std::hash::Hash for ArrayLen {
     fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
         std::mem::discriminant(self).hash(state);
         if let ArrayLen::Const(e) = self {
-            format!("{:?}", e).hash(state);
+            match array_len_value(self) {
+                Some(n) => n.hash(state),
+                None => format!("{:?}", e).hash(state),
+            }
         }
     }
 }
@@ -177,6 +200,12 @@ pub enum ExprKind {
         args: Vec<HirExpr>,
         result: LocalId,
     },
+    /// 通过函数指针调用：`callee(args...)`，`callee` 是运行期地址。
+    CallIndirect {
+        callee: Box<HirExpr>,
+        args: Vec<HirExpr>,
+        result: LocalId,
+    },
     /// 字段访问（含元组索引）。字段名在类型检查时解析，编译期求值靠它取值。
     Field(Box<HirExpr>, String),
     /// 解引用。
@@ -215,8 +244,8 @@ pub enum ExprKind {
     Try,
     /// `throw`。
     Throw,
-    /// 数组字面量。
-    Array,
+    /// 数组字面量（元素按源码顺序保存）。
+    Array(Vec<HirExpr>),
     /// 元组字面量。
     Tuple,
     /// 结构体字面量：字段按源码书写顺序保存。

@@ -107,7 +107,7 @@ impl<'a> InferCtxt<'a> {
                 let mut sz = 0usize;
                 for t in tys {
                     let a = self.align_of(t);
-                    sz = (sz + a - 1) / a * a;
+                    sz = sz.div_ceil(a) * a;
                     sz += self.size_of(t);
                 }
                 sz
@@ -120,7 +120,7 @@ impl<'a> InferCtxt<'a> {
                     let mut sz = 0usize;
                     for f in &s.fields {
                         let a = self.align_of(&f.ty);
-                        sz = (sz + a - 1) / a * a;
+                        sz = sz.div_ceil(a) * a;
                         sz += self.size_of(&f.ty);
                     }
                     sz
@@ -415,25 +415,22 @@ impl<'a> InferCtxt<'a> {
     fn check_trait_impl(&mut self, type_id: DefId, trait_id: DefId, span: Span) -> Result<()> {
         // 遍历所有 impl 块，寻找匹配的
         for impl_block in self.impl_blocks {
-            if let Some(t) = impl_block.trait_id {
-                if t == trait_id && self.impl_matches_type(impl_block, &Ty::Named(type_id, vec![]))
-                {
-                    return Ok(());
-                }
+            if impl_block.trait_id == Some(trait_id)
+                && self.impl_matches_type(impl_block, &Ty::Named(type_id, vec![]))
+            {
+                return Ok(());
             }
         }
         // 检查类型定义上是否用 `#[derive(..)]` 声明了这个 trait
-        if let Some(td) = self.type_defs.get(&type_id) {
-            if let hir::HirTypeDef::Struct(s) = td {
-                for attr in &s.attrs {
-                    // 早先这里只判断"有没有 derive 属性"就返回成功，
-                    // 等于 `#[derive(Clone)]` 能满足**任何** trait。只认
-                    // 列表里真正写出来的那个 trait 名。
-                    if attr.name == "derive"
-                        && attr.args.iter().any(|a| *a == self.type_id_name(trait_id))
-                    {
-                        return Ok(());
-                    }
+        if let Some(hir::HirTypeDef::Struct(s)) = self.type_defs.get(&type_id) {
+            for attr in &s.attrs {
+                // 早先这里只判断"有没有 derive 属性"就返回成功，
+                // 等于 `#[derive(Clone)]` 能满足**任何** trait。只认
+                // 列表里真正写出来的那个 trait 名。
+                if attr.name == "derive"
+                    && attr.args.iter().any(|a| *a == self.type_id_name(trait_id))
+                {
+                    return Ok(());
                 }
             }
         }

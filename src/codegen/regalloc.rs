@@ -16,7 +16,7 @@
 
 use std::collections::{HashMap, HashSet};
 
-use crate::ssa::{SsaFunction, SsaInstr, SsaTerminator, SsaValue, SsaBinaryOp};
+use crate::ssa::{SsaBinaryOp, SsaFunction, SsaInstr, SsaTerminator, SsaValue};
 use Location as L;
 
 /// 一个值的存放位置。
@@ -69,13 +69,7 @@ pub fn assign_int_widths(func: &SsaFunction) -> HashSet<u32> {
     };
     loop {
         let mut changed = false;
-        let mark = |v: &SsaValue, set: &mut HashSet<u32>| -> bool {
-            if set.insert(v.id()) {
-                true
-            } else {
-                false
-            }
-        };
+        let mark = |v: &SsaValue, set: &mut HashSet<u32>| -> bool { set.insert(v.id()) };
         for block in &func.blocks {
             for instr in &block.instrs {
                 match instr {
@@ -84,13 +78,19 @@ pub fn assign_int_widths(func: &SsaFunction) -> HashSet<u32> {
                         value: crate::ssa::SsaConst::Int(i),
                     } => {
                         // 常量超 i32 范围 → i64
-                        if *i < i32::MIN as i128 || *i > i32::MAX as i128 {
-                            if mark(result, &mut wide) {
-                                changed = true;
-                            }
+                        if (*i < i32::MIN as i128 || *i > i32::MAX as i128)
+                            && mark(result, &mut wide)
+                        {
+                            changed = true;
                         }
                     }
-                    SsaInstr::Binary { result, ty, lhs, rhs, op } => {
+                    SsaInstr::Binary {
+                        result,
+                        ty,
+                        lhs,
+                        rhs,
+                        op,
+                    } => {
                         if is_wide_ty(ty) {
                             for v in [result, lhs, rhs] {
                                 if mark(v, &mut wide) {
@@ -100,14 +100,28 @@ pub fn assign_int_widths(func: &SsaFunction) -> HashSet<u32> {
                         }
                         // 比较运算（Eq/Ne/Lt/Gt/Le/Ge）结果是 Bool，但若任一操作数是
                         // i64，另一侧也必须是 i64——比较要求两侧位宽一致。
-                        if matches!(op, SsaBinaryOp::Eq | SsaBinaryOp::Ne | SsaBinaryOp::Lt | SsaBinaryOp::Gt | SsaBinaryOp::Le | SsaBinaryOp::Ge) {
+                        if matches!(
+                            op,
+                            SsaBinaryOp::Eq
+                                | SsaBinaryOp::Ne
+                                | SsaBinaryOp::Lt
+                                | SsaBinaryOp::Gt
+                                | SsaBinaryOp::Le
+                                | SsaBinaryOp::Ge
+                        ) {
                             let lhs_wide = wide.contains(&lhs.id());
                             let rhs_wide = wide.contains(&rhs.id());
-                            if lhs_wide && mark(rhs, &mut wide) { changed = true; }
-                            if rhs_wide && mark(lhs, &mut wide) { changed = true; }
+                            if lhs_wide && mark(rhs, &mut wide) {
+                                changed = true;
+                            }
+                            if rhs_wide && mark(lhs, &mut wide) {
+                                changed = true;
+                            }
                         }
                     }
-                    SsaInstr::Unary { result, operand, .. } => {
+                    SsaInstr::Unary {
+                        result, operand, ..
+                    } => {
                         // 一元运算：result 和 operand 同宽
                         if wide.contains(&result.id()) && mark(operand, &mut wide) {
                             changed = true;
@@ -116,12 +130,18 @@ pub fn assign_int_widths(func: &SsaFunction) -> HashSet<u32> {
                             changed = true;
                         }
                     }
-                    SsaInstr::Call { result, ty, .. } => {
+                    SsaInstr::Call { result, ty, .. }
+                    | SsaInstr::CallIndirect { result, ty, .. } => {
                         if is_wide_ty(ty) && mark(result, &mut wide) {
                             changed = true;
                         }
                     }
-                    SsaInstr::Cast { result, src, from, to } => {
+                    SsaInstr::Cast {
+                        result,
+                        src,
+                        from,
+                        to,
+                    } => {
                         if is_wide_ty(from) && mark(src, &mut wide) {
                             changed = true;
                         }
@@ -137,11 +157,13 @@ pub fn assign_int_widths(func: &SsaFunction) -> HashSet<u32> {
                             changed = true;
                         }
                     }
-                    SsaInstr::Phi { result, incoming, .. } => {
-                        if incoming.iter().any(|(_, v)| wide.contains(&v.id())) {
-                            if mark(result, &mut wide) {
-                                changed = true;
-                            }
+                    SsaInstr::Phi {
+                        result, incoming, ..
+                    } => {
+                        if incoming.iter().any(|(_, v)| wide.contains(&v.id()))
+                            && mark(result, &mut wide)
+                        {
+                            changed = true;
                         }
                     }
                     SsaInstr::Load { result, ty, .. } => {
@@ -149,10 +171,10 @@ pub fn assign_int_widths(func: &SsaFunction) -> HashSet<u32> {
                             changed = true;
                         }
                     }
-                    SsaInstr::Store { value, ty, .. } => {
-                        if is_wide_ty(ty) && mark(value, &mut wide) {
-                            changed = true;
-                        }
+                    SsaInstr::Store { value, ty, .. }
+                        if is_wide_ty(ty) && mark(value, &mut wide) =>
+                    {
+                        changed = true;
                     }
                     _ => {}
                 }
@@ -537,7 +559,7 @@ fn live_intervals(func: &SsaFunction) -> (HashMap<u32, (usize, usize)>, Vec<usiz
             pos += 1;
         }
         for instr in block.instrs.iter().skip(n_phi) {
-            if matches!(instr, SsaInstr::Call { .. }) {
+            if matches!(instr, SsaInstr::Call { .. } | SsaInstr::CallIndirect { .. }) {
                 calls.push(pos);
             }
             let mut us = Vec::new();

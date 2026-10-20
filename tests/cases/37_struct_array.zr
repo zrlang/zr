@@ -1,0 +1,40 @@
+//=============================================================================
+// tests/cases/37_struct_array.zr — 结构体数组的值语义
+//
+// 覆盖：结构体数组字面量、元素读取/赋值、按值传参、按值返回、嵌套字段，
+// 以及副本与原数组互不影响。
+//=============================================================================
+
+struct Point {
+    x: i32,
+    y: i32,
+}
+
+fn sum(a: [Point; 2]) -> i32 {
+    return a[0].x + a[1].y;
+}
+
+fn make() -> [Point; 2] {
+    return [Point { x: 10, y: 20 }, Point { x: 30, y: 40 }];
+}
+
+fn main() -> i32 {
+    let a = [Point { x: 1, y: 2 }, Point { x: 3, y: 4 }];
+    if a[0].x != 1 || a[0].y != 2 { return 1; }
+    if a[1].x != 3 || a[1].y != 4 { return 2; }
+    if sum(a) != 5 { return 3; }
+
+    let mut b = a;
+    b[0].x = 9;
+    b[1] = Point { x: 7, y: 8 };
+    if b[0].x != 9 || b[1].x != 7 || b[1].y != 8 { return 4; }
+    if a[0].x != 1 || a[1].x != 3 || a[1].y != 4 { return 5; }
+
+    let mut c = make();
+    if c[0].x != 10 || c[0].y != 20 { return 6; }
+    if c[1].x != 30 || c[1].y != 40 { return 7; }
+    c[1].y = 44;
+    if c[1].y != 44 { return 8; }
+
+    return 0;
+}
