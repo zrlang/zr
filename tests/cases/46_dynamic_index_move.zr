@@ -1,0 +1,50 @@
+//=============================================================================
+// tests/cases/46_dynamic_index_move.zr — 动态下标 `arr[i]` 的 Drop 部分移动
+//
+// 覆盖：单次移动后其余元素仍析构、循环内逐元素移动、标量数组动态读取。
+//=============================================================================
+
+struct R { v: i32, out: *mut i32 }
+impl Drop for R {
+    fn drop(&mut self) {
+        *self.out = *self.out + 1;
+    }
+}
+fn main() -> i32 {
+    let mut drops = 0;
+    {
+        let a = [
+            R { v: 1, out: &mut drops as *mut i32 },
+            R { v: 2, out: &mut drops as *mut i32 },
+            R { v: 3, out: &mut drops as *mut i32 },
+        ];
+        let i = 1;
+        let r = a[i];
+        if r.v != 2 { return 1; }
+    }
+    if drops != 3 { return 2; }
+
+    let mut drops2 = 0;
+    {
+        let a = [
+            R { v: 10, out: &mut drops2 as *mut i32 },
+            R { v: 20, out: &mut drops2 as *mut i32 },
+            R { v: 30, out: &mut drops2 as *mut i32 },
+        ];
+        let idx = 0;
+        while idx < 3 {
+            if idx == 2 { break; }
+            let r = a[idx];
+            if r.v != 10 && r.v != 20 { return 3; }
+            idx = idx + 1;
+        }
+    }
+    if drops2 != 3 { return 4; }
+
+    let nums = [4, 5, 6];
+    let j = 2;
+    let n = nums[j];
+    if n != 6 { return 5; }
+
+    return 0;
+}

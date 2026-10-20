@@ -598,7 +598,7 @@ fn convert_function(func: &mir::MirFunction) -> SsaFunction {
                 mir::MirInstr::Suspend => {
                     // 状态机降级在 MIR 阶段完成；同步 `yield` 是空操作。
                 }
-                mir::MirInstr::Await(name, future, _) => {
+                mir::MirInstr::Await(name, future, ..) => {
                     // `await` 对后端是透明的（协程由运行时调度），所以不产生
                     // 新值：future 本身就是结果。
                     let res = materialize(future, &mut instrs, &mut stacks, &next_value);
@@ -1057,7 +1057,7 @@ fn defined_name_set(block: &mir::MirBasicBlock) -> HashSet<String> {
             | mir::MirInstr::Call(n, ..)
             | mir::MirInstr::FuncAddr(n, ..)
             | mir::MirInstr::CallIndirect(n, ..)
-            | mir::MirInstr::Await(n, _, _)
+            | mir::MirInstr::Await(n, ..)
             | mir::MirInstr::Cast(n, ..)
             | mir::MirInstr::Load(n, ..)
             | mir::MirInstr::SlotAddr(n, ..)
@@ -1137,7 +1137,7 @@ fn used_before_def(block: &mir::MirBasicBlock) -> Vec<String> {
                 v
             }
             mir::MirInstr::FuncAddr(..) => Vec::new(),
-            mir::MirInstr::Await(_, v, _) => mir_value_names(v),
+            mir::MirInstr::Await(_, v, ..) => mir_value_names(v),
             mir::MirInstr::Cast(_, v, ..) => mir_value_names(v),
             mir::MirInstr::Load(_, addr, _) => mir_value_names(addr),
             mir::MirInstr::SlotAddr(..) | mir::MirInstr::Suspend => Vec::new(),
@@ -1167,7 +1167,7 @@ fn used_before_def(block: &mir::MirBasicBlock) -> Vec<String> {
             mir::MirInstr::Call(n, ..) => Some(n),
             mir::MirInstr::FuncAddr(n, ..) => Some(n),
             mir::MirInstr::CallIndirect(n, ..) => Some(n),
-            mir::MirInstr::Await(n, _, _) => Some(n),
+            mir::MirInstr::Await(n, ..) => Some(n),
             mir::MirInstr::Cast(n, ..) => Some(n),
             mir::MirInstr::Load(n, ..) => Some(n),
             mir::MirInstr::SlotAddr(n, ..) => Some(n),
@@ -1217,7 +1217,7 @@ fn defined_names(block: &mir::MirBasicBlock) -> Vec<String> {
             mir::MirInstr::Call(n, ..) => Some(n),
             mir::MirInstr::FuncAddr(n, ..) => Some(n),
             mir::MirInstr::CallIndirect(n, ..) => Some(n),
-            mir::MirInstr::Await(n, _, _) => Some(n),
+            mir::MirInstr::Await(n, ..) => Some(n),
             mir::MirInstr::Cast(n, ..) => Some(n),
             mir::MirInstr::Load(n, ..) => Some(n),
             mir::MirInstr::SlotAddr(n, ..) => Some(n),

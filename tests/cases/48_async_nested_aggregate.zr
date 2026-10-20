@@ -1,0 +1,19 @@
+//=============================================================================
+// tests/cases/48_async_nested_aggregate.zr — 异步返回嵌套聚合
+//
+// 覆盖：普通数组、结构体、结构体数组从 async fn 返回并按元素读取。
+//=============================================================================
+
+struct P { x: i32, y: i32 }
+async fn a3() -> [i32; 3] { return [10,20,30]; }
+async fn p() -> P { return P { x: 4, y: 5 }; }
+async fn nested() -> [P; 2] { return [P{x:1,y:2}, P{x:3,y:4}]; }
+async fn main() -> i32 {
+  let a = a3().await;
+  if a[0] + a[1] + a[2] != 60 { return 1; }
+  let q = p().await;
+  if q.x + q.y != 9 { return 2; }
+  let n = nested().await;
+  if n[0].x + n[1].y != 5 { return 3; }
+  return 0;
+}

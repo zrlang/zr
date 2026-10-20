@@ -225,8 +225,6 @@ pub enum ExprKind {
     Match,
     /// `while` 循环。
     While(Box<HirExpr>, HirBlock),
-    /// `for` 循环（脱糖后保留 for-specific 语义）。
-    For,
     /// `loop` 无限循环。
     Loop(HirBlock),
     /// `break`（含标签与值）：跳到最内层循环的出口。
@@ -479,6 +477,8 @@ pub struct HirFunction {
     pub body: Option<HirBlock>,
     /// 是否 `async fn`。
     pub is_async: bool,
+    /// `async fn` 的真实输出类型（`return_type` 对外是 `Future`）。
+    pub async_output: Option<Ty>,
     /// `comptime fn`：只能在编译期求值（调用点折叠成常量）。
     pub is_comptime: bool,
     /// 调用约定 / ABI（保留字段，后端按目标选择调用约定时使用）。

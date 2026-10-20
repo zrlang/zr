@@ -44,9 +44,15 @@ pub fn lower_function(
     }
 
     // 同步函数按值返回数组/结构体：追加一个隐藏参数指向调用方的返回槽，
-    // 避免把指针返回到已经销毁的被调函数栈帧。
+    // 避免把指针返回到已经销毁的被调函数栈帧。异步函数对外返回 Future，
+    // 真实输出类型在 `async_output` 里。
+    let actual_ret = if func.is_async {
+        func.async_output.as_ref().unwrap_or(&func.return_type)
+    } else {
+        &func.return_type
+    };
     if !func.is_async {
-        if let hir::Ty::Array(elem, len) = &func.return_type {
+        if let hir::Ty::Array(elem, len) = actual_ret {
             if let Some(n) = hir::array_len_value(len) {
                 let hidden = format!("arg_{}", func.params.len());
                 b.param_names.push(hidden.clone());
@@ -54,11 +60,17 @@ pub fn lower_function(
                 b.hidden_ret = Some(hidden);
             }
         }
-        if let Some(layout) = struct_layout(&b, &func.return_type) {
+        if let Some(layout) = struct_layout(&b, actual_ret) {
             let hidden = format!("arg_{}", func.params.len());
             b.param_names.push(hidden.clone());
-            b.ret_struct = Some((func.return_type.clone(), layout.size));
+            b.ret_struct = Some((actual_ret.clone(), layout.size));
             b.hidden_ret = Some(hidden);
+        }
+    } else if matches!(actual_ret, hir::Ty::Array(..) | hir::Ty::Named(..)) {
+        // 异步函数没有调用方返回槽：结果先写进堆帧的输出区，await 再把
+        // 字节复制到调用方存储。因此这里只需要知道输出大小。
+        if let Some((size, _)) = type_size_align(&b, actual_ret, 0) {
+            b.async_ret_bytes = Some(size.max(0) as usize);
         }
     }
 
@@ -87,6 +99,11 @@ pub fn lower_function(
             } else {
                 b.mark_place_moved(expr);
             }
+        }
+    }
+    if b.async_ret_bytes.is_some() {
+        if let Some(value) = &tail {
+            b.consume_temp(value);
         }
     }
     if let (Some((elem, n)), Some(dst)) = (b.ret_array.clone(), b.hidden_ret.clone()) {
@@ -127,6 +144,8 @@ pub fn lower_function(
         },
         inline_never: func.attr("inline").is_some_and(|a| a.has_arg("never")),
         inline_always: func.attr("inline").is_some_and(|a| a.has_arg("always")),
+        aggregate_ret: b.async_ret_bytes,
+        returns_future: !func.is_async && matches!(func.return_type, hir::Ty::Opaque(_)),
         params: b.param_names.iter().map(|_| MirParam).collect(),
         blocks: b.blocks,
     }
@@ -222,7 +241,6 @@ fn place_move_path(b: &Builder, expr: &HirExpr) -> Option<(LocalId, Vec<usize>)>
         _ => None,
     }
 }
-
 
 /// 降级一个表达式，返回其产生的值。
 fn lower_expr(b: &mut Builder, expr: &HirExpr) -> MirValue {
@@ -593,6 +611,11 @@ fn lower_expr(b: &mut Builder, expr: &HirExpr) -> MirValue {
                     rv = Some(MirValue::Var(dst));
                 }
             }
+            if b.async_ret_bytes.is_some() {
+                if let Some(value) = &rv {
+                    b.consume_temp(value);
+                }
+            }
             b.emit_temp_drops_from(temp_mark);
             b.emit_all_drops();
             b.current_block_mut().term = Some(MirTerminator::Return(rv.clone()));
@@ -602,10 +625,17 @@ fn lower_expr(b: &mut Builder, expr: &HirExpr) -> MirValue {
             // await 表达式：先计算 future，然后生成 await 点
             let f = lower_expr(b, future);
             let name = format!("t{}", b.temp_id());
+            let agg = match &expr.ty {
+                hir::Ty::Array(..) | hir::Ty::Named(..) => {
+                    type_size_align(b, &expr.ty, 0).map(|(size, _)| size.max(0) as usize)
+                }
+                _ => None,
+            };
             b.current_block_mut().instrs.push(MirInstr::Await(
                 name.clone(),
                 f,
                 num_ty_of(&expr.ty),
+                agg,
             ));
             MirValue::Var(name)
         }
@@ -795,29 +825,29 @@ fn lower_expr(b: &mut Builder, expr: &HirExpr) -> MirValue {
                 return lower_expr(b, place);
             }
             match &place.kind {
-            // `&local`：局部变量的栈槽地址。
-            Local(id) => {
-                let name = format!("t{}", b.temp_id());
-                b.current_block_mut()
-                    .instrs
-                    .push(MirInstr::SlotAddr(name.clone(), id.0, 8));
-                MirValue::Var(name)
-            }
-            // `&*p` 就是 `p`。
-            Deref(inner) => lower_expr(b, inner),
-            // `&p[i]` 就是 `p + i*size`。
-            Index(recv, idx) => lower_index_addr(b, recv, idx, &place.ty),
-            // `&s.field`：字段地址。
-            Field(recv, name) => {
-                let base = lower_expr(b, recv);
-                let off =
-                    struct_layout(b, &recv.ty).and_then(|l| l.offset(name).map(|(off, _)| off));
-                match off {
-                    Some(off) => offset_addr(b, base, off),
-                    None => MirValue::Unit,
+                // `&local`：局部变量的栈槽地址。
+                Local(id) => {
+                    let name = format!("t{}", b.temp_id());
+                    b.current_block_mut()
+                        .instrs
+                        .push(MirInstr::SlotAddr(name.clone(), id.0, 8));
+                    MirValue::Var(name)
                 }
-            }
-            _ => MirValue::Unit,
+                // `&*p` 就是 `p`。
+                Deref(inner) => lower_expr(b, inner),
+                // `&p[i]` 就是 `p + i*size`。
+                Index(recv, idx) => lower_index_addr(b, recv, idx, &place.ty),
+                // `&s.field`：字段地址。
+                Field(recv, name) => {
+                    let base = lower_expr(b, recv);
+                    let off =
+                        struct_layout(b, &recv.ty).and_then(|l| l.offset(name).map(|(off, _)| off));
+                    match off {
+                        Some(off) => offset_addr(b, base, off),
+                        None => MirValue::Unit,
+                    }
+                }
+                _ => MirValue::Unit,
             }
         }
         Yield => {
@@ -939,6 +969,16 @@ struct DropLocal {
     /// 已从该局部量中移出的字段/数组元素路径。路径段是字段声明下标或
     /// 数组下标；析构时跳过这些子树，其余字段仍正常析构。
     moved_paths: Vec<Vec<usize>>,
+    /// 动态数组下标的逐元素“已移动”标志。数组每个顶层元素一字节；
+    /// `arr[i]` 移动时写入 1，数组析构时跳过对应元素。没有动态下标时
+    /// 全为 0，不改变原有析构路径。
+    flags: Option<DropFlags>,
+}
+
+#[derive(Clone)]
+struct DropFlags {
+    addr: String,
+    len: i128,
 }
 
 /// 一个尚未绑定、等待语句结束析构的右值临时量。
@@ -991,6 +1031,8 @@ struct Builder {
     ret_struct: Option<(hir::Ty, i128)>,
     /// 当前语句创建的 Drop 临时量；语句结束时逆序析构未移出的项。
     temp_drops: Vec<TempDrop>,
+    /// 异步函数按值返回聚合类型时的输出字节数。
+    async_ret_bytes: Option<usize>,
 }
 
 /// 把常量表折成 `DefId -> MirValue`。
@@ -1049,6 +1091,7 @@ impl Builder {
             hidden_ret: None,
             ret_struct: None,
             temp_drops: Vec::new(),
+            async_ret_bytes: None,
         }
     }
 
@@ -1170,18 +1213,64 @@ impl Builder {
         if !self.is_drop_ty(ty) {
             return;
         }
+        let flags = if let hir::Ty::Array(_, len) = ty {
+            hir::array_len_value(len).filter(|n| *n > 0).map(|n| {
+                let addr = self.synthetic_storage(n);
+                for i in 0..n {
+                    let at = offset_addr(self, MirValue::Var(addr.clone()), i);
+                    self.current_block_mut().instrs.push(MirInstr::Store(
+                        at,
+                        MirValue::Int(0),
+                        NumTy::Uint(8),
+                    ));
+                }
+                DropFlags { addr, len: n }
+            })
+        } else {
+            None
+        };
         if let Some(scope) = self.drop_scopes.last_mut() {
             scope.push(DropLocal {
                 local,
                 ty: ty.clone(),
                 moved: false,
                 moved_paths: Vec::new(),
+                flags,
             });
         }
     }
 
     /// 标记“整个局部量”已移动。
     fn mark_place_moved(&mut self, expr: &HirExpr) {
+        // 动态下标移动：`arr[i]`（i 为局部量/字面量）。为每个元素维护
+        // 一字节标志，析构时逐个检查，因此移动一个元素不会连累兄弟元素。
+        if let hir::ExprKind::Index(base, idx) = &expr.kind {
+            if let hir::ExprKind::Local(local) = &base.kind {
+                if matches!(
+                    idx.kind,
+                    hir::ExprKind::Local(_) | hir::ExprKind::Literal(_)
+                ) {
+                    let flags = self
+                        .drop_scopes
+                        .iter()
+                        .rev()
+                        .flat_map(|s| s.iter().rev())
+                        .find(|e| e.local == *local)
+                        .and_then(|e| e.flags.clone());
+                    if let Some(flags) = flags {
+                        let index = lower_expr(self, idx);
+                        let at =
+                            binary_into(self, MirValue::Var(flags.addr), MirBinaryOp::Add, index);
+                        self.current_block_mut().instrs.push(MirInstr::Store(
+                            at,
+                            MirValue::Int(1),
+                            NumTy::Uint(8),
+                        ));
+                        return;
+                    }
+                }
+            }
+        }
         let Some((local, path)) = place_move_path(self, expr) else {
             if std::env::var_os("ZR_DEBUG_DROP").is_some() {
                 eprintln!("partial-move: no path");
@@ -1208,7 +1297,10 @@ impl Builder {
                         entry.moved_paths.push(path.clone());
                     }
                     if std::env::var_os("ZR_DEBUG_DROP").is_some() {
-                        eprintln!("partial stored local={} now={:?}", local.0, entry.moved_paths);
+                        eprintln!(
+                            "partial stored local={} now={:?}",
+                            local.0, entry.moved_paths
+                        );
                     }
                     return;
                 }
@@ -1382,6 +1474,7 @@ impl Builder {
                     0,
                     &[],
                     &temp.moved_paths,
+                    None,
                 );
             }
         }
@@ -1392,7 +1485,14 @@ impl Builder {
             return;
         }
         let value = self.use_local(entry.local.0, num_ty_of(&entry.ty));
-        self.emit_drop_at_moved(value, &entry.ty, 0, &[], &entry.moved_paths);
+        self.emit_drop_at_moved(
+            value,
+            &entry.ty,
+            0,
+            &[],
+            &entry.moved_paths,
+            entry.flags.as_ref(),
+        );
     }
 
     fn emit_drop(&mut self, local: LocalId, ty: &hir::Ty) {
@@ -1402,8 +1502,8 @@ impl Builder {
             .rev()
             .flat_map(|s| s.iter().rev())
             .find(|e| e.local == local)
-            .map(|e| (e.moved, e.moved_paths.clone()))
-            .unwrap_or((false, Vec::new()));
+            .map(|e| (e.moved, e.moved_paths.clone(), e.flags.clone()))
+            .unwrap_or((false, Vec::new(), None));
         if paths.0 {
             return;
         }
@@ -1411,13 +1511,13 @@ impl Builder {
             eprintln!("emit local={} paths={:?}", local.0, paths.1);
         }
         let value = self.use_local(local.0, num_ty_of(ty));
-        self.emit_drop_at_moved(value, ty, 0, &[], &paths.1);
+        self.emit_drop_at_moved(value, ty, 0, &[], &paths.1, paths.2.as_ref());
     }
 
     /// 对一块存储执行析构：先调用用户 `Drop::drop`，再递归析构字段。
     /// 没有直接 impl 但包含 Drop 字段的结构体也会自动得到字段析构。
     fn emit_drop_at(&mut self, addr: MirValue, ty: &hir::Ty, depth: usize) {
-        self.emit_drop_at_moved(addr, ty, depth, &[], &[]);
+        self.emit_drop_at_moved(addr, ty, depth, &[], &[], None);
     }
 
     fn emit_drop_at_moved(
@@ -1427,6 +1527,7 @@ impl Builder {
         depth: usize,
         path: &[usize],
         moved_paths: &[Vec<usize>],
+        flags: Option<&DropFlags>,
     ) {
         if depth > 16 {
             return;
@@ -1437,6 +1538,7 @@ impl Builder {
                 return;
             };
             let size = type_size(self, elem);
+            let guarded = flags.filter(|f| depth == 0 && f.len == n);
             for i in 0..n {
                 let mut child = path.to_vec();
                 child.push(i as usize);
@@ -1448,7 +1550,38 @@ impl Builder {
                 } else {
                     offset_addr(self, addr.clone(), i * size)
                 };
-                self.emit_drop_at_moved(at, elem, depth + 1, &child, moved_paths);
+                if let Some(flags) = guarded {
+                    if self.current_block_mut().term.is_none() {
+                        let flag_at = offset_addr(self, MirValue::Var(flags.addr.clone()), i);
+                        let flag = self.temp();
+                        self.current_block_mut().instrs.push(MirInstr::Load(
+                            flag.clone(),
+                            flag_at,
+                            NumTy::Uint(8),
+                        ));
+                        let alive = self.temp();
+                        self.current_block_mut().instrs.push(MirInstr::Binary(
+                            alive.clone(),
+                            MirValue::Var(flag),
+                            MirBinaryOp::Eq,
+                            MirValue::Int(0),
+                            NumTy::Uint(8),
+                        ));
+                        let drop_bb = self.new_block();
+                        let next_bb = self.new_block();
+                        self.current_block_mut().term = Some(MirTerminator::Branch {
+                            cond: MirValue::Var(alive),
+                            then_block: drop_bb,
+                            else_block: next_bb,
+                        });
+                        self.current = drop_bb;
+                        self.emit_drop_at_moved(at, elem, depth + 1, &child, moved_paths, None);
+                        self.terminate_if_open(MirTerminator::Goto(next_bb));
+                        self.current = next_bb;
+                        continue;
+                    }
+                }
+                self.emit_drop_at_moved(at, elem, depth + 1, &child, moved_paths, None);
             }
             return;
         }
@@ -1475,7 +1608,7 @@ impl Builder {
             }
             if self.has_drop_glue(field_ty, depth + 1) {
                 let at = offset_addr(self, addr.clone(), *off);
-                self.emit_drop_at_moved(at, field_ty, depth + 1, &child, moved_paths);
+                self.emit_drop_at_moved(at, field_ty, depth + 1, &child, moved_paths, None);
             }
         }
     }
@@ -1765,9 +1898,11 @@ fn copy_array_into(b: &mut Builder, src: MirValue, elem_ty: &hir::Ty, len: i128,
             copy_array_into(b, src_at, &inner, inner_len, dst_at);
         } else {
             let elem = b.temp();
-            b.current_block_mut()
-                .instrs
-                .push(MirInstr::Load(elem.clone(), src_at, num_ty_of(elem_ty)));
+            b.current_block_mut().instrs.push(MirInstr::Load(
+                elem.clone(),
+                src_at,
+                num_ty_of(elem_ty),
+            ));
             b.current_block_mut().instrs.push(MirInstr::Store(
                 dst_at,
                 MirValue::Var(elem),

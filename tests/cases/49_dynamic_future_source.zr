@@ -1,0 +1,23 @@
+//=============================================================================
+// tests/cases/49_dynamic_future_source.zr — 动态 future 来源
+//
+// 覆盖：`-> impl Future` 不同分支返回不同异步函数的 future；await 时通过
+// 帧头函数指针动态 poll，提前释放/未消费 future 动态 drop。
+//=============================================================================
+
+async fn twice(x: i32) -> i32 { return x * 2; }
+async fn add(a: i32, b: i32) -> i32 { return a + b; }
+fn pick(flag: bool, x: i32) -> impl Future {
+    if flag { return twice(x); }
+    return add(x, 1);
+}
+async fn main() -> i32 {
+    let a: i32 = pick(true, 20).await;
+    if a != 40 { return 1; }
+    let b: i32 = pick(false, 20).await;
+    if b != 21 { return 2; }
+    let f = pick(true, 5);
+    let c: i32 = f.await;
+    if c != 10 { return 3; }
+    return 0;
+}

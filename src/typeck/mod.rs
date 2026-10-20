@@ -546,6 +546,7 @@ impl TypeChecker {
                     return_type: Ty::Infer(InferId(0)),
                     body: None,
                     is_async: item.is_async,
+                    async_output: None,
                     is_comptime: item.is_comptime,
                     // 以 `;` 结尾的声明（`extern "C"` 块里的函数）按 C ABI 处理。
                     abi: if item.body.is_none() {
@@ -983,20 +984,6 @@ impl TypeChecker {
         for f in &prog.functions {
             let id = self.find_def(&f.name)?;
             let mut ret = self.ast_to_hir_type(&f.return_type)?;
-            if f.is_async && matches!(ret, Ty::Array(..)) {
-                return Err(CompileError::type_error(format!(
-                    "async fn `{}` 暂不支持按值返回数组",
-                    f.name
-                )));
-            }
-            if let Ty::Named(id, _) = &ret {
-                if self.drop_impls.contains_key(id) && f.is_async {
-                    return Err(CompileError::type_error(format!(
-                        "async fn `{}` 暂不支持按值返回 Drop 类型",
-                        f.name
-                    )));
-                }
-            }
             // async fn 的返回类型降级为 `impl Future<Output = T>`（不透明类型）
             if f.is_async && !matches!(ret, Ty::Opaque(_)) {
                 let opaque_id = self.alloc_def(format!("async_future_{}", self.next_def));
@@ -1097,6 +1084,9 @@ impl TypeChecker {
             if let Some(hf) = self.functions.get_mut(&id) {
                 hf.params = params;
                 hf.body = body;
+                if f.is_async {
+                    hf.async_output = Some(ret_ty);
+                }
             }
             self.pop_scope();
         }
@@ -1475,6 +1465,134 @@ impl TypeChecker {
                 });
             }
             Expression::For(pat, iter, body, _) => {
+                // 数组按值遍历：元素逐个绑定到循环变量（与 Rust 的
+                // `[T; N]` IntoIterator 一致）。源数组先绑定到局部量，
+                // 保证表达式只求值一次；元素移动由 MIR 侧的下标移动
+                // 跟踪负责，提前 break 时未遍历的元素仍会析构。
+                let raw_iter_ty = self.infer_expr_ty(iter)?;
+                let iter_ty = self.infer.resolve(&raw_iter_ty);
+                if let Ty::Array(elem_ty, len) = &iter_ty {
+                    let Some(n) = hir::array_len_value(len) else {
+                        return Err(CompileError::type_error(
+                            "cannot iterate over an array with a dynamic length",
+                        )
+                        .with_span(span));
+                    };
+                    let elem_ty = (**elem_ty).clone();
+
+                    self.push_scope();
+                    let iter_hir = self.check_expr(iter, &iter_ty)?;
+                    let hir_pat = self.lower_pattern(pat, &elem_ty)?;
+                    let var = first_binding(&hir_pat).unwrap_or_else(|| {
+                        let id = self.alloc_local();
+                        self.locals.insert(id, elem_ty.clone());
+                        self.infer.locals.insert(id, elem_ty.clone());
+                        id
+                    });
+                    let body_hir = self.check_block(body, &Ty::Unit)?;
+                    self.pop_scope();
+
+                    let src_local = self.alloc_local();
+                    let idx_local = self.alloc_local();
+                    self.locals.insert(src_local, iter_ty.clone());
+                    self.infer.locals.insert(src_local, iter_ty.clone());
+                    self.locals.insert(idx_local, Ty::Uint(64));
+                    self.infer.locals.insert(idx_local, Ty::Uint(64));
+
+                    let idx_ref = || HirExpr {
+                        kind: ExprKind::Local(idx_local),
+                        ty: Ty::Uint(64),
+                        span,
+                    };
+                    let item_init = HirExpr {
+                        kind: ExprKind::Index(
+                            Box::new(HirExpr {
+                                kind: ExprKind::Local(src_local),
+                                ty: iter_ty.clone(),
+                                span,
+                            }),
+                            Box::new(idx_ref()),
+                        ),
+                        ty: elem_ty.clone(),
+                        span,
+                    };
+
+                    let mut inner_stmts = vec![HirStmt::Let {
+                        local: var,
+                        init: Some(Box::new(item_init)),
+                    }];
+                    inner_stmts.extend(body_hir.stmts);
+                    if let Some(tail) = body_hir.tail {
+                        inner_stmts.push(HirStmt::Expr(tail));
+                    }
+                    let inc = HirExpr {
+                        kind: ExprKind::Assign(
+                            Box::new(idx_ref()),
+                            Box::new(HirExpr {
+                                kind: ExprKind::Binary(
+                                    hir::BinaryOp::Add,
+                                    Box::new(idx_ref()),
+                                    Box::new(HirExpr {
+                                        kind: ExprKind::Literal(HirLiteral::Int(1)),
+                                        ty: Ty::Uint(64),
+                                        span,
+                                    }),
+                                ),
+                                ty: Ty::Uint(64),
+                                span,
+                            }),
+                        ),
+                        ty: Ty::Unit,
+                        span,
+                    };
+                    inner_stmts.push(HirStmt::Expr(Box::new(inc.clone())));
+                    let mut loop_body = hir::HirBlock {
+                        stmts: inner_stmts,
+                        tail: None,
+                    };
+                    rewrite_for_continue(&mut loop_body, &inc, 0);
+                    let cond = HirExpr {
+                        kind: ExprKind::Binary(
+                            hir::BinaryOp::Lt,
+                            Box::new(idx_ref()),
+                            Box::new(HirExpr {
+                                kind: ExprKind::Literal(HirLiteral::Int(n)),
+                                ty: Ty::Uint(64),
+                                span,
+                            }),
+                        ),
+                        ty: Ty::Bool,
+                        span,
+                    };
+                    let while_expr = HirExpr {
+                        kind: ExprKind::While(Box::new(cond), loop_body),
+                        ty: Ty::Unit,
+                        span,
+                    };
+                    return Ok(HirExpr {
+                        kind: ExprKind::Block(hir::HirBlock {
+                            stmts: vec![
+                                HirStmt::Let {
+                                    local: src_local,
+                                    init: Some(Box::new(iter_hir)),
+                                },
+                                HirStmt::Var {
+                                    local: idx_local,
+                                    init: Some(Box::new(HirExpr {
+                                        kind: ExprKind::Literal(HirLiteral::Int(0)),
+                                        ty: Ty::Uint(64),
+                                        span,
+                                    })),
+                                },
+                                HirStmt::Expr(Box::new(while_expr)),
+                            ],
+                            tail: None,
+                        }),
+                        ty: Ty::Unit,
+                        span,
+                    });
+                }
+
                 let (start, end, inclusive) = match iter.as_ref() {
                     Expression::Binary(lhs, ast::BinaryOp::Range, rhs, _) => {
                         (lhs.as_ref(), rhs.as_ref(), false)
@@ -1496,10 +1614,10 @@ impl TypeChecker {
                 let end_hir = self.check_expr(end, &Ty::Infer(InferId(0)))?;
                 let elem_ty = self.infer.resolve(&end_hir.ty);
                 if !matches!(elem_ty, Ty::Int(_) | Ty::Uint(_)) {
-                    return Err(CompileError::type_error(
-                        "`for` range bounds must be integers",
-                    )
-                    .with_span(span));
+                    return Err(
+                        CompileError::type_error("`for` range bounds must be integers")
+                            .with_span(span),
+                    );
                 }
                 let start_hir = self.check_expr(start, &elem_ty)?;
                 self.infer
@@ -1788,8 +1906,11 @@ impl TypeChecker {
                         .async_outputs
                         .get(id)
                         .cloned()
-                        .unwrap_or(Ty::Infer(InferId(0))),
-                    _ => Ty::Infer(InferId(0)),
+                        .unwrap_or_else(|| expected.clone()),
+                    // `impl Future` 类型的 Output 可能没有登记（例如返回不同
+                    // 异步函数分支的动态来源）；给调用方一个用期望类型补全
+                    // 的机会，`let y: i32 = f.await` 因此可以确定结果宽度。
+                    _ => expected.clone(),
                 };
                 return Ok(HirExpr {
                     kind: ExprKind::Await(Box::new(inner)),
@@ -2033,9 +2154,7 @@ impl TypeChecker {
     fn tuple_struct_target(&self, callee: &Expression) -> Option<DefId> {
         let id = match callee {
             Expression::Variable(name, _) => self.symbols.get(name).copied()?,
-            Expression::Path(path, _) if path.len() == 1 => {
-                self.symbols.get(&path[0]).copied()?
-            }
+            Expression::Path(path, _) if path.len() == 1 => self.symbols.get(&path[0]).copied()?,
             _ => return None,
         };
         let hir::HirTypeDef::Struct(s) = self.type_defs.get(&id)? else {
@@ -2141,13 +2260,16 @@ impl TypeChecker {
         span: ast::Span,
     ) -> Result<HirExpr> {
         let sig = self.functions.get(&method).cloned().ok_or_else(|| {
-            CompileError::internal(format!("impl method {:?} missing from function table", method))
+            CompileError::internal(format!(
+                "impl method {:?} missing from function table",
+                method
+            ))
         })?;
         if sig.params.is_empty() {
-            return Err(CompileError::type_error(
-                "impl method is missing its receiver parameter",
-            )
-            .with_span(span));
+            return Err(
+                CompileError::type_error("impl method is missing its receiver parameter")
+                    .with_span(span),
+            );
         }
         let mut hir_args = Vec::with_capacity(args.len() + 1);
         if !matches!(
@@ -2589,7 +2711,9 @@ impl TypeChecker {
                 let Some(hir::HirTypeDef::Struct(s)) = self.type_defs.get(id) else {
                     return false;
                 };
-                s.fields.iter().any(|f| self.has_drop_glue(&f.ty, depth + 1))
+                s.fields
+                    .iter()
+                    .any(|f| self.has_drop_glue(&f.ty, depth + 1))
             }
             Ty::Array(elem, _) => self.has_drop_glue(elem, depth + 1),
             _ => false,
@@ -3328,6 +3452,7 @@ impl TypeChecker {
             return_type: Ty::Infer(InferId(0)),
             body: None,
             is_async: f.is_async,
+            async_output: None,
             is_comptime: f.is_comptime,
             abi: hir::Abi::Zr,
             attrs: convert_attrs(&f.attrs),
@@ -4102,11 +4227,9 @@ fn ty_name(ty: &Ty) -> String {
     }
 }
 
-/// 取模式中第一个绑定变量的 `LocalId`。
-
 /// 把 `for` 循环体里的 `continue` 改写成“先执行自增，再 continue”。
 /// `depth > 0` 表示位于内层循环中，那里的 continue 属于内层循环，不能改。
-fn rewrite_for_continue(block: &mut HirBlock, inc: &HirExpr, depth: usize) {
+fn rewrite_for_continue(block: &mut hir::HirBlock, inc: &HirExpr, depth: usize) {
     for stmt in &mut block.stmts {
         match stmt {
             HirStmt::Expr(e) => rewrite_for_continue_expr(e, inc, depth),
@@ -4131,7 +4254,7 @@ fn rewrite_for_continue_expr(e: &mut HirExpr, inc: &HirExpr, depth: usize) {
                 ty: Ty::Never,
                 span: e.span,
             };
-            e.kind = ExprKind::Block(HirBlock {
+            e.kind = ExprKind::Block(hir::HirBlock {
                 stmts: vec![HirStmt::Expr(Box::new(inc.clone()))],
                 tail: Some(Box::new(cont)),
             });
@@ -4185,6 +4308,7 @@ fn rewrite_for_continue_expr(e: &mut HirExpr, inc: &HirExpr, depth: usize) {
     }
 }
 
+/// 取模式中第一个绑定变量的 `LocalId`。
 fn first_binding(p: &hir::HirPattern) -> Option<LocalId> {
     match p {
         hir::HirPattern::Binding(local) => Some(*local),
@@ -4275,7 +4399,6 @@ fn substitute_local(e: &mut hir::HirExpr, target: LocalId, with: &hir::HirExpr) 
         | ExprKind::Local(_)
         | ExprKind::Def(_)
         | ExprKind::Match
-        | ExprKind::For
         | ExprKind::Break
         | ExprKind::Continue
         | ExprKind::Defer
@@ -4661,10 +4784,7 @@ mod drop_move_tests {
             "#,
         )
         .expect_err("应拒绝从 Drop 类型中部分移动 Drop 字段");
-        assert!(
-            err.message.contains("implements Drop"),
-            "actual: {err}"
-        );
+        assert!(err.message.contains("implements Drop"), "actual: {err}");
     }
 
     /// 外层没有直接实现 Drop 时，移出 Drop 字段是允许的。

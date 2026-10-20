@@ -30,7 +30,18 @@ use super::{
 
 const STATE_OFF: i128 = 0;
 const RESULT_OFF: i128 = 8;
-const NAMES_OFF: i128 = 16;
+/// 帧头里的动态 poll / drop 函数指针（由 future 构造器写入）。
+const POLL_OFF: i128 = 16;
+const DROP_OFF: i128 = 24;
+/// 聚合返回值在帧里的存放位置（16 字节对齐）。标量仍使用 `RESULT_OFF`。
+const RESULT_AGG_OFF: i128 = 32;
+const NAMES_OFF: i128 = 32;
+
+#[derive(Clone, Debug)]
+enum FutureTarget {
+    Static(String),
+    Dynamic,
+}
 
 pub fn lower_module(module: &mut MirModule) {
     if !module.functions.iter().any(|f| f.is_async) {
@@ -47,6 +58,13 @@ pub fn lower_module(module: &mut MirModule) {
     // 都返回同一个异步函数的 future，就把该函数登记成 future 生产者，
     // 调用点即可像直接调用 async fn 一样 await/drop。
     let producers = compute_future_producers(&module.functions, &lowerable);
+    let dynamic_futures: HashSet<String> = module
+        .functions
+        .iter()
+        .filter(|f| !f.is_async && f.returns_future && !producers.contains_key(&f.name))
+        .map(|f| f.name.clone())
+        .collect();
+    let needs_frame_metadata = !dynamic_futures.is_empty();
 
     let mut out = Vec::with_capacity(module.functions.len() * 2);
     for mut func in module.functions.drain(..) {
@@ -54,24 +72,34 @@ pub fn lower_module(module: &mut MirModule) {
         if func.is_async && !is_lowered_async {
             // 空块函数无法拆分状态机；它调用的可降级异步子函数仍按同步
             // busy-poll 改写。
-            rewrite_awaits(&mut func, &producers, false);
+            rewrite_awaits(&mut func, &producers, &dynamic_futures, false);
             out.push(func);
             continue;
         }
         let is_async = func.is_async;
-        let future_callees = rewrite_awaits(&mut func, &producers, is_async);
+        let (future_callees, dynamic_callees) =
+            rewrite_awaits(&mut func, &producers, &dynamic_futures, is_async);
         if is_lowered_async {
-            match lower_function(func.clone(), &future_callees) {
+            match lower_function(
+                func.clone(),
+                &future_callees,
+                &dynamic_callees,
+                needs_frame_metadata,
+            ) {
                 Some((mut wrapper, mut poll, drop)) => {
                     if wrapper.name == "main" {
                         // `async fn main`：构造函数改名，另生成同步入口来驱动
                         // future 直到 Ready，把结果作为进程退出码返回。
                         let future_name = "main__future".to_string();
+                        rename_frame_metadata(&mut wrapper, "main", &future_name);
                         wrapper.name = future_name.clone();
                         poll.name = format!("{future_name}__poll");
+                        let mut drop = drop;
+                        drop.name = format!("{future_name}__drop");
                         let main = make_async_main(&future_name, &poll.name);
                         out.push(wrapper);
                         out.push(poll);
+                        out.push(drop);
                         out.push(main);
                     } else {
                         out.push(wrapper);
@@ -85,7 +113,104 @@ pub fn lower_module(module: &mut MirModule) {
             out.push(func);
         }
     }
+    if dynamic_futures
+        .iter()
+        .any(|name| out.iter().any(|f| f.name == *name))
+    {
+        out.push(dynamic_drop_helper());
+    }
     module.functions = out;
+}
+
+/// 动态 future 的通用 drop 入口：空帧直接返回，否则取帧头 drop 指针。
+fn dynamic_drop_helper() -> MirFunction {
+    let frame = "arg_0".to_string();
+    let cond = "__dyn_cond".to_string();
+    let addr = "__dyn_addr".to_string();
+    let fp = "__dyn_fp".to_string();
+    let fcond = "__dyn_fcond".to_string();
+    MirFunction {
+        name: "__zr_dyn_future_drop".to_string(),
+        params: vec![MirParam],
+        param_types: vec![NumTy::Uint(64)],
+        blocks: vec![
+            MirBasicBlock {
+                id: 0,
+                instrs: vec![MirInstr::Binary(
+                    cond.clone(),
+                    MirValue::Var(frame.clone()),
+                    MirBinaryOp::Ne,
+                    MirValue::Int(0),
+                    NumTy::Uint(64),
+                )],
+                term: Some(MirTerminator::Branch {
+                    cond: MirValue::Var(cond),
+                    then_block: 1,
+                    else_block: 3,
+                }),
+            },
+            MirBasicBlock {
+                id: 1,
+                instrs: vec![
+                    MirInstr::Binary(
+                        addr.clone(),
+                        MirValue::Var(frame.clone()),
+                        MirBinaryOp::Add,
+                        MirValue::Int(DROP_OFF),
+                        NumTy::Uint(64),
+                    ),
+                    MirInstr::Load(fp.clone(), MirValue::Var(addr), NumTy::Uint(64)),
+                    MirInstr::Binary(
+                        fcond.clone(),
+                        MirValue::Var(fp.clone()),
+                        MirBinaryOp::Ne,
+                        MirValue::Int(0),
+                        NumTy::Uint(64),
+                    ),
+                ],
+                term: Some(MirTerminator::Branch {
+                    cond: MirValue::Var(fcond),
+                    then_block: 2,
+                    else_block: 3,
+                }),
+            },
+            MirBasicBlock {
+                id: 2,
+                instrs: vec![MirInstr::CallIndirect(
+                    "__dyn_ret".to_string(),
+                    MirValue::Var(fp),
+                    vec![MirValue::Var(frame)],
+                    NumTy::Uint(64),
+                )],
+                term: Some(MirTerminator::Goto(3)),
+            },
+            MirBasicBlock {
+                id: 3,
+                instrs: Vec::new(),
+                term: Some(MirTerminator::Return(Some(MirValue::Int(0)))),
+            },
+        ],
+        is_async: false,
+        inline_never: true,
+        inline_always: false,
+        aggregate_ret: None,
+        returns_future: false,
+    }
+}
+
+/// 改写帧头里记录的函数指针符号名（主要用于 `main` future 改名）。
+fn rename_frame_metadata(func: &mut MirFunction, old: &str, new: &str) {
+    for block in &mut func.blocks {
+        for instr in &mut block.instrs {
+            if let MirInstr::FuncAddr(_, sym) = instr {
+                if sym == &format!("{old}__poll") {
+                    *sym = format!("{new}__poll");
+                } else if sym == &format!("{old}__drop") {
+                    *sym = format!("{new}__drop");
+                }
+            }
+        }
+    }
 }
 
 /// 空函数没有可拆分的块；其余异步函数都可以降级。
@@ -104,19 +229,30 @@ fn can_lower_async(func: &MirFunction) -> bool {
 fn rewrite_awaits(
     func: &mut MirFunction,
     producers: &HashMap<String, String>,
+    dynamic_futures: &HashSet<String>,
     is_async: bool,
-) -> HashMap<String, String> {
+) -> (HashMap<String, String>, HashSet<String>) {
     if func.blocks.is_empty() {
-        return HashMap::new();
+        return (HashMap::new(), HashSet::new());
     }
     let old_blocks = std::mem::take(&mut func.blocks);
+    let mut next_local = old_blocks
+        .iter()
+        .flat_map(|b| b.instrs.iter())
+        .filter_map(|i| match i {
+            MirInstr::SlotAddr(_, local, _) => Some(*local),
+            _ => None,
+        })
+        .max()
+        .unwrap_or(0)
+        .saturating_add(1);
 
     // `await` 记录 future 的输出类型。调用点必须用输出类型而不是默认的
     // i64，否则浮点返回会走错寄存器。
     let mut await_types: HashMap<String, NumTy> = HashMap::new();
     for old in &old_blocks {
         for instr in &old.instrs {
-            if let MirInstr::Await(_, MirValue::Var(v), ty) = instr {
+            if let MirInstr::Await(_, MirValue::Var(v), ty, _) = instr {
                 await_types.insert(v.clone(), *ty);
             }
         }
@@ -145,7 +281,9 @@ fn rewrite_awaits(
     for old in &old_blocks {
         for instr in &old.instrs {
             if let MirInstr::Call(dst, callee, _, _) = instr {
-                if producers.contains_key(callee) && !owned.contains(dst) {
+                if (producers.contains_key(callee) || dynamic_futures.contains(callee))
+                    && !owned.contains(dst)
+                {
                     owned.push(dst.clone());
                 }
             }
@@ -209,7 +347,7 @@ fn rewrite_awaits(
     let mut blocks: Vec<MirBasicBlock> = Vec::new();
     let mut old_first: HashMap<usize, usize> = HashMap::new();
     let mut pending_terms: Vec<(usize, Option<MirTerminator>)> = Vec::new();
-    let mut aliases: HashMap<String, String> = HashMap::new();
+    let mut aliases: HashMap<String, FutureTarget> = HashMap::new();
     let mut temp = 0usize;
 
     for old in &old_blocks {
@@ -220,8 +358,14 @@ fn rewrite_awaits(
 
         for instr in &old.instrs {
             match instr {
-                MirInstr::Call(dst, callee, args, _) if producers.contains_key(callee) => {
-                    aliases.insert(dst.clone(), producers[callee].clone());
+                MirInstr::Call(dst, callee, args, _)
+                    if producers.contains_key(callee) || dynamic_futures.contains(callee) =>
+                {
+                    let target = match producers.get(callee) {
+                        Some(target) => FutureTarget::Static(target.clone()),
+                        None => FutureTarget::Dynamic,
+                    };
+                    aliases.insert(dst.clone(), target);
                     cur_instrs.push(MirInstr::Call(
                         dst.clone(),
                         callee.clone(),
@@ -239,8 +383,8 @@ fn rewrite_awaits(
                     ));
                 }
                 MirInstr::Assign(dst, MirValue::Var(src)) => {
-                    if let Some(callee) = aliases.get(src).cloned() {
-                        aliases.insert(dst.clone(), callee);
+                    if let Some(target) = aliases.get(src).cloned() {
+                        aliases.insert(dst.clone(), target);
                     }
                     cur_instrs.push(instr.clone());
                     // future 是移动语义：赋值后源名字失效，清 0 防止重复释放。
@@ -248,9 +392,8 @@ fn rewrite_awaits(
                         cur_instrs.push(MirInstr::Assign(src.clone(), MirValue::Int(0)));
                     }
                 }
-                MirInstr::Await(dst, MirValue::Var(fut), ty) if aliases.contains_key(fut) => {
-                    let callee = aliases[fut].clone();
-                    let poll_name = format!("{callee}__poll");
+                MirInstr::Await(dst, MirValue::Var(fut), ty, agg) if aliases.contains_key(fut) => {
+                    let target = aliases[fut].clone();
                     let poll_id = blocks.len() + 1;
                     let pending_id = poll_id + 1;
                     let ready_id = if is_async {
@@ -267,15 +410,42 @@ fn rewrite_awaits(
 
                     let status = fresh(&mut temp, "__await_t");
                     let cond = fresh(&mut temp, "__await_t");
+                    let poll = match &target {
+                        FutureTarget::Static(callee) => MirInstr::Call(
+                            status.clone(),
+                            format!("{callee}__poll"),
+                            vec![MirValue::Var(fut.clone())],
+                            NumTy::Int(64),
+                        ),
+                        FutureTarget::Dynamic => {
+                            let addr = fresh(&mut temp, "__await_t");
+                            let fp = fresh(&mut temp, "__await_t");
+                            if let Some(block) = blocks.last_mut() {
+                                block.instrs.push(MirInstr::Binary(
+                                    addr.clone(),
+                                    MirValue::Var(fut.clone()),
+                                    MirBinaryOp::Add,
+                                    MirValue::Int(POLL_OFF),
+                                    NumTy::Uint(64),
+                                ));
+                                block.instrs.push(MirInstr::Load(
+                                    fp.clone(),
+                                    MirValue::Var(addr),
+                                    NumTy::Uint(64),
+                                ));
+                            }
+                            MirInstr::CallIndirect(
+                                status.clone(),
+                                MirValue::Var(fp),
+                                vec![MirValue::Var(fut.clone())],
+                                NumTy::Int(64),
+                            )
+                        }
+                    };
                     blocks.push(MirBasicBlock {
                         id: poll_id,
                         instrs: vec![
-                            MirInstr::Call(
-                                status.clone(),
-                                poll_name,
-                                vec![MirValue::Var(fut.clone())],
-                                NumTy::Int(64),
-                            ),
+                            poll,
                             MirInstr::Binary(
                                 cond.clone(),
                                 MirValue::Var(status),
@@ -300,24 +470,65 @@ fn rewrite_awaits(
                     }
 
                     cur_id = ready_id;
-                    let addr = fresh(&mut temp, "__await_t");
-                    cur_instrs.push(MirInstr::Binary(
-                        addr.clone(),
-                        MirValue::Var(fut.clone()),
-                        MirBinaryOp::Add,
-                        MirValue::Int(RESULT_OFF),
-                        NumTy::Uint(64),
-                    ));
-                    cur_instrs.push(MirInstr::Load(dst.clone(), MirValue::Var(addr), *ty));
-                    cur_instrs.push(MirInstr::Call(
-                        fresh(&mut temp, "__await_t"),
-                        "zr_dealloc".to_string(),
-                        vec![MirValue::Var(fut.clone())],
-                        NumTy::Uint(64),
-                    ));
-                    // await 消费 future；出口 drop 不应再次释放。
-                    if owned.contains(fut) {
-                        cur_instrs.push(MirInstr::Assign(fut.clone(), MirValue::Int(0)));
+                    if let Some(size) = agg {
+                        // 聚合返回值：输出字节在子帧的 RESULT_AGG_OFF。先搬进
+                        // 调用方自己的存储，再释放子帧；若结果未被消费，builder
+                        // 注册的临时量会在语句结束时对这块存储执行 Drop。
+                        let storage = fresh(&mut temp, "__await_agg");
+                        cur_instrs.push(MirInstr::SlotAddr(
+                            storage.clone(),
+                            next_local,
+                            (*size).max(1) as u32,
+                        ));
+                        next_local += 1;
+                        let addr = fresh(&mut temp, "__await_t");
+                        cur_instrs.push(MirInstr::Binary(
+                            addr.clone(),
+                            MirValue::Var(fut.clone()),
+                            MirBinaryOp::Add,
+                            MirValue::Int(RESULT_AGG_OFF),
+                            NumTy::Uint(64),
+                        ));
+                        copy_bytes(
+                            &mut cur_instrs,
+                            MirValue::Var(storage.clone()),
+                            0,
+                            MirValue::Var(addr),
+                            *size,
+                            &mut temp,
+                        );
+                        cur_instrs.push(MirInstr::Call(
+                            fresh(&mut temp, "__await_t"),
+                            "zr_dealloc".to_string(),
+                            vec![MirValue::Var(fut.clone())],
+                            NumTy::Uint(64),
+                        ));
+                        // 立即清空 future 名字：后续的聚合结果搬运/赋值不能
+                        // 让“最后一次使用”分析把已释放的帧再 drop 一次。
+                        if owned.contains(fut) {
+                            cur_instrs.push(MirInstr::Assign(fut.clone(), MirValue::Int(0)));
+                        }
+                        cur_instrs.push(MirInstr::Assign(dst.clone(), MirValue::Var(storage)));
+                    } else {
+                        let addr = fresh(&mut temp, "__await_t");
+                        cur_instrs.push(MirInstr::Binary(
+                            addr.clone(),
+                            MirValue::Var(fut.clone()),
+                            MirBinaryOp::Add,
+                            MirValue::Int(RESULT_OFF),
+                            NumTy::Uint(64),
+                        ));
+                        cur_instrs.push(MirInstr::Load(dst.clone(), MirValue::Var(addr), *ty));
+                        cur_instrs.push(MirInstr::Call(
+                            fresh(&mut temp, "__await_t"),
+                            "zr_dealloc".to_string(),
+                            vec![MirValue::Var(fut.clone())],
+                            NumTy::Uint(64),
+                        ));
+                        // await 消费 future；出口 drop 不应再次释放。
+                        if owned.contains(fut) {
+                            cur_instrs.push(MirInstr::Assign(fut.clone(), MirValue::Int(0)));
+                        }
                     }
                 }
                 _ => cur_instrs.push(instr.clone()),
@@ -356,13 +567,8 @@ fn rewrite_awaits(
     for (bi, ii, names) in insertions.into_iter().rev() {
         let mut seq = Vec::new();
         for name in names {
-            let callee = &aliases[&name];
-            seq.push(MirInstr::Call(
-                fresh(&mut early_tmp, "__early_t"),
-                format!("{callee}__drop"),
-                vec![MirValue::Var(name.clone())],
-                NumTy::Uint(64),
-            ));
+            let target = aliases[&name].clone();
+            emit_future_drop(&mut seq, &name, &target, &mut early_tmp);
             seq.push(MirInstr::Assign(name, MirValue::Int(0)));
         }
         blocks[bi].instrs.splice(ii + 1..ii + 1, seq);
@@ -386,25 +592,30 @@ fn rewrite_awaits(
                 if escaped.contains(name) {
                     continue;
                 }
-                if let Some(callee) = aliases.get(name) {
-                    let call = fresh(&mut temp, "__await_t");
-                    block.instrs.push(MirInstr::Call(
-                        call,
-                        format!("{callee}__drop"),
-                        vec![MirValue::Var(name.clone())],
-                        NumTy::Uint(64),
-                    ));
+                if let Some(target) = aliases.get(name).cloned() {
+                    emit_future_drop(&mut block.instrs, name, &target, &mut temp);
                 }
             }
         }
     }
 
     func.blocks = blocks;
-    owned
+    let live: Vec<String> = owned
         .into_iter()
         .filter(|name| !escaped.contains(name))
-        .filter_map(|name| aliases.get(&name).cloned().map(|callee| (name, callee)))
-        .collect()
+        .collect();
+    let static_callees = live
+        .iter()
+        .filter_map(|name| match aliases.get(name) {
+            Some(FutureTarget::Static(callee)) => Some((name.clone(), callee.clone())),
+            _ => None,
+        })
+        .collect();
+    let dynamic = live
+        .into_iter()
+        .filter(|name| matches!(aliases.get(name), Some(FutureTarget::Dynamic)))
+        .collect();
+    (static_callees, dynamic)
 }
 
 /// 计算“普通函数返回某个异步函数 future”的映射（fixpoint，支持包装器
@@ -486,7 +697,7 @@ fn early_drop_points(
     blocks: &[MirBasicBlock],
     owned: &[String],
     escaped: &HashSet<String>,
-    aliases: &HashMap<String, String>,
+    aliases: &HashMap<String, FutureTarget>,
 ) -> Vec<(usize, usize, Vec<String>)> {
     let mut live_in: HashMap<usize, HashSet<String>> =
         blocks.iter().map(|b| (b.id, HashSet::new())).collect();
@@ -583,6 +794,8 @@ fn early_drop_points(
 fn lower_function(
     mut func: MirFunction,
     future_callees: &HashMap<String, String>,
+    dynamic_callees: &HashSet<String>,
+    frame_metadata: bool,
 ) -> Option<(MirFunction, MirFunction, MirFunction)> {
     if func.blocks.is_empty() {
         return None;
@@ -604,7 +817,14 @@ fn lower_function(
     // 被取地址的局部量/数组槽也搬进堆帧（Rust 协程把所有跨挂起点存活的
     // 局部量保存在状态里）。槽按 16 字节对齐，兼容 SSE 数组访问。
     let mut local_offsets: HashMap<u32, i128> = HashMap::new();
-    let mut cursor = NAMES_OFF;
+    let result_bytes = func.aggregate_ret.unwrap_or(0) as i128;
+    let mut cursor = if result_bytes > 0 {
+        (RESULT_AGG_OFF + result_bytes + 15) & !15
+    } else if frame_metadata {
+        NAMES_OFF
+    } else {
+        POLL_OFF
+    };
     for block in &func.blocks {
         for instr in &block.instrs {
             if let MirInstr::SlotAddr(_, local, size) = instr {
@@ -778,12 +998,24 @@ fn lower_function(
                 MirTerminator::Return(value) => {
                     if let Some(value) = value {
                         if !matches!(value, MirValue::Unit) {
-                            let (_, vty) = value_type(&value, &types);
-                            let (value, store_ty) =
-                                widen_int_result(&mut seg.instrs, value, vty, &mut temp_id);
-                            let a = seg_addr(&mut seg.instrs, "__frame", RESULT_OFF, &mut temp_id);
-                            seg.instrs
-                                .push(MirInstr::Store(MirValue::Var(a), value, store_ty));
+                            if let Some(size) = func.aggregate_ret {
+                                copy_bytes(
+                                    &mut seg.instrs,
+                                    MirValue::Var("__frame".to_string()),
+                                    RESULT_AGG_OFF,
+                                    value,
+                                    size,
+                                    &mut temp_id,
+                                );
+                            } else {
+                                let (_, vty) = value_type(&value, &types);
+                                let (value, store_ty) =
+                                    widen_int_result(&mut seg.instrs, value, vty, &mut temp_id);
+                                let a =
+                                    seg_addr(&mut seg.instrs, "__frame", RESULT_OFF, &mut temp_id);
+                                seg.instrs
+                                    .push(MirInstr::Store(MirValue::Var(a), value, store_ty));
+                            }
                         }
                     }
                     MirTerminator::Return(Some(MirValue::Int(1)))
@@ -855,6 +1087,8 @@ fn lower_function(
         is_async: false,
         inline_never: true,
         inline_always: false,
+        aggregate_ret: None,
+        returns_future: false,
     };
 
     // Rust 风格：`f(args)` 只创建 future（堆帧），不执行函数体；
@@ -879,6 +1113,23 @@ fn lower_function(
         MirValue::Int(0),
         NumTy::Uint(64),
     ));
+    let future_name = func.name.clone();
+    if frame_metadata {
+        for (off, suffix) in [(POLL_OFF, "poll"), (DROP_OFF, "drop")] {
+            let fp = format!("__wrap_fp{wtemp}");
+            wtemp += 1;
+            entry_instrs.push(MirInstr::FuncAddr(
+                fp.clone(),
+                format!("{future_name}__{suffix}"),
+            ));
+            let a = bin_addr(&mut entry_instrs, &frame, off, &mut wtemp);
+            entry_instrs.push(MirInstr::Store(
+                MirValue::Var(a),
+                MirValue::Var(fp),
+                NumTy::Uint(64),
+            ));
+        }
+    }
     for i in 0..arg_count {
         let name = format!("arg_{i}");
         let a = bin_addr(&mut entry_instrs, &frame, offsets[&name], &mut wtemp);
@@ -901,11 +1152,14 @@ fn lower_function(
         is_async: false,
         inline_never: func.inline_never,
         inline_always: false,
+        aggregate_ret: None,
+        returns_future: false,
     };
 
     let drop = make_async_drop(
         &wrapper.name,
         future_callees,
+        dynamic_callees,
         &offsets,
         &states,
         &suspend_live,
@@ -918,6 +1172,7 @@ fn lower_function(
 fn make_async_drop(
     name: &str,
     future_callees: &HashMap<String, String>,
+    dynamic_callees: &HashSet<String>,
     offsets: &HashMap<String, i128>,
     states: &HashMap<(usize, usize), i64>,
     suspend_live: &HashMap<(usize, usize), HashSet<String>>,
@@ -934,7 +1189,10 @@ fn make_async_drop(
             .get(key)
             .into_iter()
             .flatten()
-            .filter(|n| future_callees.contains_key(*n) && offsets.contains_key(*n))
+            .filter(|n| {
+                (future_callees.contains_key(*n) || dynamic_callees.contains(*n))
+                    && offsets.contains_key(*n)
+            })
             .cloned()
             .collect();
         names.sort();
@@ -1015,13 +1273,22 @@ fn make_async_drop(
                     MirValue::Var(addr),
                     NumTy::Uint(64),
                 ));
-                let callee = &future_callees[child];
-                instrs.push(MirInstr::Call(
-                    fresh(&mut temp, "__drop_t"),
-                    format!("{callee}__drop"),
-                    vec![MirValue::Var(value)],
-                    NumTy::Uint(64),
-                ));
+                if dynamic_callees.contains(child) {
+                    instrs.push(MirInstr::Call(
+                        fresh(&mut temp, "__drop_t"),
+                        "__zr_dyn_future_drop".to_string(),
+                        vec![MirValue::Var(value)],
+                        NumTy::Uint(64),
+                    ));
+                } else {
+                    let callee = &future_callees[child];
+                    instrs.push(MirInstr::Call(
+                        fresh(&mut temp, "__drop_t"),
+                        format!("{callee}__drop"),
+                        vec![MirValue::Var(value)],
+                        NumTy::Uint(64),
+                    ));
+                }
             }
         }
         instrs.push(MirInstr::Call(
@@ -1054,6 +1321,8 @@ fn make_async_drop(
         is_async: false,
         inline_never: true,
         inline_always: false,
+        aggregate_ret: None,
+        returns_future: false,
     }
 }
 
@@ -1123,6 +1392,8 @@ fn make_async_main(future: &str, poll: &str) -> MirFunction {
         is_async: false,
         inline_never: false,
         inline_always: false,
+        aggregate_ret: None,
+        returns_future: false,
     }
 }
 
@@ -1174,7 +1445,7 @@ fn infer_types(func: &MirFunction) -> HashMap<String, NumTy> {
                     MirInstr::Assign(n, v) => (n, value_type(v, &types).1),
                     MirInstr::Binary(n, _, _, _, t) => (n, *t),
                     MirInstr::Unary(n, _, v) => (n, value_type(v, &types).1),
-                    MirInstr::Await(n, _, t) => (n, *t),
+                    MirInstr::Await(n, _, t, _) => (n, *t),
                     MirInstr::Call(n, _, _, t) => (n, *t),
                     MirInstr::Cast(n, _, _, to) => (n, *to),
                     MirInstr::Load(n, _, t) => (n, *t),
@@ -1260,7 +1531,7 @@ fn instr_def(instr: &MirInstr) -> Option<String> {
         MirInstr::Assign(n, _)
         | MirInstr::Binary(n, ..)
         | MirInstr::Unary(n, ..)
-        | MirInstr::Await(n, _, _)
+        | MirInstr::Await(n, ..)
         | MirInstr::Call(n, ..)
         | MirInstr::FuncAddr(n, ..)
         | MirInstr::CallIndirect(n, ..)
@@ -1285,7 +1556,7 @@ fn instr_uses(instr: &MirInstr) -> Vec<String> {
             push(a);
             push(b);
         }
-        MirInstr::Unary(_, _, v) | MirInstr::Await(_, v, _) | MirInstr::Cast(_, v, ..) => push(v),
+        MirInstr::Unary(_, _, v) | MirInstr::Await(_, v, ..) | MirInstr::Cast(_, v, ..) => push(v),
         MirInstr::Call(_, _, args, _) => {
             for a in args {
                 push(a);
@@ -1346,6 +1617,74 @@ fn term_successors(term: Option<&MirTerminator>) -> Vec<usize> {
     }
 }
 
+/// 释放一个 future：静态来源直接调 `f__drop`；动态来源从帧头取 drop
+/// 函数指针做间接调用。
+fn emit_future_drop(
+    instrs: &mut Vec<MirInstr>,
+    name: &str,
+    target: &FutureTarget,
+    temp: &mut usize,
+) {
+    match target {
+        FutureTarget::Static(callee) => instrs.push(MirInstr::Call(
+            fresh(temp, "__drop_t"),
+            format!("{callee}__drop"),
+            vec![MirValue::Var(name.to_string())],
+            NumTy::Uint(64),
+        )),
+        FutureTarget::Dynamic => instrs.push(MirInstr::Call(
+            fresh(temp, "__drop_t"),
+            "__zr_dyn_future_drop".to_string(),
+            vec![MirValue::Var(name.to_string())],
+            NumTy::Uint(64),
+        )),
+    }
+}
+
+/// 逐字节/逐 8 字节复制一块内存。用于异步聚合返回值跨帧搬运；
+/// 不调用外部 memcpy，保持后端无 libc 依赖。
+fn copy_bytes(
+    instrs: &mut Vec<MirInstr>,
+    dst: MirValue,
+    dst_off: i128,
+    src: MirValue,
+    size: usize,
+    counter: &mut usize,
+) {
+    let addr = |base: &MirValue, off: i128, instrs: &mut Vec<MirInstr>, counter: &mut usize| {
+        if off == 0 {
+            base.clone()
+        } else {
+            let name = fresh(counter, "__copy_t");
+            instrs.push(MirInstr::Binary(
+                name.clone(),
+                base.clone(),
+                MirBinaryOp::Add,
+                MirValue::Int(off),
+                NumTy::Uint(64),
+            ));
+            MirValue::Var(name)
+        }
+    };
+    let mut off = 0usize;
+    while off + 8 <= size {
+        let tmp = fresh(counter, "__copy_t");
+        let s = addr(&src, off as i128, instrs, counter);
+        instrs.push(MirInstr::Load(tmp.clone(), s, NumTy::Uint(64)));
+        let d = addr(&dst, dst_off + off as i128, instrs, counter);
+        instrs.push(MirInstr::Store(d, MirValue::Var(tmp), NumTy::Uint(64)));
+        off += 8;
+    }
+    while off < size {
+        let tmp = fresh(counter, "__copy_t");
+        let s = addr(&src, off as i128, instrs, counter);
+        instrs.push(MirInstr::Load(tmp.clone(), s, NumTy::Uint(8)));
+        let d = addr(&dst, dst_off + off as i128, instrs, counter);
+        instrs.push(MirInstr::Store(d, MirValue::Var(tmp), NumTy::Uint(8)));
+        off += 1;
+    }
+}
+
 fn fresh(counter: &mut usize, prefix: &str) -> String {
     let name = format!("{prefix}{counter}");
     *counter += 1;
@@ -1394,7 +1733,7 @@ mod tests {
         live.insert((0, 0), HashSet::from(["child".to_string()]));
         live.insert((0, 2), HashSet::from(["child".to_string()]));
 
-        let f = make_async_drop("f", &futures, &offsets, &states, &live);
+        let f = make_async_drop("f", &futures, &HashSet::new(), &offsets, &states, &live);
         assert_eq!(f.name, "f__drop");
         for (i, block) in f.blocks.iter().enumerate() {
             assert_eq!(block.id, i, "drop blocks must be indexed by id");
@@ -1425,8 +1764,8 @@ mod tests {
             term: Some(MirTerminator::Return(None)),
         }];
         let mut futures = HashMap::new();
-        futures.insert("t".to_string(), "f".to_string());
-        futures.insert("v".to_string(), "f".to_string());
+        futures.insert("t".to_string(), FutureTarget::Static("f".to_string()));
+        futures.insert("v".to_string(), FutureTarget::Static("f".to_string()));
         let owned = vec!["t".to_string(), "v".to_string()];
         let points = early_drop_points(&blocks, &owned, &HashSet::new(), &futures);
         let names: Vec<&str> = points
@@ -1466,8 +1805,8 @@ mod tests {
             term: Some(MirTerminator::Return(None)),
         }];
         let futures = HashMap::from([
-            ("t0".to_string(), "f".to_string()),
-            ("t1".to_string(), "f".to_string()),
+            ("t0".to_string(), FutureTarget::Static("f".to_string())),
+            ("t1".to_string(), FutureTarget::Static("f".to_string())),
         ]);
         let owned = vec!["t0".to_string(), "t1".to_string()];
         let points = early_drop_points(&blocks, &owned, &HashSet::new(), &futures);
@@ -1507,6 +1846,8 @@ mod tests {
             is_async: false,
             inline_never: false,
             inline_always: false,
+            aggregate_ret: None,
+            returns_future: false,
         };
         let wrap = MirFunction {
             name: "wrap".to_string(),
@@ -1525,6 +1866,8 @@ mod tests {
             is_async: false,
             inline_never: false,
             inline_always: false,
+            aggregate_ret: None,
+            returns_future: false,
         };
         let f = MirFunction {
             name: "f".to_string(),
@@ -1534,6 +1877,8 @@ mod tests {
             is_async: true,
             inline_never: false,
             inline_always: false,
+            aggregate_ret: None,
+            returns_future: false,
         };
         let lowerable = HashSet::from(["f".to_string()]);
         let producers = compute_future_producers(&[f, make, wrap], &lowerable);

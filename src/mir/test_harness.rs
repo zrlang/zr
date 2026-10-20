@@ -95,6 +95,8 @@ pub fn build_harness(test_names: &[String]) -> MirFunction {
         blocks,
         inline_never: false,
         inline_always: false,
+        aggregate_ret: None,
+        returns_future: false,
     }
 }
 

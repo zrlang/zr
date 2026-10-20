@@ -709,7 +709,6 @@ fn literal_kind(v: &HirLiteral) -> &'static str {
 fn describe(kind: &ExprKind) -> &'static str {
     match kind {
         ExprKind::Match => "`match`",
-        ExprKind::For => "`for`",
         ExprKind::Field(..) => "field access",
         ExprKind::Deref(_) => "dereference",
         ExprKind::AddrOf(_) => "address-of",

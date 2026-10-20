@@ -1,0 +1,33 @@
+//=============================================================================
+// tests/cases/47_async_return_aggregate.zr — 异步按值返回聚合类型
+//
+// 覆盖：Drop 结构体、Drop 数组从 async fn 返回后在调用方作用域析构。
+//=============================================================================
+
+struct R { id: i32, log: &mut i32 }
+impl Drop for R { fn drop(&mut self) { *self.log = *self.log * 10 + self.id; } }
+
+async fn make_r(id: i32, log: &mut i32) -> R {
+    return R { id: id, log: log };
+}
+
+async fn make_arr(log: &mut i32) -> [R; 2] {
+    return [R { id: 1, log: log }, R { id: 2, log: log }];
+}
+
+async fn main() -> i32 {
+    let mut log = 0;
+    {
+        let r = make_r(7, &mut log).await;
+        if r.id != 7 { return 1; }
+    }
+    if log != 7 { return 2; }
+
+    log = 0;
+    {
+        let a = make_arr(&mut log).await;
+        if a[0].id != 1 || a[1].id != 2 { return 3; }
+    }
+    if log != 12 { return 4; }
+    return 0;
+}

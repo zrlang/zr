@@ -39,6 +39,12 @@ pub struct MirFunction {
     pub inline_never: bool,
     /// `#[inline(always)]`：优化器必须把这个函数内联进调用点。
     pub inline_always: bool,
+    /// 异步函数按值返回聚合类型时的输出字节数。`None` 表示标量/`()`；
+    /// `Some(0)` 的零大小聚合也按聚合处理。
+    pub aggregate_ret: Option<usize>,
+    /// 普通函数是否返回一个 future（签名里的 `impl Future`）。调用点可把
+    /// 结果当作动态 future：poll/drop 走帧头里的函数指针。
+    pub returns_future: bool,
 }
 
 /// 函数参数。
@@ -72,8 +78,8 @@ pub enum MirInstr {
     /// 一元运算 `name = op x`（结果类型与操作数一致，所以不必另带）。
     Unary(String, MirUnaryOp, MirValue),
     /// await 点：暂停当前协程，等待 future 就绪。
-    /// `name = await future`。
-    Await(String, MirValue, NumTy),
+    /// `name = await future`。最后一个字段是聚合输出字节数（标量为 `None`）。
+    Await(String, MirValue, NumTy, Option<usize>),
     /// 显式让出点（`yield expr`）。异步函数里由状态机降级为 Pending；
     /// 同步函数里是空操作。
     Suspend,
@@ -231,7 +237,12 @@ pub fn lower(hir: &HirModule) -> MirModule {
     let fn_params: HashMap<String, Vec<hir::Ty>> = hir
         .functions
         .iter()
-        .map(|f| (f.name.clone(), f.params.iter().map(|p| p.ty.clone()).collect()))
+        .map(|f| {
+            (
+                f.name.clone(),
+                f.params.iter().map(|p| p.ty.clone()).collect(),
+            )
+        })
         .collect();
 
     for func in &hir.functions {

@@ -62,6 +62,13 @@ cargo test --test zr_language
 | `41_return_drop_array.zr` | Drop 数组按值返回：return、尾表达式、参数转发、调用方析构 |
 | `42_temp_partial_move.zr` | 临时结构体部分移动：普通/嵌套字段、整个 Drop 字段、剩余字段析构 |
 | `43_return_drop_struct.zr` | 同步 Drop 结构体按值返回：return、尾表达式、参数转发 |
+| `44_for_range.zr` | `for` 范围循环：排他/包含、终点单次求值、continue/break、嵌套与 u8 |
+| `45_for_array.zr` | `for` 数组遍历：标量/结构体/Drop 数组、continue/break、嵌套与源表达式单次求值 |
+| `46_dynamic_index_move.zr` | 动态下标 `arr[i]` 的 Drop 部分移动：按元素标记、循环内移动、标量数组读取 |
+| `47_async_return_aggregate.zr` | 异步按值返回 Drop 结构体/Drop 数组，调用方作用域析构 |
+| `48_async_nested_aggregate.zr` | 异步返回数组、结构体、结构体数组及元素读取 |
+| `49_dynamic_future_source.zr` | `-> impl Future` 动态来源：不同分支返回不同异步 future，动态 poll/drop |
+| `50_dynamic_future_aggregate.zr` | 动态 future 返回聚合值：数组结果跨 poll 搬运 |
 
 ## 尚未覆盖（编译器还不支持）
 
@@ -70,7 +77,6 @@ Rust Book 的其余章节目前一个都测不了，因为对应特性尚未实�
 
 | Rust Book 章节 | 阻塞原因 |
 |----------------|----------|
-| 控制流：`for` | `for x in a..b` 的 `..` 表达式仍解析成标识符 |
 | 所有权 / 借用 / 引用 / 切片 | 借用检查与引用语义未实现 |
 | 枚举 | `enum` 未实现（具名结构体与字段访问已覆盖） |
 | 浮点（仅 ARM32 / Thumb / RISC-V / wasm） | x86-64 与 aarch64 已支持；其余后端遇到浮点字面量会**明确报错**（不再静默发射 0） |

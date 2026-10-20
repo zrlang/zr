@@ -1,0 +1,19 @@
+//=============================================================================
+// tests/cases/50_dynamic_future_aggregate.zr — 动态 future 返回聚合值
+//
+// 覆盖：动态来源 future 返回数组，await 时把聚合结果从子帧搬到调用方。
+//=============================================================================
+
+async fn pair(x: i32) -> [i32; 2] { return [x, x + 1]; }
+async fn pair2(x: i32) -> [i32; 2] { return [x * 2, x * 3]; }
+fn pick(flag: bool, x: i32) -> impl Future {
+    if flag { return pair(x); }
+    return pair2(x);
+}
+async fn main() -> i32 {
+    let a: [i32; 2] = pick(true, 5).await;
+    if a[0] != 5 || a[1] != 6 { return 1; }
+    let b: [i32; 2] = pick(false, 5).await;
+    if b[0] != 10 || b[1] != 15 { return 2; }
+    return 0;
+}
