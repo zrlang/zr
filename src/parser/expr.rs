@@ -1104,7 +1104,8 @@ impl Parser {
             }
             // 解析操作数：in/out(reg) expr
             let is_out = self.check(&TokenKind::Ident("out".into()));
-            let is_in = self.check(&TokenKind::Ident("in".into()));
+            let is_in = self.check(&TokenKind::KwIn)
+                || self.check(&TokenKind::Ident("in".into()));
             if !is_out && !is_in {
                 // 跳过未知参数
                 self.advance();
@@ -1112,7 +1113,7 @@ impl Parser {
             }
             self.advance(); // in/out
             self.consume(&TokenKind::LParen, "expected '(' after in/out")?;
-            let _constraint = match self.peek().kind.clone() {
+            let constraint = match self.peek().kind.clone() {
                 TokenKind::Ident(c) => {
                     self.advance();
                     c
@@ -1125,7 +1126,7 @@ impl Parser {
             };
             self.consume(&TokenKind::RParen, "expected ')' after constraint")?;
             let expr = self.parse_expression()?;
-            let operand = crate::parser::ast::AsmOperand { expr };
+            let operand = crate::parser::ast::AsmOperand { constraint, expr };
             if is_out {
                 outputs.push(operand);
             } else {

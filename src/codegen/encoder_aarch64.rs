@@ -1164,8 +1164,7 @@ fn emit_instr(unit: &mut CompilationUnit, instr: &SsaInstr) {
             put_out(unit, *result);
         }
         SsaInstr::Asm { .. } => {
-            // 内联汇编：暂不支持，占位
-            todo!("inline asm codegen for aarch64");
+            crate::codegen::unsupported_inline_asm("aarch64");
         }
         // `Var` 只是 SSA 值的命名引用，运行时不产生代码。
         SsaInstr::Var { .. } => {}

@@ -1,0 +1,30 @@
+// tests/cases/27_inline_asm.zr — 内联汇编（x86-64 整数子集）
+//
+// 验证输入/输出操作数、`{n}` 占位符与常用整数指令的编码。
+// 其它后端目前会明确报"未实现"，而不是静默编错。
+
+fn main() -> i32 {
+    let x: i32 = 7;
+    let mut y: i32 = 0;
+    asm!("mov {0}, {1}", out(reg) y, in(reg) x);
+    if y != 7 { return 1; }
+
+    asm!("mov {0}, {1}\nadd {0}, 5", out(reg) y, in(reg) y);
+    if y != 12 { return 2; }
+
+    asm!("mov {0}, {1}\nxor {0}, {0}", out(reg) y, in(reg) y);
+    if y != 0 { return 3; }
+
+    let mut z: i32 = 3;
+    asm!("mov {0}, {1}\nshl {0}, 2", out(reg) z, in(reg) z);
+    if z != 12 { return 4; }
+
+    // SSE2：两个标量位模式装进 XMM，`paddd` 做 4 路 32 位并行加法。
+    let k: i32 = 5;
+    let mut s: i32 = 0;
+    asm!("movd xmm0, {1}\nmovd xmm1, {2}\npaddd xmm0, xmm1\nmovd {0}, xmm0",
+         out("rdx") s, in("rax") x, in("rcx") k);
+    if s != 12 { return 5; }
+
+    return 0;
+}

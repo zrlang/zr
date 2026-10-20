@@ -372,8 +372,6 @@ fn emit_vcvt_fp_to_fp(unit: &mut CompilationUnit, dst_is_single: bool, rd: u8, r
 ///
 /// AAPCS32 浮点实参：s0-s15 (单精度) / d0-d7 (双精度)，与整数实参各自计数。
 fn emit_call_args(unit: &mut CompilationUnit, args: &[SsaValue]) -> u32 {
-    let mut gi = 0usize;  // 整数实参计数
-    let mut fi = 0usize;  // 浮点实参计数
     let mut int_args: Vec<SsaValue> = Vec::new();
     let mut float_args: Vec<SsaValue> = Vec::new();
 
@@ -381,10 +379,8 @@ fn emit_call_args(unit: &mut CompilationUnit, args: &[SsaValue]) -> u32 {
     for a in args {
         if float_slot(*a).is_some() {
             float_args.push(*a);
-            fi += 1;
         } else {
             int_args.push(*a);
-            gi += 1;
         }
     }
 
@@ -1417,7 +1413,7 @@ fn assign_float_slots(func: &SsaFunction) -> usize {
 
     loop {
         let mut changed = false;
-        let mut mark = |v: &SsaValue, w: u8, map: &mut HashMap<u32, u8>| -> bool {
+        let mark = |v: &SsaValue, w: u8, map: &mut HashMap<u32, u8>| -> bool {
             match map.get(&v.id()) {
                 // 已知但更窄，保留更宽的那个（f64 优先）
                 Some(old) if *old >= w => false,
@@ -1887,8 +1883,7 @@ fn emit_instr(unit: &mut CompilationUnit, instr: &SsaInstr) {
             }
         }
         SsaInstr::Asm { .. } => {
-            // 内联汇编：暂不支持，占位
-            todo!("inline asm codegen for ARM");
+            crate::codegen::unsupported_inline_asm("arm32");
         }
     }
 }

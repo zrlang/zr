@@ -115,6 +115,7 @@ pub struct MemOp {
 
 /// 一元运算符。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(dead_code)]
 pub enum WasmUnaryOp {
     /// `i32.wrap_i64`：取低 32 位。
     WrapI64ToI32,
@@ -243,6 +244,7 @@ impl WasmUnaryOp {
 
 /// 二元运算符。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(dead_code)]
 pub enum WasmBinaryOp {
     // 整数运算
     Add,
@@ -450,8 +452,10 @@ impl WasmModule {
                             data.extend_from_slice(text.as_bytes());
                             data.push(0);
                             strings.insert(text.clone(), addr);
-}
-}
+                        }
+                    }
+                }
+            }
             // 本函数里每个被取地址的局部变量各留 8 字节槽（零初始化）。
             let mut slots: HashMap<u32, i64> = HashMap::new();
             for block in &func.blocks {
@@ -890,7 +894,7 @@ fn infer_float_widths(func: &SsaFunction) -> HashMap<u32, u8> {
 
     loop {
         let mut changed = false;
-        let mut mark = |v: &SsaValue, w: u8, map: &mut HashMap<u32, u8>| -> bool {
+        let mark = |v: &SsaValue, w: u8, map: &mut HashMap<u32, u8>| -> bool {
             match map.get(&v.id()) {
                 Some(old) if *old >= w => false,
                 _ => {
@@ -1474,6 +1478,9 @@ fn emit_ssa_instr(
             }
             body.push(WasmInstr::Store { op, addr64 });
         }
+        SsaInstr::Asm { .. } => {
+            crate::codegen::unsupported_inline_asm("wasm32");
+        }
     }
 }
 
@@ -1996,11 +2003,9 @@ mod tests {
                 // 段内容：vec(count) 后紧跟 limits.flags
                 flags = Some(bytes[i + 1]);
             }
-i += len as usize;
+            i += len as usize;
         }
         assert_eq!(flags.expect("memory 段") & 0x04, 0x04);
-    }
-    }
     }
 
     #[test]

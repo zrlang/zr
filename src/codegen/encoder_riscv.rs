@@ -31,6 +31,7 @@
 //! 尾声：`addi sp, sp, -N` / `addi sp, sp, +N`（N = 槽数 × 8）。临时槽
 //! 在槽数为 0 的函数里也安全（在保留区下方独自下探）。
 
+#![allow(dead_code)]
 use crate::codegen::target::{Arch, Os, Target};
 use crate::codegen::{
     CompilationUnit, Relocation, RelocationKind, Symbol, SymbolKind, SymbolSection,
@@ -709,20 +710,20 @@ fn emit_cast_wide(
 
 /// i64 乘法（暂不支持）
 fn emit_mul_wide(
-    unit: &mut CompilationUnit,
-    result: SsaValue,
-    lhs: SsaValue,
-    rhs: SsaValue,
+    _unit: &mut CompilationUnit,
+    _result: SsaValue,
+    _lhs: SsaValue,
+    _rhs: SsaValue,
 ) {
     crate::codegen::unsupported_binary_op(SsaBinaryOp::Mul);
 }
 
 /// i64 除法/取模（暂不支持）
 fn emit_divmod_wide(
-    unit: &mut CompilationUnit,
-    result: SsaValue,
-    lhs: SsaValue,
-    rhs: SsaValue,
+    _unit: &mut CompilationUnit,
+    _result: SsaValue,
+    _lhs: SsaValue,
+    _rhs: SsaValue,
     is_div: bool,
 ) {
     crate::codegen::unsupported_binary_op(if is_div { SsaBinaryOp::Div } else { SsaBinaryOp::Rem });
@@ -730,11 +731,11 @@ fn emit_divmod_wide(
 
 /// i64 移位（暂不支持）
 fn emit_shift_wide(
-    unit: &mut CompilationUnit,
-    result: SsaValue,
+    _unit: &mut CompilationUnit,
+    _result: SsaValue,
     op: SsaBinaryOp,
-    lhs: SsaValue,
-    rhs: SsaValue,
+    _lhs: SsaValue,
+    _rhs: SsaValue,
 ) {
     crate::codegen::unsupported_binary_op(op);
 }
@@ -1206,6 +1207,7 @@ fn assign_float_slots(func: &SsaFunction) -> usize {
                         // 内联汇编：无浮点结果，不需要标记浮点宽度
                     }
                     _ => {}
+                }
             }
         }
         if !changed {
@@ -1225,9 +1227,7 @@ fn assign_float_slots(func: &SsaFunction) -> usize {
     });
     count
 }
-}
 
-/// 发射一条 SSA 指令。
 /// 发射一条 SSA 指令。
 fn emit_instr(unit: &mut CompilationUnit, instr: &SsaInstr, wide: bool) {
     match instr {
@@ -1350,8 +1350,7 @@ fn emit_instr(unit: &mut CompilationUnit, instr: &SsaInstr, wide: bool) {
             emit_store_mem(unit, rp, rs, *ty, wide);
         }
         SsaInstr::Asm { .. } => {
-            // 内联汇编：暂不支持，占位
-            todo!("inline asm codegen for riscv");
+            crate::codegen::unsupported_inline_asm("riscv");
         }
     }
 }

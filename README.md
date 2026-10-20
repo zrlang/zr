@@ -4,7 +4,7 @@
 > 一门为系统编程而生的现代编程语言。
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](./LICENSE)
-[![Version](https://img.shields.io/badge/version-0.7.0-blue.svg)](./Cargo.toml)
+[![Version](https://img.shields.io/badge/version-0.8.0-blue.svg)](./Cargo.toml)
 [![Build](https://img.shields.io/badge/build-passing-brightgreen.svg)]()
 
 ---
@@ -684,6 +684,30 @@ extern "C" fn callback(data: *mut void) -> i32 {
 }
 ```
 
+### 内联汇编与 SIMD
+
+x86-64 目标支持 `asm!`。操作数编号先输出、后输入，模板使用 Intel 语法：
+
+```rust
+fn add_via_asm(x: i32, y: i32) -> i32 {
+    let mut z: i32 = 0;
+    asm!("mov {0}, {1}\nadd {0}, {2}", out(reg) z, in(reg) x, in(reg) y);
+    return z;
+}
+```
+
+约束可以写成 `reg`（由编译器挑寄存器）或显式寄存器名（如 `rax`、`rdx`）。
+SSE/SSE2 指令可直接使用 `xmm0`-`xmm15`：
+
+```rust
+let mut z: i32 = 0;
+asm!("movd xmm0, {1}\nmovd xmm1, {2}\npaddd xmm0, xmm1\nmovd {0}, xmm0",
+     out("rdx") z, in("rax") x, in("rcx") y);
+```
+
+当前范围：x86-64 的整数与常用 SSE/SSE2 指令、寄存器/立即数操作数；尚未提供
+`inout`/内存约束与自动向量化。其它后端遇到 `asm!` 会给出明确的"未实现"错误。
+
 ---
 
 ## 模块与标准库
@@ -976,7 +1000,7 @@ zr 编译器采用经典的多阶段架构：
 
 ## 路线图
 
-### v0.5.0（当前） ✅
+### v0.5.0 ✅
 - [x] 词法分析器
 - [x] 递归下降 + Pratt 解析器
 - [x] HIR + Hindley-Milner 类型推导
@@ -1032,7 +1056,7 @@ zr 编译器采用经典的多阶段架构：
 - [x] 编译确定性：块号与 φ 编号不再依赖 `HashMap` 遍历顺序
 - [x] 浮点类型贯通：`Binary` / `Call` 携带结果类型，后端据此选 GPR 还是 XMM 指令
 
-### v0.7.0（进行中） 🚧
+### v0.7.0 ✅
 - [x] x86-64 f32 支持（常量携带位宽，走 `ss` 指令；见 v0.6.0）
 - [x] AArch64 f32/f64 指令选择
   - [x] 浮点常量、算术（`fadd`/`fsub`/`fmul`/`fdiv`）、取负（`fneg`）
@@ -1182,13 +1206,25 @@ zr 编译器采用经典的多阶段架构：
   - [x] 字符串字面量预先登记进 `.rodata`（确定性编号），各线程仅查表；片段按函数顺序合并，产物**逐字节**与串行一致。
   - [x] 函数顺序确定化：类型检查/ HIR 生成按 DefId 排序，修掉 HashMap 迭代导致的非确定性（连带修复 `comptime` 折叠需先看到函数定义的问题）。
 
-### v0.8.0（进行中） 📋
+### v0.8.0（当前） ✅
 - [x] `zr build` / `zr run` 子命令（类似 `go build` / `go run`）
 - [x] `zr pkg` 注册中心协议与联网能力（搜索、发布、下载、添加 registry 依赖）
-- [ ] 格式化器 `zr fmt` 风格定稿
-- [ ] 语言服务器（LSP）补全与跳转
-- [ ] 内联汇编
-- [ ] SIMD 指令选择
+- [x] 格式化器 `zr fmt` 风格定稿
+  - [x] 缩进、运算符/逗号间距、空行折叠、CRLF/制表符归一化
+  - [x] 注释保留、match 分支与尾随逗号；格式化结果幂等
+  - [x] `zr fmt --check` 只检查不写回，并接入 LSP `textDocument/formatting`
+- [x] 语言服务器（LSP）补全与跳转
+  - [x] `textDocument/completion`：按前缀补全函数、常量、结构体、枚举与参数
+  - [x] `textDocument/definition` / `hover` / `documentSymbol` / 诊断发布
+- [x] 内联汇编（x86-64）
+  - [x] `asm!("...", out(reg) x, in(reg) y)` 语法、`{n}` 占位符与显式寄存器约束
+  - [x] 输入/输出操作数经栈槽回写；多指令模板；寄存器保存/恢复
+  - [x] 整数指令子集（mov/add/sub/and/or/xor/cmp/test/shift/imul/push/pop/…）
+  - [x] 其它后端（AArch64 / ARM / Thumb / RISC-V / wasm）明确报错而非静默编错
+- [x] SIMD 指令选择（x86-64 SSE/SSE2 基础）
+  - [x] `xmm0`-`xmm15`、`movd/movq` 与 GPR ↔ XMM 搬运
+  - [x] `addps/paddd/pxor/movdqa/pslld` 等打包浮点/整数指令编码
+  - [x] 通过 `asm!` 直接发射 SIMD 指令；自动向量化留待 v0.9
 
 ### v1.0.0（目标） 🎯
 - [ ] API 稳定

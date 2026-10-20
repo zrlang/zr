@@ -291,7 +291,9 @@ pub struct AsmExpr {
 /// 汇编操作数。
 #[derive(Debug, Clone)]
 pub struct AsmOperand {
-    /// 关联的表达式（输入）或名称（输出）。
+    /// 寄存器约束（`reg`、`rax` 等）。
+    pub constraint: String,
+    /// 关联的表达式（输入值或输出位置）。
     pub expr: Expression,
 }
 

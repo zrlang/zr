@@ -9,7 +9,7 @@
 //!
 //! HIR 是后续 MIR 降级、借用检查、模式穷尽性检查、闭包转换的输入。
 
-pub use crate::parser::ast::{Abi, AsmOperand, Span};
+pub use crate::parser::ast::{Abi, Span};
 use std::collections::HashMap;
 
 /// 一个 HIR 程序（已通过类型检查）。
@@ -238,10 +238,10 @@ pub enum ExprKind {
     Asm {
         /// 模板字符串，如 `"add {0}, {1}"`。
         template: String,
-        /// 输出操作数：`out(reg) expr`。
-        outputs: Vec<AsmOperand>,
-        /// 输入操作数：`in(reg) expr`。
-        inputs: Vec<AsmOperand>,
+        /// 输出操作数：`out(reg) expr`，约束与已降级的表达式。
+        outputs: Vec<(String, HirExpr)>,
+        /// 输入操作数：`in(reg) expr`，约束与已降级的表达式。
+        inputs: Vec<(String, HirExpr)>,
     },
     /// `yield`。
     Yield,

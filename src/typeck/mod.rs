@@ -1487,18 +1487,22 @@ impl TypeChecker {
                 });
             }
             Expression::Asm(asm, _) => {
-                // 保留对 asm 操作数的类型检查（副作用）
+                // 操作数逐个降级到 HIR，并保留寄存器约束。
+                let mut outputs = Vec::with_capacity(asm.outputs.len());
                 for o in &asm.outputs {
-                    let _ = self.check_expr(&o.expr, &Ty::Infer(InferId(0)));
+                    let e = self.check_expr(&o.expr, &Ty::Infer(InferId(0)))?;
+                    outputs.push((o.constraint.clone(), e));
                 }
+                let mut inputs = Vec::with_capacity(asm.inputs.len());
                 for i in &asm.inputs {
-                    let _ = self.check_expr(&i.expr, &Ty::Infer(InferId(0)));
+                    let e = self.check_expr(&i.expr, &Ty::Infer(InferId(0)))?;
+                    inputs.push((i.constraint.clone(), e));
                 }
                 return Ok(HirExpr {
                     kind: ExprKind::Asm {
                         template: asm.template.clone(),
-                        outputs: asm.outputs.clone(),
-                        inputs: asm.inputs.clone(),
+                        outputs,
+                        inputs,
                     },
                     ty: Ty::Unit,
                     span,

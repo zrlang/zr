@@ -19,7 +19,7 @@
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
-use crate::zpm::registry::{RegistryClient, RegistryState};
+use crate::zpm::registry::RegistryClient;
 
 /// 项目清单。
 #[derive(Debug, Clone, Default)]

@@ -123,14 +123,12 @@ pub enum SsaInstr {
     ///
     /// 这是一个语句（无结果值），但有副作用，不可被消除或重排。
     Asm {
-        /// 结果变量名（用于 SSA，虽然汇编本身不产生值，但 SSA 形式需要名字）。
-        name: String,
         /// 模板字符串，如 `"add {0}, {1}"`。
         template: String,
-        /// 输出操作数：`out(reg) expr` -> (constraint, expr)
-        outputs: Vec<(String, SsaValue)>,
-        /// 输入操作数：`in(reg) expr` -> (constraint, expr)
-        inputs: Vec<(String, SsaValue)>,
+        /// 输出操作数：`(约束, 目标地址, 值类型)`。
+        outputs: Vec<(String, SsaValue, mir::NumTy)>,
+        /// 输入操作数：`(约束, 值, 值类型)`。
+        inputs: Vec<(String, SsaValue, mir::NumTy)>,
     },
     /// 变量引用（用于 φ 函数合并前的原始变量）。
     Var { result: SsaValue, name: String },
@@ -583,13 +581,32 @@ fn convert_function(func: &mir::MirFunction) -> SsaFunction {
                     });
                     // Store 不定义任何变量，也不压栈。
                 }
-            mir::MirInstr::Asm { name, template: _, outputs: _, inputs } => {
-                // 内联汇编：评估输入操作数，结果名为 name
-                for (_, v) in inputs {
-                    let _ = materialize(v, &mut instrs, &mut stacks, &next_value);
-                }
-                stacks.entry(name.clone()).or_default().push(alloc());
-                pushed.push(name.clone());
+            mir::MirInstr::Asm {
+                name: _,
+                template,
+                outputs,
+                inputs,
+            } => {
+                let ssa_outputs = outputs
+                    .iter()
+                    .map(|(c, v, ty)| {
+                        let v = materialize(v, &mut instrs, &mut stacks, &next_value);
+                        (c.clone(), v, *ty)
+                    })
+                    .collect();
+                let ssa_inputs = inputs
+                    .iter()
+                    .map(|(c, v, ty)| {
+                        let v = materialize(v, &mut instrs, &mut stacks, &next_value);
+                        (c.clone(), v, *ty)
+                    })
+                    .collect();
+                instrs.push(SsaInstr::Asm {
+                    template: template.clone(),
+                    outputs: ssa_outputs,
+                    inputs: ssa_inputs,
+                });
+                // 汇编语句本身没有值；`name` 只供 SSA 定义点记录使用。
             }
             }
         }
@@ -967,10 +984,11 @@ fn defined_name_set(block: &mir::MirBasicBlock) -> HashSet<String> {
             | mir::MirInstr::Cast(n, ..)
             | mir::MirInstr::Load(n, ..)
             | mir::MirInstr::SlotAddr(n, _)
-            | mir::MirInstr::Asm { name, .. } => Some(name),
+            | mir::MirInstr::Asm { name: n, .. } => Some(n),
             // Store 不定义名字。
             mir::MirInstr::Store(..) => None,
         })
+        .cloned()
         .collect()
 }
 
@@ -1043,9 +1061,10 @@ fn used_before_def(block: &mir::MirBasicBlock) -> Vec<String> {
                 v.extend(mir_value_names(value));
                 v
             }
-            mir::MirInstr::Asm { inputs, .. } => {
-                inputs.iter().flat_map(|(_, v)| mir_value_names(v)).collect()
-            }
+            mir::MirInstr::Asm { inputs, .. } => inputs
+                .iter()
+                .flat_map(|(_, v, _)| mir_value_names(v))
+                .collect(),
         };
         note_read(reads, &defined, &mut out);
 
@@ -1400,6 +1419,16 @@ pub fn instr_uses(instr: &SsaInstr, out: &mut Vec<SsaValue>) {
             out.push(*value);
         }
         SsaInstr::SlotAddr { .. } => {}
-        SsaInstr::Asm { .. } => {}
+        SsaInstr::Asm {
+            outputs, inputs, ..
+        } => {
+            // 输出是"目标地址"，同样要在汇编指令处保持存活。
+            for (_, addr, _) in outputs {
+                out.push(*addr);
+            }
+            for (_, value, _) in inputs {
+                out.push(*value);
+            }
+        }
     }
 }

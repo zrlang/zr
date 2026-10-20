@@ -10,7 +10,6 @@ use crate::mir::{
     MirBasicBlock, MirBinaryOp, MirFunction, MirInstr, MirParam, MirTerminator, MirUnaryOp,
     MirValue, NumTy,
 };
-use crate::parser::AsmOperand;
 use crate::typeck::hir::{self, HirBlock, HirConst, HirExpr, HirFunction, HirStmt};
 use std::collections::{HashMap, HashSet};
 
@@ -166,6 +165,7 @@ fn lower_expr(b: &mut Builder, expr: &HirExpr) -> MirValue {
                         .push(MirInstr::Store(addr, v, ty));
                     MirValue::Unit
                 }
+                _ => MirValue::Unit,
             }
         }
         Block(block) => lower_block(b, block).unwrap_or(MirValue::Unit),
@@ -375,21 +375,38 @@ fn lower_expr(b: &mut Builder, expr: &HirExpr) -> MirValue {
             Index(recv, idx) => lower_index_addr(b, recv, idx, &place.ty),
             _ => MirValue::Unit,
         },
-        hir::ExprKind::Asm { template, outputs: _, inputs } => {
-            // 内联汇编：评估输入操作数，发射 Asm 指令
-            // 输出操作数是写入位置，不需要评估表达式（它们是目标位置）
-            // 输入操作数需要评估
-            let mut inputs = Vec::new();
-            for inp in inputs {
-                let v = lower_expr(b, &inp.expr);
-                inputs.push((inp.constraint.clone(), v));
+        hir::ExprKind::Asm {
+            template,
+            outputs,
+            inputs,
+        } => {
+            // 输出操作数是写入位置：局部变量走栈槽地址，`*p` 直接取指针值。
+            let mut mir_outputs = Vec::with_capacity(outputs.len());
+            for (constraint, out) in outputs {
+                let addr = match &out.kind {
+                    Local(id) => {
+                        let slot = b.temp();
+                        b.current_block_mut()
+                            .instrs
+                            .push(MirInstr::SlotAddr(slot.clone(), id.0));
+                        MirValue::Var(slot)
+                    }
+                    Deref(ptr) => lower_expr(b, ptr),
+                    _ => MirValue::Unit,
+                };
+                mir_outputs.push((constraint.clone(), addr, num_ty_of(&out.ty)));
+            }
+            let mut mir_inputs = Vec::with_capacity(inputs.len());
+            for (constraint, inp) in inputs {
+                let ty = num_ty_of(&inp.ty);
+                mir_inputs.push((constraint.clone(), lower_expr(b, inp), ty));
             }
             let name = format!("asm{}", b.temp_id());
             b.current_block_mut().instrs.push(MirInstr::Asm {
                 name,
                 template: template.clone(),
-                outputs: Vec::new(), // 输出位置在代码生成时确定
-                inputs,
+                outputs: mir_outputs,
+                inputs: mir_inputs,
             });
             MirValue::Unit
         }
@@ -845,6 +862,17 @@ fn collect_addr_taken_expr(e: &HirExpr, out: &mut HashSet<u32>) {
         }
         Loop(b) => collect_addr_taken(b, out),
         Return(Some(e)) => collect_addr_taken_expr(e, out),
+        Asm { outputs, inputs, .. } => {
+            for (_, e) in outputs {
+                if let Local(id) = &e.kind {
+                    out.insert(id.0);
+                }
+                collect_addr_taken_expr(e, out);
+            }
+            for (_, e) in inputs {
+                collect_addr_taken_expr(e, out);
+            }
+        }
         _ => {}
     }
 }

@@ -43,7 +43,10 @@ fn is_pure(instr: &SsaInstr) -> bool {
     // 被其它写改变，既不能当纯表达式合并（CSE）也不能提出循环（LICM）。
     !matches!(
         instr,
-        SsaInstr::Call { .. } | SsaInstr::Load { .. } | SsaInstr::Store { .. }
+        SsaInstr::Call { .. }
+            | SsaInstr::Load { .. }
+            | SsaInstr::Store { .. }
+            | SsaInstr::Asm { .. }
     )
 }
 
@@ -324,8 +327,12 @@ fn uses(instr: &SsaInstr, out: &mut Vec<SsaValue>) {
             out.push(*value);
         }
         SsaInstr::SlotAddr { .. } => {}
-        SsaInstr::Asm { inputs, .. } => {
-            for (_, v) in inputs {
+        SsaInstr::Asm { outputs, inputs, .. } => {
+            // 输出操作数是"写回地址"，指令执行时同样要读取。
+            for (_, addr, _) in outputs {
+                out.push(*addr);
+            }
+            for (_, v, _) in inputs {
                 out.push(*v);
             }
         }
@@ -794,7 +801,8 @@ fn propagate_constants(func: &mut SsaFunction) {
                     | SsaInstr::Var { .. }
                     | SsaInstr::Load { .. }
                     | SsaInstr::SlotAddr { .. }
-                    | SsaInstr::Store { .. } => {
+                    | SsaInstr::Store { .. }
+                    | SsaInstr::Asm { .. } => {
                         if let Some(r) = instr.result() {
                             if set_lattice(&mut lattice, r, Lattice::Top) {
                                 changed = true;

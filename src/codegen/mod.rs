@@ -804,6 +804,7 @@ pub fn runtime_diagnostic(target: &Target) -> String {
 /// 寄存器压力超出后端能力时报错并退出。
 ///
 /// 已经实现溢出（spilling）的后端不会走到这里。
+#[allow(dead_code)]
 pub fn unsupported_pressure(func: &str, pool: usize) -> ! {
     eprintln!(
         "zr: error: function `{func}` needs more than {pool} registers at once, \
@@ -825,6 +826,14 @@ pub fn unsupported_const(kind: &str) -> ! {
 /// 这个目标后端没有实现该运算码。报错并终止。
 pub fn unsupported_binary_op(op: crate::ssa::SsaBinaryOp) -> ! {
     panic!("zr: 该目标后端尚未实现二元运算 `{op:?}`（浮点/位运算等）")
+}
+
+/// 目标后端没有内联汇编支持时，明确报错并终止。
+pub fn unsupported_inline_asm(target: &str) -> ! {
+    eprintln!(
+        "zr: error: inline assembly (`asm!`) is not implemented for the {target} target"
+    );
+    std::process::exit(1);
 }
 
 pub fn unsupported_cast(from: crate::mir::NumTy, to: crate::mir::NumTy) -> ! {

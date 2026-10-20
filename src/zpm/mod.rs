@@ -2,6 +2,8 @@
 //!
 //! 实现 PubGrub 版本求解算法，支持 semver 范围（`^`、`~`、`>=`、`<=`）。
 
+#![allow(dead_code)]
+
 pub mod registry;
 pub mod build_scripts;
 

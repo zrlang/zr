@@ -264,6 +264,7 @@ fn un_op(unit: &mut CompilationUnit, hw1: u16, rd: Reg, rm: Reg) {
 }
 
 /// 扩展（`sxtb`/`sxth`/`uxtb`/`uxth`）16 位。只编码 Rd，源被隐含为 Rd。
+#[allow(dead_code)]
 fn extend16(unit: &mut CompilationUnit, kind: u16, rd: Reg, rm: Reg) {
     let field: u16 = match kind {
         0b00 => 0b01, // sxtb
@@ -1459,8 +1460,7 @@ fn emit_instr(unit: &mut CompilationUnit, instr: &SsaInstr) {
             }
         }
         SsaInstr::Asm { .. } => {
-            // 内联汇编：暂不支持，占位
-            todo!("inline asm codegen for thumb");
+            crate::codegen::unsupported_inline_asm("thumbv7em");
         }
     }
 }
@@ -1472,7 +1472,7 @@ fn assign_float_slots(func: &SsaFunction) -> usize {
         |v: &SsaValue, map: &HashMap<u32, u8>| -> u8 { map.get(&v.id()).copied().unwrap_or(0) };
     loop {
         let mut changed = false;
-        let mut mark = |v: &SsaValue, w: u8, map: &mut HashMap<u32, u8>| -> bool {
+        let mark = |v: &SsaValue, w: u8, map: &mut HashMap<u32, u8>| -> bool {
             match map.get(&v.id()) {
                 Some(old) if *old >= w => false,
                 _ => {

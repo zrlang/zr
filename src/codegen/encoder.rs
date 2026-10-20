@@ -1090,10 +1090,12 @@ fn emit_instr(unit: &mut CompilationUnit, instr: &SsaInstr) {
                 emit_lea_slot(unit, alloc_reg(*result), slot);
             }
         }
-        SsaInstr::Asm { .. } => {
-            // 内联汇编：暂不支持，占位
-            todo!("inline asm codegen for x86_64");
-        }
+        SsaInstr::Asm {
+            template,
+            outputs,
+            inputs,
+            ..
+        } => emit_inline_asm(unit, template, outputs, inputs),
         SsaInstr::Var { .. } => {
             // Var 是 φ 合并前的引用，运行时无需动作
         }
@@ -2172,6 +2174,661 @@ fn emit_full_alu(unit: &mut CompilationUnit, op: u8, dst: Gpr, src: Gpr) {
     emit1(unit, rex);
     emit1(unit, opcode);
     modrm(unit, 3, src.bits(), dst.bits());
+}
+
+
+// ======================================================================
+// 内联汇编（`asm!`）
+// ======================================================================
+
+/// 汇编操作数可用的寄存器池（顺序固定，保证产物确定）。
+const ASM_REG_POOL: [Gpr; 13] = [
+    Gpr::R10,
+    Gpr::R11,
+    Gpr::R12,
+    Gpr::R13,
+    Gpr::R14,
+    Gpr::R15,
+    Gpr::R8,
+    Gpr::R9,
+    Gpr::Rsi,
+    Gpr::Rdi,
+    Gpr::Rax,
+    Gpr::Rcx,
+    Gpr::Rdx,
+];
+
+/// 内联汇编期间需要保存/恢复的寄存器（编译器可能存放活跃值）。
+const ASM_SAVED: [Gpr; 13] = [
+    Gpr::Rax,
+    Gpr::Rcx,
+    Gpr::Rdx,
+    Gpr::Rsi,
+    Gpr::Rdi,
+    Gpr::R8,
+    Gpr::R9,
+    Gpr::R10,
+    Gpr::R11,
+    Gpr::R12,
+    Gpr::R13,
+    Gpr::R14,
+    Gpr::R15,
+];
+
+fn gpr_by_name(name: &str) -> Option<Gpr> {
+    let n = name.trim().to_ascii_lowercase();
+    Some(match n.as_str() {
+        "rax" | "eax" | "ax" | "al" => Gpr::Rax,
+        "rcx" | "ecx" | "cx" | "cl" => Gpr::Rcx,
+        "rdx" | "edx" | "dx" | "dl" => Gpr::Rdx,
+        "rsi" | "esi" | "si" | "sil" => Gpr::Rsi,
+        "rdi" | "edi" | "di" | "dil" => Gpr::Rdi,
+        "r8" | "r8d" | "r8w" | "r8b" => Gpr::R8,
+        "r9" | "r9d" | "r9w" | "r9b" => Gpr::R9,
+        "r10" | "r10d" | "r10w" | "r10b" => Gpr::R10,
+        "r11" | "r11d" | "r11w" | "r11b" => Gpr::R11,
+        "r12" | "r12d" | "r12w" | "r12b" => Gpr::R12,
+        "r13" | "r13d" | "r13w" | "r13b" => Gpr::R13,
+        "r14" | "r14d" | "r14w" | "r14b" => Gpr::R14,
+        "r15" | "r15d" | "r15w" | "r15b" => Gpr::R15,
+        _ => return None,
+    })
+}
+
+fn xmm_by_name(name: &str) -> Option<u8> {
+    let n = name.trim().to_ascii_lowercase();
+    let rest = n.strip_prefix("xmm")?;
+    rest.parse::<u8>().ok().filter(|v| *v < 16)
+}
+
+fn gpr_name(r: Gpr) -> &'static str {
+    match r {
+        Gpr::Rax => "rax",
+        Gpr::Rcx => "rcx",
+        Gpr::Rdx => "rdx",
+        Gpr::Rsi => "rsi",
+        Gpr::Rdi => "rdi",
+        Gpr::R8 => "r8",
+        Gpr::R9 => "r9",
+        Gpr::R10 => "r10",
+        Gpr::R11 => "r11",
+        Gpr::R12 => "r12",
+        Gpr::R13 => "r13",
+        Gpr::R14 => "r14",
+        Gpr::R15 => "r15",
+    }
+}
+
+/// `push r64`（低 8 个寄存器不带 REX.B）。
+fn emit_push64(unit: &mut CompilationUnit, r: Gpr) {
+    if r.rex_bit() {
+        emit1(unit, 0x41);
+    }
+    emit1(unit, 0x50 + r.bits());
+}
+
+/// `pop r64`。
+fn emit_pop64(unit: &mut CompilationUnit, r: Gpr) {
+    if r.rex_bit() {
+        emit1(unit, 0x41);
+    }
+    emit1(unit, 0x58 + r.bits());
+}
+
+/// `mov r64, imm64`。
+fn emit_mov_imm64(unit: &mut CompilationUnit, dst: Gpr, imm: i64) {
+    let rex = 0x48u8 | if dst.rex_bit() { 0x01 } else { 0 };
+    emit1(unit, rex);
+    emit1(unit, 0xb8 + dst.bits());
+    emit8(unit, imm as u64);
+}
+
+/// `mov [rsp + disp32], src`，按 `ty` 位宽写入。
+fn emit_store_mem_reg(unit: &mut CompilationUnit, base: Gpr, src: Gpr, ty: NumTy) {
+    let (bytes, _) = mem_access(ty);
+    let rex = 0x40 | if src.rex_bit() { 0x04 } else { 0 } | if base.rex_bit() { 0x01 } else { 0 };
+    match bytes {
+        1 => {
+            if rex != 0x40 {
+                emit1(unit, rex);
+            }
+            emit1(unit, 0x88);
+        }
+        2 => {
+            emit1(unit, 0x66);
+            if rex != 0x40 {
+                emit1(unit, rex);
+            }
+            emit1(unit, 0x89);
+        }
+        4 => {
+            if rex != 0x40 {
+                emit1(unit, rex);
+            }
+            emit1(unit, 0x89);
+        }
+        _ => {
+            emit1(unit, rex | 0x08);
+            emit1(unit, 0x89);
+        }
+    }
+    // mod=10 (disp32)，rm=100 (SIB)；SIB base=base、无 index。
+    emit1(unit, 0b10_000_100 | (src.bits() << 3));
+    emit1(unit, 0b00_100_000 | base.bits());
+    emit4(unit, 0);
+}
+
+/// `mov dst, [rsp + disp]`，按 `ty` 位宽/符号扩展。
+fn emit_load_mem_rsp(unit: &mut CompilationUnit, dst: Gpr, disp: i32, ty: NumTy) {
+    let (bytes, signed) = mem_access(ty);
+    let rex = 0x40 | if dst.rex_bit() { 0x04 } else { 0 };
+    match (bytes, signed) {
+        (1, false) => {
+            emit1(unit, rex | 0x08);
+            emit2(unit, 0x0f, 0xb6);
+        }
+        (1, true) => {
+            emit1(unit, rex | 0x08);
+            emit2(unit, 0x0f, 0xbe);
+        }
+        (2, false) => {
+            emit1(unit, rex | 0x08);
+            emit2(unit, 0x0f, 0xb7);
+        }
+        (2, true) => {
+            emit1(unit, rex | 0x08);
+            emit2(unit, 0x0f, 0xbf);
+        }
+        (4, false) => {
+            emit1(unit, rex);
+            emit1(unit, 0x8b);
+        }
+        (4, true) => {
+            emit1(unit, rex | 0x08);
+            emit1(unit, 0x63);
+        }
+        _ => {
+            emit1(unit, rex | 0x08);
+            emit1(unit, 0x8b);
+        }
+    }
+    emit1(unit, 0b10_000_100 | (dst.bits() << 3));
+    emit1(unit, 0b00_100_100);
+    emit4(unit, disp as u32);
+}
+
+/// `op dst, imm32`（`add` / `sub` / `and` / `or` / `xor` / `cmp`）。
+fn emit_alu_imm(unit: &mut CompilationUnit, ext: u8, dst: Gpr, imm: i64, cmp: bool) {
+    let rex = 0x48u8 | if dst.rex_bit() { 0x01 } else { 0 };
+    emit1(unit, rex);
+    emit1(unit, if cmp { 0x81 } else { 0x81 });
+    modrm(unit, 3, ext, dst.bits());
+    emit4(unit, imm as u32);
+}
+
+/// `inc` / `dec` / `not` / `neg`（`FF` 或 `F7` 组）。
+fn emit_group3(unit: &mut CompilationUnit, opcode: u8, ext: u8, dst: Gpr) {
+    let rex = 0x48u8 | if dst.rex_bit() { 0x01 } else { 0 };
+    emit1(unit, rex);
+    emit1(unit, opcode);
+    modrm(unit, 3, ext, dst.bits());
+}
+
+/// 解析汇编立即数：十进制、`0x` 十六进制、可选负号。
+fn parse_imm(text: &str) -> Option<i64> {
+    let t = text.trim();
+    let (neg, t) = match t.strip_prefix('-') {
+        Some(rest) => (true, rest),
+        None => (false, t),
+    };
+    let value = if let Some(hex) = t.strip_prefix("0x").or_else(|| t.strip_prefix("0X")) {
+        i64::from_str_radix(hex, 16).ok()?
+    } else {
+        t.parse::<i64>().ok()?
+    };
+    Some(if neg { -value } else { value })
+}
+
+/// 把 `{0}` / `{1}` 换成操作数寄存器名，并处理 `{{` / `}}` 转义。
+fn substitute_template(template: &str, regs: &[Gpr]) -> String {
+    let mut out = String::with_capacity(template.len());
+    let mut chars = template.chars().peekable();
+    while let Some(c) = chars.next() {
+        match c {
+            '{' => {
+                if chars.peek() == Some(&'{') {
+                    chars.next();
+                    out.push('{');
+                    continue;
+                }
+                let mut digits = String::new();
+                for d in chars.by_ref() {
+                    if d == '}' {
+                        break;
+                    }
+                    digits.push(d);
+                }
+                if let Ok(idx) = digits.parse::<usize>() {
+                    if let Some(r) = regs.get(idx) {
+                        out.push_str(gpr_name(*r));
+                        continue;
+                    }
+                }
+                out.push('{');
+                out.push_str(&digits);
+                out.push('}');
+            }
+            '}' => {
+                if chars.peek() == Some(&'}') {
+                    chars.next();
+                }
+                out.push('}');
+            }
+            _ => out.push(c),
+        }
+    }
+    out
+}
+
+/// 发射一条 SSE 寄存器-寄存器指令。`prefix` 为 `66` / `F3` / `F2`。
+fn emit_sse_rr(
+    unit: &mut CompilationUnit,
+    prefix: Option<u8>,
+    opcode: u8,
+    dst: u8,
+    src: u8,
+) {
+    let mut rex = 0x40u8;
+    if dst >= 8 {
+        rex |= 0x04;
+    }
+    if src >= 8 {
+        rex |= 0x01;
+    }
+    if let Some(p) = prefix {
+        emit1(unit, p);
+    }
+    if rex != 0x40 {
+        emit1(unit, rex);
+    }
+    emit2(unit, 0x0f, opcode);
+    modrm(unit, 3, dst, src);
+}
+
+/// 发射带一个 8 位立即数的 SSE 指令（如 `pslld xmm, imm8`）。
+fn emit_sse_imm(unit: &mut CompilationUnit, prefix: Option<u8>, opcode: u8, ext: u8, dst: u8, imm: u8) {
+    let mut rex = 0x40u8;
+    if dst >= 8 {
+        rex |= 0x01;
+    }
+    if let Some(p) = prefix {
+        emit1(unit, p);
+    }
+    if rex != 0x40 {
+        emit1(unit, rex);
+    }
+    emit2(unit, 0x0f, opcode);
+    modrm(unit, 3, ext, dst);
+    emit1(unit, imm);
+}
+
+/// `movd` / `movq`：GPR <-> XMM。
+fn emit_mov_gpr_xmm(unit: &mut CompilationUnit, xmm: u8, gpr: Gpr, qword: bool, to_xmm: bool) {
+    let mut rex = 0x40u8;
+    if qword {
+        rex |= 0x08;
+    }
+    if xmm >= 8 {
+        rex |= 0x04;
+    }
+    if gpr.rex_bit() {
+        rex |= 0x01;
+    }
+    emit1(unit, 0x66);
+    if rex != 0x40 {
+        emit1(unit, rex);
+    }
+    emit1(unit, 0x0f);
+    // 6E: movd/movq xmm, r/m；7E: movd/movq r/m, xmm。
+    emit1(unit, if to_xmm { 0x6e } else { 0x7e });
+    modrm(unit, 3, xmm, gpr.bits());
+}
+
+/// SSE 二元/一元指令表：`(前缀, 操作码)`。第二个操作数既可以是 XMM，也可以是
+/// 显式 GPR（`movd`/`movq` 单独处理）。
+fn sse_rr_opcode(name: &str) -> Option<(Option<u8>, u8)> {
+    Some(match name {
+        "movaps" => (None, 0x28),
+        "movapd" => (Some(0x66), 0x28),
+        "movups" => (None, 0x10),
+        "movupd" => (Some(0x66), 0x10),
+        "movdqa" => (Some(0x66), 0x6f),
+        "movdqu" => (Some(0xf3), 0x6f),
+        "addps" => (None, 0x58),
+        "addpd" => (Some(0x66), 0x58),
+        "addss" => (Some(0xf3), 0x58),
+        "addsd" => (Some(0xf2), 0x58),
+        "subps" => (None, 0x5c),
+        "subpd" => (Some(0x66), 0x5c),
+        "subss" => (Some(0xf3), 0x5c),
+        "subsd" => (Some(0xf2), 0x5c),
+        "mulps" => (None, 0x59),
+        "mulpd" => (Some(0x66), 0x59),
+        "mulss" => (Some(0xf3), 0x59),
+        "mulsd" => (Some(0xf2), 0x59),
+        "divps" => (None, 0x5e),
+        "divpd" => (Some(0x66), 0x5e),
+        "divss" => (Some(0xf3), 0x5e),
+        "divsd" => (Some(0xf2), 0x5e),
+        "minps" => (None, 0x5d),
+        "minpd" => (Some(0x66), 0x5d),
+        "maxps" => (None, 0x5f),
+        "maxpd" => (Some(0x66), 0x5f),
+        "sqrtps" => (None, 0x51),
+        "sqrtpd" => (Some(0x66), 0x51),
+        "andps" => (None, 0x54),
+        "andpd" => (Some(0x66), 0x54),
+        "andnps" => (None, 0x55),
+        "andnpd" => (Some(0x66), 0x55),
+        "orps" => (None, 0x56),
+        "orpd" => (Some(0x66), 0x56),
+        "xorps" => (None, 0x57),
+        "xorpd" => (Some(0x66), 0x57),
+        "paddb" => (Some(0x66), 0xfc),
+        "paddw" => (Some(0x66), 0xfd),
+        "paddd" => (Some(0x66), 0xfe),
+        "paddq" => (Some(0x66), 0xd4),
+        "psubb" => (Some(0x66), 0xf8),
+        "psubw" => (Some(0x66), 0xf9),
+        "psubd" => (Some(0x66), 0xfa),
+        "psubq" => (Some(0x66), 0xfb),
+        "pmullw" => (Some(0x66), 0xd5),
+        "pmuludq" => (Some(0x66), 0xf4),
+        "pxor" => (Some(0x66), 0xef),
+        "pand" => (Some(0x66), 0xdb),
+        "pandn" => (Some(0x66), 0xdf),
+        "por" => (Some(0x66), 0xeb),
+        "pcmpeqb" => (Some(0x66), 0x74),
+        "pcmpeqw" => (Some(0x66), 0x75),
+        "pcmpeqd" => (Some(0x66), 0x76),
+        "pcmpgtb" => (Some(0x66), 0x64),
+        "pcmpgtw" => (Some(0x66), 0x65),
+        "pcmpgtd" => (Some(0x66), 0x66),
+        "punpcklbw" => (Some(0x66), 0x60),
+        "punpcklwd" => (Some(0x66), 0x61),
+        "punpckldq" => (Some(0x66), 0x62),
+        "punpckhbw" => (Some(0x66), 0x68),
+        "punpckhwd" => (Some(0x66), 0x69),
+        "punpckhdq" => (Some(0x66), 0x6a),
+        _ => return None,
+    })
+}
+
+/// SSE 移位指令：`(ext, 操作码)`（`66 0F 72/73` + imm8）。
+fn sse_shift_opcode(name: &str) -> Option<(u8, u8)> {
+    Some(match name {
+        "pslld" => (6, 0x72),
+        "psrld" => (2, 0x72),
+        "psrad" => (4, 0x72),
+        "psllq" => (6, 0x73),
+        "psrlq" => (2, 0x73),
+        "pslldq" => (7, 0x73),
+        "psrldq" => (3, 0x73),
+        _ => return None,
+    })
+}
+
+/// 发射一条内联汇编语句（x86-64 Intel 语法子集）。
+///
+/// 支持的操作数约束：`reg`（由编译器分配寄存器）或显式 64 位寄存器名。
+/// 支持 `nop` / `ret` / `int3` / `ud2` / `hlt` / `pause` / `leave` /
+/// `syscall` / `rdtsc` / `cpuid`，以及 `mov` / `lea` 之外的常用整数
+/// 指令（`add` / `sub` / `and` / `or` / `xor` / `cmp` / `test` /
+/// `inc` / `dec` / `neg` / `not` / `imul` / `shl` / `shr` / `sar` /
+/// `push` / `pop` / `int`）。
+fn emit_inline_asm(
+    unit: &mut CompilationUnit,
+    template: &str,
+    outputs: &[(String, SsaValue, NumTy)],
+    inputs: &[(String, SsaValue, NumTy)],
+) {
+    let mut used: Vec<Gpr> = Vec::new();
+    let pick = |constraint: &str, used: &mut Vec<Gpr>| -> Gpr {
+        if let Some(r) = gpr_by_name(constraint) {
+            if !used.contains(&r) {
+                used.push(r);
+            }
+            return r;
+        }
+        for r in ASM_REG_POOL {
+            if !used.contains(&r) {
+                used.push(r);
+                return r;
+            }
+        }
+        crate::codegen::unsupported_inline_asm("x86-64");
+    };
+
+    let mut operand_regs: Vec<Gpr> = Vec::with_capacity(outputs.len() + inputs.len());
+    for (constraint, _, _) in outputs {
+        operand_regs.push(pick(constraint, &mut used));
+    }
+    for (constraint, _, _) in inputs {
+        operand_regs.push(pick(constraint, &mut used));
+    }
+    let mut addr_regs: Vec<Gpr> = Vec::with_capacity(outputs.len());
+    for _ in outputs {
+        addr_regs.push(pick("reg", &mut used));
+    }
+
+    // 保存所有可能被编译器占用、且会被本段汇编触碰的寄存器。
+    let saved: Vec<Gpr> = ASM_SAVED
+        .iter()
+        .copied()
+        .filter(|r| used.contains(r))
+        .collect();
+    for r in &saved {
+        emit_push64(unit, *r);
+    }
+
+    // 栈槽在 push 之后整体下移 `saved.len() * 8`。
+    let frame_shift = (saved.len() * 8) as i32;
+    let load_operand = |unit: &mut CompilationUnit, dst: Gpr, v: SsaValue, ty: NumTy| match location_of(v) {
+        Location::Reg(i) => {
+            let src = ALLOCATABLE[i];
+            if src != dst {
+                emit_mov_rr(unit, dst, src);
+            }
+        }
+        Location::Stack(slot) => {
+            emit_load_mem_rsp(unit, dst, frame_shift + (slot as i32) * 8, ty)
+        }
+    };
+
+    for (i, (_, v, _)) in outputs.iter().enumerate() {
+        load_operand(unit, addr_regs[i], *v, NumTy::Uint(64));
+    }
+    let out_base = outputs.len();
+    for (i, (_, v, ty)) in inputs.iter().enumerate() {
+        load_operand(unit, operand_regs[out_base + i], *v, *ty);
+    }
+
+    let text = substitute_template(template, &operand_regs);
+    for line in text.lines() {
+        let line = line.split(';').next().unwrap_or("").split('#').next().unwrap_or("");
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let (mnemonic, rest) = match line.split_once(char::is_whitespace) {
+            Some((m, r)) => (m.to_ascii_lowercase(), r.trim()),
+            None => (line.to_ascii_lowercase(), ""),
+        };
+        let args: Vec<&str> = if rest.is_empty() {
+            Vec::new()
+        } else {
+            rest.split(',').map(str::trim).collect()
+        };
+
+        let reg_arg = |s: &str| -> Option<Gpr> { gpr_by_name(s) };
+        let unsupported = || -> ! {
+            eprintln!("zr: error: unsupported inline assembly instruction: `{line}`");
+            std::process::exit(1);
+        };
+
+        match mnemonic.as_str() {
+            "nop" => emit1(unit, 0x90),
+            "ret" => emit1(unit, 0xc3),
+            "int3" => emit1(unit, 0xcc),
+            "ud2" => emit2(unit, 0x0f, 0x0b),
+            "hlt" => emit1(unit, 0xf4),
+            "pause" => emit2(unit, 0xf3, 0x90),
+            "leave" => emit1(unit, 0xc9),
+            "syscall" => emit2(unit, 0x0f, 0x05),
+            "rdtsc" => emit2(unit, 0x0f, 0x31),
+            "cpuid" => emit2(unit, 0x0f, 0xa2),
+            "int" => {
+                if let Some(imm) = args.first().and_then(|a| parse_imm(a)) {
+                    emit1(unit, 0xcd);
+                    emit1(unit, imm as u8);
+                } else {
+                    unsupported();
+                }
+            }
+            "mov" => {
+                if args.len() != 2 {
+                    unsupported();
+                }
+                let dst = reg_arg(args[0]);
+                let src = reg_arg(args[1]);
+                match (dst, src) {
+                    (Some(d), Some(s)) => emit_mov_rr(unit, d, s),
+                    (Some(d), None) => {
+                        let imm = parse_imm(args[1]).unwrap_or_else(|| unsupported());
+                        emit_mov_imm64(unit, d, imm);
+                    }
+                    _ => unsupported(),
+                }
+            }
+            "add" | "sub" | "and" | "or" | "xor" | "cmp" => {
+                if args.len() != 2 {
+                    unsupported();
+                }
+                let dst = reg_arg(args[0]).unwrap_or_else(|| unsupported());
+                let ext = match mnemonic.as_str() {
+                    "add" => 0,
+                    "or" => 1,
+                    "and" => 4,
+                    "sub" => 5,
+                    "xor" => 6,
+                    "cmp" => 7,
+                    _ => unreachable!(),
+                };
+                match reg_arg(args[1]) {
+                    Some(src) => {
+                        if mnemonic == "cmp" {
+                            emit_cmp_rr(unit, dst, src);
+                        } else {
+                            emit_full_alu(unit, ext, dst, src);
+                        }
+                    }
+                    None => {
+                        let imm = parse_imm(args[1]).unwrap_or_else(|| unsupported());
+                        emit_alu_imm(unit, ext, dst, imm, mnemonic == "cmp");
+                    }
+                }
+            }
+            "test" => {
+                if args.len() != 2 {
+                    unsupported();
+                }
+                let dst = reg_arg(args[0]).unwrap_or_else(|| unsupported());
+                match reg_arg(args[1]) {
+                    Some(src) => emit_test_rr(unit, dst, src),
+                    None => {
+                        let imm = parse_imm(args[1]).unwrap_or_else(|| unsupported());
+                        emit_alu_imm(unit, 0, dst, imm, false);
+                    }
+                }
+            }
+            "inc" | "dec" | "neg" | "not" => {
+                let dst = args.first().and_then(|a| reg_arg(a)).unwrap_or_else(|| unsupported());
+                match mnemonic.as_str() {
+                    "inc" => emit_group3(unit, 0xff, 0, dst),
+                    "dec" => emit_group3(unit, 0xff, 1, dst),
+                    "not" => emit_group3(unit, 0xf7, 2, dst),
+                    "neg" => emit_group3(unit, 0xf7, 3, dst),
+                    _ => unreachable!(),
+                }
+            }
+            "imul" if args.len() == 2 => {
+                let dst = reg_arg(args[0]).unwrap_or_else(|| unsupported());
+                let src = reg_arg(args[1]).unwrap_or_else(|| unsupported());
+                emit_mul(unit, dst, dst, src);
+            }
+            "shl" | "shr" | "sar" => {
+                if args.len() != 2 {
+                    unsupported();
+                }
+                let dst = reg_arg(args[0]).unwrap_or_else(|| unsupported());
+                let imm = parse_imm(args[1]).unwrap_or_else(|| unsupported());
+                let ext = match mnemonic.as_str() {
+                    "shl" => 4,
+                    "shr" => 5,
+                    "sar" => 7,
+                    _ => unreachable!(),
+                };
+                let rex = 0x48u8 | if dst.rex_bit() { 0x01 } else { 0 };
+                emit1(unit, rex);
+                emit1(unit, 0xc1);
+                modrm(unit, 3, ext, dst.bits());
+                emit1(unit, imm as u8);
+            }
+            "push" | "pop" => {
+                let r = args.first().and_then(|a| reg_arg(a)).unwrap_or_else(|| unsupported());
+                if mnemonic == "push" {
+                    emit_push64(unit, r);
+                } else {
+                    emit_pop64(unit, r);
+                }
+            }
+            "movd" | "movq" if args.len() == 2 => {
+                let (qdst, qsrc) = (xmm_by_name(args[0]), xmm_by_name(args[1]));
+                match (qdst, qsrc, reg_arg(args[0]), reg_arg(args[1])) {
+                    (Some(x), None, _, Some(g)) => emit_mov_gpr_xmm(unit, x, g, mnemonic == "movq", true),
+                    (None, Some(x), Some(g), _) => {
+                        emit_mov_gpr_xmm(unit, x, g, mnemonic == "movq", false)
+                    }
+                    (Some(dst), Some(src), _, _) => {
+                        // 寄存器间复制：用 `movaps` 编码（位模式等价）。
+                        emit_sse_rr(unit, None, 0x28, dst, src)
+                    }
+                    _ => unsupported(),
+                }
+            }
+            _ if sse_shift_opcode(&mnemonic).is_some() => {
+                let (ext, opc) = sse_shift_opcode(&mnemonic).unwrap();
+                let dst = args.first().and_then(|a| xmm_by_name(a)).unwrap_or_else(|| unsupported());
+                let imm = args.get(1).and_then(|a| parse_imm(a)).unwrap_or_else(|| unsupported());
+                emit_sse_imm(unit, Some(0x66), opc, ext, dst, imm as u8);
+            }
+            _ if sse_rr_opcode(&mnemonic).is_some() => {
+                let (prefix, opc) = sse_rr_opcode(&mnemonic).unwrap();
+                let dst = args.first().and_then(|a| xmm_by_name(a)).unwrap_or_else(|| unsupported());
+                let src = args.get(1).and_then(|a| xmm_by_name(a)).unwrap_or_else(|| unsupported());
+                emit_sse_rr(unit, prefix, opc, dst, src);
+            }
+            _ => unsupported(),
+        }
+    }
+
+    for (i, (_, _, ty)) in outputs.iter().enumerate() {
+        emit_store_mem_reg(unit, addr_regs[i], operand_regs[i], *ty);
+    }
+
+    for r in saved.iter().rev() {
+        emit_pop64(unit, *r);
+    }
 }
 
 #[cfg(test)]

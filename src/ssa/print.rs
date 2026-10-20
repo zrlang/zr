@@ -80,8 +80,23 @@ pub fn print_module(module: &SsaModule) {
                     super::SsaInstr::Var { result, name } => {
                         println!("%{} = var {}", result.id(), name)
                     }
-                    super::SsaInstr::Asm { .. } => {
-                        println!("; asm!()")
+                    super::SsaInstr::Asm {
+                        template,
+                        outputs,
+                        inputs,
+                    } => {
+                        let fmt_ops = |ops: &[(String, super::SsaValue, crate::mir::NumTy)]| {
+                            ops.iter()
+                                .map(|(c, v, t)| format!("{c}:{t:?} %{}", v.id()))
+                                .collect::<Vec<_>>()
+                                .join(", ")
+                        };
+                        println!(
+                            "; asm!({:?}) out[{}] in[{}]",
+                            template,
+                            fmt_ops(outputs),
+                            fmt_ops(inputs)
+                        )
                     }
                 }
             }

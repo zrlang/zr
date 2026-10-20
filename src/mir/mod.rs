@@ -98,10 +98,10 @@ pub enum MirInstr {
         name: String,
         /// 模板字符串，如 `"add {0}, {1}"`。
         template: String,
-        /// 输出操作数：`out(reg) expr` -> (constraint, expr)
-        outputs: Vec<(String, MirValue)>,
-        /// 输入操作数：`in(reg) expr` -> (constraint, expr)
-        inputs: Vec<(String, MirValue)>,
+        /// 输出操作数：`(约束, 目标地址, 值类型)`。
+        outputs: Vec<(String, MirValue, NumTy)>,
+        /// 输入操作数：`(约束, 值, 值类型)`。
+        inputs: Vec<(String, MirValue, NumTy)>,
     },
 }
 

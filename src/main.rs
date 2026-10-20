@@ -984,8 +984,22 @@ fn emit_llvm_ir(target: &Target, module: &ssa::SsaModule) -> String {
                     SsaInstr::Var { result, name } => {
                         out.push_str(&format!("  ; var {} -> %{}\n", name, result.id()));
                     }
-                    SsaInstr::Asm { .. } => {
-                        out.push_str("  ; asm!()\n");
+                    SsaInstr::Asm {
+                        template,
+                        outputs,
+                        inputs,
+                    } => {
+                        let fmt_ops = |ops: &[(String, ssa::SsaValue, crate::mir::NumTy)]| {
+                            ops.iter()
+                                .map(|(c, v, t)| format!("{c}:{t:?} %{}", v.id()))
+                                .collect::<Vec<_>>()
+                                .join(", ")
+                        };
+                        out.push_str(&format!(
+                            "  ; asm!({template:?}) out[{}] in[{}]\n",
+                            fmt_ops(outputs),
+                            fmt_ops(inputs)
+                        ));
                     }
                 }
             }
