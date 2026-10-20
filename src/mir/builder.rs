@@ -854,6 +854,18 @@ fn lower_expr(b: &mut Builder, expr: &HirExpr) -> MirValue {
             b.current_block_mut().instrs.push(MirInstr::Suspend);
             MirValue::Unit
         }
+        Spawn(inner) => {
+            let frame = lower_expr(b, inner);
+            b.consume_temp(&frame);
+            let name = format!("t{}", b.temp_id());
+            b.current_block_mut().instrs.push(MirInstr::Call(
+                name,
+                "zr_spawn".to_string(),
+                vec![frame],
+                NumTy::Uint(64),
+            ));
+            MirValue::Unit
+        }
         hir::ExprKind::Asm {
             template,
             outputs,
@@ -2234,7 +2246,7 @@ fn collect_addr_taken_expr(e: &HirExpr, out: &mut HashSet<u32>) {
                 collect_addr_taken_expr(e, out);
             }
         }
-        Return(Some(e)) => collect_addr_taken_expr(e, out),
+        Return(Some(e)) | Spawn(e) => collect_addr_taken_expr(e, out),
         Asm {
             outputs, inputs, ..
         } => {

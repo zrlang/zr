@@ -10,6 +10,7 @@
 #   zr_alloc    -> HeapAlloc(GetProcessHeap())
 #   zr_dealloc  -> HeapFree
 #   zr_realloc  -> HeapRealloc
+#   zr_spawn / zr_run_tasks -> 单线程任务队列
 #
 # Microsoft x64 ABI：
 #   前 4 个参数位于 rcx/rdx/r8/r9，第 5 个起在栈上；
@@ -197,4 +198,102 @@ zr_realloc:
     xor     r9d, r9d            // dwFlags = 0
     call    HeapRealloc
     add     rsp, 0x60
+    ret
+#------------------------------------------------------------------------------
+# 任务队列：单线程执行器。
+#   zr_spawn(frame)      把 future 帧挂到队尾，节点 = {frame, next}。
+#   zr_run_tasks()       轮询所有任务；Ready 后调用帧头 drop 并释放节点。
+# 帧头布局由 async_lower 固定：state=0, result=8, poll=16, drop=24。
+#------------------------------------------------------------------------------
+    .section .bss
+    .align 8
+zr_task_head:
+    .quad 0
+zr_task_tail:
+    .quad 0
+
+    .text
+
+    .globl zr_spawn
+zr_spawn:
+    push    rbp
+    mov     rbp, rsp
+    push    r12
+    push    r13
+    sub     rsp, 0x20
+    mov     r12, rcx            // frame
+    mov     ecx, 16
+    mov     edx, 8
+    call    zr_alloc
+    test    rax, rax
+    jz      .spawn_done
+    mov     r13, rax
+    mov     [r13], r12
+    mov     qword ptr [r13+8], 0
+    mov     rax, [zr_task_tail]
+    test    rax, rax
+    jz      .spawn_empty
+    mov     [rax+8], r13
+    jmp     .spawn_set_tail
+.spawn_empty:
+    mov     [zr_task_head], r13
+.spawn_set_tail:
+    mov     [zr_task_tail], r13
+.spawn_done:
+    add     rsp, 0x20
+    pop     r13
+    pop     r12
+    pop     rbp
+    ret
+
+    .globl zr_run_tasks
+zr_run_tasks:
+    push    rbp
+    mov     rbp, rsp
+    push    r12
+    push    r13
+    push    r14
+    sub     rsp, 0x28
+.run_loop:
+    mov     r12, [zr_task_head]
+    test    r12, r12
+    jz      .run_done
+    mov     r13, [r12+8]
+    mov     [zr_task_head], r13
+    test    r13, r13
+    jnz     .run_have_next
+    mov     qword ptr [zr_task_tail], 0
+.run_have_next:
+    mov     r14, [r12]
+    mov     rcx, r14
+    mov     rax, [r14+16]
+    call    rax
+    test    rax, rax
+    jz      .run_pending
+    mov     rcx, r14
+    mov     rax, [r14+24]
+    call    rax
+    mov     rcx, r12
+    mov     edx, 16
+    mov     r8d, 8
+    call    zr_dealloc
+    jmp     .run_loop
+.run_pending:
+    mov     qword ptr [r12+8], 0
+    mov     rax, [zr_task_tail]
+    test    rax, rax
+    jz      .run_pending_empty
+    mov     [rax+8], r12
+    jmp     .run_pending_tail
+.run_pending_empty:
+    mov     [zr_task_head], r12
+.run_pending_tail:
+    mov     [zr_task_tail], r12
+    jmp     .run_loop
+.run_done:
+    add     rsp, 0x28
+    pop     r14
+    pop     r13
+    pop     r12
+    pop     rbp
     ret

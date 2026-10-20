@@ -1,7 +1,7 @@
 #==============================================================================
 # runtime/rt_linux_x86_64.s — zr 语言运行时（Linux x86-64, AT&T syntax）
 #
-# 用纯 syscall 实现 7 个 `zr_*` 符号，不依赖 libc。
+# 用纯 syscall 实现基础 `zr_*` 符号与单线程任务队列，不依赖 libc。
 # System V AMD64 ABI。
 #
 # 系统调用号（x86-64 Linux）：write=1, read=0, exit=60, brk=12
@@ -182,4 +182,101 @@ zr_realloc:
 
 .realloc_inplace:
     movq    %rdi, %rax
+    ret
+
+#------------------------------------------------------------------------------
+# 任务队列：单线程执行器。
+#   zr_spawn(frame)      把 future 帧挂到队尾，节点 = {frame, next}。
+#   zr_run_tasks()       轮询所有任务；Ready 后调用帧头 drop 并释放节点。
+# 帧头布局由 async_lower 固定：state=0, result=8, poll=16, drop=24。
+#------------------------------------------------------------------------------
+    .bss
+    .align  8
+zr_task_head:
+    .quad   0
+zr_task_tail:
+    .quad   0
+
+    .text
+
+    .global zr_spawn
+zr_spawn:
+    pushq   %rbp
+    movq    %rsp, %rbp
+    pushq   %r12
+    pushq   %r13
+    movq    %rdi, %r12          # frame
+    movq    $16, %rdi
+    movq    $8, %rsi
+    call    zr_alloc
+    testq   %rax, %rax
+    jz      .spawn_done
+    movq    %rax, %r13
+    movq    %r12, (%r13)
+    movq    $0, 8(%r13)
+    movq    zr_task_tail(%rip), %rax
+    testq   %rax, %rax
+    jz      .spawn_empty
+    movq    %r13, 8(%rax)
+    jmp     .spawn_set_tail
+.spawn_empty:
+    movq    %r13, zr_task_head(%rip)
+.spawn_set_tail:
+    movq    %r13, zr_task_tail(%rip)
+.spawn_done:
+    popq    %r13
+    popq    %r12
+    popq    %rbp
+    ret
+
+    .global zr_run_tasks
+zr_run_tasks:
+    pushq   %rbp
+    movq    %rsp, %rbp
+    pushq   %r12
+    pushq   %r13
+    pushq   %r14
+    subq    $8, %rsp
+.run_loop:
+    movq    zr_task_head(%rip), %r12
+    testq   %r12, %r12
+    jz      .run_done
+    movq    8(%r12), %r13
+    movq    %r13, zr_task_head(%rip)
+    testq   %r13, %r13
+    jnz     .run_have_next
+    movq    $0, zr_task_tail(%rip)
+.run_have_next:
+    movq    (%r12), %r14
+    movq    %r14, %rdi
+    movq    16(%r14), %rax
+    call    *%rax
+    testq   %rax, %rax
+    jz      .run_pending
+    movq    %r14, %rdi
+    movq    24(%r14), %rax
+    call    *%rax
+    movq    %r12, %rdi
+    movq    $16, %rsi
+    movq    $8, %rdx
+    call    zr_dealloc
+    jmp     .run_loop
+.run_pending:
+    movq    $0, 8(%r12)
+    movq    zr_task_tail(%rip), %rax
+    testq   %rax, %rax
+    jz      .run_pending_empty
+    movq    %r12, 8(%rax)
+    jmp     .run_pending_tail
+.run_pending_empty:
+    movq    %r12, zr_task_head(%rip)
+.run_pending_tail:
+    movq    %r12, zr_task_tail(%rip)
+    jmp     .run_loop
+.run_done:
+    addq    $8, %rsp
+    popq    %r14
+    popq    %r13
+    popq    %r12
+    popq    %rbp
     ret

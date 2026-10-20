@@ -272,8 +272,8 @@ pub enum ExprKind {
     },
     /// `yield`。
     Yield,
-    /// `spawn`。
-    Spawn,
+    /// `spawn`：把内层 future 交给执行器。
+    Spawn(Box<HirExpr>),
     /// `sizeof` / `alignof` / `typeof` / `offsetof` 内置。
     Intrinsic,
 }

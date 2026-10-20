@@ -288,9 +288,16 @@ pub fn compile(target: &Target, module: &SsaModule) -> Result<CompilationUnit, S
 
     // 2. 若有 `main`，包装入口（调用 main 后退出进程）
     let has_main = module.functions.iter().any(|f| f.name == "main");
+    let has_spawn = unit.relocations.iter().any(|r| r.symbol == "zr_spawn");
+    if has_spawn && arch != Arch::X86_64 {
+        return Err(format!(
+            "`spawn` requires x86-64 function pointers; target {} is not supported yet",
+            target.describe()
+        ));
+    }
     if has_main {
         match arch {
-            Arch::X86_64 => encoder::emit_start_wrapper(target, &mut unit),
+            Arch::X86_64 => encoder::emit_start_wrapper(target, &mut unit, has_spawn),
             Arch::AArch64 => encoder_aarch64::emit_start_wrapper(target, &mut unit),
             Arch::Arm32 | Arch::Arm32Thumb => {
                 if target.is_arm32_thumb() {

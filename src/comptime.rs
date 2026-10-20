@@ -725,7 +725,7 @@ fn describe(kind: &ExprKind) -> &'static str {
         ExprKind::Await(_) => "`await`",
         ExprKind::Asm { .. } => "inline assembly",
         ExprKind::Yield => "`yield`",
-        ExprKind::Spawn => "`spawn`",
+        ExprKind::Spawn(_) => "`spawn`",
         ExprKind::Intrinsic => "a compile-time intrinsic",
         _ => "this expression",
     }
@@ -1386,7 +1386,7 @@ fn children_mut(expr: &mut HirExpr) -> Vec<&mut HirExpr> {
         }
         ExprKind::Struct(fields) => fields.iter_mut().map(|(_, e)| e).collect(),
         ExprKind::Index(a, b) => vec![a, b],
-        ExprKind::Cast(a) | ExprKind::Await(a) => vec![a],
+        ExprKind::Cast(a) | ExprKind::Await(a) | ExprKind::Spawn(a) => vec![a],
         ExprKind::If(c, then_block, else_block) => {
             let mut out = vec![c.as_mut()];
             out.extend(block_children_mut(then_block));

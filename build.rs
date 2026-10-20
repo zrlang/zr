@@ -1,7 +1,7 @@
 //! build.rs — 为各目标平台编译 zr 运行时（汇编）并导出其位置。
 //!
-//! 运行时提供 7 个 `zr_*` 符号（panic/write/read/exit/alloc/dealloc/
-//! realloc），各平台实现方式不同：
+//! 运行时提供基础 `zr_*` 符号（panic/write/read/exit/alloc/dealloc/
+//! realloc）以及任务队列入口（spawn/run_tasks），各平台实现方式不同：
 //!
 //! | 目标 | 源文件 | 实现 |
 //! |------|--------|------|

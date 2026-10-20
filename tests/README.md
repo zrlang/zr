@@ -69,6 +69,7 @@ cargo test --test zr_language
 | `48_async_nested_aggregate.zr` | 异步返回数组、结构体、结构体数组及元素读取 |
 | `49_dynamic_future_source.zr` | `-> impl Future` 动态来源：不同分支返回不同异步 future，动态 poll/drop |
 | `50_dynamic_future_aggregate.zr` | 动态 future 返回聚合值：数组结果跨 poll 搬运 |
+| `51_spawn.zr` | `spawn` 任务队列：await 前轮询、退出前清空、Ready 后 drop 帧 |
 
 ## 尚未覆盖（编译器还不支持）
 

@@ -2168,11 +2168,17 @@ fn push_reloc(unit: &mut CompilationUnit, instr_start: usize, instr_len: usize, 
 ///   （x86-64: syscall 号 60；aarch64: `x8 = 93` + `svc #0`），不依赖运行时；
 /// - **macOS / Windows**：把返回值交给运行时的 `zr_exit`
 ///   （分别转发到 libc 的 `_exit` 与 kernel32 的 `ExitProcess`）。
-pub fn emit_start_wrapper(target: &Target, unit: &mut CompilationUnit) {
+pub fn emit_start_wrapper(target: &Target, unit: &mut CompilationUnit, run_tasks: bool) {
     debug_assert_eq!(target.arch(), Arch::X86_64);
     let start = unit.code.len();
 
     emit_call(unit, "main");
+    if run_tasks {
+        // 主函数返回后把剩余任务跑完；r12 是跨调用保留寄存器。
+        emit_mov_rr(unit, Gpr::R12, Gpr::Rax);
+        emit_call(unit, "zr_run_tasks");
+        emit_mov_rr(unit, Gpr::Rax, Gpr::R12);
+    }
 
     match target.os() {
         Os::Linux => {
@@ -3290,7 +3296,7 @@ mod tests {
     fn linux_start_wrapper_calls_main_then_syscall() {
         let mut u = unit();
         let target = Target::new(Arch::X86_64, Os::Linux);
-        emit_start_wrapper(&target, &mut u);
+        emit_start_wrapper(&target, &mut u, false);
         assert_eq!(u.code[0], 0xe8, "call main");
         assert!(u.code.ends_with(&[0x0f, 0x05]), "以 syscall 结束");
         assert_eq!(u.entry, "_start");
@@ -3300,7 +3306,7 @@ mod tests {
     fn macos_start_wrapper_delegates_to_runtime_exit() {
         let mut u = unit();
         let target = Target::new(Arch::X86_64, Os::Darwin);
-        emit_start_wrapper(&target, &mut u);
+        emit_start_wrapper(&target, &mut u, false);
         assert_eq!(u.code[0], 0xe8, "call main");
         assert_eq!(&u.code[5..8], &[0x48, 0x89, 0xc7], "mov rdi, rax");
         assert_eq!(u.code[8], 0xe8, "call zr_exit");
@@ -3309,10 +3315,20 @@ mod tests {
     }
 
     #[test]
+    fn start_wrapper_drains_spawned_tasks() {
+        let mut u = unit();
+        let target = Target::new(Arch::X86_64, Os::Linux);
+        emit_start_wrapper(&target, &mut u, true);
+        let targets: Vec<&str> = u.relocations.iter().map(|r| r.symbol.as_str()).collect();
+        assert_eq!(targets, vec!["main", "zr_run_tasks"]);
+        assert!(u.code.ends_with(&[0x0f, 0x05]), "仍以 syscall 结束");
+    }
+
+    #[test]
     fn windows_start_wrapper_moves_return_into_rcx() {
         let mut u = unit();
         let target = Target::new(Arch::X86_64, Os::Win);
-        emit_start_wrapper(&target, &mut u);
+        emit_start_wrapper(&target, &mut u, false);
         assert_eq!(&u.code[5..8], &[0x48, 0x89, 0xc1], "mov rcx, rax");
         assert_eq!(u.code[8], 0xe8, "call zr_exit");
     }

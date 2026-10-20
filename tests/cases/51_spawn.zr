@@ -1,0 +1,26 @@
+//=============================================================================
+// tests/cases/51_spawn.zr — spawn 任务队列
+//
+// 覆盖：`spawn` 把 future 帧挂到全局执行器；下一次 await 前先跑任务队列；
+// 程序退出前入口桩也会清空队列。任务 Ready 后调用帧头 drop 释放帧。
+//=============================================================================
+
+async fn bump(p: *mut i32) {
+    *p = *p + 1;
+}
+
+async fn tick() -> i32 {
+    return 7;
+}
+
+async fn main() -> i32 {
+    let mut x: i32 = 0;
+    spawn(bump(&mut x));
+    let v: i32 = tick().await;
+    if v != 7 { return 1; }
+    if x != 1 { return 2; }
+
+    // 最后一次 spawn 没有后续 await，由入口桩在退出前清空队列。
+    spawn(bump(&mut x));
+    return 0;
+}

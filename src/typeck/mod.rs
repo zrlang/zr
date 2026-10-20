@@ -1951,10 +1951,14 @@ impl TypeChecker {
             }
             Expression::Spawn(e, _) => {
                 let inner = self.check_expr(e, &Ty::Infer(InferId(0)))?;
-                let _ = inner;
+                if !matches!(inner.ty, Ty::Opaque(_)) {
+                    return Err(CompileError::type_error(
+                        "`spawn` expects a future from an `async fn` or `-> impl Future`",
+                    ));
+                }
                 return Ok(HirExpr {
-                    kind: ExprKind::Spawn,
-                    ty: Ty::Infer(InferId(0)),
+                    kind: ExprKind::Spawn(Box::new(inner)),
+                    ty: Ty::Unit,
                     span,
                 });
             }
@@ -4268,7 +4272,8 @@ fn rewrite_for_continue_expr(e: &mut HirExpr, inc: &HirExpr, depth: usize) {
         | ExprKind::Field(x, _)
         | ExprKind::Deref(x)
         | ExprKind::AddrOf(x)
-        | ExprKind::Cast(x) => rewrite_for_continue_expr(x, inc, depth),
+        | ExprKind::Cast(x)
+        | ExprKind::Spawn(x) => rewrite_for_continue_expr(x, inc, depth),
         ExprKind::Call { args, .. } => {
             for arg in args {
                 rewrite_for_continue_expr(arg, inc, depth);
@@ -4358,7 +4363,8 @@ fn substitute_local(e: &mut hir::HirExpr, target: LocalId, with: &hir::HirExpr) 
         | ExprKind::Deref(v)
         | ExprKind::AddrOf(v)
         | ExprKind::Await(v)
-        | ExprKind::Cast(v) => substitute_local(v, target, with),
+        | ExprKind::Cast(v)
+        | ExprKind::Spawn(v) => substitute_local(v, target, with),
         ExprKind::Return(v) => {
             if let Some(v) = v {
                 substitute_local(v, target, with);
@@ -4409,7 +4415,6 @@ fn substitute_local(e: &mut hir::HirExpr, target: LocalId, with: &hir::HirExpr) 
         | ExprKind::Closure
         | ExprKind::Asm { .. }
         | ExprKind::Yield
-        | ExprKind::Spawn
         | ExprKind::Intrinsic => {}
     }
 }

@@ -64,7 +64,14 @@ pub fn lower_module(module: &mut MirModule) {
         .filter(|f| !f.is_async && f.returns_future && !producers.contains_key(&f.name))
         .map(|f| f.name.clone())
         .collect();
-    let needs_frame_metadata = !dynamic_futures.is_empty();
+    let uses_executor = module.functions.iter().any(|f| {
+        f.blocks.iter().any(|b| {
+            b.instrs
+                .iter()
+                .any(|i| matches!(i, MirInstr::Call(_, callee, _, _) if callee == "zr_spawn"))
+        })
+    });
+    let needs_frame_metadata = !dynamic_futures.is_empty() || uses_executor;
 
     let mut out = Vec::with_capacity(module.functions.len() * 2);
     for mut func in module.functions.drain(..) {
@@ -72,13 +79,24 @@ pub fn lower_module(module: &mut MirModule) {
         if func.is_async && !is_lowered_async {
             // 空块函数无法拆分状态机；它调用的可降级异步子函数仍按同步
             // busy-poll 改写。
-            rewrite_awaits(&mut func, &producers, &dynamic_futures, false);
+            rewrite_awaits(
+                &mut func,
+                &producers,
+                &dynamic_futures,
+                false,
+                uses_executor,
+            );
             out.push(func);
             continue;
         }
         let is_async = func.is_async;
-        let (future_callees, dynamic_callees) =
-            rewrite_awaits(&mut func, &producers, &dynamic_futures, is_async);
+        let (future_callees, dynamic_callees) = rewrite_awaits(
+            &mut func,
+            &producers,
+            &dynamic_futures,
+            is_async,
+            uses_executor,
+        );
         if is_lowered_async {
             match lower_function(
                 func.clone(),
@@ -231,6 +249,7 @@ fn rewrite_awaits(
     producers: &HashMap<String, String>,
     dynamic_futures: &HashSet<String>,
     is_async: bool,
+    executor_tick: bool,
 ) -> (HashMap<String, String>, HashSet<String>) {
     if func.blocks.is_empty() {
         return (HashMap::new(), HashSet::new());
@@ -407,6 +426,16 @@ fn rewrite_awaits(
                         instrs: std::mem::take(&mut cur_instrs),
                         term: Some(MirTerminator::Goto(poll_id)),
                     });
+                    if executor_tick {
+                        if let Some(block) = blocks.last_mut() {
+                            block.instrs.push(MirInstr::Call(
+                                fresh(&mut temp, "__await_t"),
+                                "zr_run_tasks".to_string(),
+                                Vec::new(),
+                                NumTy::Uint(64),
+                            ));
+                        }
+                    }
 
                     let status = fresh(&mut temp, "__await_t");
                     let cond = fresh(&mut temp, "__await_t");
