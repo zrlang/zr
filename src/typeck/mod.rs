@@ -3558,7 +3558,7 @@ fn substitute_local(e: &mut hir::HirExpr, target: LocalId, with: &hir::HirExpr) 
         | ExprKind::Array
         | ExprKind::Tuple
         | ExprKind::Closure
-        | ExprKind::Asm
+        | ExprKind::Asm { .. }
         | ExprKind::Yield
         | ExprKind::Spawn
         | ExprKind::Intrinsic => {}

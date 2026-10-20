@@ -1069,7 +1069,7 @@ impl Parser {
         self.consume(&TokenKind::LParen, "expected '(' after asm!")?;
 
         // 第一个参数：模板字符串
-        let _template = match self.peek().kind.clone() {
+        let template = match self.peek().kind.clone() {
             TokenKind::StringLiteral(s) => {
                 self.advance();
                 s
@@ -1136,7 +1136,7 @@ impl Parser {
         self.consume(&TokenKind::RParen, "expected ')' to close asm!")?;
 
         Ok(Expression::Asm(
-            crate::parser::ast::AsmExpr { outputs, inputs },
+            crate::parser::ast::AsmExpr { template, outputs, inputs },
             span,
         ))
     }

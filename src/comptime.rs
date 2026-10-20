@@ -724,7 +724,7 @@ fn describe(kind: &ExprKind) -> &'static str {
         ExprKind::Struct(_) => "a struct literal",
         ExprKind::Closure => "a closure",
         ExprKind::Await(_) => "`await`",
-        ExprKind::Asm => "inline assembly",
+        ExprKind::Asm { .. } => "inline assembly",
         ExprKind::Yield => "`yield`",
         ExprKind::Spawn => "`spawn`",
         ExprKind::Intrinsic => "a compile-time intrinsic",

@@ -384,7 +384,9 @@ fn lower_expr(b: &mut Builder, expr: &HirExpr) -> MirValue {
                 let v = lower_expr(b, &inp.expr);
                 inputs.push((inp.constraint.clone(), v));
             }
+            let name = format!("asm{}", b.temp_id());
             b.current_block_mut().instrs.push(MirInstr::Asm {
+                name,
                 template: template.clone(),
                 outputs: Vec::new(), // 输出位置在代码生成时确定
                 inputs,

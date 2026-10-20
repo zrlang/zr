@@ -280,7 +280,9 @@ pub enum Literal {
 /// 内联汇编表达式。
 #[derive(Debug, Clone)]
 pub struct AsmExpr {
-    /// 输出操作数：`out(reg) name`。
+    /// 模板字符串，如 `"add {0}, {1}"`。
+    pub template: String,
+    /// 输出操作数：`out(reg) expr`。
     pub outputs: Vec<AsmOperand>,
     /// 输入操作数：`in(reg) expr`。
     pub inputs: Vec<AsmOperand>,

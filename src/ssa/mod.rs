@@ -123,6 +123,9 @@ pub enum SsaInstr {
     ///
     /// 这是一个语句（无结果值），但有副作用，不可被消除或重排。
     Asm {
+        /// 结果变量名（用于 SSA，虽然汇编本身不产生值，但 SSA 形式需要名字）。
+        name: String,
+        /// 模板字符串，如 `"add {0}, {1}"`。
         template: String,
         /// 输出操作数：`out(reg) expr` -> (constraint, expr)
         outputs: Vec<(String, SsaValue)>,
@@ -228,6 +231,7 @@ impl SsaInstr {
             SsaInstr::Var { result, .. } => Some(*result),
             // 存储没有结果值（但仍有副作用）。
             SsaInstr::Store { .. } => None,
+            SsaInstr::Asm { .. } => None,
         }
     }
 }
@@ -963,8 +967,9 @@ fn defined_name_set(block: &mir::MirBasicBlock) -> HashSet<String> {
             | mir::MirInstr::Cast(n, ..)
             | mir::MirInstr::Load(n, ..)
             | mir::MirInstr::SlotAddr(n, _)
-            // Store、Asm 不定义名字。
-            | mir::MirInstr::Store(..) => None,
+            | mir::MirInstr::Asm { name, .. } => Some(name),
+            // Store 不定义名字。
+            mir::MirInstr::Store(..) => None,
         })
         .collect()
 }
@@ -1038,6 +1043,9 @@ fn used_before_def(block: &mir::MirBasicBlock) -> Vec<String> {
                 v.extend(mir_value_names(value));
                 v
             }
+            mir::MirInstr::Asm { inputs, .. } => {
+                inputs.iter().flat_map(|(_, v)| mir_value_names(v)).collect()
+            }
         };
         note_read(reads, &defined, &mut out);
 
@@ -1051,7 +1059,7 @@ fn used_before_def(block: &mir::MirBasicBlock) -> Vec<String> {
             mir::MirInstr::Cast(n, ..) => Some(n),
             mir::MirInstr::Load(n, ..) => Some(n),
             mir::MirInstr::SlotAddr(n, _) => Some(n),
-            mir::MirInstr::Asm { .. } => Some(n),
+            mir::MirInstr::Asm { name, .. } => Some(name),
             // Store 无定义。
             mir::MirInstr::Store(..) => None,
         };
@@ -1392,5 +1400,6 @@ pub fn instr_uses(instr: &SsaInstr, out: &mut Vec<SsaValue>) {
             out.push(*value);
         }
         SsaInstr::SlotAddr { .. } => {}
+        SsaInstr::Asm { .. } => {}
     }
 }

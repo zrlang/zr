@@ -450,10 +450,8 @@ impl WasmModule {
                             data.extend_from_slice(text.as_bytes());
                             data.push(0);
                             strings.insert(text.clone(), addr);
-                        }
-                    }
-                }
-            }
+}
+}
             // 本函数里每个被取地址的局部变量各留 8 字节槽（零初始化）。
             let mut slots: HashMap<u32, i64> = HashMap::new();
             for block in &func.blocks {
@@ -1115,7 +1113,7 @@ fn wasm_binop(op: SsaBinaryOp, lhs_ty: WasmType, rhs_ty: WasmType) -> (WasmType,
 ///
 /// 指针宽度随架构变化：wasm32 的线性内存用 i32 下标，wasm64 用 i64。
 /// 参数类型写死成 i32 的话，wasm64 模块里所有访存都会按 32 位解释地址。
-fn runtime_imports_for(arch: Arch) -> Vec<WasmImport> {
+pub fn runtime_imports_for(arch: Arch) -> Vec<WasmImport> {
     let ptr = if arch == Arch::Wasm64 {
         WasmType::I64
     } else {
@@ -1945,7 +1943,7 @@ mod tests {
     }
 
     /// 扫描顶层段的 id（跳过 magic/version 与各段的长度前缀）。
-    fn section_ids(bytes: &[u8]) -> Vec<u8> {
+    pub fn section_ids(bytes: &[u8]) -> Vec<u8> {
         let mut ids = Vec::new();
         let mut i = 8;
         while i < bytes.len() {
@@ -1998,9 +1996,11 @@ mod tests {
                 // 段内容：vec(count) 后紧跟 limits.flags
                 flags = Some(bytes[i + 1]);
             }
-            i += len as usize;
+i += len as usize;
         }
         assert_eq!(flags.expect("memory 段") & 0x04, 0x04);
+    }
+    }
     }
 
     #[test]
