@@ -5,6 +5,7 @@
 # System V AMD64 ABI。
 #
 # 系统调用号（x86-64 Linux）：write=1, read=0, exit=60, brk=12
+#                            lseek=8, fstat=5, ioctl=16
 #
 # 内存分配：用 brk(12) 实现的简单 bump allocator。
 # 教学级实现：不归还单个块，单次分配失败返回 NULL。
@@ -13,6 +14,11 @@
     .global zr_panic
     .global zr_write
     .global zr_read
+    .global zr_open
+    .global zr_close
+    .global zr_seek
+    .global zr_fstat_size
+    .global zr_isatty
     .global zr_exit
     .global zr_alloc
     .global zr_dealloc
@@ -91,6 +97,62 @@ zr_open:
 zr_close:
     movq    $3, %rax          # SYS_close
     syscall
+    ret
+
+#------------------------------------------------------------------------------
+# zr_seek(fd, offset, whence) -> i64
+#   rdi = fd, rsi = offset（字节数，可为负）, rdx = whence
+#   whence: 0 = 起点(SEEK_SET), 1 = 当前位置(SEEK_CUR), 2 = 末尾(SEEK_END)
+# 返回新的文件偏移；出错返回 -1。
+#------------------------------------------------------------------------------
+zr_seek:
+    movq    $8, %rax          # SYS_lseek
+    syscall
+    testq   %rax, %rax
+    jns     .seek_ok
+    movq    $-1, %rax         # 出错：内核返回 -errno，统一成 -1
+.seek_ok:
+    ret
+
+#------------------------------------------------------------------------------
+# zr_fstat_size(fd) -> i64
+#   rdi = fd
+# 用 fstat(2) 填一个 144 字节的 struct stat，st_size 在偏移 48（8 字节）。
+# 返回文件大小；出错返回 -1。
+#------------------------------------------------------------------------------
+zr_fstat_size:
+    subq    $152, %rsp        # 144 字节的 stat 缓冲区（顺带保持 16 字节对齐）
+    leaq    0(%rsp), %rsi     # statbuf
+    movq    $5, %rax          # SYS_fstat
+    syscall
+    testq   %rax, %rax
+    jl      .fstat_failed
+    movq    48(%rsp), %rax    # st_size
+    addq    $152, %rsp
+    ret
+.fstat_failed:
+    movq    $-1, %rax
+    addq    $152, %rsp
+    ret
+
+#------------------------------------------------------------------------------
+# zr_isatty(fd) -> i32
+#   rdi = fd
+# 用 ioctl(fd, TCGETS) 判断：终端返回 1，其它（文件、管道、错误）返回 0。
+#------------------------------------------------------------------------------
+zr_isatty:
+    subq    $72, %rsp         # struct termios 缓冲区
+    leaq    0(%rsp), %rdx     # termios
+    movq    $0x5401, %rsi     # TCGETS
+    movq    $16, %rax         # SYS_ioctl
+    syscall
+    addq    $72, %rsp
+    testq   %rax, %rax
+    jz      .isatty_yes
+    xorl    %eax, %eax        # 不是终端
+    ret
+.isatty_yes:
+    movl    $1, %eax
     ret
 
 #------------------------------------------------------------------------------

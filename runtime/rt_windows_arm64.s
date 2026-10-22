@@ -3,6 +3,17 @@
 #
 # 与 x86-64 版一一对应：kernel32 薄封装。
 #
+#   zr_write    -> WriteFile
+#   zr_read     -> ReadFile
+#   zr_seek     -> SetFilePointerEx
+#   zr_fstat_size -> GetFileSizeEx
+#   zr_isatty   -> GetConsoleMode
+#   zr_exit     -> ExitProcess
+#   zr_panic    -> WriteFile(stderr) + ExitProcess(99)
+#   zr_alloc    -> HeapAlloc(GetProcessHeap())
+#   zr_dealloc  -> HeapFree
+#   zr_realloc  -> HeapRealloc
+#
 # Windows ARM64 ABI：
 #   前 4 个参数位于 x0..x3，第 5 个起在栈上（[sp]）；
 #   没有 shadow space，x18 为平台保留，x29/x30 用于帧与返回地址；
@@ -119,6 +130,145 @@ zr_read_have_handle:
 
 zr_read_fail:
     mov    x0, #-1
+    add    sp, sp, #0x60
+    ret
+
+#------------------------------------------------------------------------------
+# zr_seek(fd, offset, whence) -> i64
+#   x0=fd, x1=offset（字节数，可为负）, x2=whence
+#   whence: 0 = 起点(FILE_BEGIN), 1 = 当前位置(FILE_CURRENT), 2 = 末尾(FILE_END)
+# 用 SetFilePointerEx：x0=hFile, x1=移动距离（按值）, x2=&新偏移,
+# x3=移动方式。返回新的文件偏移；出错返回 -1。
+#------------------------------------------------------------------------------
+    .globl zr_seek
+zr_seek:
+    sub    sp, sp, #0x60
+    str    x30, [sp, #0x48]     // 跨调用保存返回地址
+    mov    x4, x1               // offset（i64，需要完整 64 位）
+    mov    w5, w2               // whence（32 位）
+    mov    x6, x0               // fd
+    cmp    x6, #0
+    b.eq   zr_seek_stdin
+    cmp    x6, #1
+    b.eq   zr_seek_stdout
+    cmp    x6, #2
+    b.eq   zr_seek_stderr
+    b      zr_seek_call         // 其他值视为原生 HANDLE
+
+zr_seek_stdin:
+    mov    x0, #-10
+    b      zr_seek_call
+
+zr_seek_stdout:
+    mov    x0, #-11
+    b      zr_seek_call
+
+zr_seek_stderr:
+    mov    x0, #-12
+
+zr_seek_call:
+    mov    x1, x4               // liDistanceToMove（按值传递）
+    add    x2, sp, #0x30        // lpNewFilePointer
+    mov    w3, w5               // dwMoveMethod
+    bl     SetFilePointerEx
+    cbz    w0, zr_seek_fail
+    ldr    x0, [sp, #0x30]
+    ldr    x30, [sp, #0x48]
+    add    sp, sp, #0x60
+    ret
+
+zr_seek_fail:
+    mov    x0, #-1
+    ldr    x30, [sp, #0x48]
+    add    sp, sp, #0x60
+    ret
+
+#------------------------------------------------------------------------------
+# zr_fstat_size(fd) -> i64
+#   x0=fd
+# 用 GetFileSizeEx：x0=hFile, x1=&文件大小（LARGE_INTEGER）。
+# 返回文件大小；出错返回 -1。
+#------------------------------------------------------------------------------
+    .globl zr_fstat_size
+zr_fstat_size:
+    sub    sp, sp, #0x60
+    str    x30, [sp, #0x48]
+    mov    x6, x0
+    cmp    x6, #0
+    b.eq   zr_size_stdin
+    cmp    x6, #1
+    b.eq   zr_size_stdout
+    cmp    x6, #2
+    b.eq   zr_size_stderr
+    b      zr_size_call         // 其他值视为原生 HANDLE
+
+zr_size_stdin:
+    mov    x0, #-10
+    b      zr_size_call
+
+zr_size_stdout:
+    mov    x0, #-11
+    b      zr_size_call
+
+zr_size_stderr:
+    mov    x0, #-12
+
+zr_size_call:
+    add    x1, sp, #0x30        // lpFileSize
+    bl     GetFileSizeEx
+    cbz    w0, zr_size_fail
+    ldr    x0, [sp, #0x30]
+    ldr    x30, [sp, #0x48]
+    add    sp, sp, #0x60
+    ret
+
+zr_size_fail:
+    mov    x0, #-1
+    ldr    x30, [sp, #0x48]
+    add    sp, sp, #0x60
+    ret
+
+#------------------------------------------------------------------------------
+# zr_isatty(fd) -> i32
+#   x0=fd
+# 用 GetConsoleMode：成功说明句柄是控制台（终端），返回 1；否则返回 0。
+#------------------------------------------------------------------------------
+    .globl zr_isatty
+zr_isatty:
+    sub    sp, sp, #0x60
+    str    x30, [sp, #0x48]
+    mov    x6, x0
+    cmp    x6, #0
+    b.eq   zr_tty_stdin
+    cmp    x6, #1
+    b.eq   zr_tty_stdout
+    cmp    x6, #2
+    b.eq   zr_tty_stderr
+    b      zr_tty_call          // 其他值视为原生 HANDLE
+
+zr_tty_stdin:
+    mov    x0, #-10
+    b      zr_tty_call
+
+zr_tty_stdout:
+    mov    x0, #-11
+    b      zr_tty_call
+
+zr_tty_stderr:
+    mov    x0, #-12
+
+zr_tty_call:
+    add    x1, sp, #0x30        // lpMode
+    bl     GetConsoleMode
+    cbz    w0, zr_tty_not_tty
+    mov    x0, #1
+    ldr    x30, [sp, #0x48]
+    add    sp, sp, #0x60
+    ret
+
+zr_tty_not_tty:
+    mov    x0, #0
+    ldr    x30, [sp, #0x48]
     add    sp, sp, #0x60
     ret
 

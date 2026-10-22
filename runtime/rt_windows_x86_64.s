@@ -5,6 +5,9 @@
 # 因此运行时是 kernel32 的薄封装：
 #   zr_write    -> WriteFile
 #   zr_read     -> ReadFile
+#   zr_seek     -> SetFilePointerEx
+#   zr_fstat_size -> GetFileSizeEx
+#   zr_isatty   -> GetConsoleMode
 #   zr_exit     -> ExitProcess
 #   zr_panic    -> WriteFile(stderr) + ExitProcess(99)
 #   zr_alloc    -> HeapAlloc(GetProcessHeap())
@@ -18,6 +21,9 @@
 #   因此每次调用前都要 `sub rsp, 0x40`：前 0x20 字节是 shadow space，
 #   `[rsp+0x20]` 是第 5 个参数槽（lpOverlapped = NULL），
 #   `[rsp+0x28]` 是我们自用的"实际读写字节数"缓冲区。
+#   （函数入口处 rsp ≡ 8 (mod 16)，调用点要求 rsp ≡ 0 (mod 16)，
+#   故需要自用栈槽的新函数用 `sub rsp, 0x48`：0x20 shadow space +
+#   0x08 对齐 + 0x20 自用空间。）
 #
 # 语法：MSVC / clang / mingw 都可以用 Intel 语法汇编，故显式声明。
 # 链接需要 kernel32 的导入库（clang 驱动会自动附加）。
@@ -137,6 +143,154 @@ zr_read_call:
 zr_read_failed:
     mov     rax, -1
     add     rsp, 0x40
+    ret
+
+#------------------------------------------------------------------------------
+# zr_seek(fd, offset, whence) -> i64
+#   rcx = fd, rdx = offset（字节数，可为负）, r8 = whence
+#   whence: 0 = 起点(FILE_BEGIN), 1 = 当前位置(FILE_CURRENT), 2 = 末尾(FILE_END)
+# 用 SetFilePointerEx：rcx=hFile, rdx=移动距离（按值）, r8=&新偏移,
+# r9=移动方式。返回新的文件偏移；出错返回 -1。
+#------------------------------------------------------------------------------
+    .globl zr_seek
+zr_seek:
+    push    rbx                 # 保存调用者的 rbx（callee-save）
+    mov     rbx, rsp            # rbx = 原始栈指针（用于返回时还原）
+    and     rsp, -16            # 强制 16 字节对齐：调用点要求 rsp ≡ 0 (mod 16)
+    sub     rsp, 0x50           # 0x20 shadow space + 0x10 第 5 参数槽 + 0x20 自用
+    mov     r10, rdx            # offset（i64，需要完整 64 位）
+    mov     r11d, r8d           # whence（32 位）
+    mov     rax, rcx            # fd
+    cmp     rax, 0
+    je      zr_seek_stdin
+    cmp     rax, 1
+    je      zr_seek_stdout
+    cmp     rax, 2
+    je      zr_seek_stderr
+    jmp     zr_seek_call        // 其他值视为原生 HANDLE
+
+zr_seek_stdin:
+    mov     rcx, -10
+    jmp     zr_seek_call
+
+zr_seek_stdout:
+    mov     rcx, -11
+    jmp     zr_seek_call
+
+zr_seek_stderr:
+    mov     rcx, -12
+
+zr_seek_call:
+    mov     rdx, r10            // liDistanceToMove（按值传递）
+    lea     r8, [rsp+0x30]      // lpNewFilePointer
+    mov     r9d, r11d           // dwMoveMethod
+    call    SetFilePointerEx
+    test    eax, eax
+    jz      zr_seek_failed
+    mov     rax, qword ptr [rsp+0x30]
+    mov     rsp, rbx
+    pop     rbx
+    ret
+
+zr_seek_failed:
+    mov     rax, -1
+    mov     rsp, rbx
+    pop     rbx
+    ret
+
+#------------------------------------------------------------------------------
+# zr_fstat_size(fd) -> i64
+#   rcx = fd
+# 用 GetFileSizeEx：rcx=hFile, rdx=&文件大小（LARGE_INTEGER）。
+# 返回文件大小；出错返回 -1。
+#------------------------------------------------------------------------------
+    .globl zr_fstat_size
+zr_fstat_size:
+    push    rbx
+    mov     rbx, rsp
+    and     rsp, -16            # 强制 16 字节对齐
+    sub     rsp, 0x50           # 0x20 shadow space + 0x10 第 5 参数槽 + 0x20 自用
+    mov     rax, rcx
+    cmp     rax, 0
+    je      zr_size_stdin
+    cmp     rax, 1
+    je      zr_size_stdout
+    cmp     rax, 2
+    je      zr_size_stderr
+    jmp     zr_size_call        // 其他值视为原生 HANDLE
+
+zr_size_stdin:
+    mov     rcx, -10
+    jmp     zr_size_call
+
+zr_size_stdout:
+    mov     rcx, -11
+    jmp     zr_size_call
+
+zr_size_stderr:
+    mov     rcx, -12
+
+zr_size_call:
+    lea     rdx, [rsp+0x30]      // lpFileSize
+    call    GetFileSizeEx
+    test    eax, eax
+    jz      zr_size_failed
+    mov     rax, qword ptr [rsp+0x30]
+    mov     rsp, rbx
+    pop     rbx
+    ret
+
+zr_size_failed:
+    mov     rax, -1
+    mov     rsp, rbx
+    pop     rbx
+    ret
+
+#------------------------------------------------------------------------------
+# zr_isatty(fd) -> i32
+#   rcx = fd
+# 用 GetConsoleMode：成功说明句柄是控制台（终端），返回 1；否则返回 0。
+#------------------------------------------------------------------------------
+    .globl zr_isatty
+zr_isatty:
+    push    rbx
+    mov     rbx, rsp
+    and     rsp, -16            # 强制 16 字节对齐
+    sub     rsp, 0x50           # 0x20 shadow space + 0x10 第 5 参数槽 + 0x20 自用
+    mov     rax, rcx
+    cmp     rax, 0
+    je      zr_tty_stdin
+    cmp     rax, 1
+    je      zr_tty_stdout
+    cmp     rax, 2
+    je      zr_tty_stderr
+    jmp     zr_tty_call         // 其他值视为原生 HANDLE
+
+zr_tty_stdin:
+    mov     rcx, -10
+    jmp     zr_tty_call
+
+zr_tty_stdout:
+    mov     rcx, -11
+    jmp     zr_tty_call
+
+zr_tty_stderr:
+    mov     rcx, -12
+
+zr_tty_call:
+    lea     rdx, [rsp+0x30]      // lpMode
+    call    GetConsoleMode
+    test    eax, eax
+    jz      zr_tty_not_tty
+    mov     eax, 1
+    mov     rsp, rbx
+    pop     rbx
+    ret
+
+zr_tty_not_tty:
+    xor     eax, eax
+    mov     rsp, rbx
+    pop     rbx
     ret
 
 #------------------------------------------------------------------------------

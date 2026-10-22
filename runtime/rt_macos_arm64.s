@@ -57,19 +57,19 @@ _zr_open:
     mov     x29, sp
     mov     x8, x1             // x8 = mode
     cmp     x8, 0
-    b.eq    1f
+    b.eq    2f                 // 只读
     cmp     x8, 1
-    b.eq    2f
-    // 只读：O_RDONLY
-    mov     x1, 0
+    b.eq    1f                 // 写（截断）
+    // 追加：O_WRONLY | O_CREAT | O_APPEND = 0x1 | 0x200 | 0x8
+    mov     x1, 0x209
     b       3f
 1:
-    // O_WRONLY | O_CREAT | O_TRUNC = 0x1 | 0x200 | 0x400
+    // 写（截断）：O_WRONLY | O_CREAT | O_TRUNC = 0x1 | 0x200 | 0x400
     mov     x1, 0x601
     b       3f
 2:
-    // O_WRONLY | O_CREAT | O_APPEND = 0x1 | 0x200 | 0x8
-    mov     x1, 0x209
+    // 只读：O_RDONLY
+    mov     x1, 0
 3:
     mov     x2, 0644           // mode
     bl      _open
@@ -83,6 +83,57 @@ _zr_open:
     .globl _zr_close
 _zr_close:
     b       _close
+
+#------------------------------------------------------------------------------
+# zr_seek(fd, offset, whence) -> i64
+#   x0=fd, x1=offset（字节数，可为负）, x2=whence
+#   whence: 0 = 起点(SEEK_SET), 1 = 当前位置(SEEK_CUR), 2 = 末尾(SEEK_END)
+# lseek 的参数顺序与 C 一致，SEEK_SET/CUR/END 也正好是 0/1/2；
+# 出错时 libc 返回 -1，正是我们对外的约定。
+#------------------------------------------------------------------------------
+    .globl _zr_seek
+_zr_seek:
+    b       _lseek
+
+#------------------------------------------------------------------------------
+# zr_fstat_size(fd) -> i64
+#   x0=fd
+# macOS 的 struct stat 是 144 字节，st_size 在偏移 96（8 字节）。
+# arm64 上只有 64 位 inode 一套 ABI，libc 的符号就是 `fstat`。
+# 返回文件大小；出错返回 -1。
+#------------------------------------------------------------------------------
+    .globl _zr_fstat_size
+_zr_fstat_size:
+    stp     x29, x30, [sp, #-32]!
+    mov     x29, sp
+    sub     sp, sp, #144       // 144 字节的 stat 缓冲区（sp 保持 16 字节对齐）
+    mov     x1, sp             // statbuf
+    bl      _fstat
+    cmp     x0, #0
+    b.ne    .fstat_failed      // fstat 成功返回 0
+    ldr     x0, [sp, #96]      // st_size
+    b       .fstat_done
+.fstat_failed:
+    mov     x0, #-1
+.fstat_done:
+    add     sp, sp, #144
+    ldp     x29, x30, [sp], #32
+    ret
+
+#------------------------------------------------------------------------------
+# zr_isatty(fd) -> i32
+#   x0=fd
+# libc 的 isatty：终端返回非 0，其它返回 0；这里统一成 1 / 0。
+#------------------------------------------------------------------------------
+    .globl _zr_isatty
+_zr_isatty:
+    stp     x29, x30, [sp, #-16]!
+    mov     x29, sp
+    bl      _isatty
+    cmp     x0, #0
+    cset    w0, ne              // 终端 -> 1，其它 -> 0
+    ldp     x29, x30, [sp], #16
+    ret
 
 #------------------------------------------------------------------------------
 # zr_exit(code) -> !

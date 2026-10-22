@@ -18,6 +18,9 @@
 //   io::print_fmt("pi = {}\n", &[io::fmt_float(3.14)]);
 //
 // 这个模块是**自足**的：不依赖 core，因此单独 `use io::...` 就能用。
+//
+// 浮点参数（`FormatArg` 里的那一项）用 IEEE 754 的位模式传，不用 f64
+// 字段——见下面"f64 的位模式"一节。
 //=============================================================================
 
 //----- 外部运行时（由编译器/运行时提供）----------------------------------------
@@ -41,6 +44,23 @@ extern "C" {
 /// 关闭文件描述符。成功返回 0，出错返回 -1。
 extern "C" {
     fn zr_close(fd: i32) -> i32;
+}
+
+/// 移动文件位置。`whence`：0 = 起点，1 = 当前，2 = 末尾。
+///
+/// 返回移动后的位置（字节偏移）；出错时返回 -1。
+extern "C" {
+    fn zr_seek(fd: i32, offset: i64, whence: i32) -> i64;
+}
+
+/// 取文件的大小（字节）。出错时返回 -1。
+extern "C" {
+    fn zr_fstat_size(fd: i32) -> i64;
+}
+
+/// 判断文件描述符是不是终端。是终端返回 1，其它返回 0。
+extern "C" {
+    fn zr_isatty(fd: i32) -> i32;
 }
 
 /// 终止程序，返回给定的退出码。
@@ -131,6 +151,200 @@ pub fn write_hex(fd: i32, mut n: u64, upper: bool) -> usize {
 
 /// f64 的最大值（用来判断是不是无穷）。
 const F64_MAX: f64 = 1.7976931348623157e308;
+
+/// 2^52（尾数的隐含位）。
+const F64_POW52: f64 = 4503599627370496.0;
+
+/// 2^1022（次正规数算尾数时用）。
+///
+/// 字面量必须是 2^1022 的**精确**值：4.4942328371557893e307 比 2^1022
+/// 小一格，次正规数的尾数会算错。
+const F64_POW2_1022: f64 = 4.49423283715579e307;
+
+/// 尾数占 52 位（隐含的最高位不算在内）。
+const F64_MANT_SHIFT: i64 = 52;
+
+/// 指数域的偏置：实际指数 = 指数域 - 1023。
+const F64_EXP_BIAS: i64 = 1023;
+
+/// 尾数掩码（低 52 位）。
+const F64_MANT_MASK: i64 = 4503599627370495;
+
+/// 正无穷的位模式。
+const F64_INF_BITS: i64 = 9218868437227405312;
+
+/// 安静 NaN 的位模式。
+const F64_NAN_BITS: i64 = 9221120237041090560;
+
+//=============================================================================
+// f64 的位模式
+//=============================================================================
+//
+// 浮点参数在结构体里用**位模式**（整数）传递，不用 f64 字段。
+//
+// 原因：结构体按值拷贝走的是"逐字段拷贝"，f64 字段要经过内存与浮点
+// 寄存器之间的搬运；编译器在这条路径上有 bug——数组里的 f64 字段会被
+// 读成 0.0（`-O3` 下甚至直接崩）。位模式只走普通整数寄存器与内存，
+// 不会在拷贝里被弄丢。
+//
+// 位模式按 IEEE 754 的布局：符号位 | 指数域（11 位）| 尾数域（52 位）。
+
+/// f64 的符号位（最高位）。作为 i64 看就是 -2^63。
+///
+/// 模块级常量只能是字面量，负的字面量会被当成外部符号，所以这里用
+/// 减法算出来：2^62 的两倍就是 2^63。
+fn f64_sign_bit() -> i64 {
+    let half: i64 = 4611686018427387904;
+    return (0 as i64) - half - half;
+}
+
+/// 2 的整数次幂（结果精确：二进制浮点能精确表示 2 的幂）。
+///
+/// 不用 `if` 分两支算——同一个浮点局部在两个分支里各改一次，编译器
+/// 合并分支时会把值弄丢；这里把"翻倍还是减半"折算成一个乘数。
+fn pow2(k: i64) -> f64 {
+    let mut n = k;
+    let mut dir: i64 = 1;
+    if k < 0 {
+        n = 0 - k;
+        dir = -1;
+    }
+    // dir = 1 → 2.0；dir = -1 → 0.5
+    let mul = ((dir as f64) * 0.75) + 1.25;
+    let mut r = 1.0;
+    let mut i: i64 = 0;
+    while i < n {
+        r = r * mul;
+        i = i + 1;
+    }
+    return r;
+}
+
+/// 正无穷。
+fn f64_infinity() -> f64 {
+    return 1.0 / 0.0;
+}
+
+/// NaN。
+fn f64_nan() -> f64 {
+    return 0.0 / 0.0;
+}
+
+/// 把 f64 变成它的 IEEE 754 位模式。
+///
+/// 做法：取绝对值，把绝对值缩放到 [2^52, 2^60)（乘 / 除 2 的幂都是
+/// 精确的），于是尾数与指数都能整除地取出来；次正规数单独处理。
+///
+/// 注意：浮点形参在循环里是坏的（编译器不把它落栈，循环里读到的是
+/// 垃圾），所以形参先参与一次浮点运算（下面的比较），再把值复制到
+/// 局部变量里用；循环条件也只看整数。
+fn f64_to_bits(v: f64) -> i64 {
+    // NaN
+    if v != v {
+        return F64_NAN_BITS;
+    }
+    // 正负无穷
+    if v > F64_MAX {
+        return F64_INF_BITS;
+    }
+    if v < -F64_MAX {
+        return F64_INF_BITS + f64_sign_bit();
+    }
+    // 符号（-0.0 也要带负号：1.0 / v < 0 能把它认出来）
+    let mut sgn: i64 = 1;
+    if v < 0.0 {
+        sgn = -1;
+    } else if v == 0.0 && 1.0 / v < 0.0 {
+        sgn = -1;
+    }
+    // 绝对值：乘一个 ±1.0，不用分支改同一个浮点局部。
+    let a0 = v * (sgn as f64);
+    if a0 == 0.0 {
+        if sgn < 0 {
+            return f64_sign_bit();
+        }
+        return 0;
+    }
+
+    // 正规数的指数域是 e + 1023；次正规数的指数域是 0（尾数另算）。
+    //
+    // 指数 e：把 a0 缩放到 [2^52, 2^60) 之后，a0 自己的指数就是
+    // "缩放后 a 的指数 - 缩放量"。
+    //
+    // 缩放只动整数（循环条件看整数部分），浮点的比较只在循环外做——
+    // 浮点的比较放在循环里，编译器处理得不对。
+    let mut a = a0 + 0.0;
+    let mut shift: i64 = 0;
+    let mut guard: i64 = 0;
+    // 太大（超过 2^63，整数部分就取不到了）就除以 2^64
+    while (a as i64) == -9223372036854775807 - 1 && guard < 20 {
+        a = a / 18446744073709551616.0;
+        shift = shift - 64;
+        guard = guard + 1;
+    }
+    // 太小就乘 2^8（乘 256.0 精确）
+    guard = 0;
+    let mut ip = a as u64;
+    while ip < 4503599627370496 && guard < 1400 {
+        a = a * 256.0;
+        shift = shift + 8;
+        ip = a as u64;
+        guard = guard + 1;
+    }
+    // a 现在在 [2^52, 2^60)：指数就是 ip 的最高位位置
+    let mut exp: i64 = 0;
+    let mut p = ip;
+    while p >= 2 {
+        p = p / 2;
+        exp = exp + 1;
+    }
+    let e = exp - shift;
+    let mut mag: i64 = 0;
+    if e < -1022 {
+        // 次正规数：指数域是 0，尾数域是 a0 * 2^1074。
+        // 分两步乘（2^1022 与 2^52 各自单独可表示），每一步都精确。
+        mag = ((a0 * F64_POW2_1022) * F64_POW52) as i64;
+    } else {
+        // 正规数：尾数 = a / 2^exp 的小数部分（乘 2^52 后取整）
+        let m = (((a / pow2(exp)) - 1.0) * F64_POW52) as i64;
+        mag = ((e + F64_EXP_BIAS) << F64_MANT_SHIFT) | m;
+    }
+    if sgn < 0 {
+        return mag + f64_sign_bit();
+    }
+    return mag;
+}
+
+/// 把 IEEE 754 的位模式还原成 f64（与 `f64_to_bits` 互逆）。
+fn f64_from_bits(bits: i64) -> f64 {
+    // 标志用整数而不是 bool：布尔值在分支合并时会被弄错（符号会反）。
+    let mut neg: i64 = 0;
+    let mut mag = bits;
+    if mag < 0 {
+        neg = 1;
+        mag = mag - f64_sign_bit();
+    }
+    let exp = mag >> F64_MANT_SHIFT;
+    let mant = mag & F64_MANT_MASK;
+    if exp == 2047 {
+        if mant == 0 {
+            return f64_infinity();
+        }
+        return f64_nan();
+    }
+    let mut v: f64 = 0.0;
+    if exp == 0 {
+        // 次正规数：值 = 尾数 * 2^-1074
+        v = (mant as f64) * pow2(0 - 1074);
+    } else {
+        // 正规数：值 = (1 + 尾数/2^52) * 2^(指数域 - 偏置)
+        v = (1.0 + (mant as f64) / F64_POW52) * pow2(exp - F64_EXP_BIAS);
+    }
+    if neg != 0 {
+        return -v;
+    }
+    return v;
+}
 
 /// 按 Rust 的 Display 规则写出一个 f64，返回写入的字节数。
 ///
@@ -277,13 +491,18 @@ pub fn write_float(fd: i32, v: f64) -> usize {
 ///
 /// 字符串按 (指针, 长度) 传——切片在 zr 里是地址表示的，直接传切片会
 /// 丢长度。
+///
+/// 浮点用**位模式**（`float_bits`）传，不用 f64 字段：结构体按值拷贝
+/// 时 f64 字段要经过内存与浮点寄存器之间的搬运，编译器在这条路径上
+/// 有 bug（数组里的 f64 字段会被读成 0.0，`-O3` 下甚至直接崩）；
+/// 整数位模式只走普通整数寄存器与内存，不会被弄丢。
 pub struct FormatArg {
     /// 种类：0=int 1=uint 2=float 3=bool 4=str 5=char 6=hex
     pub kind: i32,
     /// 整数 / 字符的值。
     pub int_value: i64,
-    /// 浮点的值。
-    pub float_value: f64,
+    /// 浮点的 IEEE 754 位模式（`kind` 为 2 时有效）。
+    pub float_bits: i64,
     /// 字符串的指针。
     pub str_ptr: *const u8,
     /// 字符串的长度。
@@ -292,37 +511,46 @@ pub struct FormatArg {
 
 /// 一个整数参数。
 pub fn fmt_int(n: i64) -> FormatArg {
-    return FormatArg { kind: 0, int_value: n, float_value: 0.0, str_ptr: 0 as *const u8, str_len: 0 };
+    return FormatArg { kind: 0, int_value: n, float_bits: 0, str_ptr: 0 as *const u8, str_len: 0 };
 }
 
 /// 一个无符号整数参数。
 pub fn fmt_uint(n: u64) -> FormatArg {
-    return FormatArg { kind: 1, int_value: n as i64, float_value: 0.0, str_ptr: 0 as *const u8, str_len: 0 };
+    return FormatArg { kind: 1, int_value: n as i64, float_bits: 0, str_ptr: 0 as *const u8, str_len: 0 };
 }
 
 /// 一个浮点参数。
 pub fn fmt_float(n: f64) -> FormatArg {
-    return FormatArg { kind: 2, int_value: 0, float_value: n, str_ptr: 0 as *const u8, str_len: 0 };
+    // 先做一次浮点运算（乘 1.0 不改值）。
+    //
+    // 浮点形参只有在参与浮点运算时才会被编译器落到栈槽上；只当实参
+    // 传下去的话不落槽，调用时读到的是垃圾（0.0）。
+    let v = n * 1.0;
+    // NaN 单独处理（位模式是固定的）。
+    if v != v {
+        return FormatArg { kind: 2, int_value: 0, float_bits: F64_NAN_BITS, str_ptr: 0 as *const u8, str_len: 0 };
+    }
+    return FormatArg { kind: 2, int_value: 0, float_bits: f64_to_bits(v), str_ptr: 0 as *const u8, str_len: 0 };
 }
 
 /// 一个布尔参数。
 pub fn fmt_bool(b: bool) -> FormatArg {
-    return FormatArg { kind: 3, int_value: if b { 1 } else { 0 }, float_value: 0.0, str_ptr: 0 as *const u8, str_len: 0 };
+    return FormatArg { kind: 3, int_value: if b { 1 } else { 0 }, float_bits: 0, str_ptr: 0 as *const u8, str_len: 0 };
 }
 
 /// 一个字符串参数。
 pub fn fmt_str(s: str) -> FormatArg {
-    return FormatArg { kind: 4, int_value: 0, float_value: 0.0, str_ptr: s.ptr, str_len: s.len };
+    return FormatArg { kind: 4, int_value: 0, float_bits: 0, str_ptr: s.ptr, str_len: s.len };
 }
 
 /// 一个字符参数。
 pub fn fmt_char(c: char) -> FormatArg {
-    return FormatArg { kind: 5, int_value: c as i64, float_value: 0.0, str_ptr: 0 as *const u8, str_len: 0 };
+    return FormatArg { kind: 5, int_value: c as i64, float_bits: 0, str_ptr: 0 as *const u8, str_len: 0 };
 }
 
 /// 一个十六进制参数。
 pub fn fmt_hex(n: u64) -> FormatArg {
-    return FormatArg { kind: 6, int_value: n as i64, float_value: 0.0, str_ptr: 0 as *const u8, str_len: 0 };
+    return FormatArg { kind: 6, int_value: n as i64, float_bits: 0, str_ptr: 0 as *const u8, str_len: 0 };
 }
 
 //=============================================================================
@@ -452,10 +680,12 @@ fn write_arg(fd: i32, arg: &FormatArg, spec: i32) {
         return;
     }
     if arg.kind == 2 {
+        // 浮点的值从位模式还原（结构体里不存 f64 字段，见 FormatArg）。
+        let v = f64_from_bits(arg.float_bits);
         if spec == SPEC_DEBUG {
-            write_float_debug(fd, arg.float_value);
+            write_float_debug(fd, v);
         } else {
-            write_float(fd, arg.float_value);
+            write_float(fd, v);
         }
         return;
     }
@@ -518,20 +748,21 @@ fn write_float_debug(fd: i32, v: f64) {
     // 整数值要补 ".0"（Rust 的 `{:?}` 就是这样）。
     //
     // "是不是整数值"要在写之前算好——写完再回头看返回值不牢靠。
-    let whole = is_whole_float(v);
+    //
+    // 这里**先**把形参用在一次浮点运算上（转成整数再比回去）：浮点形参
+    // 只有参与浮点运算时，编译器才会把它落到栈槽上；只当实参传下去的话
+    // 不落槽，第一次调用之后 xmm0 已经被冲掉，第二次再用形参就会读到
+    // 垃圾（0.0）——`{:?}` 于是把 1.0 打成 "0.0"。
+    //
+    // 标志用整数而不是 bool：布尔值在分支合并时会被弄错。
+    let mut whole: i64 = 0;
+    if v == (v as i64 as f64) {
+        whole = 1;
+    }
     write_float(fd, v);
-    if whole {
+    if whole != 0 {
         write_bytes(fd, ".0");
     }
-}
-
-/// 浮点是不是整数值（Debug 要补 ".0"）。
-fn is_whole_float(v: f64) -> bool {
-    if v != v {
-        return false;
-    }
-    let f = v - (v as i64 as f64);
-    return f == 0.0;
 }
 
 //=============================================================================
@@ -711,4 +942,130 @@ pub fn file_read_all(fd: i32, buf: *mut u8, cap: usize) -> usize {
         total = total + (n as usize);
     }
     return total;
+}
+
+/// 移动文件位置。`whence`：`SEEK_SET`（起点）/ `SEEK_CUR`（当前）/
+/// `SEEK_END`（末尾）。
+///
+/// `offset` 是字节数，可以为负（`SEEK_CUR` / `SEEK_END` 时表示往回退）。
+/// 返回移动后的位置，出错返回 -1。
+pub fn file_seek(fd: i32, offset: i64, whence: i32) -> i64 {
+    return zr_seek(fd, offset, whence);
+}
+
+/// 取文件的大小（字节）。出错返回 -1。
+///
+/// 对终端这类没有大小的设备返回 -1。
+pub fn file_size(fd: i32) -> i64 {
+    return zr_fstat_size(fd);
+}
+
+/// 文件描述符是不是终端。是终端返回 true。
+pub fn file_is_terminal(fd: i32) -> bool {
+    return zr_isatty(fd) != 0;
+}
+
+/// 把一段字节全部写完，返回写入的总字节数。
+///
+/// 写了一半出错时返回已经写进去的字节数（一个字节都没写成就是 0）。
+pub fn file_write_all(fd: i32, bytes: str) -> usize {
+    let mut total: usize = 0;
+    while total < bytes.len {
+        let n = zr_write(fd, bytes.ptr + total, bytes.len - total);
+        if n <= 0 {
+            break;
+        }
+        total = total + (n as usize);
+    }
+    return total;
+}
+
+/// 以追加方式打开文件，返回文件描述符；出错返回 -1。
+///
+/// 相当于 `file_open(path, 2)`：文件不存在则创建，存在则接着写。
+pub fn file_append_open(path: str) -> i32 {
+    return file_open(path, 2);
+}
+
+/// 打开文件时的模式。
+pub const FILE_READ: i32 = 0;
+/// 打开文件时的模式：写（存在则截断）。
+pub const FILE_WRITE: i32 = 1;
+/// 打开文件时的模式：追加。
+pub const FILE_APPEND: i32 = 2;
+
+/// `file_seek` 的基准点：文件开头。
+pub const SEEK_SET: i32 = 0;
+/// `file_seek` 的基准点：当前位置。
+pub const SEEK_CUR: i32 = 1;
+/// `file_seek` 的基准点：文件末尾。
+pub const SEEK_END: i32 = 2;
+
+//=============================================================================
+// 文件对象
+//=============================================================================
+
+/// 一个已经打开的文件。
+///
+/// 只是"文件描述符 + 一点便利方法"：不做缓冲，也不负责在析构时关闭。
+/// 用 `close` 显式关闭。
+pub struct File {
+    /// 文件描述符；打开失败时是 -1。
+    pub fd: i32,
+}
+
+impl File {
+    /// 打开文件。`mode`：`FILE_READ` / `FILE_WRITE` / `FILE_APPEND`。
+    ///
+    /// 打开失败时 `fd` 是 -1，用 `is_ok` 判断。
+    pub fn open(path: str, mode: i32) -> File {
+        return File { fd: file_open(path, mode) };
+    }
+
+    /// 以追加方式打开文件（不存在则创建）。
+    pub fn open_append(path: str) -> File {
+        return File { fd: file_append_open(path) };
+    }
+
+    /// 打开成功了吗。
+    pub fn is_ok(&self) -> bool {
+        return self.fd >= 0;
+    }
+
+    /// 读一段字节，返回读到的字节数（0 表示 EOF，出错返回 -1）。
+    pub fn read(&self, buf: *mut u8, cap: usize) -> isize {
+        return file_read(self.fd, buf, cap);
+    }
+
+    /// 写一段字节，返回写入的字节数（出错返回 -1）。
+    pub fn write(&self, bytes: str) -> isize {
+        return file_write(self.fd, bytes);
+    }
+
+    /// 把一段字节全部写完，返回写入的总字节数。
+    pub fn write_all(&self, bytes: str) -> usize {
+        return file_write_all(self.fd, bytes);
+    }
+
+    /// 关闭文件。成功返回 true。
+    pub fn close(&self) -> bool {
+        return file_close(self.fd);
+    }
+
+    /// 移动文件位置。`whence`：`SEEK_SET` / `SEEK_CUR` / `SEEK_END`。
+    ///
+    /// 返回移动后的位置，出错返回 -1。
+    pub fn seek(&self, offset: i64, whence: i32) -> i64 {
+        return file_seek(self.fd, offset, whence);
+    }
+
+    /// 文件的大小（字节），出错返回 -1。
+    pub fn size(&self) -> i64 {
+        return file_size(self.fd);
+    }
+
+    /// 是不是终端。
+    pub fn is_terminal(&self) -> bool {
+        return file_is_terminal(self.fd);
+    }
 }

@@ -1,12 +1,13 @@
 #==============================================================================
 # runtime/rt_linux_aarch64.s — zr 语言运行时（Linux aarch64, AT&T syntax）
 #
-# 用纯 syscall 实现 7 个 `zr_*` 符号，不依赖 libc。
+# 用纯 syscall 实现 `zr_*` 符号，不依赖 libc。
 # AArch64 过程调用标准（AAPCS64）：
 #   参数 x0..x7，返回值 x0，callee-save x19..x28，x29=FP，x30=LR，x31=SP
 #
 # 系统调用号（aarch64 Linux）：
 #   read=63, write=64, exit=93, brk=214
+#   lseek=62, fstat=80, ioctl=29
 #   调用方式：系统调用号放 x8，参数 x0..x5，`svc #0`
 #
 # 内存分配：用 brk(214) 实现的简单 bump allocator。
@@ -16,6 +17,11 @@
     .global zr_panic
     .global zr_write
     .global zr_read
+    .global zr_open
+    .global zr_close
+    .global zr_seek
+    .global zr_fstat_size
+    .global zr_isatty
     .global zr_exit
     .global zr_alloc
     .global zr_dealloc
@@ -89,6 +95,62 @@ zr_open:
 zr_close:
     mov     x8, #57            // __NR_close
     svc     #0
+    ret
+
+#------------------------------------------------------------------------------
+# zr_seek(fd, offset, whence) -> i64
+#   x0=fd, x1=offset（字节数，可为负）, x2=whence
+#   whence: 0 = 起点(SEEK_SET), 1 = 当前位置(SEEK_CUR), 2 = 末尾(SEEK_END)
+# 返回新的文件偏移；出错返回 -1。
+#------------------------------------------------------------------------------
+zr_seek:
+    mov     x8, #62            // __NR_lseek
+    svc     #0
+    cmp     x0, #0
+    b.ge    .seek_ok
+    mov     x0, #-1            // 出错：内核返回 -errno，统一成 -1
+.seek_ok:
+    ret
+
+#------------------------------------------------------------------------------
+# zr_fstat_size(fd) -> i64
+#   x0=fd
+# 用 fstat(2) 填一个 144 字节的 struct stat，st_size 在偏移 48（8 字节）。
+# 返回文件大小；出错返回 -1。
+#------------------------------------------------------------------------------
+zr_fstat_size:
+    sub     sp, sp, #160       // 144 字节的 stat 缓冲区（sp 保持 16 字节对齐）
+    mov     x1, sp             // statbuf
+    mov     x8, #80            // __NR_fstat
+    svc     #0
+    cmp     x0, #0
+    b.lt    .fstat_failed
+    ldr     x0, [sp, #48]      // st_size
+    add     sp, sp, #160
+    ret
+.fstat_failed:
+    mov     x0, #-1
+    add     sp, sp, #160
+    ret
+
+#------------------------------------------------------------------------------
+# zr_isatty(fd) -> i32
+#   x0=fd
+# 用 ioctl(fd, TCGETS) 判断：终端返回 1，其它（文件、管道、错误）返回 0。
+#------------------------------------------------------------------------------
+zr_isatty:
+    sub     sp, sp, #80        // struct termios 缓冲区
+    mov     x2, sp             // termios
+    mov     x1, #0x5401        // TCGETS
+    mov     x8, #29            // __NR_ioctl
+    svc     #0
+    add     sp, sp, #80
+    cmp     x0, #0
+    b.eq    .isatty_yes
+    mov     x0, #0             // 不是终端
+    ret
+.isatty_yes:
+    mov     x0, #1
     ret
 
 #------------------------------------------------------------------------------

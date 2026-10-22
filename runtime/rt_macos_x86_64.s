@@ -5,6 +5,9 @@
 # `_main`，libSystem 负责进程初始化。因此本运行时做最薄的一层封装：
 #   zr_write    -> _write
 #   zr_read     -> _read
+#   zr_seek     -> _lseek
+#   zr_fstat_size -> _fstat$INODE64
+#   zr_isatty   -> _isatty
 #   zr_exit     -> _exit
 #   zr_alloc    -> _malloc
 #   zr_dealloc  -> _free
@@ -12,7 +15,16 @@
 #   zr_spawn / zr_run_tasks -> 单线程任务队列
 #
 # System V AMD64 ABI：参数 rdi/rsi/rdx/rcx/r8/r9，返回值 rax；
-# 调用前 rsp 必须 16 字节对齐（push rbp 恰好恢复对齐）。
+# 调用前 rsp 必须 16 字节对齐。
+#
+# 栈对齐说明：
+#   Darwin 的程序入口是被 dyld 用 `call` 调进来的（入口处 rsp ≡ 8 mod 16），
+#   而 zr 编译器生成的 `_start` 直接 `call main`，没有再调整栈，于是
+#   zr 代码发起的每一层调用都比 ABI 要求少 8 字节。libc 里用 `movaps`
+#   落栈的函数（open、malloc 等）在这种栈上会直接段错误。
+#   所以凡是调用 libc 的封装在调用前都用 `and rsp, -16` 把栈强制对齐
+#   （rbp 保存调用者的栈指针，返回时用 rbp 还原）：对齐与不对齐的
+#   调用方都能正常工作。编译器侧修好 `_start` 之后这段依旧是无害的。
 #
 # 符号名带前导下划线（Mach-O 对 C 符号的编码规则）。
 #==============================================================================
@@ -30,10 +42,12 @@
 _zr_panic:
     push    rbp
     mov     rbp, rsp
+    and     rsp, -16          // 调用点要求 rsp ≡ 0 (mod 16)
     mov     rdi, 2              // fd = stderr（rsi=msg, rdx=len 已由调用方设置）
     call    _write
     mov     rdi, 99             // panic exit code
     call    _exit
+    mov     rsp, rbp
     pop     rbp
     ret
 
@@ -42,14 +56,26 @@ _zr_panic:
 #------------------------------------------------------------------------------
     .globl _zr_write
 _zr_write:
-    jmp     _write
+    push    rbp
+    mov     rbp, rsp
+    and     rsp, -16          // 调用点要求 rsp ≡ 0 (mod 16)
+    call    _write
+    mov     rsp, rbp
+    pop     rbp
+    ret
 
 #------------------------------------------------------------------------------
 # zr_read(fd, buf, count) -> isize
 #------------------------------------------------------------------------------
     .globl _zr_read
 _zr_read:
-    jmp     _read
+    push    rbp
+    mov     rbp, rsp
+    and     rsp, -16          // 调用点要求 rsp ≡ 0 (mod 16)
+    call    _read
+    mov     rsp, rbp
+    pop     rbp
+    ret
 
 #------------------------------------------------------------------------------
 # zr_open(path, mode) -> isize
@@ -62,25 +88,26 @@ _zr_read:
 _zr_open:
     push    rbp
     mov     rbp, rsp
-    mov     rsi, r8           # r8 = mode
+    and     rsp, -16          // 调用点要求 rsp ≡ 0 (mod 16)
+    mov     r8, rsi           # r8 = mode（注意：本文件是 Intel 语法，目标是 r8）
     cmp     r8, 0
-    je      1f
+    je      2f                # 只读
     cmp     r8, 1
-    je      2f
-    # 只读：O_RDONLY
-    xor     esi, esi
+    je      1f                # 写（截断）
+    # 追加：O_WRONLY | O_CREAT | O_APPEND = 0x1 | 0x200 | 0x8
+    mov     esi, 0x209
     jmp     3f
 1:
-    # O_WRONLY | O_CREAT | O_TRUNC = 0x1 | 0x200 | 0x400
+    # 写（截断）：O_WRONLY | O_CREAT | O_TRUNC = 0x1 | 0x200 | 0x400
     mov     esi, 0x601
     jmp     3f
 2:
-    # O_WRONLY | O_CREAT | O_APPEND = 0x1 | 0x200 | 0x8
-    mov     esi, 0x209
+    # 只读：O_RDONLY
+    xor     esi, esi
 3:
     mov     rdx, 0644         # mode
     call    _open
-    mov     rbp, rsp
+    mov     rsp, rbp
     pop     rbp
     ret
 
@@ -90,14 +117,89 @@ _zr_open:
 #------------------------------------------------------------------------------
     .globl _zr_close
 _zr_close:
-    jmp     _close
+    push    rbp
+    mov     rbp, rsp
+    and     rsp, -16          // 调用点要求 rsp ≡ 0 (mod 16)
+    call    _close
+    mov     rsp, rbp
+    pop     rbp
+    ret
+
+#------------------------------------------------------------------------------
+# zr_seek(fd, offset, whence) -> i64
+#   rdi = fd, rsi = offset（字节数，可为负）, rdx = whence
+#   whence: 0 = 起点(SEEK_SET), 1 = 当前位置(SEEK_CUR), 2 = 末尾(SEEK_END)
+# lseek 的参数顺序与 C 一致，SEEK_SET/CUR/END 也正好是 0/1/2；
+# 出错时 libc 返回 -1，正是我们对外的约定。
+#------------------------------------------------------------------------------
+    .globl _zr_seek
+_zr_seek:
+    push    rbp
+    mov     rbp, rsp
+    and     rsp, -16          // 调用点要求 rsp ≡ 0 (mod 16)
+    call    _lseek
+    mov     rsp, rbp
+    pop     rbp
+    ret
+
+#------------------------------------------------------------------------------
+# zr_fstat_size(fd) -> i64
+#   rdi = fd
+# macOS 的 struct stat 是 144 字节，st_size 在偏移 96（8 字节）。
+# 注意：x86-64 上 libc 的 `fstat` 符号是 32 位 inode 的老版本（恒失败），
+# 真正可用的是 `fstat$INODE64`（C 头文件里的 __DARWIN_INODE64(fstat)）。
+# 返回文件大小；出错返回 -1。
+#------------------------------------------------------------------------------
+    .globl _zr_fstat_size
+_zr_fstat_size:
+    push    rbp
+    mov     rbp, rsp
+    and     rsp, -16          // 调用点要求 rsp ≡ 0 (mod 16)
+    sub     rsp, 144           // 144 字节的 stat 缓冲区
+    mov     rsi, rsp           // statbuf
+    call    _fstat$INODE64
+    test    rax, rax
+    jnz     .fstat_failed      # fstat 成功返回 0
+    mov     rax, qword ptr [rsp+96]    // st_size
+    jmp     .fstat_done
+.fstat_failed:
+    mov     rax, -1
+.fstat_done:
+    add     rsp, 144
+    mov     rsp, rbp
+    pop     rbp
+    ret
+
+#------------------------------------------------------------------------------
+# zr_isatty(fd) -> i32
+#   rdi = fd
+# libc 的 isatty：终端返回非 0，其它返回 0；这里统一成 1 / 0。
+#------------------------------------------------------------------------------
+    .globl _zr_isatty
+_zr_isatty:
+    push    rbp
+    mov     rbp, rsp
+    and     rsp, -16          // 调用点要求 rsp ≡ 0 (mod 16)
+    call    _isatty
+    test    rax, rax
+    setne   al
+    movzx   rax, al
+    mov     rsp, rbp
+    pop     rbp
+    ret
 
 #------------------------------------------------------------------------------
 # zr_exit(code) -> !
 #------------------------------------------------------------------------------
     .globl _zr_exit
 _zr_exit:
-    jmp     _exit
+    push    rbp
+    mov     rbp, rsp
+    and     rsp, -16          // 调用点要求 rsp ≡ 0 (mod 16)
+    call    _exit
+    mov     rsp, rbp
+    pop     rbp
+    ret
 
 #------------------------------------------------------------------------------
 # zr_alloc(size, align) -> *mut void
@@ -105,14 +207,26 @@ _zr_exit:
 #------------------------------------------------------------------------------
     .globl _zr_alloc
 _zr_alloc:
-    jmp     _malloc
+    push    rbp
+    mov     rbp, rsp
+    and     rsp, -16          // 调用点要求 rsp ≡ 0 (mod 16)
+    call    _malloc
+    mov     rsp, rbp
+    pop     rbp
+    ret
 
 #------------------------------------------------------------------------------
 # zr_dealloc(ptr, size, align)
 #------------------------------------------------------------------------------
     .globl _zr_dealloc
 _zr_dealloc:
-    jmp     _free
+    push    rbp
+    mov     rbp, rsp
+    and     rsp, -16          // 调用点要求 rsp ≡ 0 (mod 16)
+    call    _free
+    mov     rsp, rbp
+    pop     rbp
+    ret
 
 #------------------------------------------------------------------------------
 # zr_realloc(ptr, old_size, new_size, align) -> *mut void
@@ -120,8 +234,14 @@ _zr_dealloc:
 #------------------------------------------------------------------------------
     .globl _zr_realloc
 _zr_realloc:
+    push    rbp
+    mov     rbp, rsp
+    and     rsp, -16          // 调用点要求 rsp ≡ 0 (mod 16)
     mov     rsi, rdx            // realloc(ptr, new_size)：只看第 2 个参数
-    jmp     _realloc
+    call    _realloc
+    mov     rsp, rbp
+    pop     rbp
+    ret
 #------------------------------------------------------------------------------
 # 任务队列：单线程执行器。
 #   zr_spawn(frame)      把 future 帧挂到队尾，节点 = {frame, next}。
