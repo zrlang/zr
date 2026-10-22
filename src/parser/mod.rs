@@ -72,8 +72,26 @@ impl Parser {
             ..Program::default()
         };
 
+        // crate 级别的 `#[cfg]`（`#![cfg(..)]`）：条件不成立时整个文件
+        // 视为空。
+        //
+        // 逐文件判断（不是逐 crate）：模块文件里的 `#![cfg(..)]` 只影响
+        // 那个文件本身。
+        if program.attrs.iter().any(|a| {
+            a.name == "cfg" && !crate::attributes::is_cfg_enabled(
+                std::slice::from_ref(a),
+                &crate::attributes::global_target(),
+            )
+        }) {
+            return Ok(program);
+        }
+
         while !self.is_at_end() {
-            let item = self.parse_module_item()?;
+            // 被 `#[cfg]` 过滤掉的条目直接丢弃：它对后面的名称解析而言
+            // 根本不存在。
+            let Some(item) = self.parse_module_item_opt()? else {
+                continue;
+            };
             match item {
                 ModuleItem::Function(f) => program.functions.push(f),
                 ModuleItem::TypeDef(t) => program.type_defs.push(t),
@@ -96,10 +114,44 @@ impl Parser {
     }
 
     /// 解析一个模块级条目。
-    fn parse_module_item(&mut self) -> Result<ModuleItem> {
+    ///
+    /// 被 `#[cfg]` 过滤掉的条目返回 `None`：它**不会**进入 AST，因此对
+    /// 名称解析而言完全不存在（Rust 的语义）。
+    fn parse_module_item_opt(&mut self) -> Result<Option<ModuleItem>> {
         let attrs = self.parse_outer_attrs()?;
         let vis = self.parse_visibility();
 
+        // cfg 过滤：条件不成立的条目在进入 AST 之前就被剔除。
+        //
+        // 之所以在**解析阶段**做（而不是留给类型检查器）：`const` /
+        // `static` / `enum` / `impl` / `type` 这些条目的属性并没有被 AST
+        // 保留下来（只有 `fn` 与 `struct` 保留了），等到类型检查阶段已经
+        // 无从知道它们带过什么属性了。
+        if !crate::attributes::is_cfg_enabled(&attrs, &crate::attributes::global_target()) {
+            // 条件不成立：条目照样解析（语法错误仍要报出来），但不进 AST。
+            let _ = self.parse_module_item_body(vis, attrs)?;
+            return Ok(None);
+        }
+        Ok(Some(self.parse_module_item_body(vis, attrs)?))
+    }
+
+    /// 解析一个模块级条目（`decl.rs` 里内联模块的调用入口）。
+    ///
+    /// 内联模块的条目列表由 `decl.rs` 收集，无法"少放一个"，所以被 cfg
+    /// 掉的条目在这里以**空 extern 块**占位：它不含任何函数，对后续阶段
+    /// 没有任何影响。
+    fn parse_module_item(&mut self) -> Result<ModuleItem> {
+        Ok(self.parse_module_item_opt()?.unwrap_or(ModuleItem::Extern(ExternBlock {
+            functions: Vec::new(),
+        })))
+    }
+
+    /// 模块级条目的本体（属性与可见性已经解析过了）。
+    fn parse_module_item_body(
+        &mut self,
+        vis: Visibility,
+        attrs: Vec<Attribute>,
+    ) -> Result<ModuleItem> {
         // 分流
         // `macro_rules! name { ... }`
         if self.check(&TokenKind::Ident("macro_rules".into()))
@@ -235,6 +287,30 @@ impl Parser {
     fn parse_attribute_body(&mut self, inner: bool) -> Result<Attribute> {
         self.consume(&TokenKind::LBracket, "expected '[' after '#'")?;
         let name = self.consume_ident("expected attribute name")?;
+        // `cfg` 走**专用解析路径**：它的参数是 Rust 的 meta item（可以嵌套
+        // 的谓词），不是普通表达式。走通用路径的话 `not(unix)` 会被当成
+        // 函数调用解析，`target_os = "linux"` 里的 `=` 也会被当成赋值号。
+        if name == "cfg" {
+            let args = self.parse_cfg_attr_args()?;
+            self.consume(&TokenKind::RBracket, "expected ']' to close attribute")?;
+            let _ = inner;
+            return Ok(Attribute { name, args });
+        }
+        // `#[deprecated = "..."]`：属性名后面直接跟 `=`（Rust 的写法）。
+        //
+        // 早先这里没有这种形态，`=` 被当成表达式起点，直接报
+        // "unexpected expression start: Eq"。值按**属性名本身**作为键存进
+        // 参数表（`deprecated_message` 认得它）。
+        if self.check(&TokenKind::Eq) {
+            self.advance(); // =
+            let v = self.parse_expression()?;
+            self.consume(&TokenKind::RBracket, "expected ']' to close attribute")?;
+            let _ = inner;
+            return Ok(Attribute {
+                name: name.clone(),
+                args: vec![AttributeArg::NameValue(name, v)],
+            });
+        }
         let mut args = Vec::new();
         // 参数写在圆括号里：`#[repr(C)]`、`#[inline(always)]`、
         // `#[repr(align = 8)]`。早先这里没有消费 `(`，整个 `(...)` 被
@@ -273,6 +349,69 @@ impl Parser {
         self.consume(&TokenKind::RBracket, "expected ']' to close attribute")?;
         let _ = inner;
         Ok(Attribute { name, args })
+    }
+
+    // ===== cfg 谓词 =====
+
+    /// 解析 `#[cfg(...)]` 的参数：Rust 的 meta item 语法。
+    ///
+    /// 谓词有三种形态：裸路径（`unix`）、键值对（`target_os = "linux"`）
+    /// 与带参数的路径（`not(unix)` / `all(..)` / `any(..)`）。
+    fn parse_cfg_attr_args(&mut self) -> Result<Vec<AttributeArg>> {
+        self.consume(
+            &TokenKind::LParen,
+            "expected '(' after 'cfg' (Rust-style: `#[cfg(target_os = \"linux\")]`)",
+        )?;
+        let mut args = Vec::new();
+        while !self.check(&TokenKind::RParen) {
+            args.push(self.parse_cfg_pred()?.into_attr_arg());
+            if !self.match_kind(&TokenKind::Comma) {
+                break;
+            }
+        }
+        self.consume(&TokenKind::RParen, "expected ')' to close cfg predicate")?;
+        if args.is_empty() {
+            return Err(self.expected("expected a cfg predicate", &TokenKind::Ident(String::new())));
+        }
+        Ok(args)
+    }
+
+    /// 解析一个 cfg 谓词。
+    fn parse_cfg_pred(&mut self) -> Result<CfgPred> {
+        let span = self.peek().span;
+        let name = self.consume_ident("expected cfg predicate")?;
+        // `key = "value"`
+        if self.match_kind(&TokenKind::Eq) {
+            let value = self.parse_cfg_value()?;
+            return Ok(CfgPred::KeyValue(name, value));
+        }
+        // `op(..)` —— `all` / `any` / `not` 的嵌套谓词
+        if self.check(&TokenKind::LParen) {
+            self.advance();
+            let mut preds = Vec::new();
+            while !self.check(&TokenKind::RParen) {
+                preds.push(self.parse_cfg_pred()?);
+                if !self.match_kind(&TokenKind::Comma) {
+                    break;
+                }
+            }
+            self.consume(&TokenKind::RParen, "expected ')' to close cfg predicate")?;
+            return Ok(CfgPred::Nested(name, preds, span));
+        }
+        Ok(CfgPred::Flag(name, span))
+    }
+
+    /// cfg 键值对的值：必须是字符串字面量。
+    fn parse_cfg_value(&mut self) -> Result<Expression> {
+        let span = self.peek().span;
+        if let TokenKind::StringLiteral(s) = self.peek().kind.clone() {
+            self.advance();
+            return Ok(Expression::Literal(Literal::String(s), span));
+        }
+        Err(self.expected(
+            "expected a string literal in cfg predicate",
+            &TokenKind::StringLiteral(String::new()),
+        ))
     }
 
     /// 属性的一个位置参数。
@@ -636,6 +775,57 @@ fn is_block_like(expr: &Expression) -> bool {
             | Expression::Loop(..)
             | Expression::Block(..)
     )
+}
+
+/// cfg 谓词的解析结果。
+///
+/// Rust 的 meta item 有三种形态：裸路径（`unix`）、键值对
+/// （`target_os = "linux"`）与带参数的路径（`not(unix)`）。解析时先收成
+/// 这个中间形态，再按位置编码成属性参数（顶层）或嵌套实参（`all(..)` 里）。
+enum CfgPred {
+    /// 裸路径：`unix`。
+    Flag(String, Span),
+    /// 键值对：`target_os = "linux"`。
+    KeyValue(String, Expression),
+    /// 带参数的路径：`not(unix)` / `all(..)` / `any(..)`。
+    Nested(String, Vec<CfgPred>, Span),
+}
+
+impl CfgPred {
+    /// 编码成属性参数（`#[cfg(..)]` 的顶层）。
+    fn into_attr_arg(self) -> AttributeArg {
+        match self {
+            CfgPred::Flag(name, span) => AttributeArg::Pos(Expression::Variable(name, span)),
+            CfgPred::KeyValue(key, value) => AttributeArg::NameValue(key, value),
+            CfgPred::Nested(op, preds, span) => {
+                let args = preds.into_iter().map(CfgPred::into_arg).collect();
+                AttributeArg::Pos(Expression::Call(
+                    Box::new(Expression::Variable(op, span)),
+                    args,
+                    span,
+                ))
+            }
+        }
+    }
+
+    /// 编码成嵌套实参（`all(..)` / `any(..)` / `not(..)` 里面）。
+    ///
+    /// 键值对在这里复用 `Argument::Named` 承载：它的"名字 + 值"结构正好
+    /// 对得上 `target_os = "linux"`。
+    fn into_arg(self) -> Argument {
+        match self {
+            CfgPred::Flag(name, span) => Argument::Pos(Expression::Variable(name, span)),
+            CfgPred::KeyValue(key, value) => Argument::Named(key, value),
+            CfgPred::Nested(op, preds, span) => {
+                let args = preds.into_iter().map(CfgPred::into_arg).collect();
+                Argument::Pos(Expression::Call(
+                    Box::new(Expression::Variable(op, span)),
+                    args,
+                    span,
+                ))
+            }
+        }
+    }
 }
 
 #[cfg(test)]

@@ -242,12 +242,97 @@ _zr_realloc:
     mov     rsp, rbp
     pop     rbp
     ret
+
+    .globl _zr_thread_create
+    .globl _zr_thread_join
+    .globl _zr_thread_self
+    .globl _zr_process_fork
+    .globl _zr_process_exec
+    .globl _zr_process_wait
+    .globl _zr_process_getpid
+
+#==============================================================================
+# 线程支持（macOS 上暂存根，返回 ENOSYS）
+//------------------------------------------------------------------------------
+# zr_thread_create(start_routine, arg) -> i32
+#   rdi = start_routine, rsi = arg
+# 返回 -1 (ENOSYS)，macOS 上暂未实现真 pthread
+//------------------------------------------------------------------------------
+    .globl _zr_thread_create
+_zr_thread_create:
+    mov     rax, -1
+    ret
+
+#------------------------------------------------------------------------------
+# zr_thread_join(thread, retval) -> i32
+#   rdi = thread, rsi = retval
+# 返回 -1 (ENOSYS)
+//------------------------------------------------------------------------------
+    .globl _zr_thread_join
+_zr_thread_join:
+    mov     rax, -1
+    ret
+
+#------------------------------------------------------------------------------
+# zr_thread_self() -> u64
+# 返回 0
+//------------------------------------------------------------------------------
+    .globl _zr_thread_self
+_zr_thread_self:
+    xor     rax, rax
+    ret
+
+#==============================================================================
+# 进程支持
+//------------------------------------------------------------------------------
+# zr_process_fork() -> i64
+# 返回：父进程返回子进程 PID，子进程返回 0，出错返回 -1
+//------------------------------------------------------------------------------
+    .globl _zr_process_fork
+_zr_process_fork:
+    call    _fork
+    ret
+
+#------------------------------------------------------------------------------
+# zr_process_exec(path, argv, envp) -> !
+#   rdi = path, rsi = argv, rdx = envp
+# 不返回（成功时替换当前进程），出错返回 -1
+//------------------------------------------------------------------------------
+    .globl _zr_process_exec
+_zr_process_exec:
+    call    _execve
+    ret
+
+#------------------------------------------------------------------------------
+# zr_process_wait(pid, status_ptr, options) -> i64
+#   rdi = pid, rsi = status_ptr, rdx = options
+# 返回等待的子进程 PID，出错返回 -1
+//------------------------------------------------------------------------------
+    .globl _zr_process_wait
+_zr_process_wait:
+    // wait4(pid, status, options, rusage)
+    mov     rcx, rdx          // options
+    xor     rdx, rdx          // status
+    xor     r8, r8            // rusage = NULL
+    // macOS wait4 签名: pid_t wait4(pid_t pid, int *status, int options, struct rusage *rusage)
+    mov     rax, 7            // SYS_wait4 (macOS)
+    syscall
+    ret
+
+#------------------------------------------------------------------------------
+# zr_process_getpid() -> i32
+//------------------------------------------------------------------------------
+    .globl _zr_process_getpid
+_zr_process_getpid:
+    call    _getpid
+    ret
+
 #------------------------------------------------------------------------------
 # 任务队列：单线程执行器。
 #   zr_spawn(frame)      把 future 帧挂到队尾，节点 = {frame, next}。
 #   zr_run_tasks()       轮询所有任务；Ready 后调用帧头 drop 并释放节点。
 # 帧头布局由 async_lower 固定：state=0, result=8, poll=16, drop=24。
-#------------------------------------------------------------------------------
+//------------------------------------------------------------------------------
     .section __DATA,__bss
     .align 3
 _zr_task_head:

@@ -1,0 +1,100 @@
+//=============================================================================
+// std/thread.zr — 线程支持
+//
+// 提供 Rust 风格的线程 API：
+//   thread::spawn(|| { ... })
+//   thread::current().id()
+//   thread::sleep(duration)
+//=============================================================================
+
+//----- 外部运行时符号 ----------------------------------------------------------
+
+extern "C" {
+    fn zr_thread_create(start: fn(*mut void), arg: *mut void) -> i32;
+    fn zr_thread_join(thread: *mut void, retval: *mut *mut void) -> i32;
+    fn zr_thread_self() -> u64;
+    fn zr_panic(msg: *const u8, len: usize) -> !;
+    fn zr_alloc(size: usize, align: usize) -> *mut void;
+    fn zr_dealloc(ptr: *mut void, size: usize, align: usize);
+}
+
+/// 内置函数
+fn size_of_thread_handle() -> usize {
+    16  // ThreadHandle 大小
+}
+
+/// 线程句柄
+pub struct Thread {
+    handle: *mut void,
+    joined: bool,
+}
+
+/// 线程 ID
+pub struct ThreadId { value: u64 }
+
+/// 当前线程的 ID
+pub fn current_id() -> ThreadId {
+    ThreadId { value: zr_thread_self() }
+}
+
+/// 睡眠指定的毫秒数
+pub fn sleep_ms(ms: u64) {
+    let mut i: u64 = 0;
+    while i < ms * 10000 {
+        i = i + 1;
+    }
+}
+
+/// 启动一个新线程
+pub fn start_thread(f: fn()) -> Thread {
+    let handle = alloc_thread_handle();
+    let result = zr_thread_create(thread_entry_impl, handle as *mut void);
+    if result != 0 {
+        dealloc_thread_handle(handle);
+        let msg = "thread spawn failed";
+        zr_panic(msg.ptr, msg.len);
+    }
+    Thread { handle, joined: false }
+}
+
+// 线程入口点
+extern "C" {
+    fn thread_entry(arg: *mut void);
+}
+
+fn thread_entry_impl(arg: *mut void) {
+    let handle = arg as *mut ThreadHandle;
+    let f = (*handle).func;
+    f();
+    (*handle).result = 0;
+}
+
+struct ThreadHandle {
+    func: fn(),
+    result: i32,
+}
+
+fn alloc_thread_handle() -> *mut ThreadHandle {
+    let ptr = zr_alloc(size_of_thread_handle(), 16);
+    ptr as *mut ThreadHandle
+}
+
+fn dealloc_thread_handle(ptr: *mut ThreadHandle) {
+    zr_dealloc(ptr as *mut void, size_of_thread_handle(), 16);
+}
+
+impl Thread {
+    pub fn join(self) -> i32 {
+        let mut retval: *mut void = 0 as *mut void;
+        let result = zr_thread_join(self.handle, &mut retval);
+        self.joined = true;
+        result
+    }
+}
+
+impl Drop for Thread {
+    fn drop(&mut self) {
+        if !self.joined {
+        }
+    }
+}

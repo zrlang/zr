@@ -499,7 +499,7 @@ pub fn emit_object(target: &Target, unit: &CompilationUnit, path: &Path) -> std:
     let mut unit = unit.clone();
     unit.kind = OutputKind::Relocatable;
     // 目标文件不解析重定位：外部符号必须显式声明，交由平台链接器绑定。
-    objfile::add_extern_symbols(&mut unit);
+    objfile::add_extern_symbols(&mut unit, target.os());
     let bytes = match target.format() {
         ObjectFormat::Elf => linker::assemble_elf(target, &unit)?,
         ObjectFormat::MachO => macho::assemble_macho(target, &unit)?,

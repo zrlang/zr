@@ -1,0 +1,209 @@
+//=============================================================================
+// std/process.zr — 进程支持
+//
+// 提供 Rust 风格的进程 API：
+//   process::fork()
+//   process::exec(path, args)
+//   process::wait(pid)
+//   process::id()
+//   process::exit(code)
+//   Command 结构体用于启动子进程
+//=============================================================================
+
+//----- 外部运行时符号 ----------------------------------------------------------
+
+extern "C" {
+    fn zr_process_fork() -> i64;
+    fn zr_process_exec(path: *const u8, argv: *const *const u8, envp: *const *const u8) -> i32;
+    fn zr_process_wait(pid: i64, status: *mut i32, options: i32) -> i64;
+    fn zr_process_getpid() -> i32;
+    fn zr_write(fd: i32, buf: *const u8, count: usize) -> isize;
+    fn zr_alloc(size: usize, align: usize) -> *mut void;
+    fn zr_dealloc(ptr: *mut void, size: usize, align: usize);
+    fn zr_exit(code: i32) -> !;
+    fn zr_panic(msg: *const u8, len: usize) -> !;
+}
+
+/// 内置函数
+fn size_of_str() -> usize {
+    16
+}
+fn size_of_ptr() -> usize {
+    8
+}
+
+/// 创建子进程
+/// 返回：父进程返回子进程 PID (i32)，子进程返回 0，出错返回 -1
+pub fn fork() -> i32 {
+    return zr_process_fork() as i32;
+}
+
+/// 替换当前进程镜像
+/// 不返回（成功时），出错返回 -1
+pub fn exec(path: str, args_ptr: *const str, argc: usize) -> i32 {
+    let argv_ptr = zr_alloc((argc + 1) * size_of_ptr(), 16) as *mut *const u8;
+    
+    let mut i: usize = 0;
+    while i < argc {
+        let s = *((args_ptr as usize + i * size_of_str()) as *mut str);
+        let argv_i = (argv_ptr as usize + i * size_of_ptr()) as *mut *const u8;
+        argv_i[0] = s.ptr;
+        i = i + 1;
+    }
+    let argv_argc = (argv_ptr as usize + argc * size_of_ptr()) as *mut *const u8;
+    argv_argc[0] = 0 as *const u8;
+    
+    let envp_ptr = 0 as *const *const u8;
+    
+    let result = zr_process_exec(path.ptr, argv_ptr, envp_ptr);
+    
+    zr_dealloc(argv_ptr as *mut void, (argc + 1) * size_of_ptr(), 16);
+    
+    return result;
+}
+
+/// 等待子进程结束
+/// pid: 要等待的进程 ID，-1 表示任意子进程
+/// status: 存放退出状态的指针（可为 null）
+/// options: 选项（0=阻塞等待, 1=WNOHANG 非阻塞）
+/// 返回：等待到的子进程 PID，出错返回 -1
+pub fn wait(pid: i32, status: *mut i32, options: i32) -> i32 {
+    return zr_process_wait(pid as i64, status, options) as i32;
+}
+
+/// 获取当前进程 ID
+pub fn id() -> i32 {
+    return zr_process_getpid();
+}
+
+/// 退出当前进程
+pub fn exit(code: i32) -> ! {
+    zr_exit(code)
+}
+
+/// 子进程退出状态
+pub struct ExitStatus {
+    code: i32,
+}
+
+impl ExitStatus {
+    pub fn success(self) -> bool {
+        self.code == 0
+    }
+    pub fn code(self) -> i32 {
+        self.code
+    }
+}
+
+/// 进程命令构建器（类似 Rust 的 std::process::Command）
+pub struct Command {
+    program: str,
+    args_ptr: *mut str,
+    arg_count: usize,
+    arg_capacity: usize,
+}
+
+impl Command {
+    pub fn new(program: str) -> Command {
+        let args_ptr = zr_alloc(32 * size_of_str(), 16) as *mut str;
+        Command {
+            program,
+            args_ptr,
+            arg_count: 0,
+            arg_capacity: 32,
+        }
+    }
+    
+    pub fn arg(&mut self, arg: str) -> Command {
+        if self.arg_count < self.arg_capacity {
+            let p = (self.args_ptr as usize + self.arg_count * size_of_str()) as *mut str;
+            p[0] = arg;
+            self.arg_count = self.arg_count + 1;
+        }
+        self
+    }
+    
+    pub fn env(&mut self, key: str, val: str) -> Command {
+        // 简化实现：暂不支持环境变量
+        self
+    }
+    
+    /// 启动子进程，返回 Child 句柄
+    pub fn spawn(self) -> Child {
+        // 简化实现：fork + exec
+        let pid = fork();
+        if pid == 0 {
+            // 子进程
+            // 构建参数数组
+            let argc = self.arg_count + 1; // +1 for program
+            let argv_ptr = zr_alloc((argc + 1) * size_of_ptr(), 16) as *mut *const u8;
+            
+            argv_ptr[0] = self.program.ptr;
+            let mut i: usize = 0;
+            while i < self.arg_count {
+                let arg = *((self.args_ptr as usize + i * size_of_str()) as *mut str);
+                let argv_i = (argv_ptr as usize + (i + 1) * size_of_ptr()) as *mut *const u8;
+                argv_i[0] = arg.ptr;
+                i = i + 1;
+            }
+            let argv_argc = (argv_ptr as usize + argc * size_of_ptr()) as *mut *const u8;
+            argv_argc[0] = 0 as *const u8;
+            
+            let _ = zr_process_exec(self.program.ptr, argv_ptr, 0 as *const *const u8);
+            
+            // exec 失败
+            zr_exit(127);
+        }
+        if pid < 0 {
+            // fork 失败
+            let msg = "fork failed";
+            zr_panic(msg.ptr, msg.len);
+        }
+        // 父进程
+        Child { pid, exited: false, exit_status: 0 }
+    }
+}
+
+/// 子进程句柄
+pub struct Child {
+    pid: i32,
+    exited: bool,
+    exit_status: i32,
+}
+
+impl Child {
+    /// 等待子进程结束
+    pub fn wait(self) -> ExitStatus {
+        let mut status: i32 = 0;
+        let result = wait(self.pid, &mut status, 0);
+        if result > 0 {
+            self.exited = true;
+            self.exit_status = status;
+        }
+        ExitStatus { code: self.exit_status }
+    }
+    
+    /// 尝试非阻塞等待
+    /// 返回 0 表示未退出，>0 表示退出状态
+    pub fn try_wait(self) -> i32 {
+        let mut status: i32 = 0;
+        let result = wait(self.pid, &mut status, 1); // WNOHANG = 1
+        if result > 0 {
+            self.exited = true;
+            self.exit_status = status;
+            return self.exit_status;
+        }
+        return 0;
+    }
+    
+    /// 获取子进程 PID
+    pub fn id(self) -> i32 {
+        self.pid
+    }
+    
+    /// 杀死子进程（简化：发送 SIGKILL）
+    pub fn kill(self) -> bool {
+        // 简化实现：不支持信号
+        false
+    }
+}

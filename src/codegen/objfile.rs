@@ -403,7 +403,7 @@ pub fn apply_relocations(unit: &mut CompilationUnit, text_base: u64, rodata_base
 /// 目标文件必须显式声明被引用的外部符号（`zr_exit`、`main` 等），
 /// 否则平台链接器无法把重定位绑定到对应实现。ELF / Mach-O / COFF
 /// 三种容器都用这一表示，只是外部符号的编码方式不同。
-pub fn add_extern_symbols(unit: &mut CompilationUnit) {
+pub fn add_extern_symbols(unit: &mut CompilationUnit, target_os: crate::codegen::target::Os) {
     let mut missing: Vec<String> = unit
         .relocations
         .iter()
@@ -412,9 +412,16 @@ pub fn add_extern_symbols(unit: &mut CompilationUnit) {
         .collect();
     missing.dedup();
 
+    let prefix = if target_os == crate::codegen::target::Os::Macos || target_os == crate::codegen::target::Os::Ios {
+        "_"
+    } else {
+        ""
+    };
+
     for name in missing {
+        let mangled_name = format!("{}{}", prefix, name);
         unit.symbols.push(Symbol {
-            name,
+            name: mangled_name,
             section: SymbolSection::Undefined,
             offset: 0,
             size: 0,
@@ -695,8 +702,8 @@ mod tests {
             .push(Relocation::new(0, 0, 4, "zr_exit", RelocationKind::PcRel32));
         unit.relocations
             .push(Relocation::new(4, 4, 4, "zr_exit", RelocationKind::PcRel32));
-        add_extern_symbols(&mut unit);
-        add_extern_symbols(&mut unit);
+        add_extern_symbols(&mut unit, crate::codegen::target::Os::Linux);
+        add_extern_symbols(&mut unit, crate::codegen::target::Os::Linux);
         let externs: Vec<_> = unit
             .symbols
             .iter()

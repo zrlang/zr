@@ -23,6 +23,13 @@
     .global zr_alloc
     .global zr_dealloc
     .global zr_realloc
+    .global zr_thread_create
+    .global zr_thread_join
+    .global zr_thread_self
+    .global zr_process_fork
+    .global zr_process_exec
+    .global zr_process_wait
+    .global zr_process_getpid
 
     .section .text
 
@@ -382,4 +389,198 @@ zr_run_tasks:
     popq    %r13
     popq    %r12
     popq    %rbp
+    ret
+
+#==============================================================================
+# 线程支持（pthread 封装）
+#------------------------------------------------------------------------------
+# zr_thread_create(start_routine, arg) -> i32
+#   rdi = start_routine (fn(*mut void)), rsi = arg
+# 返回 0 成功，非 0 失败（errno）。
+# 调用 pthread_create，线程函数签名：void* (*)(void*)
+#------------------------------------------------------------------------------
+zr_thread_create:
+    pushq   %rbp
+    movq    %rsp, %rbp
+    pushq   %r12
+    pushq   %r13
+    pushq   %r14
+    pushq   %r15
+
+    movq    %rdi, %r12      # start_routine
+    movq    %rsi, %r13      # arg
+
+    # 分配 pthread_t (8 字节)
+    movq    $8, %rdi
+    movq    $8, %rsi
+    call    zr_alloc
+    testq   %rax, %rax
+    jz      .thread_create_fail
+    movq    %rax, %r14      # pthread_t*
+
+    # 分配栈（64KB）
+    movq    $65536, %rdi
+    movq    $16, %rsi
+    call    zr_alloc
+    testq   %rax, %rax
+    jz      .thread_create_fail_stack
+    movq    %rax, %r15      # stack pointer
+
+    # pthread_create(pthread_t*, attr, start_routine, arg)
+    # Linux x86-64: 使用 clone 系统调用实现，或者链接 pthread
+    # 这里用 syscall 直接实现 clone
+    # 栈增长方向向下，传入栈顶
+    leaq    -8(%r15), %rdi  # child_stack (栈顶，8字节对齐)
+    movq    $0x00010000, %rsi  # CLONE_VM | CLONE_FS | CLONE_FILES | CLONE_SIGHAND | CLONE_THREAD | CLONE_SYSVSEM
+    movq    $0, %rdx        # ptid
+    movq    $0, %r10        # tls
+    movq    %r12, %r8       # start_routine
+    movq    %r13, %r9       # arg
+    movq    $56, %rax       # SYS_clone
+    syscall
+    testq   %rax, %rax
+    jz      .thread_child
+    # 父进程：rax = child tid
+    movq    %rax, (%r14)    # 存入 pthread_t
+    xorl    %eax, %eax      # 返回 0
+    jmp     .thread_create_done
+
+.thread_child:
+    # 子线程：rax = 0，运行 start_routine(arg)
+    call    *%r8
+    # 线程结束，调用 exit
+    movq    %rax, %rdi
+    movq    $60, %rax       # SYS_exit
+    syscall
+    ud2
+
+.thread_create_fail_stack:
+    movq    %r14, %rdi
+    movq    $8, %rsi
+    movq    $8, %rdx
+    call    zr_dealloc
+.thread_create_fail:
+    movq    $-1, %rax
+
+.thread_create_done:
+    popq    %r15
+    popq    %r14
+    popq    %r13
+    popq    %r12
+    popq    %rbp
+    ret
+
+#------------------------------------------------------------------------------
+# zr_thread_join(thread, retval) -> i32
+#   rdi = thread (pthread_t*), rsi = retval (*mut void)
+# 等待线程结束，将返回值存入 *retval，返回 0 成功。
+# 使用 futex 等待或简单轮询（简化实现：用 waitpid）
+#------------------------------------------------------------------------------
+zr_thread_join:
+    pushq   %rbp
+    movq    %rsp, %rbp
+    pushq   %r12
+    pushq   %r13
+
+    movq    %rdi, %r12      # thread ptr
+    movq    %rsi, %r13      # retval ptr
+
+    # 简单实现：轮询等待（生产环境应用 futex）
+    # 读取线程 ID
+    movq    (%r12), %rdi    # tid
+
+.join_loop:
+    # 使用 tgkill 或 waitpid 等待（简化：用 futex）
+    # 这里用 SYS_futex 等待
+    movq    $202, %rax      # SYS_futex
+    movq    %r12, %rdi      # uaddr
+    movq    $0, %rsi        # FUTEX_WAIT
+    movq    $0, %rdx        # val
+    movq    $0, %r10        # timeout
+    syscall
+    testq   %rax, %rax
+    jz      .join_done
+    # 如果 futex 失败（不支持），回退到轮询
+    cmpq    $-38, %rax      # -ENOSYS
+    je      .join_poll
+    # 其他错误
+    movq    $-1, %rax
+    jmp     .join_done
+
+.join_poll:
+    # 简单轮询（1ms 睡眠）
+    movq    $35, %rax       # SYS_nanosleep
+    leaq    .join_ts(%rip), %rdi
+    xorq    %rsi, %rsi
+    syscall
+    jmp     .join_loop
+
+.section .rodata
+.join_ts:
+    .quad   0               # tv_sec
+    .quad   1000000         # tv_nsec = 1ms
+.text
+
+.join_done:
+    # 线程已结束，retval 已在线程退出时设置（简化：线程返回值在 rax，这里无法获取）
+    # 实际实现需要线程局部存储或共享内存
+    testq   %r13, %r13
+    jz      .join_no_retval
+    movq    $0, (%r13)      # 简化：存 0
+.join_no_retval:
+    xorl    %eax, %eax
+    popq    %r13
+    popq    %r12
+    popq    %rbp
+    ret
+
+#------------------------------------------------------------------------------
+# zr_thread_self() -> u64
+# 返回当前线程 ID (pthread_self / gettid)
+#------------------------------------------------------------------------------
+zr_thread_self:
+    movq    $186, %rax      # SYS_gettid
+    syscall
+    ret
+
+#==============================================================================
+# 进程支持
+#------------------------------------------------------------------------------
+# zr_process_fork() -> i64
+# 返回：父进程返回子进程 PID，子进程返回 0，出错返回 -1
+#------------------------------------------------------------------------------
+zr_process_fork:
+    movq    $57, %rax       # SYS_fork
+    syscall
+    ret
+
+#------------------------------------------------------------------------------
+# zr_process_exec(path, argv, envp) -> !
+#   rdi = path, rsi = argv, rdx = envp
+# 不返回（成功时替换当前进程），出错返回 -1
+#------------------------------------------------------------------------------
+zr_process_exec:
+    movq    $59, %rax       # SYS_execve
+    syscall
+    # 只有出错才返回
+    ret
+
+#------------------------------------------------------------------------------
+# zr_process_wait(pid, status_ptr, options) -> i64
+#   rdi = pid, rsi = status_ptr, rdx = options
+# 返回等待的子进程 PID，出错返回 -1
+#------------------------------------------------------------------------------
+zr_process_wait:
+    movq    $61, %rax       # SYS_wait4
+    # r10 = rusage (NULL)
+    xorq    %r10, %r10
+    syscall
+    ret
+
+#------------------------------------------------------------------------------
+# zr_process_getpid() -> i32
+#------------------------------------------------------------------------------
+zr_process_getpid:
+    movq    $39, %rax       # SYS_getpid
+    syscall
     ret

@@ -579,6 +579,13 @@ fn compile(input: &str, cmd: &Cli) -> Result<std::path::PathBuf, String> {
         ));
     }
 
+    // 0.5 cfg 上下文：按**编译目标**求值 `#[cfg(..)]` 条件。
+    //
+    // 必须在解析之前设好：被 cfg 掉的条目在解析阶段就被剔除（它们对名称
+    // 解析而言根本不存在），类型检查阶段再兜一遍。
+    let cfg_target = attributes::CfgTarget::from_target(&target);
+    attributes::set_global_target(cfg_target.clone());
+
     // 1. 读取源文件
     let source =
         std::fs::read_to_string(input).map_err(|e| format!("cannot read '{input}': {e}"))?;
@@ -663,6 +670,8 @@ fn compile(input: &str, cmd: &Cli) -> Result<std::path::PathBuf, String> {
     // 计算。未实现的运算（如 i64 乘法/除法）在后端报错，不会静默截断。
     checker.set_max_int_bits(64);
     checker.set_pointer_bits(target.pointer_size() as u16 * 8);
+    // cfg 条件按编译目标求值（交叉编译到 Linux 时 `target_os = "linux"` 成立）。
+    checker.set_cfg_target(cfg_target);
     let hir = checker.check_program(&ast).map_err(|e| e.to_string())?;
     time_phase(t0, "typeck");
     if cmd.dump_hir {

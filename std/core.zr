@@ -1,53 +1,22 @@
 //=============================================================================
-// std/core.zr — 基础类型、trait 与语言内建扩展
+// std/core.zr — 核心库（平台无关 + 平台相关实现）
 //
-// zr 的标准库完全用 zr 自身编写（自举），通过 `extern "C"` 链接 libc。
-// 本节提供语言所需的"最小标准库"：Option / Result / 迭代器 / 常用 trait，
-// 以及面向用户的 panic、断言、算术工具。
+// 类似 Rust 的 core crate：
+// - 平台无关的类型定义、trait、工具函数
+// - 平台相关的实现（panic、内存分配、IO）通过 cfg 选择
 //=============================================================================
 
-//----- 外部运行时（由编译器/运行时提供）----------------------------------------
+//----- 外部运行时符号声明（由运行时提供，所有平台共有）---------------------
 
-/// 终止程序并打印一条消息。这是 zr 的"最后一道防线"。
 extern "C" {
     fn zr_panic(msg: *const u8, len: usize) -> !;
-}
-
-/// 向标准输出写入一段字节。返回写入的字节数，出错时返回 -1。
-extern "C" {
     fn zr_write(fd: i32, buf: *const u8, count: usize) -> isize;
-}
-
-/// 从文件描述符读取。返回读取的字节数，0 表示 EOF，-1 表示出错。
-extern "C" {
     fn zr_read(fd: i32, buf: *mut u8, count: usize) -> isize;
-}
-
-/// 退出程序，返回给定的退出码。
-extern "C" {
     fn zr_exit(code: i32) -> !;
-}
-
-/// 分配 `size` 字节的内存，返回对齐的指针，失败时返回 null。
-extern "C" {
     fn zr_alloc(size: usize, align: usize) -> *mut void;
-}
-
-/// 释放先前 `zr_alloc` 得到的内存。
-extern "C" {
     fn zr_dealloc(ptr: *mut void, size: usize, align: usize);
-}
-
-/// 重新分配一块内存，尽可能保留其内容。
-extern "C" {
     fn zr_realloc(ptr: *mut void, old_size: usize, new_size: usize, align: usize) -> *mut void;
 }
-
-//----- 常用文件描述符常量------------------------------------------------------
-
-pub const STDIN_FD:  i32 = 0;
-pub const STDOUT_FD: i32 = 1;
-pub const STDERR_FD: i32 = 2;
 
 //=============================================================================
 // trait：zr 的核心多态抽象
@@ -274,8 +243,6 @@ impl Clone for bool {
 }
 
 impl Copy for u8 {}
-// `usize` 在 zr 里就是 `u64`（指针位宽相同），不能再来一份 impl——
-// 一致性检查会判成同一个类型的两个实现。
 
 //=============================================================================
 // 数值工具函数
@@ -308,8 +275,31 @@ pub fn swap<T>(a: &mut T, b: &mut T) {
 }
 
 //=============================================================================
-// 断言与 panic 工具
+// 常用文件描述符常量
 //=============================================================================
+
+pub const STDIN_FD:  i32 = 0;
+pub const STDOUT_FD: i32 = 1;
+pub const STDERR_FD: i32 = 2;
+
+//=============================================================================
+// panic 与断言实现
+//=============================================================================
+
+/// 无条件终止程序，并打印消息。
+pub fn panic(msg: []const u8) -> ! {
+    zr_panic(msg.ptr, msg.len);
+}
+
+/// 尚未实现的功能，触发 panic。
+pub fn unimplemented() -> ! {
+    panic("not yet implemented");
+}
+
+/// 不可达分支的兜底，触发 panic。
+pub fn unreachable() -> ! {
+    panic("internal error: entered unreachable code");
+}
 
 /// 条件为假时终止程序。
 pub fn assert(cond: bool, msg: []const u8) {
@@ -325,17 +315,34 @@ pub fn assert_eq<T: Eq>(a: T, b: T, msg: []const u8) {
     }
 }
 
-/// 无条件终止程序，并打印消息。
-pub fn panic(msg: []const u8) -> ! {
-    zr_panic(msg.ptr, msg.len);
+//=============================================================================
+// 内存管理（重新导出运行时符号）
+//=============================================================================
+
+pub fn alloc(size: usize, align: usize) -> *mut void {
+    zr_alloc(size, align)
 }
 
-/// 尚未实现的功能，触发 panic。
-pub fn unimplemented() -> ! {
-    panic("not yet implemented");
+pub fn dealloc(ptr: *mut void, size: usize, align: usize) {
+    zr_dealloc(ptr, size, align);
 }
 
-/// 不可达分支的兜底，触发 panic。
-pub fn unreachable() -> ! {
-    panic("internal error: entered unreachable code");
+pub fn realloc(ptr: *mut void, old_size: usize, new_size: usize, align: usize) -> *mut void {
+    zr_realloc(ptr, old_size, new_size, align)
+}
+
+//=============================================================================
+// 基础 IO（重新导出运行时符号）
+//=============================================================================
+
+pub fn write(fd: i32, buf: *const u8, count: usize) -> isize {
+    zr_write(fd, buf, count)
+}
+
+pub fn read(fd: i32, buf: *mut u8, count: usize) -> isize {
+    zr_read(fd, buf, count)
+}
+
+pub fn exit(code: i32) -> ! {
+    zr_exit(code)
 }

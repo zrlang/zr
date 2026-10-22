@@ -566,7 +566,7 @@ mod tests {
             "zr_exit",
             RelocationKind::Branch26,
         ));
-        crate::codegen::objfile::add_extern_symbols(&mut unit);
+        crate::codegen::objfile::add_extern_symbols(&mut unit, target.os());
         let bytes = assemble_macho(&target(Arch::AArch64), &unit).unwrap();
         let ncmds = u32::from_le_bytes(bytes[16..20].try_into().unwrap());
         assert_eq!(ncmds, 4, "segment + build_version + symtab + dysymtab");
@@ -588,7 +588,7 @@ mod tests {
         let mut unit = sample_unit(OutputKind::Relocatable);
         unit.relocations
             .push(Relocation::new(0, 0, 4, "main", RelocationKind::Branch26));
-        crate::codegen::objfile::add_extern_symbols(&mut unit);
+        crate::codegen::objfile::add_extern_symbols(&mut unit, target.os());
 
         let symtab = Symtab::build(&unit, 0);
         let mut out = Vec::new();
@@ -608,7 +608,7 @@ mod tests {
         let mut unit = sample_unit(OutputKind::Relocatable);
         unit.relocations
             .push(Relocation::new(0, 0, 4, "foo", RelocationKind::Branch26));
-        crate::codegen::objfile::add_extern_symbols(&mut unit);
+        crate::codegen::objfile::add_extern_symbols(&mut unit, target.os());
         let symtab = Symtab::build(&unit, 0);
         let mut out = Vec::new();
         write_relocations(&target(Arch::AArch64), &mut out, &unit, &symtab.order).unwrap();

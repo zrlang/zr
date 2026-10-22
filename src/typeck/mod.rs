@@ -124,8 +124,11 @@ pub struct TypeChecker {
     known_modules: HashSet<String>,
     /// 警告集合（deprecated 使用等）。
     warnings: Vec<CompileError>,
-    /// 已处理的 cfg 条件（用于过滤条目）。
-    cfg_enabled: bool,
+    /// cfg 求值用的目标平台信息。
+    ///
+    /// 条目的 `#[cfg]` 条件要按**编译目标**求值：`#[cfg(target_os =
+    /// "linux")]` 在交叉编译到 Linux 时成立，在 macOS 上不成立。
+    cfg_target: attributes::CfgTarget,
     /// AST 层的函数表（名字 → 函数）。
     ///
     /// comptime 函数需要在**类型检查函数体之前**就能被求值（`comptime fact(4)`
@@ -173,7 +176,7 @@ impl Default for TypeChecker {
             use_aliases: HashMap::new(),
             known_modules: HashSet::new(),
             warnings: Vec::new(),
-            cfg_enabled: true,
+            cfg_target: attributes::CfgTarget::host(),
             ast_fns: HashMap::new(),
         }
     }
@@ -203,6 +206,19 @@ impl TypeChecker {
     /// 设置目标指针位宽，供 `usize` / `isize` 解析使用。
     pub fn set_pointer_bits(&mut self, bits: u16) {
         self.pointer_bits = bits;
+    }
+
+    /// 设置 cfg 求值用的目标平台信息。
+    ///
+    /// 必须按**编译目标**设置，而不是宿主平台：交叉编译到 Linux 时，
+    /// `#[cfg(target_os = "linux")]` 的条目应当存在。
+    pub fn set_cfg_target(&mut self, target: attributes::CfgTarget) {
+        self.cfg_target = target;
+    }
+
+    /// 条目的 cfg 条件是否成立（成立则保留该条目）。
+    fn cfg_enabled(&self, attrs: &[ast::Attribute]) -> bool {
+        attributes::is_cfg_enabled(attrs, &self.cfg_target)
     }
 
     /// 整数字面量后缀 → 具体整型。无后缀或未知后缀返回 `None`。
@@ -247,6 +263,13 @@ impl TypeChecker {
                 continue;
             };
             for method in &ib.methods {
+                // cfg 过滤：被 cfg 掉的方法不存在。
+                //
+                // impl 块本身在解析阶段就被整体剔除了（属性没有留在 AST
+                // 上），但**方法**的属性留下来了，所以这里要再过滤一次。
+                if !self.cfg_enabled(&method.attrs) {
+                    continue;
+                }
                 let mut m = method.clone();
                 m.name = format!("{target_name}__{}", method.name);
                 self.impl_targets.insert(m.name.clone(), ib.target.clone());
@@ -429,22 +452,33 @@ impl TypeChecker {
 
     /// 处理所有属性：cfg 过滤、derive 生成、deprecated 标记。
     fn process_attributes(&mut self, prog: &Program) -> Result<()> {
-        // cfg 过滤：检查模块级属性
-        for attr in &prog.attrs {
-            if attr.name == "cfg" {
-                // 模块级 cfg：如果条件不满足，整个模块被过滤
-                // 简化实现：模块级 cfg 暂不处理（需要目标信息）
-            }
-        }
-
         // 收集所有条目的属性信息
+        //
+        // cfg 过滤在这里先做一遍：被 cfg 掉的条目不该产生 deprecated 警告，
+        // 更不该进入符号表（引用它要报 "cannot find value"）。
+        //
+        // 注意：模块级条目（`const` / `static` / `enum` / `impl` / `type`）
+        // 的属性没有留在 AST 上，所以它们的 cfg 过滤是在**解析阶段**完成的
+        // （见 `parser::parse_module_item_opt`）；这里处理的是属性还在
+        // AST 上的条目：`fn` 与 `struct`。
         for item in &prog.functions {
+            if !self.cfg_enabled(&item.attrs) {
+                continue;
+            }
             self.process_fn_attrs(item)?;
         }
         for td in &prog.type_defs {
+            if let ast::TypeDef::Struct(s) = td {
+                if !self.cfg_enabled(&s.attrs) {
+                    continue;
+                }
+            }
             self.process_type_attrs(td)?;
         }
         for t in &prog.traits {
+            if !self.cfg_enabled(&t.attrs) {
+                continue;
+            }
             self.process_trait_attrs(t)?;
         }
         Ok(())
@@ -452,11 +486,6 @@ impl TypeChecker {
 
     /// 处理函数属性。
     fn process_fn_attrs(&mut self, f: &ast::Function) -> Result<()> {
-        // cfg 过滤
-        if !self.cfg_enabled {
-            return Ok(());
-        }
-
         // deprecated 标记
         if attributes::is_deprecated(&f.attrs) {
             let msg = attributes::deprecated_message(&f.attrs)
@@ -584,6 +613,11 @@ impl TypeChecker {
 
     fn collect_declarations(&mut self, prog: &Program) -> Result<()> {
         for item in &prog.functions {
+            // cfg 过滤：条件不成立的函数**不存在**——不进符号表，引用它
+            // 会报 "cannot find value"。
+            if !self.cfg_enabled(&item.attrs) {
+                continue;
+            }
             let id = self.alloc_def(item.name.clone());
             self.ast_fns.insert(item.name.clone(), item.clone());
             self.functions.insert(
@@ -607,6 +641,15 @@ impl TypeChecker {
             );
         }
         for td in &prog.type_defs {
+            // cfg 过滤：结构体的属性留在 AST 上，可以在这里判断。
+            //
+            // `enum` / `union` / `type` 别名的属性没有留在 AST 上，它们在
+            // 解析阶段就被剔除了（见 `parser::parse_module_item_opt`）。
+            if let ast::TypeDef::Struct(s) = td {
+                if !self.cfg_enabled(&s.attrs) {
+                    continue;
+                }
+            }
             let id = self.alloc_def(match td {
                 ast::TypeDef::Struct(s) => s.name.clone(),
                 ast::TypeDef::Enum(e) => e.name.clone(),
@@ -673,6 +716,10 @@ impl TypeChecker {
             // 名字带 trait 前缀，免得两个 trait 的同名方法（`Eq::eq` 与
             // `PartialEq::eq`）撞成同一个定义。
             for m in &t.methods {
+                // cfg 过滤：被 cfg 掉的 trait 方法不存在。
+                if !self.cfg_enabled(&m.attrs) {
+                    continue;
+                }
                 let mid = self.alloc_def(format!("{}::{}", t.name, m.name));
                 self.ast_fns.insert(format!("{}::{}", t.name, m.name), m.clone());
                 self.functions.insert(mid, self.fn_to_hir(m, mid));
@@ -765,6 +812,12 @@ impl TypeChecker {
 
     fn check_type_defs(&mut self, prog: &Program) -> Result<()> {
         for td in &prog.type_defs {
+            // cfg 过滤：被 cfg 掉的类型定义没有符号表条目，直接跳过。
+            if let ast::TypeDef::Struct(s) = td {
+                if !self.cfg_enabled(&s.attrs) {
+                    continue;
+                }
+            }
             match td {
                 ast::TypeDef::Struct(s) => self.check_struct_def(s)?,
                 ast::TypeDef::Enum(e) => self.check_enum_def(e)?,
@@ -964,6 +1017,10 @@ impl TypeChecker {
             let hir_t = self.trait_defs.get_mut(&id).unwrap();
             hir_t.assoc_types = assoc_types;
             for m in &t.methods {
+                // cfg 过滤：被 cfg 掉的 trait 方法没有签名条目。
+                if !self.cfg_enabled(&m.attrs) {
+                    continue;
+                }
                 // trait 中的方法是声明，不要求有 body
                 let key = format!("{}::{}", t.name, m.name);
                 let fid = self.find_def(&key)?;
@@ -1094,6 +1151,10 @@ impl TypeChecker {
 
     fn check_function_signatures(&mut self, prog: &Program) -> Result<()> {
         for f in &prog.functions {
+            // cfg 过滤：被 cfg 掉的函数没有符号表条目。
+            if !self.cfg_enabled(&f.attrs) {
+                continue;
+            }
             let id = self.find_def(&f.name)?;
             // 签名里的泛型参数 / `Self` 要先绑上——它们是类型变量。
             self.push_type_params(&f.generics, ast::Span::unknown());
@@ -1163,6 +1224,10 @@ impl TypeChecker {
     fn check_function_bodies(&mut self, prog: &Program) -> Result<Vec<hir::HirFunction>> {
         let _result: Vec<hir::HirFunction> = Vec::new();
         for f in &prog.functions {
+            // cfg 过滤：被 cfg 掉的函数没有符号表条目。
+            if !self.cfg_enabled(&f.attrs) {
+                continue;
+            }
             let id = self.find_def(&f.name)?;
             // 泛型函数的体跳过：类型参数是推断变量，按它检查只会报一堆
             // 假错。函数体留空，用到它时再报"未实现"。
