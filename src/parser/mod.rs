@@ -9,7 +9,7 @@
 //!                 | trait_def | impl_block | attr
 //! statement      := let_stmt | var_stmt | const_stmt | expr_stmt
 //! let_stmt       := 'let' pattern (':' type)? ('=' expr)? ';'
-//! var_stmt       := 'var' pattern (':' type)? ('=' expr)? ';'
+//! let_stmt       := 'let' 'mut'? pattern (':' type)? ('=' expr)? ';'
 //! expr_stmt      := expr ';'
 //! expression     := assignment
 //! assignment     := logical_or (assign_op expression)?
@@ -51,6 +51,7 @@ pub struct Parser {
     /// `if x { ... }` 里的 `{` 必须是条件体块，不能被当成结构体字面量
     /// 的起始（Rust 的 "no struct literal in condition position" 规则）。
     no_struct_literal: bool,
+    no_block_expr: bool,
 }
 
 impl Parser {
@@ -60,6 +61,7 @@ impl Parser {
             tokens,
             pos: 0,
             no_struct_literal: false,
+            no_block_expr: false,
         }
     }
 
@@ -199,7 +201,7 @@ impl Parser {
         }
 
         Err(self.unexpected(&[
-            "fn/let/const/var/struct/enum/union/type/trait/impl/mod/use/extern/static",
+            "fn/let/const/struct/enum/union/type/trait/impl/mod/use/extern/static",
         ]))
     }
 
@@ -336,12 +338,9 @@ impl Parser {
 
     /// 解析一条语句。
     fn parse_statement(&mut self) -> Result<Statement> {
-        // `let` / `var`
+        // `let` / `let mut`
         if self.match_kind(&TokenKind::KwLet) {
             return self.parse_let_stmt(false);
-        }
-        if self.match_kind(&TokenKind::KwVar) {
-            return self.parse_let_stmt(true);
         }
         // `const` 在语句位置 = 局部常量（编译期求值）
         if self.match_kind(&TokenKind::KwConst) {
@@ -383,7 +382,20 @@ impl Parser {
                 self.parse_pattern()?,
             )
         };
-        let _ = mutability;
+        // `mut` 修饰的是绑定本身；把它写回顶层 Binding 模式，
+        // 后续类型检查才能知道这个局部变量可被赋值。
+        let pattern = match (mutability, pattern) {
+            (
+                crate::parser::ast::Mutability::Mutable,
+                crate::parser::ast::Pattern::Binding(name, _, sub, span),
+            ) => crate::parser::ast::Pattern::Binding(
+                name,
+                crate::parser::ast::Mutability::Mutable,
+                sub,
+                span,
+            ),
+            (_, pattern) => pattern,
+        };
         let ty = if self.match_kind(&TokenKind::Colon) {
             Some(self.parse_type()?)
         } else {
@@ -413,6 +425,21 @@ impl Parser {
         }
     }
 
+    /// 在一个**不会与块语法歧义**的上下文里解析表达式。
+    ///
+    /// `if cond { .. }` 的条件里，`{` 既可能是结构体字面量的开头，也可能是
+    /// 块的开头——顶层必须禁用结构体字面量。但嵌套进去之后就没有这个歧义
+    /// 了：`f(P { x: 1 })` 的实参、`arr[P { x: 1 }]` 的下标、字段值、
+    /// 括号内的表达式里，`{` 只能是结构体字面量。早先这些位置也一并禁用，
+    /// 于是 `if f(P { x: 1 }) { .. }` 直接报"expected ')'"。
+    fn parse_nested_expr(&mut self) -> Result<crate::parser::ast::Expression> {
+        let saved = self.no_struct_literal;
+        self.no_struct_literal = false;
+        let result = self.parse_expression();
+        self.no_struct_literal = saved;
+        result
+    }
+
     /// 解析一个块 `{ ... }`，不消费闭合大括号。
     ///
     /// 进入块内恢复结构体字面量：`no_struct_literal` 只用于消解
@@ -429,10 +456,10 @@ impl Parser {
         let mut stmts = Vec::new();
         let mut tail: Option<Box<Expression>> = None;
         while !self.check(&TokenKind::RBrace) && !self.check(&TokenKind::Eof) {
-            // `let` / `var` / `const` 语句
+            // `let` / `const` 语句
             if matches!(
                 self.peek().kind,
-                TokenKind::KwLet | TokenKind::KwVar | TokenKind::KwConst
+                TokenKind::KwLet | TokenKind::KwConst
             ) {
                 stmts.push(self.parse_statement()?);
                 continue;
@@ -602,6 +629,7 @@ fn is_block_like(expr: &Expression) -> bool {
     matches!(
         expr,
         Expression::If(..)
+            | Expression::IfLet(..)
             | Expression::Match(..)
             | Expression::While(..)
             | Expression::For(..)
@@ -634,6 +662,56 @@ mod tests {
         assert_eq!(p.functions[0].name, "add");
         assert_eq!(p.functions[0].params.len(), 2);
         assert_eq!(p.functions[0].return_type, Type::I(32));
+    }
+
+    #[test]
+    fn let_mut_marks_the_binding_as_mutable() {
+        let p = parse_ok("fn main() { let mut x: i32 = 1; x = 2; }");
+        let body = p.functions[0].body.as_ref().expect("body");
+        match &body.stmts[0] {
+            Statement::Var(
+                Pattern::Binding(_, Mutability::Mutable, _, _),
+                _,
+                _,
+                _,
+            ) => {}
+            other => panic!("expected a mutable let binding, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_if_let_with_else_block_debug() {
+        let src = "fn main() { let y = if let z = x { z } else { 0 }; }";
+        let tokens = crate::lexer::Lexer::new(src).tokenize();
+        println!("Tokens:");
+        for (i, t) in tokens.iter().enumerate() {
+            println!("  {}: {:?}", i, t);
+        }
+        let mut p = crate::parser::Parser::new(tokens);
+        match p.parse() {
+            Ok(prog) => println!("Parsed successfully"),
+            Err(e) => {
+                println!("Parse error: {}", e);
+                // Try to see current parser state
+            }
+        }
+    }
+
+    #[test]
+    fn parse_if_let_with_else_block() {
+        let tokens = crate::lexer::Lexer::new("fn main() { let y = if let z = x { z } else { 0 }; }").tokenize();
+        let mut p = crate::parser::Parser::new(tokens);
+        let prog = p.parse().expect("should parse successfully");
+        assert_eq!(prog.functions.len(), 1);
+        let body = prog.functions[0].body.as_ref().expect("body");
+        assert_eq!(body.stmts.len(), 1);
+    }
+
+    #[test]
+    fn var_is_no_longer_a_binding_keyword() {
+        let tokens = Lexer::new("fn main() { var x: i32 = 1; }").tokenize();
+        let err = Parser::new(tokens).parse().expect_err("`var` 不应再被接受");
+        assert!(!err.message.is_empty());
     }
 
     #[test]

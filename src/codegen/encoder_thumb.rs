@@ -916,6 +916,25 @@ fn emit_compare_wide(
 /// 反向移位补进来），后段整字搬移并补符号/零。Thumb-2 的寄存器移位指令
 /// (`LSL.W`/`LSR.W`/`ASR.W Rd, Rn, Rm`) 允许 Rd == Rm，因此拼进位不需要
 /// 额外的暂存寄存器（r9=lo、r10=hi、r11=cnt、r12=scratch 恰好够用）。
+/// 64 位按位运算：lo / hi 两个字各自做一遍同样的位运算。
+fn emit_bitop_wide(
+    unit: &mut CompilationUnit,
+    result: SsaValue,
+    prefix: u16,
+    lhs: SsaValue,
+    rhs: SsaValue,
+) {
+    let lo = SPILL_SRC;
+    let hi = SPILL_SRC2;
+    let rlo = MUL_TMP;
+    let rhi = SPILL_DST;
+    wide_load(unit, lhs, lo, hi);
+    wide_load(unit, rhs, rlo, rhi);
+    dp3(unit, prefix, lo, lo, rlo);
+    dp3(unit, prefix, hi, hi, rhi);
+    wide_store(unit, result, lo, hi);
+}
+
 fn emit_shift_wide(
     unit: &mut CompilationUnit,
     result: SsaValue,
@@ -1342,6 +1361,15 @@ fn emit_instr(unit: &mut CompilationUnit, instr: &SsaInstr) {
                     SsaBinaryOp::Shl | SsaBinaryOp::Shr => {
                         emit_shift_wide(unit, *result, *op, *lhs, *rhs)
                     }
+                    SsaBinaryOp::BitAnd | SsaBinaryOp::And => {
+                        emit_bitop_wide(unit, *result, 0xea00, *lhs, *rhs)
+                    }
+                    SsaBinaryOp::BitOr | SsaBinaryOp::Or => {
+                        emit_bitop_wide(unit, *result, 0xea40, *lhs, *rhs)
+                    }
+                    SsaBinaryOp::BitXor => {
+                        emit_bitop_wide(unit, *result, 0xea80, *lhs, *rhs)
+                    }
                     SsaBinaryOp::Eq
                     | SsaBinaryOp::Ne
                     | SsaBinaryOp::Lt
@@ -1355,7 +1383,6 @@ fn emit_instr(unit: &mut CompilationUnit, instr: &SsaInstr) {
                             None => crate::codegen::unsupported_binary_op(*op),
                         }
                     }
-                    _ => crate::codegen::unsupported_binary_op(*op),
                 }
             } else if float_slot(*lhs).is_some() || float_slot(*rhs).is_some() || ty.is_float() {
                 emit_binary_float(unit, *result, *op, *lhs, *rhs, *ty);

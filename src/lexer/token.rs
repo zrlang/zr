@@ -47,8 +47,6 @@ pub enum TokenKind {
     KwLet,
     /// `const`
     KwConst,
-    /// `var`（可变绑定，区别于 `let`）
-    KwVar,
     /// `mut`
     KwMut,
     /// `if`
@@ -153,6 +151,10 @@ pub enum TokenKind {
     TyU(usize),
     /// `f32` / `f64`
     TyF(usize),
+    /// `usize`
+    TyUsize,
+    /// `isize`
+    TyIsize,
     /// `bool`
     TyBool,
     /// `str`（UTF-8 字符串切片 `[]const u8`）
@@ -308,7 +310,6 @@ impl TokenKind {
             TokenKind::KwFn => Some("fn"),
             TokenKind::KwLet => Some("let"),
             TokenKind::KwConst => Some("const"),
-            TokenKind::KwVar => Some("var"),
             TokenKind::KwMut => Some("mut"),
             TokenKind::KwIf => Some("if"),
             TokenKind::KwElse => Some("else"),
@@ -360,6 +361,8 @@ impl TokenKind {
             // 里的 `never` 就是这种用法。缺了这条，`consume_ident` 会直接
             // 报错，`inline(never)` 根本解析不出来。
             TokenKind::TyNever => Some("never"),
+            TokenKind::TyUsize => Some("usize"),
+            TokenKind::TyIsize => Some("isize"),
             TokenKind::TyBool => Some("bool"),
             TokenKind::TyStr => Some("str"),
             TokenKind::TyChar => Some("char"),

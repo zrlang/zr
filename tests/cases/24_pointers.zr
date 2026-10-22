@@ -24,7 +24,7 @@ fn main() -> i32 {
     if byte_at(s, 1) != 66 { return 4; }
 
     // 2. 取地址 + 解引用读（`&x` 是只读指针，只许读）。
-    let x: i32 = 7;
+    let mut x: i32 = 7;
     let p: *i32 = &x;
     if *p != 7 { return 5; }
 
@@ -42,9 +42,9 @@ fn main() -> i32 {
     if pm[0] != 99 { return 9; }
 
     // 5. 循环里通过可变指针累加：0+1+2+3+4 = 10。
-    let acc: i32 = 0;
+    let mut acc: i32 = 0;
     let q: *mut i32 = &mut acc;
-    let i: i32 = 0;
+    let mut i: i32 = 0;
     while i < 5 {
         *q = *q + i;
         i = i + 1;
@@ -53,8 +53,8 @@ fn main() -> i32 {
 
     // 6. 循环里对字符串字节求和：A+B+C = 198。
     //    顺带覆盖：对只读指针 `s[k]` 只读不写。
-    let k: i32 = 0;
-    let sum: i32 = 0;
+    let mut k: i32 = 0;
+    let mut sum: i32 = 0;
     while k < 3 {
         sum = sum + s[k] as i32;
         k = k + 1;

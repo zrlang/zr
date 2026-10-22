@@ -237,14 +237,16 @@ impl Parser {
                     let args = self.parse_pattern_call_args()?;
                     return Ok(Pattern::Variant { path, args, span });
                 }
-                // unit 变体：`Color::Red => ...` —— 退化成最后一段的绑定名
-                let last = path.last().cloned().unwrap_or(ident);
-                return Ok(Pattern::Binding(
-                    last,
-                    crate::parser::ast::Mutability::Immutable,
-                    None,
+                // unit 变体：`Color::Red => ...` —— 无载荷的变体模式。
+                //
+                // 早先退化成"最后一段的绑定名"，于是 `Color::Red` 变成了
+                // 绑定任意值的模式：`match c { Color::Red => .. }` 恒匹配，
+                // 判别式根本没参与比较。
+                return Ok(Pattern::Variant {
+                    path,
+                    args: Vec::new(),
                     span,
-                ));
+                });
             }
 
             // 枚举变体 / 结构体模式：`Name { ... }` 或 `Name(p1, p2)`

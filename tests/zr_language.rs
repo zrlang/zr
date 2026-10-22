@@ -102,6 +102,56 @@ fn zr_language_cases() {
 /// 只测宿主目标——自行构造的 ELF（交叉编译、无平台链接器时走的那条路）不带
 /// 运行时，`zr_write` 会是未定义符号。所以这个用例不放进 `tests/cases/`：
 /// 那里每个用例还会在 aarch64 模拟器下再跑一遍。
+/// `io` 模块的输出要和 Rust 一致：整数的十进制、浮点的"最短往返十进制"
+/// （2.675 打成 "2.675" 而不是 "2.6749999999999998"）、Debug 的引号与
+/// ".0"、十六进制规格、格式串里的转义序列。
+#[test]
+fn io_print_matches_rust() {
+    let zr = env!("CARGO_BIN_EXE_zr");
+    let source = r#"use io::{println_fmt, fmt_int, fmt_float, fmt_str, fmt_bool};
+
+fn main() -> i32 {
+    let a1 = [fmt_int(42), fmt_float(2.675), fmt_str("hi"), fmt_bool(true)];
+    println_fmt("int={} float={} str={} bool={}", &a1[0] as *const FormatArg, 4);
+    let a2 = [fmt_float(1.0), fmt_int(255), fmt_int(255)];
+    println_fmt("debug={:?} hex={:x} hexu={:X} esc=a\tb\\c", &a2[0] as *const FormatArg, 3);
+    return 0;
+}
+"#;
+    let src = std::env::temp_dir().join("zr_io_print.zr");
+    std::fs::write(&src, source).unwrap();
+
+    for opt in OPT_LEVELS {
+        let out = std::env::temp_dir().join("zr_io_print");
+        let compile = Command::new(zr)
+            .arg(&src)
+            .arg(opt)
+            .arg("-o")
+            .arg(&out)
+            .output()
+            .expect("failed to spawn the zr compiler");
+        assert!(
+            compile.status.success(),
+            "编译失败 ({opt}):\n{}",
+            String::from_utf8_lossy(&compile.stderr)
+        );
+        let run = Command::new(&out).output().expect("failed to run program");
+        assert_eq!(
+            run.status.code(),
+            Some(0),
+            "退出码异常 ({opt}); stderr: {}",
+            String::from_utf8_lossy(&run.stderr)
+        );
+        assert_eq!(
+            run.stdout,
+            b"int=42 float=2.675 str=hi bool=true\ndebug=1.0 hex=ff hexu=FF esc=a\tb\\c\n",
+            "标准输出不符 ({opt})"
+        );
+        let _ = std::fs::remove_file(&out);
+    }
+    let _ = std::fs::remove_file(&src);
+}
+
 #[test]
 fn extern_c_write_prints_string_literal() {
     let zr = env!("CARGO_BIN_EXE_zr");

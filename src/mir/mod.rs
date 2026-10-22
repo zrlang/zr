@@ -14,6 +14,7 @@
 
 pub mod async_lower;
 pub mod builder;
+pub mod narrow;
 pub mod test_harness;
 
 use crate::typeck::hir::{self, HirModule};
@@ -257,6 +258,12 @@ pub fn lower(hir: &HirModule) -> MirModule {
                 &fn_params,
             ));
         }
+    }
+
+    // 窄浮点（f8 / f16）的位模式转换编成独立的辅助函数，用到才加进来。
+    for bits in narrow::used_widths() {
+        functions.push(narrow::f32_to_narrow_fn(bits));
+        functions.push(narrow::narrow_to_f32_fn(bits));
     }
 
     let mut module = MirModule { functions };

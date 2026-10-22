@@ -53,6 +53,47 @@ zr_read:
     ret
 
 #------------------------------------------------------------------------------
+# zr_open(path, mode) -> isize
+#   rdi = path (NUL 结尾), rsi = mode（0=只读 1=写 2=追加）
+#   返回文件描述符，出错返回 -1（errno 由调用方自行判断）。
+#
+# 用 openat(AT_FDCWD, ...) —— 新内核上 open() 已经不推荐了。
+# 三种模式对应的 O_* 标志不同，在这里统一映射，调用方只管传 0/1/2。
+#------------------------------------------------------------------------------
+zr_open:
+    movq    %rsi, %rdx        # rdx = 第三个参数（mode），先留着
+    movq    %rsi, %r10        # r10 = 第四个参数（mode 位）
+    xorq    %rsi, %rsi        # rsi = 0 / 1 / 2
+    # 标志：O_WRONLY=1, O_CREAT=64, O_TRUNC=512, O_APPEND=1024
+    cmpq    $1, %rsi
+    je      1f
+    cmpq    $2, %rsi
+    je      2f
+    # 只读：O_RDONLY = 0
+    xorq    %rdx, %rdx        # flags = 0
+    jmp     3f
+1:
+    movq    $577, %rdx        # O_WRONLY | O_CREAT | O_TRUNC
+    jmp     3f
+2:
+    movq    $1089, %rdx       # O_WRONLY | O_CREAT | O_APPEND
+3:
+    movq    $64, %r10         # mode = 0644
+    movq    $-100, %rdi       # AT_FDCWD
+    movq    $257, %rax        # SYS_openat
+    syscall
+    ret
+
+#------------------------------------------------------------------------------
+# zr_close(fd) -> i32
+#   rdi = fd
+#------------------------------------------------------------------------------
+zr_close:
+    movq    $3, %rax          # SYS_close
+    syscall
+    ret
+
+#------------------------------------------------------------------------------
 # zr_exit(code) -> !
 #------------------------------------------------------------------------------
 zr_exit:

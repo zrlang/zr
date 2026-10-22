@@ -870,12 +870,22 @@ fn emit_add_sp_imm(unit: &mut CompilationUnit, bytes: u32) {
     }
 }
 
-/// `add rd, sp, #imm`：被取地址的槽（一般 ≤ 1020 字节偏移，编码上限同上）。
+/// `add rd, sp, #imm`：被取地址的槽。
+///
+/// 8 位旋转立即数编不下的大偏移（窄浮点转换那种上百条指令的函数会用到）
+/// 走 movw/movt 兜底：先把偏移装进 r12，再 `add rd, sp, r12`。
 fn emit_add_rd_sp_imm(unit: &mut CompilationUnit, rd: Reg, bytes: u32) {
-    let field = arm_imm_field(bytes).unwrap_or_else(|| {
-        crate::codegen::unsupported_const("slot offset out of range for the arm32 backend")
-    });
-    insn(unit, 0xe28d_0000 | (rd.bits() as u32) << 12 | field);
+    match arm_imm_field(bytes) {
+        Some(field) => insn(unit, 0xe28d_0000 | (rd.bits() as u32) << 12 | field),
+        None => {
+            emit_mov_imm32(unit, SPILL_DST, bytes);
+            // `add rd, sp, r12`：Rn = sp(13)，Rd = 目的，Rm = r12。
+            insn(
+                unit,
+                0xe08d_0000 | (rd.bits() as u32) << 12 | (13 << 16) | SPILL_DST.bits() as u32,
+            );
+        }
+    }
 }
 
 /// `ldr rd, [sp, #off]`：装载栈上传参区的第 5+ 个整型实参/接参。
@@ -1339,6 +1349,28 @@ fn emit_divrem_wide_const(
     wide_store(unit, result, SPILL_SRC, SPILL_SRC2);
 }
 
+/// 64 位按位运算：lo / hi 两个字各自做一遍同样的位运算。
+///
+/// 32 位目标上 64 位整数由两个字组成（`lo` / `hi`），按位运算是逐字进行的，
+/// 所以与/或/异或直接对两个字各做一次即可。
+fn emit_bitop_wide(
+    unit: &mut CompilationUnit,
+    result: SsaValue,
+    opc: u32,
+    lhs: SsaValue,
+    rhs: SsaValue,
+) {
+    let lo = SPILL_SRC;
+    let hi = SPILL_SRC2;
+    let rlo = MUL_TMP_A;
+    let rhi = SPILL_DST;
+    wide_load(unit, lhs, lo, hi);
+    wide_load(unit, rhs, rlo, rhi);
+    emit_op3(unit, opc, lo, lo, rlo);
+    emit_op3(unit, opc, hi, hi, rhi);
+    wide_store(unit, result, lo, hi);
+}
+
 fn emit_shift_wide(
     unit: &mut CompilationUnit,
     result: SsaValue,
@@ -1769,13 +1801,21 @@ fn emit_instr(unit: &mut CompilationUnit, instr: &SsaInstr) {
                     SsaBinaryOp::Shl | SsaBinaryOp::Shr => {
                         emit_shift_wide(unit, *result, *op, *lhs, *rhs)
                     }
+                    SsaBinaryOp::BitAnd | SsaBinaryOp::And => {
+                        emit_bitop_wide(unit, *result, op::AND, *lhs, *rhs)
+                    }
+                    SsaBinaryOp::BitOr | SsaBinaryOp::Or => {
+                        emit_bitop_wide(unit, *result, op::ORR, *lhs, *rhs)
+                    }
+                    SsaBinaryOp::BitXor => {
+                        emit_bitop_wide(unit, *result, op::EOR, *lhs, *rhs)
+                    }
                     SsaBinaryOp::Eq
                     | SsaBinaryOp::Ne
                     | SsaBinaryOp::Lt
                     | SsaBinaryOp::Gt
                     | SsaBinaryOp::Le
                     | SsaBinaryOp::Ge => emit_compare_wide(unit, *result, *op, *lhs, *rhs),
-                    _ => crate::codegen::unsupported_binary_op(*op),
                 }
             } else if float_slot(*lhs).is_some() || float_slot(*rhs).is_some() || ty.is_float() {
                 emit_binary_float(unit, *result, *op, *lhs, *rhs, *ty);

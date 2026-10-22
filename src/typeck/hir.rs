@@ -244,8 +244,27 @@ pub enum ExprKind {
     Throw,
     /// 数组字面量（元素按源码顺序保存）。
     Array(Vec<HirExpr>),
-    /// 元组字面量。
-    Tuple,
+    /// 元组字面量：各元素按源码顺序保存。
+    Tuple(Vec<HirExpr>),
+    /// 枚举变体构造：`Shape::Circle(5)`。
+    ///
+    /// `index` 是变体下标（判别式的值），`args` 是载荷的实参。
+    EnumVariant {
+        def_id: DefId,
+        index: usize,
+        args: Vec<HirExpr>,
+    },
+    /// 枚举的判别式（tag）：判断当前是哪个变体。
+    EnumTag(Box<HirExpr>),
+    /// 枚举载荷的字段访问：变体 `variant` 的第 `index` 个载荷字段。
+    ///
+    /// 载荷的字段偏移随变体而变（不同变体的载荷类型不同），所以访问要
+    /// 带上变体下标。
+    EnumField {
+        value: Box<HirExpr>,
+        variant: usize,
+        index: usize,
+    },
     /// 结构体字面量：字段按源码书写顺序保存。
     Struct(Vec<(String, HirExpr)>),
     /// Lambda / 闭包（已确定捕获列表与类型）。
@@ -398,16 +417,27 @@ pub enum HirPattern {
     Literal(i128),
     /// 绑定（绑定到局部变量，携带它对应的 LocalId）。
     Binding(LocalId),
-    /// 元组模式。
-    Tuple,
-    /// 结构体模式。
-    Struct,
-    /// 枚举变体模式。
-    Variant,
+    /// 元组模式：逐个元素的模式。
+    Tuple(Vec<HirPattern>),
+    /// 结构体模式：`(字段名, 字段类型, 字段模式)`。
+    ///
+    /// 字段模式要留下来：结构体模式的匹配条件是各字段条件之合，绑定也
+    /// 落在字段上（不是整个 scrutinee）。早先把子模式丢掉，模式就只剩
+    /// "是个结构体"这一条信息，`if let P { x: 1 } = p` 于是恒成立。
+    Struct(Vec<(String, Ty, HirPattern)>),
+    /// 枚举变体模式：变体下标 + 各个载荷的模式。
+    Variant {
+        index: usize,
+        args: Vec<HirPattern>,
+    },
     /// 切片模式。
     Slice,
-    /// 范围模式。
-    Range,
+    /// 范围模式：`start..=end`（`inclusive` 为真）或 `start..end`。
+    Range {
+        start: Box<HirExpr>,
+        end: Box<HirExpr>,
+        inclusive: bool,
+    },
     /// 引用模式 `ref mut? p`。
     Ref,
 }
@@ -424,7 +454,7 @@ pub enum HirStmt {
         local: LocalId,
         init: Option<Box<HirExpr>>,
     },
-    /// `var` / `mut let` 绑定（可变）。
+    /// `let mut` 绑定（可变）。
     Var {
         local: LocalId,
         init: Option<Box<HirExpr>>,
@@ -557,7 +587,14 @@ pub struct HirField {
 /// HIR 枚举变体。
 #[derive(Debug, Clone)]
 pub struct HirVariant {
+    /// 变体名（`Shape::Circle` 里的 `Circle`）。
+    pub name: String,
     pub payload: HirVariantPayload,
+    /// 判别式的值：显式写的那个，没写就是上一个 + 1。
+    ///
+    /// 判别式才是运行期的"是哪个变体"标记——`enum E { A = 5, B }` 里
+    /// A 的判别式是 5、B 是 6，不是 0 / 1。
+    pub discriminant: i128,
 }
 
 #[derive(Debug, Clone)]

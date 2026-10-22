@@ -411,7 +411,21 @@ fn render(kind: &TokenKind) -> String {
     match kind {
         Ident(s) => s.clone(),
         IntLiteral(v, suffix) => format!("{v}{}", suffix.as_deref().unwrap_or("")),
-        FloatLiteral(v, suffix) => format!("{v}{}", suffix.as_deref().unwrap_or("")),
+        // `{}` 会把 100.0 打成 "100"——浮点字面量丢了小数点就变成整数字面量
+        // 了，类型也跟着变。Debug 格式（`{:?}`）给的是最短的往返表示。
+        FloatLiteral(v, suffix) => {
+            let text = format!("{v:?}");
+            // 词法只在见过小数点之后才认指数（`1e-5` 会被读成整数 1 加后缀
+            // `e-5`），所以指数形式要补上小数点。
+            let text = match text.find(['e', 'E']) {
+                Some(pos) if !text[..pos].contains('.') => {
+                    format!("{}.0{}", &text[..pos], &text[pos..])
+                }
+                _ if !text.contains('.') => format!("{text}.0"),
+                _ => text,
+            };
+            format!("{text}{}", suffix.as_deref().unwrap_or(""))
+        }
         StringLiteral(s) => format!("{s:?}"),
         CharLiteral(c) => format!("{c:?}"),
         LineComment(s) | BlockComment(s) => s.clone(),
@@ -435,7 +449,6 @@ const SYMBOLS: &[(TokenKind, &str)] = &[
     (TokenKind::KwFn, "fn"),
     (TokenKind::KwLet, "let"),
     (TokenKind::KwConst, "const"),
-    (TokenKind::KwVar, "var"),
     (TokenKind::KwMut, "mut"),
     (TokenKind::KwIf, "if"),
     (TokenKind::KwElse, "else"),
@@ -482,6 +495,8 @@ const SYMBOLS: &[(TokenKind, &str)] = &[
     (TokenKind::KwStatic, "static"),
     (TokenKind::KwExtern, "extern"),
     (TokenKind::KwCrate, "crate"),
+    (TokenKind::TyUsize, "usize"),
+    (TokenKind::TyIsize, "isize"),
     (TokenKind::TyBool, "bool"),
     (TokenKind::TyStr, "str"),
     (TokenKind::TyChar, "char"),
@@ -612,6 +627,13 @@ mod tests {
         assert!(got.contains("1 => 2"), "match arm spacing: {got}");
         assert!(got.contains("2 => 3"), "match arm spacing: {got}");
         assert!(got.contains("_ => 0"), "match arm spacing: {got}");
+    }
+
+    #[test]
+    fn formats_usize_isize_keywords() {
+        let got = fmt("fn f(x: usize, y: isize) -> usize { return x + y as usize; }");
+        assert!(got.contains("usize"), "usize missing: {got}");
+        assert!(got.contains("isize"), "isize missing: {got}");
     }
 
     #[test]

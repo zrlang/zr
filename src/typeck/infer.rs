@@ -172,6 +172,7 @@ impl<'a> InferCtxt<'a> {
                 b.min(8)
             }
             Ty::Float(32) => 4,
+            Ty::Float(8) => 1,
             Ty::Float(_) => 8,
             Ty::Bool => 1,
             Ty::Char => 4,

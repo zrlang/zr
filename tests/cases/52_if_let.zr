@@ -1,0 +1,90 @@
+//=============================================================================
+// tests/cases/52_if_let.zr — `if let` 表达式
+//
+// `if let pat = expr { then } else { else }` 脱糖成
+// `match expr { pat => { then } _ => { else } }`，因此：
+//   - `pat` 里的绑定名在 then 分支可见；
+//   - 模式不匹配时走 else 分支；
+//   - 没有 else 时按"直接退出函数"处理（发散分支）。
+//
+// 另外覆盖 `let mut` 的可变性语义：可变绑定才能被重新赋值。
+//=============================================================================
+
+/// 绑定模式：绑定的名字在 then 分支可见。
+fn binding_in_then(x: i32) -> i32 {
+    if let y = x {
+        return y + 1;
+    } else {
+        return 0;
+    }
+}
+
+/// 表达式形式：整个 `if let` 有值。
+fn as_expression(x: i32) -> i32 {
+    let v = if let y = x { y } else { 0 };
+    return v;
+}
+
+/// 嵌套：then 分支里再套一层 `if let`。
+fn nested(x: i32) -> i32 {
+    if let y = x {
+        if let z = y {
+            return z + 10;
+        } else {
+            return 1;
+        }
+    } else {
+        return 2;
+    }
+}
+
+/// 没有 else 的 `if let`：模式不匹配就直接退出函数。
+///
+/// 这里用 `return` 让两条路都发散，函数末尾的类型检查才过得去。
+fn no_else(x: i32) -> i32 {
+    if let y = x {
+        return y;
+    }
+    return 0;
+}
+
+/// `let mut` 绑定可以重新赋值；不可变绑定不行。
+fn mutable_binding() -> i32 {
+    let mut counter: i32 = 0;
+    counter = counter + 1;
+    counter = counter + 1;
+    return counter;
+}
+
+/// 可变绑定同样能通过 `&mut` 指针写入。
+fn mutable_through_pointer() -> i32 {
+    let mut n: i32 = 0;
+    let p: *mut i32 = &mut n;
+    *p = 7;
+    return n;
+}
+
+fn main() -> i32 {
+    // --- 绑定模式 ---
+    if binding_in_then(41) != 42 { return 1; }
+    if binding_in_then(0) != 1 { return 2; }
+
+    // --- 表达式形式 ---
+    if as_expression(42) != 42 { return 3; }
+    if as_expression(0) != 0 { return 4; }
+
+    // --- 嵌套 ---
+    // 绑定模式不可反驳：`x` 是 0 也照样匹配上，所以走的是 then 分支。
+    if nested(5) != 15 { return 5; }
+    if nested(0) != 10 { return 6; }
+
+    // --- 没有 else ---
+    if no_else(42) != 42 { return 7; }
+    if no_else(0) != 0 { return 8; }
+
+    // --- 可变绑定 ---
+    if mutable_binding() != 2 { return 9; }
+    if mutable_through_pointer() != 7 { return 10; }
+
+    return 0;
+}

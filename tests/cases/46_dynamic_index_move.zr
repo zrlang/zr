@@ -31,7 +31,7 @@ fn main() -> i32 {
             R { v: 20, out: &mut drops2 as *mut i32 },
             R { v: 30, out: &mut drops2 as *mut i32 },
         ];
-        let idx = 0;
+        let mut idx = 0;
         while idx < 3 {
             if idx == 2 { break; }
             let r = a[idx];

@@ -281,7 +281,8 @@ fn emit_movq_gpr_to_xmm(unit: &mut CompilationUnit, xmm: u8, gpr: Gpr) {
     modrm(unit, 3, xmm & 7, gpr.bits());
 }
 
-/// `movd xmm, r32`：把 32 位位模式搬进 XMM 低双字。`66 0F 6E /r`
+/// `movd xmm, r32`：把 32 位位模式搬进 XMM 低位（高位清零）。
+/// `66 0F 6E /r`
 fn emit_movd_gpr_to_xmm(unit: &mut CompilationUnit, xmm: u8, gpr: Gpr) {
     emit1(unit, 0x66);
     if gpr.rex_bit() {
@@ -329,18 +330,39 @@ fn emit_cvt_ss_dbl(unit: &mut CompilationUnit, src_is_ss: bool, dst: u8, src: u8
 }
 
 /// `cvtsi2ss/cvtsi2sd xmm, r64`：F3/F2 REX.W 0F 2A /r
+///
+/// ModRM 的 reg 字段是 XMM（REX.R）、rm 字段是通用寄存器（REX.B）。
 fn emit_cvtsi2f(unit: &mut CompilationUnit, width: u8, xmm: u8, gpr: Gpr) {
     emit1(unit, sse_prefix(width));
-    emit1(unit, 0x48 | if gpr.rex_bit() { 0x01 } else { 0 });
+    let mut rex = 0x48u8;
+    if xmm >= 8 {
+        rex |= 0x04; // REX.R <- reg 字段（XMM）
+    }
+    if gpr.rex_bit() {
+        rex |= 0x01; // REX.B <- rm 字段（通用寄存器）
+    }
+    emit1(unit, rex);
     emit1(unit, 0x0F);
     emit1(unit, 0x2A);
     modrm(unit, 3, xmm & 7, gpr.bits());
 }
 
 /// `cvttss2si/cvttsd2si r64, xmm`：F3/F2 REX.W 0F 2C /r（截断向零）
+///
+/// 这条指令的 ModRM 里 **reg 字段是通用寄存器**（要 REX.R 扩展）、**rm
+/// 字段是 XMM**（要 REX.B 扩展）。两者的扩展位不能弄反：把通用寄存器的
+/// 扩展位发成 REX.B，落在 r8-r15 上时目的寄存器会被解成 rax/rcx 之类，
+/// 同时源 XMM 被解成 xmm8——读到的根本不是刚装进去的那个浮点值。
 fn emit_cvttf2si(unit: &mut CompilationUnit, width: u8, gpr: Gpr, xmm: u8) {
     emit1(unit, sse_prefix(width));
-    emit1(unit, 0x48 | if gpr.rex_bit() { 0x01 } else { 0 });
+    let mut rex = 0x48u8;
+    if gpr.rex_bit() {
+        rex |= 0x04; // REX.R <- reg 字段（通用寄存器）
+    }
+    if xmm >= 8 {
+        rex |= 0x01; // REX.B <- rm 字段（XMM）
+    }
+    emit1(unit, rex);
     emit1(unit, 0x0F);
     emit1(unit, 0x2C);
     modrm(unit, 3, gpr.bits(), xmm & 7);

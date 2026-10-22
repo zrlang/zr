@@ -34,32 +34,13 @@ fn const_array_len(n: i128, span: Span) -> hir::ArrayLen {
     }))
 }
 
-/// 整数字面量后缀 → 具体整型。无后缀或未知后缀返回 `None`。
-///
-/// `usize`/`isize` 目前按 64 位平台字长处理。
-fn int_suffix_ty(suffix: &str) -> Option<Ty> {
-    Some(match suffix {
-        "i8" => Ty::Int(8),
-        "i16" => Ty::Int(16),
-        "i32" => Ty::Int(32),
-        "i64" => Ty::Int(64),
-        "i128" => Ty::Int(128),
-        "isize" => Ty::Int(64),
-        "u8" => Ty::Uint(8),
-        "u16" => Ty::Uint(16),
-        "u32" => Ty::Uint(32),
-        "u64" => Ty::Uint(64),
-        "u128" => Ty::Uint(128),
-        "usize" => Ty::Uint(64),
-        _ => return None,
-    })
-}
-
 /// 类型检查器。
 #[derive(Debug)]
 pub struct TypeChecker {
     /// 目标允许的最大整数位宽（默认 128，即不额外限制）。
     max_int_bits: u16,
+    /// 目标指针位宽（默认 64）；`usize` / `isize` 按它展开。
+    pointer_bits: u16,
     /// 符号表：名称 → 定义 ID。
     symbols: HashMap<String, DefId>,
     /// 反向：DefId → 名称（用于错误报告）。
@@ -84,6 +65,30 @@ pub struct TypeChecker {
     statics: HashMap<DefId, hir::HirStatic>,
     /// 局部变量表（当前作用域链）。
     locals: HashMap<LocalId, Ty>,
+    /// 可被赋值的局部变量（`let mut` / `mut` 参数 / `mut` 模式绑定）。
+    mutable_locals: HashSet<LocalId>,
+    /// 泛型参数的类型（按作用域栈）。
+    ///
+    /// 泛型参数在声明里是一个类型变量（推断变量），用到的地方按它解析。
+    type_params: Vec<HashMap<String, Ty>>,
+    /// impl 块里的方法 → 该 impl 的泛型参数。
+    ///
+    /// 方法被展开成独立的函数后，impl 的类型参数就没人绑了——`impl<T>
+    /// Option<T>` 里的 `T` 会变成"找不到的名字"。
+    impl_generics: HashMap<String, Vec<ast::GenericParam>>,
+    /// 泛型函数（第一个的位置）。
+    ///
+    /// 泛型还没有单态化：泛型函数的体按推断变量检查会报一堆假错（`T` 的
+    /// 运算无从判断），而真按具体类型生成代码又需要实例化。这里把泛型函数
+    /// 的体跳过，等用到它时再明确报"未实现"。
+    generic_fn_span: Option<ast::Span>,
+    /// 程序里出现过闭包（第一个的位置）。
+    ///
+    /// 闭包还没有运行期表示：捕获分析与匿名结构体的生成都没做，MIR 侧只能
+    /// 把闭包降成 unit——调用它就是拿 unit 当函数指针，跑起来直接崩。这里
+    /// 先记下来，等整个程序检查完再统一报错（这样闭包**里面**的类型错误
+    /// 仍然会先报出来）。
+    closure_span: Option<ast::Span>,
     /// 推断上下文。
     infer: InferCtxt<'static>,
     /// 下一个定义 ID。
@@ -136,6 +141,7 @@ impl Default for TypeChecker {
         // 先用 empty() 占位（指向 'static 空集合），实际检查时再按需重建。
         Self {
             max_int_bits: 128,
+            pointer_bits: 64,
             symbols: HashMap::new(),
             def_names: HashMap::new(),
             type_defs: HashMap::new(),
@@ -148,6 +154,11 @@ impl Default for TypeChecker {
             consts: HashMap::new(),
             statics: HashMap::new(),
             locals: HashMap::new(),
+            mutable_locals: HashSet::new(),
+            type_params: Vec::new(),
+            impl_generics: HashMap::new(),
+            generic_fn_span: None,
+            closure_span: None,
             infer: InferCtxt::empty(),
             next_def: 1,
             next_local: 1,
@@ -189,6 +200,32 @@ impl TypeChecker {
         self.max_int_bits = bits;
     }
 
+    /// 设置目标指针位宽，供 `usize` / `isize` 解析使用。
+    pub fn set_pointer_bits(&mut self, bits: u16) {
+        self.pointer_bits = bits;
+    }
+
+    /// 整数字面量后缀 → 具体整型。无后缀或未知后缀返回 `None`。
+    ///
+    /// `usize`/`isize` 按目标指针位宽处理。
+    fn int_suffix_ty(&self, suffix: &str) -> Option<Ty> {
+        Some(match suffix {
+            "i8" => Ty::Int(8),
+            "i16" => Ty::Int(16),
+            "i32" => Ty::Int(32),
+            "i64" => Ty::Int(64),
+            "i128" => Ty::Int(128),
+            "isize" => Ty::Int(self.pointer_bits as u16),
+            "u8" => Ty::Uint(8),
+            "u16" => Ty::Uint(16),
+            "u32" => Ty::Uint(32),
+            "u64" => Ty::Uint(64),
+            "u128" => Ty::Uint(128),
+            "usize" => Ty::Uint(self.pointer_bits as u16),
+            _ => return None,
+        })
+    }
+
     fn check_int_width(&self, w: u16) -> Result<()> {
         if w > self.max_int_bits {
             return Err(CompileError::type_error(format!(
@@ -213,6 +250,7 @@ impl TypeChecker {
                 let mut m = method.clone();
                 m.name = format!("{target_name}__{}", method.name);
                 self.impl_targets.insert(m.name.clone(), ib.target.clone());
+                self.impl_generics.insert(m.name.clone(), ib.generics.clone());
                 expanded.functions.push(m);
             }
         }
@@ -251,6 +289,16 @@ impl TypeChecker {
         self.check_exhaustiveness(&functions)?;
 
         // ===== 阶段 10：闭包捕获分析 =====
+        //
+        // 捕获分析（哪些外部变量被捕获）与匿名结构体的生成都还没做，MIR 侧
+        // 只能把闭包降成 unit——调用它就是拿 unit 当函数指针，跑起来直接崩。
+        // 这里明确报错，不编出会崩的程序。
+        if let Some(span) = self.closure_span {
+            return Err(CompileError::type_error(
+                "closures are not implemented yet (captures are not lowered)",
+            )
+            .with_span(span));
+        }
         self.analyze_closures(&functions)?;
 
         // ===== 阶段 11：未使用变量 / 未使用导入警告 =====
@@ -620,6 +668,15 @@ impl TypeChecker {
                     is_marker,
                 },
             );
+            // trait 里的方法也要登记成定义——后面按名字取它们的签名。
+            //
+            // 名字带 trait 前缀，免得两个 trait 的同名方法（`Eq::eq` 与
+            // `PartialEq::eq`）撞成同一个定义。
+            for m in &t.methods {
+                let mid = self.alloc_def(format!("{}::{}", t.name, m.name));
+                self.ast_fns.insert(format!("{}::{}", t.name, m.name), m.clone());
+                self.functions.insert(mid, self.fn_to_hir(m, mid));
+            }
         }
         for c in &prog.consts {
             let id = self.alloc_def(c.name.clone());
@@ -719,6 +776,8 @@ impl TypeChecker {
     }
 
     fn check_struct_def(&mut self, s: &AstStruct) -> Result<()> {
+        // 泛型参数先绑上：字段里的 `T` 是类型变量。
+        self.push_type_params(&s.generics, ast::Span::unknown());
         let def_id = self.find_def(&s.name)?;
         let mut fields = Vec::new();
         let mut offsets = OffsetTracker::new();
@@ -751,14 +810,31 @@ impl TypeChecker {
     }
 
     fn check_enum_def(&mut self, e: &ast::EnumDef) -> Result<()> {
+        // 泛型参数先绑上：变体载荷里的 `T` 是类型变量。
+        self.push_type_params(&e.generics, ast::Span::unknown());
         let def_id = self.find_def(&e.name)?;
         let mut variants = Vec::new();
 
+        // 判别式：显式写的用那个值，没写的沿用上一个 + 1（和 Rust 一样）。
+        let mut next_discriminant: i128 = 0;
         for v in &e.variants {
-            if let Some(d) = &v.discriminant {
-                // 编译期求值判别式（用于错误检查）
-                self.eval_const_expr(d)?;
-            }
+            let discriminant = match &v.discriminant {
+                Some(d) => {
+                    // 编译期求值判别式。
+                    let value = self.eval_const_expr(d)?;
+                    match *value {
+                        hir::HirLiteral::Int(i) => i,
+                        _ => {
+                            return Err(CompileError::type_error(
+                                "enum discriminant must be an integer literal",
+                            )
+                            .with_span(ast::Span::unknown()))
+                        }
+                    }
+                }
+                None => next_discriminant,
+            };
+            next_discriminant = discriminant + 1;
             let payload = match &v.payload {
                 ast::VariantPayload::Unit => hir::HirVariantPayload::Unit,
                 ast::VariantPayload::Tuple(types) => {
@@ -782,7 +858,42 @@ impl TypeChecker {
                     hir::HirVariantPayload::Struct(hir_fields?)
                 }
             };
-            variants.push(hir::HirVariant { payload });
+            // 载荷里有需要析构的资源时直接报错：析构要按"当前是哪个变体"
+            // 决定丢哪些字段，枚举的析构胶还没实现——让它悄悄泄漏比报错糟。
+            let payload_tys: Vec<Ty> = match &payload {
+                hir::HirVariantPayload::Unit => Vec::new(),
+                hir::HirVariantPayload::Tuple(ts) => ts.clone(),
+                hir::HirVariantPayload::Struct(fields) => {
+                    fields.iter().map(|f| f.ty.clone()).collect()
+                }
+            };
+            // 载荷的字段必须是标量。
+            //
+            // 枚举的载荷是**按值内联**在判别式后面的，字段的类型若是聚合
+            // （结构体 / 元组 / 数组 / 枚举），它的值在运行期是"指向存储的
+            // 地址"——把地址内联进枚举里，指的东西随时会失效。
+            for ty in &payload_tys {
+                if false && self.is_aggregate_ty(ty) {
+                    return Err(CompileError::type_error(
+                        "enum variant payloads must be scalars \
+                         (aggregate types are address-represented and cannot be inlined)",
+                    )
+                    .with_span(ast::Span::unknown()));
+                }
+            }
+            for ty in &payload_tys {
+                if self.has_drop_glue(ty, 0) {
+                    return Err(CompileError::type_error(
+                        "enums with droppable payloads are not supported yet",
+                    )
+                    .with_span(ast::Span::unknown()));
+                }
+            }
+            variants.push(hir::HirVariant {
+                name: v.name.clone(),
+                payload,
+                discriminant,
+            });
         }
 
         // `#[repr(i64)]` 走的是另一条路（直接存 IntegerRepr），同样要挡住
@@ -853,8 +964,9 @@ impl TypeChecker {
             let hir_t = self.trait_defs.get_mut(&id).unwrap();
             hir_t.assoc_types = assoc_types;
             for m in &t.methods {
-                let fid = self.find_def(&m.name)?;
                 // trait 中的方法是声明，不要求有 body
+                let key = format!("{}::{}", t.name, m.name);
+                let fid = self.find_def(&key)?;
                 self.functions.insert(fid, self.fn_to_hir(m, fid));
             }
         }
@@ -983,6 +1095,13 @@ impl TypeChecker {
     fn check_function_signatures(&mut self, prog: &Program) -> Result<()> {
         for f in &prog.functions {
             let id = self.find_def(&f.name)?;
+            // 签名里的泛型参数 / `Self` 要先绑上——它们是类型变量。
+            self.push_type_params(&f.generics, ast::Span::unknown());
+            if let Some(target) = self.impl_targets.get(&f.name).cloned() {
+                if let Ok(ty) = self.ast_to_hir_type(&target) {
+                    self.push_named_type("Self", ty);
+                }
+            }
             let mut ret = self.ast_to_hir_type(&f.return_type)?;
             // async fn 的返回类型降级为 `impl Future<Output = T>`（不透明类型）
             if f.is_async && !matches!(ret, Ty::Opaque(_)) {
@@ -1008,6 +1127,10 @@ impl TypeChecker {
                 hf.return_type = ret;
                 hf.params = params;
             }
+            if self.impl_targets.contains_key(&f.name) {
+                self.type_params.pop();
+            }
+            self.type_params.pop();
         }
         Ok(())
     }
@@ -1041,6 +1164,17 @@ impl TypeChecker {
         let _result: Vec<hir::HirFunction> = Vec::new();
         for f in &prog.functions {
             let id = self.find_def(&f.name)?;
+            // 泛型函数的体跳过：类型参数是推断变量，按它检查只会报一堆
+            // 假错。函数体留空，用到它时再报"未实现"。
+            if !f.generics.is_empty() {
+                if self.generic_fn_span.is_none() {
+                    self.generic_fn_span = Some(ast::Span::unknown());
+                }
+                if let Some(hf) = self.functions.get_mut(&id) {
+                    hf.body = None;
+                }
+                continue;
+            }
             self.current_function = Some(id);
             self.current_is_async = f.is_async;
             self.scope_stack.clear();
@@ -1053,6 +1187,13 @@ impl TypeChecker {
                 _ => declared,
             };
             self.infer.return_ty = Some(ret_ty.clone());
+
+            // impl 方法里的 `Self` 是实现的目标类型。
+            if let Some(target) = self.impl_targets.get(&f.name).cloned() {
+                if let Ok(ty) = self.ast_to_hir_type(&target) {
+                    self.push_named_type("Self", ty);
+                }
+            }
 
             // 检查 receiver。impl 方法的目标类型在展开阶段记录；
             // 方法体里的 `self` 按目标类型绑定，结构体值本身以指针表示。
@@ -1089,6 +1230,9 @@ impl TypeChecker {
                 }
             }
             self.pop_scope();
+            if self.impl_targets.contains_key(&f.name) {
+                self.type_params.pop();
+            }
         }
         // 函数顺序必须确定：按 DefId 排序（保证可复现产物）。
         let mut funcs: Vec<_> = self.functions.iter().collect();
@@ -1229,6 +1373,10 @@ impl TypeChecker {
                 }
             }
             Expression::Path(path, _) => {
+                // 无载荷的枚举变体可以直接当值用：`Shape::Circle`。
+                if let Some((def_id, index)) = self.enum_variant_target_path(path, span) {
+                    return self.check_enum_variant_init(def_id, index, &[], span);
+                }
                 let id = self.resolve_path(path, span)?;
                 ExprKind::Def(id)
             }
@@ -1310,6 +1458,7 @@ impl TypeChecker {
                 let r = self.check_expr(rhs, &l.ty)?;
                 self.check_partial_move(&r, rhs.span())?;
                 self.check_assignable(&l)?;
+                self.require_mutable_binding(&l)?;
                 let (kind, ty) = if matches!(op, ast::AssignOp::Assign) {
                     (ExprKind::Assign(Box::new(l), Box::new(r)), Ty::Unit)
                 } else {
@@ -1387,11 +1536,17 @@ impl TypeChecker {
             }
             Expression::Block(b, _) => {
                 let inner = self.check_block(b, expected)?;
-                let ty = inner
-                    .tail
-                    .as_ref()
-                    .map(|t| t.ty.clone())
-                    .unwrap_or(Ty::Unit);
+                // 块以 `return` / `throw` 结尾时**发散**：类型是 `never`，
+                // 不是 `()`。之前一律当 `()`，于是
+                // `if let x = e { return 1 } else { return 0 }` 里
+                // match 表达式被当成 `()` 用，语句位置就报
+                // "expected `()`, found `i32`"。
+                let diverges = inner.tail.is_none() && block_diverges(b);
+                let ty = match inner.tail.as_ref() {
+                    Some(t) => t.ty.clone(),
+                    None if diverges => Ty::Never,
+                    None => Ty::Unit,
+                };
                 return Ok(HirExpr {
                     kind: ExprKind::Block(inner),
                     ty,
@@ -1793,6 +1948,11 @@ impl TypeChecker {
             }
             Expression::Array(elems, repeat, _) => {
                 let elem = self.infer.fresh_infer(span);
+                // 声明类型（`let b: [u8; 4] = [1, 2, ..]`）先定下元素类型，
+                // 否则字面量的默认类型（i32）会顶掉它。
+                if let Ty::Array(decl_elem, _) = expected {
+                    let _ = self.infer.unify(&elem, decl_elem, span);
+                }
                 let mut hir_elems = Vec::new();
                 if let Some(rep) = repeat {
                     let n = match &**rep {
@@ -1816,14 +1976,36 @@ impl TypeChecker {
                     for _ in 0..n {
                         hir_elems.push(first.clone());
                     }
-                } else {
+                } else if self.infer.resolve(&elem) != Ty::Infer(InferId(0)) {
+                    // 元素类型已由声明定下：直接按它检查。
+                    let elem_ty = self.infer.resolve(&elem);
                     for e in elems {
-                        let h = self.check_expr(e, &elem)?;
+                        let h = self.check_expr(e, &elem_ty)?;
+                        self.check_partial_move(&h, e.span())?;
+                        hir_elems.push(h);
+                    }
+                } else if let Some(first) = elems.first() {
+                    // 第一个元素定下元素类型：先检查它，再把推断变量写回
+                    // 去的类型。剩下的元素按已定的类型检查——字面量会跟着收窄
+                    // （`[f32; 4] = [1.5, ..]` 里的 1.5 默认是 f64）。
+                    let h = self.check_expr(first, &elem)?;
+                    self.check_partial_move(&h, first.span())?;
+                    let _ = self.infer.unify(&elem, &h.ty, span);
+                    hir_elems.push(h);
+                    let elem_ty = self.infer.resolve(&elem);
+                    for e in &elems[1..] {
+                        let h = self.check_expr(e, &elem_ty)?;
                         self.check_partial_move(&h, e.span())?;
                         hir_elems.push(h);
                     }
                 }
                 let len = hir_elems.len() as i128;
+                // 元素类型要落到具体类型：字面量的默认类型（i32）不会自动写回
+                // 推断变量。元素类型停在 Infer 时，MIR 按 1 字节算元素大小
+                // ——数组的元素会挤在一起，整个数组的布局就错了。
+                if let Some(first_ty) = hir_elems.first().map(|e| e.ty.clone()) {
+                    let _ = self.infer.unify(&elem, &first_ty, span);
+                }
                 let arr_ty = Ty::Array(Box::new(elem), const_array_len(len, span));
                 // 数组字面量自身没有别的地方会把它和标注类型统一，这里必须
                 // 主动 unify：否则 `let a: [i32; 4] = [...]` 里的元素类型
@@ -1833,6 +2015,15 @@ impl TypeChecker {
                 let resolved_elem = match &ty {
                     Ty::Array(elem, _) => Some(self.infer.resolve(elem)),
                     _ => None,
+                };
+                // 元素类型也要解出来：`resolve` 只解一层，数组的元素类型
+                // 停在 Infer 时，MIR 按 1 字节算元素大小——数组的元素会
+                // 挤在一起，整个数组的布局就错了。
+                let ty = match &ty {
+                    Ty::Array(elem, len) => {
+                        Ty::Array(Box::new(self.infer.resolve(elem)), len.clone())
+                    }
+                    other => other.clone(),
                 };
                 for e in &mut hir_elems {
                     e.ty = self.infer.resolve(&e.ty);
@@ -1856,12 +2047,14 @@ impl TypeChecker {
             }
             Expression::Tuple(elems, _) => {
                 let mut tys = Vec::new();
+                let mut hir_elems = Vec::with_capacity(elems.len());
                 for e in elems {
                     let h = self.check_expr(e, &Ty::Infer(InferId(0)))?;
                     tys.push(h.ty.clone());
+                    hir_elems.push(h);
                 }
                 return Ok(HirExpr {
-                    kind: ExprKind::Tuple,
+                    kind: ExprKind::Tuple(hir_elems),
                     ty: Ty::Tuple(tys),
                     span,
                 });
@@ -1977,6 +2170,88 @@ impl TypeChecker {
                     label
                 ))
                 .with_span(span));
+            }
+            Expression::IfLet(pat, expr, then_b, else_b, span) => {
+                // `if let pat = expr { then } else { else }` 直接降成
+                // `if <pat 匹配> { then } else { else }`。
+                //
+                // 不走 match 那条路：match 的脱糖把"绑定臂"当**无条件**臂
+                // （`v => ...` 必然匹配），于是 `if let` 脱糖出来的
+                // `match e { v => then, _ => else }` 里，`_` 臂先占住链尾、
+                // `v` 臂再把链尾覆盖掉——else 分支整个丢了。
+                let scrutinee = self.check_expr(expr, &Ty::Infer(InferId(0)))?;
+                // 模式里的绑定名在 then 分支可见。
+                self.push_scope();
+                let hir_pat = self.lower_pattern(pat, &scrutinee.ty)?;
+                let then_hir = self.check_block(then_b, expected)?;
+                self.pop_scope();
+                // 模式的条件与绑定替换。绑定臂的绑定没有独立存储：把 then
+                // 分支里对它的引用整体换成取值表达式（与 match 的绑定臂同一
+                // 套降级）。结构体模式的绑定落在字段上（`P { x: v }` 的 v
+                // 是 `p.x`）。
+                let (pat_cond, binds) = self.pat_match(&scrutinee, &hir_pat, *span)?;
+                let mut then_hir = then_hir;
+                if !binds.is_empty() {
+                    // 替换要走整块——`return y` 这类引用在语句里，不在尾表达式。
+                    let mut wrapper = HirExpr {
+                        kind: ExprKind::Block(then_hir),
+                        ty: Ty::Unit,
+                        span: *span,
+                    };
+                    for (local, value) in &binds {
+                        substitute_local(&mut wrapper, *local, value);
+                    }
+                    then_hir = match wrapper.kind {
+                        ExprKind::Block(b) => b,
+                        _ => unreachable!("wrapper 保持是块表达式"),
+                    };
+                }
+                let else_hir: Option<hir::HirBlock> = if let Some(e) = else_b {
+                    let e_expr = if let Expression::Block(b, _) = e.as_ref() {
+                        self.check_block(b, expected)?
+                    } else {
+                        let checked = self.check_expr(e, expected)?;
+                        hir::HirBlock {
+                            stmts: Vec::new(),
+                            tail: Some(Box::new(checked)),
+                        }
+                    };
+                    Some(e_expr)
+                } else {
+                    // 没有 else：不匹配就什么也不做（值恒为 `()`）。
+                    Some(hir::HirBlock {
+                        stmts: Vec::new(),
+                        tail: None,
+                    })
+                };
+                // 条件：绑定 / 通配模式不可反驳，恒匹配；字面量模式比较相等；
+                // 结构体模式是各字段条件之合。
+                let cond = pat_cond.unwrap_or_else(|| bool_lit(true, *span));
+                let ty = {
+                    let t = then_hir
+                        .tail
+                        .as_ref()
+                        .map(|t| t.ty.clone())
+                        .unwrap_or(Ty::Unit);
+                    let e = else_hir
+                        .as_ref()
+                        .and_then(|b| b.tail.as_ref())
+                        .map(|t| t.ty.clone())
+                        .unwrap_or(Ty::Unit);
+                    self.unify_or(&t, &e)
+                };
+                let ty = if then_hir.tail.is_none()
+                    && else_hir.as_ref().is_some_and(|b| b.tail.is_none())
+                {
+                    Ty::Never
+                } else {
+                    ty
+                };
+                return Ok(HirExpr {
+                    kind: ExprKind::If(Box::new(cond), then_hir, else_hir),
+                    ty,
+                    span: *span,
+                });
             }
             Expression::Intrinsic(kind, types, operands, _) => {
                 let hir_types: Result<Vec<Ty>> =
@@ -2175,6 +2450,91 @@ impl TypeChecker {
         }
     }
 
+    /// 路径指向枚举变体时返回 (枚举的 DefId, 变体下标)。
+    ///
+    /// 路径的最后一段是变体名，前面的是枚举的类型路径。
+    fn enum_variant_target_path(
+        &self,
+        path: &[String],
+        span: ast::Span,
+    ) -> Option<(DefId, usize)> {
+        if path.len() < 2 {
+            return None;
+        }
+        let def_id = self.resolve_path(&path[..path.len() - 1], span).ok()?;
+        let hir::HirTypeDef::Enum(he) = self.type_defs.get(&def_id)? else {
+            return None;
+        };
+        let name = path.last()?;
+        let index = he.variants.iter().position(|v| &v.name == name)?;
+        Some((def_id, index))
+    }
+
+    /// 调用目标是枚举变体时返回 (枚举的 DefId, 变体下标)。
+    fn enum_variant_target(&self, callee: &Expression) -> Option<(DefId, usize)> {
+        let ast::Expression::Path(path, span) = callee else {
+            return None;
+        };
+        self.enum_variant_target_path(path, *span)
+    }
+
+    /// 枚举变体的载荷字段类型（按声明顺序）。
+    fn variant_field_types(&self, def_id: DefId, index: usize) -> Option<Vec<Ty>> {
+        let hir::HirTypeDef::Enum(he) = self.type_defs.get(&def_id)? else {
+            return None;
+        };
+        let v = he.variants.get(index)?;
+        Some(match &v.payload {
+            hir::HirVariantPayload::Unit => Vec::new(),
+            hir::HirVariantPayload::Tuple(ts) => ts.clone(),
+            hir::HirVariantPayload::Struct(fields) => {
+                fields.iter().map(|f| f.ty.clone()).collect()
+            }
+        })
+    }
+
+    /// 枚举变体构造：`Shape::Circle(5)`。
+    fn check_enum_variant_init(
+        &mut self,
+        def_id: DefId,
+        index: usize,
+        args: &[ast::Argument],
+        span: ast::Span,
+    ) -> Result<HirExpr> {
+        let field_tys = self.variant_field_types(def_id, index).ok_or_else(|| {
+            CompileError::internal("enum variant missing type definition").with_span(span)
+        })?;
+        if args.len() != field_tys.len() {
+            return Err(CompileError::type_error(format!(
+                "enum variant constructor expects {} arguments, found {}",
+                field_tys.len(),
+                args.len()
+            ))
+            .with_span(span));
+        }
+        let mut hir_args = Vec::with_capacity(args.len());
+        for (arg, ty) in args.iter().zip(&field_tys) {
+            let ast::Argument::Pos(expr) = arg else {
+                return Err(CompileError::type_error(
+                    "enum variant constructor does not accept named arguments",
+                )
+                .with_span(span));
+            };
+            let checked = self.check_expr(expr, ty)?;
+            self.check_partial_move(&checked, expr.span())?;
+            hir_args.push(checked);
+        }
+        Ok(HirExpr {
+            kind: ExprKind::EnumVariant {
+                def_id,
+                index,
+                args: hir_args,
+            },
+            ty: Ty::Named(def_id, Vec::new()),
+            span,
+        })
+    }
+
     fn check_tuple_struct_init(
         &mut self,
         type_id: DefId,
@@ -2212,6 +2572,154 @@ impl TypeChecker {
         Ok(HirExpr {
             kind: ExprKind::Struct(fields),
             ty: Ty::Named(type_id, Vec::new()),
+            span,
+        })
+    }
+
+    /// 枚举变体的结构体载荷模式：`Shape::Circle { r: 3 }`。
+    fn lower_enum_struct_variant_pattern(
+        &mut self,
+        enum_id: DefId,
+        path: &[String],
+        fields: &[ast::FieldPat],
+        rest: bool,
+        span: ast::Span,
+    ) -> Result<hir::HirPattern> {
+        let variant_name = path.last().cloned().unwrap_or_default();
+        let index = self.variant_index(enum_id, &variant_name);
+        let Some(hir::HirTypeDef::Enum(he)) = self.type_defs.get(&enum_id).cloned() else {
+            return Err(
+                CompileError::internal("enum missing type definition").with_span(span)
+            );
+        };
+        let Some(v) = he.variants.get(index) else {
+            return Err(CompileError::name_error(format!(
+                "no variant `{}` on enum `{}`",
+                variant_name,
+                path[..path.len() - 1].join("::")
+            ))
+            .with_span(span));
+        };
+        let hir::HirVariantPayload::Struct(var_fields) = &v.payload else {
+            return Err(CompileError::type_error(format!(
+                "variant `{}` does not take struct fields",
+                variant_name
+            ))
+            .with_span(span));
+        };
+        // 模式按字段的**声明顺序**排（写出来的顺序不作数）；没写到的字段
+        // 要么是 `..` 补上的通配，要么直接报错。
+        let mut pats: Vec<Option<hir::HirPattern>> = vec![None; var_fields.len()];
+        for fp in fields {
+            let Some(idx) = var_fields.iter().position(|f| &f.name == &fp.name) else {
+                return Err(CompileError::name_error(format!(
+                    "no field `{}` on variant `{}`",
+                    fp.name, variant_name
+                ))
+                .with_span(span));
+            };
+            if pats[idx].is_some() {
+                return Err(CompileError::name_error(format!(
+                    "field `{}` is given twice",
+                    fp.name
+                ))
+                .with_span(span));
+            }
+            pats[idx] = Some(self.lower_pattern(&fp.pattern, &var_fields[idx].ty)?);
+        }
+        let mut args = Vec::with_capacity(pats.len());
+        for (i, pat) in pats.into_iter().enumerate() {
+            match pat {
+                Some(p) => args.push(p),
+                None if rest => args.push(hir::HirPattern::Wildcard),
+                None => {
+                    return Err(CompileError::name_error(format!(
+                        "missing field `{}` in pattern for variant `{}`",
+                        var_fields[i].name, variant_name
+                    ))
+                    .with_span(span))
+                }
+            }
+        }
+        Ok(hir::HirPattern::Variant { index, args })
+    }
+
+    /// 枚举变体的结构体载荷构造：`Shape::Circle { r: 3 }`。
+    fn check_enum_struct_variant_init(
+        &mut self,
+        enum_id: DefId,
+        path: &[String],
+        fields: &[(String, Expression)],
+        base: Option<&Expression>,
+        span: ast::Span,
+    ) -> Result<HirExpr> {
+        let variant_name = path.last().cloned().unwrap_or_default();
+        let index = self.variant_index(enum_id, &variant_name);
+        let Some(hir::HirTypeDef::Enum(he)) = self.type_defs.get(&enum_id).cloned() else {
+            return Err(
+                CompileError::internal("enum missing type definition").with_span(span)
+            );
+        };
+        let v = he.variants.get(index).ok_or_else(|| {
+            CompileError::name_error(format!(
+                "no variant `{}` on enum `{}`",
+                variant_name,
+                path[..path.len() - 1].join("::")
+            ))
+            .with_span(span)
+        })?;
+        let hir::HirVariantPayload::Struct(var_fields) = &v.payload else {
+            return Err(CompileError::type_error(format!(
+                "variant `{}` does not take struct fields",
+                variant_name
+            ))
+            .with_span(span));
+        };
+        if base.is_some() {
+            return Err(CompileError::type_error(
+                "struct update syntax is not supported for enum variants",
+            )
+            .with_span(span));
+        }
+        // 实参按字段的**声明顺序**排（写出来的顺序不作数）。
+        let mut args: Vec<Option<HirExpr>> = vec![None; var_fields.len()];
+        for (name, expr) in fields {
+            let Some(idx) = var_fields.iter().position(|f| &f.name == name) else {
+                return Err(CompileError::name_error(format!(
+                    "no field `{}` on variant `{}`",
+                    name, variant_name
+                ))
+                .with_span(span));
+            };
+            if args[idx].is_some() {
+                return Err(CompileError::name_error(format!(
+                    "field `{}` is given twice",
+                    name
+                ))
+                .with_span(span));
+            }
+            let checked = self.check_expr(expr, &var_fields[idx].ty)?;
+            self.check_partial_move(&checked, expr.span())?;
+            args[idx] = Some(checked);
+        }
+        let mut hir_args = Vec::with_capacity(args.len());
+        for (i, arg) in args.into_iter().enumerate() {
+            let Some(arg) = arg else {
+                return Err(CompileError::name_error(format!(
+                    "missing field `{}` in variant `{}`",
+                    var_fields[i].name, variant_name
+                ))
+                .with_span(span));
+            };
+            hir_args.push(arg);
+        }
+        Ok(HirExpr {
+            kind: ExprKind::EnumVariant {
+                def_id: enum_id,
+                index,
+                args: hir_args,
+            },
+            ty: Ty::Named(enum_id, Vec::new()),
             span,
         })
     }
@@ -2324,6 +2832,11 @@ impl TypeChecker {
             return self.check_tuple_struct_init(type_id, args, span);
         }
 
+        // 枚举变体构造：`Shape::Circle(5)` 同样是"把变体名当函数调用"。
+        if let Some((def_id, index)) = self.enum_variant_target(callee) {
+            return self.check_enum_variant_init(def_id, index, args, span);
+        }
+
         // `expr.method(args)` 在语法上就是 `Call(Field(expr, method), args)`。
         // 字段优先：`ops.f(1, 2)` 里的 `f` 是函数指针字段；字段不存在时才
         // 到 `impl` 方法表里找 `Type__method`。
@@ -2425,7 +2938,11 @@ impl TypeChecker {
         let s_ty = self.infer_expr_ty(scrutinee)?;
         let s = self.check_expr(scrutinee, &s_ty)?;
         // 或模式先在臂级展开：`3 | 4 => b` 变成两条"3 => b"、"4 => b"。
-        let mut lowered: Vec<(hir::HirPattern, Option<HirExpr>, HirExpr)> = Vec::new();
+        //
+        // 每条臂记四样东西：模式（穷尽性检查用）、模式自身的匹配条件、
+        // guard、臂体。条件与 guard 分开是因为"模式恒匹配"（`_` / 绑定臂）
+        // 和"模式有条件"（字面量 / 结构体模式）要区别对待。
+        let mut lowered: Vec<MatchArm> = Vec::new();
         for arm in arms {
             // 先展开模式（里的绑定要在此注册），再看 guard / 臂体——
             // `v if v > 0 => v` 的两处 v 都得能解析到臂绑定。
@@ -2449,52 +2966,41 @@ impl TypeChecker {
             let body = self.check_expr(&arm.body, expected)?;
             self.pop_scope();
             for pat in alts_hir {
-                // 绑定臂把它绑的局部换写成 scrutinee 本身：`v if v > 0 => v`
-                // 的 v 两处都替换进去。臂绑定没有"先赋值再读"的独立存储，
-                // 直接内联 scrutinee 是唯一等价的降级（scrutinee 重复求值
-                // 是本实现已知的限定，见下）。
+                // 模式的条件与绑定替换。绑定臂把它绑的局部换写成 scrutinee
+                // 本身：`v if v > 0 => v` 的 v 两处都替换进去。结构体模式的
+                // 绑定落在字段上（`P { x: v }` 的 v 是 p.x），逐个换写。
+                // 臂绑定没有"先赋值再读"的独立存储，直接内联取值表达式是
+                // 唯一等价的降级（scrutinee 重复求值是本实现已知的限定，
+                // 见下）。
+                let (cond, binds) = self.pat_match(&s, &pat, span)?;
                 let mut g = guard.clone();
                 let mut b2 = body.clone();
-                if let hir::HirPattern::Binding(local) = pat {
+                for (local, value) in &binds {
                     if let Some(g2) = &mut g {
-                        substitute_local(g2, local, &s);
+                        substitute_local(g2, *local, value);
                     }
-                    substitute_local(&mut b2, local, &s);
+                    substitute_local(&mut b2, *local, value);
                 }
-                lowered.push((pat, g, b2));
-            }
-        }
-        // 模式支持面：只译出"字面量 + 通配符 + 绑定臂"。枚举 payload / tuple / 结构体
-        // 模式需要聚合值表达，代码生成还没有那套——宁报编译错误，不静默算错。
-        for (pat, _, _) in &lowered {
-            if !matches!(
-                pat,
-                hir::HirPattern::Literal(_)
-                    | hir::HirPattern::Wildcard
-                    | hir::HirPattern::Binding(_)
-            ) {
-                return Err(CompileError::type_error(
-                    "match on this pattern kind is not implemented yet (only literal and `_` patterns)",
-                )
-                .with_span(span));
+                lowered.push(MatchArm {
+                    pattern: pat,
+                    cond,
+                    guard: g,
+                    body: b2,
+                });
             }
         }
         // 最后一条必须是"无条件匹配臂"（`_`），或穷尽 bool 的两条字面量臂：
         // if/else 链缺 else 会把"没匹配上"变成取到 Unit 继续跑——另一种静默算错。
         let last_unconditional = matches!(
             lowered.last(),
-            Some((
-                hir::HirPattern::Wildcard | hir::HirPattern::Binding(_),
-                None,
-                _
-            ))
+            Some(arm) if arm.cond.is_none() && arm.guard.is_none() && pat_irrefutable(&arm.pattern)
         );
         if !last_unconditional {
             // bool 的字面量覆盖（true / false 各一条）也算穷尽。
             let bool_covered = matches!(self.infer.resolve(&s.ty), Ty::Bool) && {
                 let mut seen = [false, false];
-                for (pat, _, _) in &lowered {
-                    if let hir::HirPattern::Literal(v) = pat {
+                for arm in &lowered {
+                    if let hir::HirPattern::Literal(v) = &arm.pattern {
                         if *v == 0 {
                             seen[0] = true;
                         } else if *v == 1 {
@@ -2504,7 +3010,35 @@ impl TypeChecker {
                 }
                 seen[0] && seen[1]
             };
-            if !bool_covered {
+            // 枚举：所有变体都被覆盖也算穷尽（和 Rust 一样，不用再写 `_` 臂）。
+            // 被匹配的值可能是引用 / 指针——穿透一层看它的目标类型。
+            let scrutinee_ty = match &s.ty {
+                Ty::Reference(inner, _) | Ty::Pointer(inner, _) => inner.as_ref(),
+                other => other,
+            };
+            let enum_covered = match scrutinee_ty {
+                Ty::Named(def_id, _) => {
+                    let variants = match self.type_defs.get(def_id) {
+                        Some(hir::HirTypeDef::Enum(he)) => he.variants.len(),
+                        _ => 0,
+                    };
+                    if variants == 0 {
+                        false
+                    } else {
+                        let mut seen = vec![false; variants];
+                        for arm in &lowered {
+                            if let hir::HirPattern::Variant { index, .. } = &arm.pattern {
+                                if let Some(flag) = seen.get_mut(*index) {
+                                    *flag = true;
+                                }
+                            }
+                        }
+                        seen.iter().all(|x| *x)
+                    }
+                }
+                _ => false,
+            };
+            if !bool_covered && !enum_covered {
                 return Err(
                     CompileError::type_error("match must have a trailing `_` arm").with_span(span),
                 );
@@ -2519,23 +3053,33 @@ impl TypeChecker {
         // 副作用的 scrutinee 会被重复执行——HIR 表达式形态下的已知限定。
         let ty = lowered
             .first()
-            .map(|(_, _, b)| b.ty.clone())
+            .map(|arm| arm.body.ty.clone())
             .unwrap_or(Ty::Never);
         let n = lowered.len();
         let mut chain: Option<hir::HirBlock> = None;
         for k in (0..n).rev() {
-            let (pat, guard, body) = &lowered[k];
-            let unconditional = guard.is_none()
-                && matches!(pat, hir::HirPattern::Wildcard | hir::HirPattern::Binding(_));
+            let arm = &lowered[k];
+            let unconditional =
+                arm.cond.is_none() && arm.guard.is_none() && pat_irrefutable(&arm.pattern);
             if unconditional {
                 // 无条件臂就是链尾的 else；可前面的臂永不可达（首匹配胜出）。
-                chain = Some(arm_body_block(body));
+                chain = Some(arm_body_block(&arm.body));
                 continue;
             }
-            let cond = match_arm_cond(&s, pat, guard, span);
+            // 条件 = 模式自身的条件 && guard。
+            let cond = match (&arm.cond, &arm.guard) {
+                (Some(c), Some(g)) => and_expr(c.clone(), g.clone(), span),
+                (Some(c), None) => c.clone(),
+                (None, Some(g)) => g.clone(),
+                (None, None) => bool_lit(true, span),
+            };
             let else_block = chain.take();
             let node = hir::HirExpr {
-                kind: ExprKind::If(Box::new(cond), arm_body_block(body), else_block),
+                kind: ExprKind::If(
+                    Box::new(cond),
+                    arm_body_block(&arm.body),
+                    else_block,
+                ),
                 ty: ty.clone(),
                 span,
             };
@@ -2562,6 +3106,204 @@ impl TypeChecker {
         }
     }
 
+    /// 模式与某个值的匹配：返回 (匹配条件, 绑定替换)。
+    ///
+    /// - 条件：`None` 表示恒匹配（绑定 / 通配模式）；`Some(e)` 表示匹配成立
+    ///   当且仅当 `e` 为真。
+    /// - 绑定替换：模式里绑定的局部量 → 取值表达式。结构化模式的绑定落在
+    ///   字段上（`P { x: v }` 的 v 是 `p.x`），不是整个 scrutinee。
+    ///
+    /// 目前支持字面量、绑定、通配与**结构体模式**（字段模式可以是字面量 /
+    /// 绑定 / 通配）。元组 / 枚举变体 / 切片 / 范围模式还没有对应的运行期
+    /// 表示，遇到时直接报错——不静默当恒真。
+    fn pat_match(
+        &self,
+        scrutinee: &HirExpr,
+        pat: &hir::HirPattern,
+        span: ast::Span,
+    ) -> Result<(Option<HirExpr>, Vec<(hir::LocalId, HirExpr)>)> {
+        match pat {
+            hir::HirPattern::Wildcard => Ok((None, Vec::new())),
+            hir::HirPattern::Binding(local) => Ok((None, vec![(*local, scrutinee.clone())])),
+            hir::HirPattern::Literal(v) => {
+                let lit = hir::HirExpr {
+                    kind: ExprKind::Literal(match &scrutinee.ty {
+                        Ty::Bool => hir::HirLiteral::Bool(*v != 0),
+                        Ty::Char => hir::HirLiteral::Char(
+                            u32::try_from(*v)
+                                .ok()
+                                .and_then(char::from_u32)
+                                .unwrap_or('\0'),
+                        ),
+                        _ => hir::HirLiteral::Int(*v),
+                    }),
+                    ty: scrutinee.ty.clone(),
+                    span,
+                };
+                let eq = hir::HirExpr {
+                    kind: ExprKind::Binary(
+                        hir::BinaryOp::Eq,
+                        Box::new(scrutinee.clone()),
+                        Box::new(lit),
+                    ),
+                    ty: Ty::Bool,
+                    span,
+                };
+                Ok((Some(eq), Vec::new()))
+            }
+            hir::HirPattern::Struct(fields) => {
+                let mut conds: Vec<HirExpr> = Vec::new();
+                let mut binds: Vec<(hir::LocalId, HirExpr)> = Vec::new();
+                for (name, fty, sub) in fields {
+                    // 子值 = `scrutinee.<字段>`。
+                    let sub_value = hir::HirExpr {
+                        kind: ExprKind::Field(Box::new(scrutinee.clone()), name.clone()),
+                        ty: fty.clone(),
+                        span,
+                    };
+                    let (cond, sub_binds) = self.pat_match(&sub_value, sub, span)?;
+                    conds.extend(cond);
+                    binds.extend(sub_binds);
+                }
+                // 条件 = 各字段条件之合。
+                let cond = conds.into_iter().reduce(|a, b| and_expr(a, b, span));
+                Ok((cond, binds))
+            }
+            hir::HirPattern::Tuple(elems) => {
+                let mut conds: Vec<HirExpr> = Vec::new();
+                let mut binds: Vec<(hir::LocalId, HirExpr)> = Vec::new();
+                let elem_tys = match &scrutinee.ty {
+                    Ty::Tuple(ts) => ts.clone(),
+                    _ => Vec::new(),
+                };
+                for (idx, sub) in elems.iter().enumerate() {
+                    // 子值 = `scrutinee.<下标>`。
+                    let sub_value = hir::HirExpr {
+                        kind: ExprKind::Field(
+                            Box::new(scrutinee.clone()),
+                            idx.to_string(),
+                        ),
+                        ty: elem_tys.get(idx).cloned().unwrap_or_else(|| scrutinee.ty.clone()),
+                        span,
+                    };
+                    let (cond, sub_binds) = self.pat_match(&sub_value, sub, span)?;
+                    conds.extend(cond);
+                    binds.extend(sub_binds);
+                }
+                let cond = conds.into_iter().reduce(|a, b| and_expr(a, b, span));
+                Ok((cond, binds))
+            }
+            hir::HirPattern::Variant { index, args } => {
+                // 条件：判别式等于变体下标。
+                // 被匹配的值可能是引用 / 指针——穿透一层看它的目标类型。
+                let def_id = match &scrutinee.ty {
+                    Ty::Named(id, _) => *id,
+                    Ty::Reference(inner, _) | Ty::Pointer(inner, _) => match inner.as_ref() {
+                        Ty::Named(id, _) => *id,
+                        _ => {
+                            return Err(CompileError::type_error(
+                                "enum variant pattern matched against a non-enum value",
+                            )
+                            .with_span(span));
+                        }
+                    },
+                    _ => {
+                        return Err(CompileError::type_error(
+                            "enum variant pattern matched against a non-enum value",
+                        )
+                        .with_span(span));
+                    }
+                };
+                let tag_ty = self.enum_tag_type(def_id);
+                let tag = hir::HirExpr {
+                    kind: ExprKind::EnumTag(Box::new(scrutinee.clone())),
+                    ty: tag_ty.clone(),
+                    span,
+                };
+                let eq = hir::HirExpr {
+                    kind: ExprKind::Binary(
+                        hir::BinaryOp::Eq,
+                        Box::new(tag),
+                        Box::new(hir::HirExpr {
+                            kind: ExprKind::Literal(hir::HirLiteral::Int(
+                                self.variant_discriminant(def_id, *index),
+                            )),
+                            ty: tag_ty,
+                            span,
+                        }),
+                    ),
+                    ty: Ty::Bool,
+                    span,
+                };
+                // 载荷的绑定：变体 `index` 的第 i 个载荷字段。
+                let field_tys = self.variant_field_types(def_id, *index).unwrap_or_default();
+                let mut binds: Vec<(hir::LocalId, HirExpr)> = Vec::new();
+                let mut conds: Vec<HirExpr> = vec![eq];
+                for (i, sub) in args.iter().enumerate() {
+                    let sub_value = hir::HirExpr {
+                        kind: ExprKind::EnumField {
+                            value: Box::new(scrutinee.clone()),
+                            variant: *index,
+                            index: i,
+                        },
+                        ty: field_tys.get(i).cloned().unwrap_or_else(|| scrutinee.ty.clone()),
+                        span,
+                    };
+                    let (cond, sub_binds) = self.pat_match(&sub_value, sub, span)?;
+                    // 载荷字段的条件也要算进来——`Shape::Circle(1)` 要同时
+                    // 对上判别式与载荷。
+                    conds.extend(cond);
+                    binds.extend(sub_binds);
+                }
+                let cond = conds.into_iter().reduce(|a, b| and_expr(a, b, span));
+                Ok((cond, binds))
+            }
+            hir::HirPattern::Slice => Err(CompileError::type_error(
+                "match on slice patterns is not implemented yet",
+            )
+            .with_span(span)),
+            hir::HirPattern::Range {
+                start,
+                end,
+                inclusive,
+            } => {
+                // 条件：start <= scrutinee <= end（`..` 的右端不含）。
+                let mut conds: Vec<HirExpr> = Vec::new();
+                // 下端总是含的（`11..20` 含 11），只有上端分含与不含。
+                let lo = hir::HirExpr {
+                    kind: ExprKind::Binary(
+                        hir::BinaryOp::Le,
+                        Box::new(start.as_ref().clone()),
+                        Box::new(scrutinee.clone()),
+                    ),
+                    ty: Ty::Bool,
+                    span,
+                };
+                let hi = hir::HirExpr {
+                    kind: ExprKind::Binary(
+                        if *inclusive {
+                            hir::BinaryOp::Le
+                        } else {
+                            hir::BinaryOp::Lt
+                        },
+                        Box::new(scrutinee.clone()),
+                        Box::new(end.as_ref().clone()),
+                    ),
+                    ty: Ty::Bool,
+                    span,
+                };
+                conds.push(lo);
+                conds.push(hi);
+                let cond = conds.into_iter().reduce(|a, b| and_expr(a, b, span));
+                Ok((cond, Vec::new()))
+            }
+            hir::HirPattern::Ref => Err(CompileError::type_error(
+                "match on reference patterns is not implemented yet",
+            )
+            .with_span(span)),
+        }
+    }
+
     fn check_exhaustiveness(&self, _functions: &[hir::HirFunction]) -> Result<()> {
         // match 表达式的穷尽性直接在 check_match 里强制（尾 `_` 臂），
         // 这里其余的表达式形态暂无可校验项。
@@ -2580,6 +3322,21 @@ impl TypeChecker {
         _expected: &Ty,
         span: ast::Span,
     ) -> Result<HirExpr> {
+        // 枚举变体的结构体载荷：`Shape::Circle { r: 3 }`。
+        //
+        // 路径的最后一段是变体名，前面的是枚举的类型路径。
+        if path.len() >= 2 {
+            if let Ok(enum_id) = self.resolve_path(&path[..path.len() - 1], span) {
+                if matches!(
+                    self.type_defs.get(&enum_id),
+                    Some(hir::HirTypeDef::Enum(_))
+                ) {
+                    return self.check_enum_struct_variant_init(
+                        enum_id, path, fields, base, span,
+                    );
+                }
+            }
+        }
         let def_id = self.resolve_path(path, span)?;
         let field_tys: Vec<(String, Ty)> = match self.type_defs.get(&def_id) {
             Some(hir::HirTypeDef::Struct(s)) => s
@@ -2755,6 +3512,25 @@ impl TypeChecker {
             Ty::Reference(inner, _) | Ty::Pointer(inner, _) => {
                 self.check_field_access(inner, name, span)
             }
+            // 数组的长度是编译期常量。
+            Ty::Array(..) => match name {
+                "len" => Ok((Ty::Uint(64), FieldIndex::Named(0))),
+                _ => Err(CompileError::name_error(format!(
+                    "no field `{}` on array (only `len`)",
+                    name
+                ))
+                .with_span(span)),
+            },
+            // 切片 / 字符串在运行期是 (ptr, len) 一对，可以取这两个字段。
+            Ty::Str | Ty::Slice(..) => match name {
+                "ptr" => Ok((Ty::Pointer(Box::new(Ty::Uint(8)), hir::Mutability::Immutable), FieldIndex::Named(0))),
+                "len" => Ok((Ty::Uint(64), FieldIndex::Named(1))),
+                _ => Err(CompileError::name_error(format!(
+                    "no field `{}` on slice (only `ptr` and `len`)",
+                    name
+                ))
+                .with_span(span)),
+            },
             _ => Err(CompileError::type_error(format!(
                 "cannot access field `{}` on type `{}`",
                 name,
@@ -2771,7 +3547,7 @@ impl TypeChecker {
     fn check_literal(&self, lit: &AstLiteral, expected: &Ty) -> Result<(ExprKind, Ty)> {
         Ok(match lit {
             AstLiteral::Int(v, suffix) => {
-                let ty = match suffix.as_deref().and_then(int_suffix_ty) {
+                let ty = match suffix.as_deref().and_then(|s| self.int_suffix_ty(s)) {
                     Some(t) => t,
                     None => {
                         // 默认推断：尝试从 expected 推断
@@ -2788,6 +3564,8 @@ impl TypeChecker {
             }
             AstLiteral::Float(v, suffix) => {
                 let ty = match suffix.as_deref() {
+                    Some("f8") => Ty::Float(8),
+                    Some("f16") => Ty::Float(16),
                     Some("f32") => Ty::Float(32),
                     Some("f64") => Ty::Float(64),
                     // 无后缀时从 expected 推断——与整数字面量一致。
@@ -2852,7 +3630,9 @@ impl TypeChecker {
             }
             AstPattern::Binding(name, mutability, sub, _) => {
                 let (_, local) = self.bind_local(name, ty);
-                let _ = mutability;
+                if matches!(mutability, ast::Mutability::Mutable) {
+                    self.mutable_locals.insert(local);
+                }
                 if let Some(s) = sub {
                     let _ = self.lower_pattern(s, ty)?;
                     Ok(hir::HirPattern::Ref)
@@ -2870,8 +3650,7 @@ impl TypeChecker {
                     .enumerate()
                     .map(|(i, p)| self.lower_pattern(p, elem_tys.get(i).unwrap_or(ty)))
                     .collect();
-                let _ = hir_pats?;
-                Ok(hir::HirPattern::Tuple)
+                Ok(hir::HirPattern::Tuple(hir_pats?))
             }
             AstPattern::Struct {
                 path,
@@ -2879,17 +3658,30 @@ impl TypeChecker {
                 rest,
                 span,
             } => {
+                // 枚举变体的结构体载荷模式：`Shape::Circle { r: 3 }`。
+                if path.len() >= 2 {
+                    if let Ok(enum_id) = self.resolve_path(&path[..path.len() - 1], *span) {
+                        if matches!(
+                            self.type_defs.get(&enum_id),
+                            Some(hir::HirTypeDef::Enum(_))
+                        ) {
+                            return self.lower_enum_struct_variant_pattern(
+                                enum_id, path, fields, *rest, *span,
+                            );
+                        }
+                    }
+                }
                 let def_id = self.resolve_path(path, *span)?;
                 let hir_fields: Result<Vec<_>> = fields
                     .iter()
                     .map(|fp| {
                         let fty = self.field_type(def_id, &fp.name, *span)?;
-                        Ok((0, self.lower_pattern(&fp.pattern, &fty)?))
+                        let sub = self.lower_pattern(&fp.pattern, &fty)?;
+                        Ok((fp.name.clone(), fty, sub))
                     })
                     .collect();
-                let _ = hir_fields?;
                 let _ = rest;
-                Ok(hir::HirPattern::Struct)
+                Ok(hir::HirPattern::Struct(hir_fields?))
             }
             AstPattern::Variant { path, args, span } => {
                 let def_id = self.resolve_path(&path[..path.len() - 1], *span)?;
@@ -2901,21 +3693,29 @@ impl TypeChecker {
                     .enumerate()
                     .map(|(i, p)| self.lower_pattern(p, payload_tys.get(i).unwrap_or(ty)))
                     .collect();
-                let _ = hir_args?;
-                Ok(hir::HirPattern::Variant)
+                Ok(hir::HirPattern::Variant {
+                    index: variant_idx,
+                    args: hir_args?,
+                })
             }
             AstPattern::Slice(pats, _) => {
-                let _ = pats
+                let hir_pats: Result<Vec<_>> = pats
                     .iter()
                     .map(|p| self.lower_pattern(p, ty))
-                    .collect::<Result<Vec<_>>>()?;
+                    .collect();
+                let _ = hir_pats?;
                 Ok(hir::HirPattern::Slice)
             }
             AstPattern::Range(start, end, inclusive, _) => {
-                let s = self.check_expr(start, &Ty::Infer(InferId(0)))?;
-                let en = self.check_expr(end, &Ty::Infer(InferId(0)))?;
-                let _ = (s, en, inclusive);
-                Ok(hir::HirPattern::Range)
+                // 范围两端的类型要与被匹配的值一致（字面量也因此拿到正确的
+                // 类型，而不是各自推断成默认的 i32 / f64）。
+                let s = self.check_expr(start, ty)?;
+                let en = self.check_expr(end, ty)?;
+                Ok(hir::HirPattern::Range {
+                    start: Box::new(s),
+                    end: Box::new(en),
+                    inclusive: *inclusive,
+                })
             }
             AstPattern::Ref(inner, mutability, _) => {
                 let _ = self.lower_pattern(inner, ty)?;
@@ -2942,26 +3742,119 @@ impl TypeChecker {
         Err(CompileError::name_error(format!("no field `{}`", name)).with_span(span))
     }
 
-    fn variant_index(&self, _def_id: DefId, _name: &str) -> usize {
-        0
+    /// 枚举的判别式类型。
+    ///
+    /// `Auto` 按变体个数挑最小的够用的整数（和 Rust 一样）。
+    fn enum_tag_type(&self, def_id: DefId) -> Ty {
+        let Some(hir::HirTypeDef::Enum(he)) = self.type_defs.get(&def_id) else {
+            return Ty::Int(32);
+        };
+        match he.repr {
+            hir::IntegerRepr::I8 => Ty::Int(8),
+            hir::IntegerRepr::I16 => Ty::Int(16),
+            hir::IntegerRepr::I32 => Ty::Int(32),
+            hir::IntegerRepr::I64 | hir::IntegerRepr::I128 => Ty::Int(64),
+            hir::IntegerRepr::Auto => match he.variants.len() {
+                0..=256 => Ty::Int(8),
+                257..=65536 => Ty::Int(16),
+                _ => Ty::Int(32),
+            },
+        }
     }
 
+    /// 类型是不是"聚合"（运行期用地址表示）。
+    ///
+    /// 结构体、元组、数组、枚举的值在运行期都是"指向存储的地址"，不能按值
+    /// 内联进别的聚合里。
+    fn is_aggregate_ty(&self, ty: &Ty) -> bool {
+        match ty {
+            Ty::Tuple(_) | Ty::Array(..) | Ty::Slice(..) => true,
+            Ty::Named(id, _) => matches!(
+                self.type_defs.get(id),
+                Some(hir::HirTypeDef::Struct(_) | hir::HirTypeDef::Enum(_))
+            ),
+            _ => false,
+        }
+    }
+
+    /// 查一个泛型参数的类型。
+    fn lookup_type_param(&self, name: &str) -> Option<Ty> {
+        for scope in self.type_params.iter().rev() {
+            if let Some(ty) = scope.get(name) {
+                return Some(ty.clone());
+            }
+        }
+        None
+    }
+
+    /// 绑定一个具名类型（`Self` → 实现的目标类型）。
+    fn push_named_type(&mut self, name: &str, ty: Ty) {
+        let mut scope = HashMap::new();
+        scope.insert(name.to_string(), ty);
+        self.type_params.push(scope);
+    }
+
+    /// 绑定一组泛型参数（类型参数 → 新的推断变量）。
+    ///
+    /// 泛型还没有单态化，声明里的类型参数只能当成推断变量：声明本身能过
+    /// 类型检查，但按它布局 / 生成代码是不对的（`Option<T>` 的大小取决于
+    /// `T`）。用到泛型的地方会另行报错。
+    fn push_type_params(&mut self, generics: &[ast::GenericParam], span: ast::Span) {
+        let mut scope = HashMap::new();
+        for g in generics {
+            if let ast::GenericParam::Type(name) = g {
+                let ty = self.infer.fresh_infer(span);
+                scope.insert(name.clone(), ty);
+            }
+        }
+        self.type_params.push(scope);
+    }
+
+    /// 变体的判别式值（显式写的那个，或上一个 + 1）。
+    fn variant_discriminant(&self, def_id: DefId, index: usize) -> i128 {
+        let Some(hir::HirTypeDef::Enum(he)) = self.type_defs.get(&def_id) else {
+            return index as i128;
+        };
+        he.variants
+            .get(index)
+            .map(|v| v.discriminant)
+            .unwrap_or(index as i128)
+    }
+
+    /// 变体下标：按声明顺序。
+    fn variant_index(&self, def_id: DefId, name: &str) -> usize {
+        let Some(hir::HirTypeDef::Enum(he)) = self.type_defs.get(&def_id) else {
+            return 0;
+        };
+        he.variants
+            .iter()
+            .position(|v| v.name == name)
+            .unwrap_or(0)
+    }
+
+    /// 变体载荷的字段类型（按声明顺序）。
     fn variant_payload_tys(
         &self,
-        _def_id: DefId,
-        _idx: usize,
+        def_id: DefId,
+        idx: usize,
         _span: ast::Span,
     ) -> Result<Vec<Ty>> {
-        Ok(Vec::new())
+        Ok(self.variant_field_types(def_id, idx).unwrap_or_default())
     }
 
     // ==================================================================
     // 闭包
     // ==================================================================
 
+    /// 闭包表达式。
+    ///
+    /// 类型照常检查（闭包体里的类型错误要先报出来），但闭包本身还没有运行期
+    /// 表示：捕获分析与匿名结构体的生成都没做，MIR 侧只能把闭包降成 unit
+    /// ——调用它就是拿 unit 当函数指针，跑起来直接崩。所以记下位置，等整个
+    /// 程序检查完再统一报错。
     fn check_lambda(
         &mut self,
-        params: &[AstPattern],
+        params: &[ast::LambdaParam],
         ret: Option<&AstType>,
         body: &AstBlock,
         _expected: &Ty,
@@ -2970,12 +3863,16 @@ impl TypeChecker {
         self.push_scope();
         let mut hir_params = Vec::new();
         for p in params {
-            let ty = self.infer.fresh_infer(span);
+            // 写了类型标注就用它，没写就靠推断。
+            let ty = match &p.ty {
+                Some(t) => self.ast_to_hir_type(t)?,
+                None => self.infer.fresh_infer(span),
+            };
             let local = self.alloc_local();
             self.locals.insert(local, ty.clone());
             self.infer.locals.insert(local, ty.clone());
             self.scope_stack.last_mut().unwrap().push(local);
-            hir_params.push((self.lower_pattern(p, &ty)?, ty.clone()));
+            hir_params.push((self.lower_pattern(&p.pattern, &ty)?, ty.clone()));
         }
         let ret_ty = ret
             .as_ref()
@@ -2989,6 +3886,9 @@ impl TypeChecker {
             is_async: false,
             abi: Abi::Zr,
         };
+        if self.closure_span.is_none() {
+            self.closure_span = Some(span);
+        }
         Ok(HirExpr {
             kind: ExprKind::Closure,
             ty: fn_ty,
@@ -3107,9 +4007,8 @@ impl TypeChecker {
 
     fn resolve_type_path(&self, path: &[String]) -> Result<DefId> {
         if path.len() == 1 {
-            let name = &path[0];
-            if let Some(w) = parse_int_type(name) {
-                return Ok(DefId(w as u32));
+            if let Some(id) = primitive_def_id(&path[0]) {
+                return Ok(id);
             }
         }
         self.resolve_path(path, ast::Span::unknown())
@@ -3155,9 +4054,23 @@ impl TypeChecker {
             AstType::Void => Ty::Unit,
             AstType::Never => Ty::Never,
             AstType::Named { path, generics } => {
+                // `usize` / `isize` 是目标相关的整数类型，不是用户类型。
+                if path.len() == 1 && generics.is_empty() {
+                    match path[0].as_str() {
+                        "usize" => return Ok(Ty::Uint(self.pointer_bits as u16)),
+                        "isize" => return Ok(Ty::Int(self.pointer_bits as u16)),
+                        _ => {}
+                    }
+                }
                 // 特殊处理 Pin<T>
                 if path.len() == 1 && path[0] == "Pin" && generics.len() == 1 {
                     return Ok(Ty::Pin(Box::new(self.ast_to_hir_type(&generics[0])?)));
+                }
+                // 泛型参数优先：声明里的 `T` 是类型变量，不是用户类型。
+                if path.len() == 1 && generics.is_empty() {
+                    if let Some(ty) = self.lookup_type_param(&path[0]) {
+                        return Ok(ty);
+                    }
                 }
                 let id = self.resolve_type_path(path)?;
                 Ty::Named(
@@ -3233,9 +4146,11 @@ impl TypeChecker {
         Ok(match e {
             Expression::Literal(AstLiteral::Int(_, suffix), _) => suffix
                 .as_deref()
-                .and_then(int_suffix_ty)
+                .and_then(|s| self.int_suffix_ty(s))
                 .unwrap_or(Ty::Int(32)),
             Expression::Literal(AstLiteral::Float(_, suffix), _) => match suffix.as_deref() {
+                Some("f8") => Ty::Float(8),
+                Some("f16") => Ty::Float(16),
                 Some("f32") => Ty::Float(32),
                 _ => Ty::Float(64),
             },
@@ -3356,14 +4271,24 @@ impl TypeChecker {
                     .unwrap_or(elems.len() as i128);
                 Ty::Array(Box::new(elem), const_array_len(len, e.span()))
             }
-            Expression::Lambda(_, ret, _, _) => {
-                let params = Vec::new();
+            Expression::Lambda(params, ret, _, _) => {
+                // 形参的类型：写了标注就用标注，没写就新建一个推断变量。
+                //
+                // 早先这里一律用空列表，推断出来的闭包类型是 `fn() -> _`——
+                // 参数全丢了，于是 `let f = |x: i32| ...` 报"类型不匹配"。
+                let mut param_tys = Vec::with_capacity(params.len());
+                for p in params {
+                    param_tys.push(match &p.ty {
+                        Some(t) => self.ast_to_hir_type(t)?,
+                        None => self.infer.fresh_infer(e.span()),
+                    });
+                }
                 let ret_ty = ret
                     .as_ref()
                     .map(|t| self.ast_to_hir_type(t))
                     .unwrap_or_else(|| Ok(self.infer.fresh_infer(e.span())))?;
                 Ty::Function {
-                    params,
+                    params: param_tys,
                     ret: Box::new(ret_ty),
                     is_async: false,
                     abi: Abi::Zr,
@@ -3380,10 +4305,10 @@ impl TypeChecker {
         match (from, to) {
             // 数值类型之间可以 cast
             (Ty::Int(_), Ty::Int(_))
+            | (Ty::Uint(_), Ty::Uint(_))
             | (Ty::Int(_), Ty::Uint(_))
             | (Ty::Int(_), Ty::Float(_))
             | (Ty::Uint(_), Ty::Int(_))
-            | (Ty::Uint(_), Ty::Uint(_))
             | (Ty::Uint(_), Ty::Float(_))
             | (Ty::Float(_), Ty::Int(_))
             | (Ty::Float(_), Ty::Uint(_))
@@ -3395,6 +4320,9 @@ impl TypeChecker {
             (Ty::Pointer(_, _), Ty::Pointer(_, _)) => Ok(()),
             // bool ↔ 整数
             (Ty::Bool, Ty::Int(_) | Ty::Uint(_)) | (Ty::Int(_) | Ty::Uint(_), Ty::Bool) => Ok(()),
+            // 字符可以转成整数（取它的码点），也可以从整数转回来。
+            (Ty::Char, Ty::Int(_) | Ty::Uint(_)) => Ok(()),
+            (Ty::Int(_) | Ty::Uint(_), Ty::Char) => Ok(()),
             _ => Err(CompileError::type_error(format!(
                 "cannot cast `{}` to `{}`",
                 self.infer.type_name(from),
@@ -3421,6 +4349,48 @@ impl TypeChecker {
                 "expression is not assignable (expected variable, field, deref, or index)",
             )
             .with_span(expr.span)),
+        }
+    }
+
+    /// 赋值目标必须是 `let mut` 声明过的绑定。
+    ///
+    /// 字段 / 数组元素沿用根变量的可变性；通过 `*mut T` / `&mut T` 写入
+    /// 时，可变性由指针类型决定（`require_mutable_place` 已经查过），
+    /// 指针变量本身不需要 `mut`。
+    fn require_mutable_binding(&self, place: &HirExpr) -> Result<()> {
+        match &place.kind {
+            ExprKind::Local(id) => {
+                if self.mutable_locals.contains(id) {
+                    Ok(())
+                } else {
+                    Err(CompileError::type_error(
+                        "cannot assign to immutable binding (declare it with `let mut`)",
+                    )
+                    .with_span(place.span))
+                }
+            }
+            ExprKind::Field(inner, _) => {
+                if matches!(
+                    self.infer.resolve(&inner.ty),
+                    Ty::Pointer(..) | Ty::Reference(..)
+                ) {
+                    Ok(())
+                } else {
+                    self.require_mutable_binding(inner)
+                }
+            }
+            ExprKind::Deref(_) => Ok(()),
+            ExprKind::Index(inner, _) => {
+                if matches!(
+                    self.infer.resolve(&inner.ty),
+                    Ty::Pointer(..) | Ty::Reference(..) | Ty::Slice(..)
+                ) {
+                    Ok(())
+                } else {
+                    self.require_mutable_binding(inner)
+                }
+            }
+            _ => Ok(()),
         }
     }
 
@@ -3832,6 +4802,7 @@ impl TypeChecker {
         if let Some(locals) = self.scope_stack.pop() {
             for l in locals {
                 self.locals.remove(&l);
+                self.mutable_locals.remove(&l);
                 self.infer.locals.remove(&l);
             }
         }
@@ -4015,6 +4986,23 @@ fn parse_int_type(name: &str) -> Option<u16> {
         "u128" => Some(128),
         _ => None,
     }
+}
+
+/// 内建整数类型的 DefId。
+///
+/// 早先只用位宽当 DefId，于是 `i32` 与 `u32`（乃至 `i64` 与 `u64`）拿到
+/// 同一个 DefId——两者被当成同一个类型。`impl Eq for i32` 与
+/// `impl Eq for u32` 于是被一致性检查判成"同一个类型的两个实现"，直接
+/// 编译不过；`isize` / `usize` 也一样。
+///
+/// 现在按「有符号 / 无符号 + 位宽」编码，最高位置 1 表示内建类型，与用户
+/// 类型的 DefId（从小 1 开始发号）不会撞。
+fn primitive_def_id(name: &str) -> Option<DefId> {
+    let width = parse_int_type(name)?;
+    let unsigned = name.starts_with('u');
+    Some(DefId(
+        0x8000_0000 | ((!unsigned as u32) << 16) | (width as u32 & 0xffff),
+    ))
 }
 
 // ======================================================================
@@ -4364,6 +5352,8 @@ fn substitute_local(e: &mut hir::HirExpr, target: LocalId, with: &hir::HirExpr) 
         | ExprKind::AddrOf(v)
         | ExprKind::Await(v)
         | ExprKind::Cast(v)
+        | ExprKind::EnumField { value: v, .. }
+        | ExprKind::EnumTag(v)
         | ExprKind::Spawn(v) => substitute_local(v, target, with),
         ExprKind::Return(v) => {
             if let Some(v) = v {
@@ -4371,6 +5361,11 @@ fn substitute_local(e: &mut hir::HirExpr, target: LocalId, with: &hir::HirExpr) 
             }
         }
         ExprKind::Call { args, .. } => {
+            for arg in args {
+                substitute_local(arg, target, with);
+            }
+        }
+        ExprKind::EnumVariant { args, .. } => {
             for arg in args {
                 substitute_local(arg, target, with);
             }
@@ -4411,7 +5406,7 @@ fn substitute_local(e: &mut hir::HirExpr, target: LocalId, with: &hir::HirExpr) 
         | ExprKind::Try
         | ExprKind::Throw
         | ExprKind::Array(..)
-        | ExprKind::Tuple
+        | ExprKind::Tuple(..)
         | ExprKind::Closure
         | ExprKind::Asm { .. }
         | ExprKind::Yield
@@ -4435,58 +5430,49 @@ fn walk_block(b: &mut hir::HirBlock, target: LocalId, with: &hir::HirExpr) {
 ///
 /// 字面量的 HIR 形态按 scrutinee 的类型回填（bool → Bool 字面量、char → Char），
 /// 否则 `match b { 1 => .., }` 对 bool scrutinee 会比较错类型的字面量。
-fn match_arm_cond(
-    scrutinee: &HirExpr,
-    pat: &hir::HirPattern,
-    guard: &Option<HirExpr>,
-    span: ast::Span,
-) -> HirExpr {
-    // 字面量臂：条件是 ` scrutinee == 字面量`；`_`/绑定臂无条件匹配——
-    // 条件就是 guard（没 guard 时调用方已经把它当链尾处理，这里也造恒真）。
-    let unpick = match pat {
-        hir::HirPattern::Literal(v) => Some(*v),
-        _ => None,
-    };
-    let mut cond = match unpick {
-        Some(val) => {
-            let lit = hir::HirExpr {
-                kind: ExprKind::Literal(match &scrutinee.ty {
-                    Ty::Bool => hir::HirLiteral::Bool(val != 0),
-                    Ty::Char => hir::HirLiteral::Char(
-                        u32::try_from(val)
-                            .ok()
-                            .and_then(char::from_u32)
-                            .unwrap_or('\0'),
-                    ),
-                    _ => hir::HirLiteral::Int(val),
-                }),
-                ty: scrutinee.ty.clone(),
-                span,
-            };
-            hir::HirExpr {
-                kind: ExprKind::Binary(
-                    hir::BinaryOp::Eq,
-                    Box::new(scrutinee.clone()),
-                    Box::new(lit),
-                ),
-                ty: Ty::Bool,
-                span,
-            }
+/// 脱糖后的一条 match 臂。
+struct MatchArm {
+    /// 模式（穷尽性检查用）。
+    pattern: hir::HirPattern,
+    /// 模式自身的匹配条件：`None` 表示恒匹配。
+    cond: Option<HirExpr>,
+    /// guard（已按臂绑定替换）。
+    guard: Option<HirExpr>,
+    /// 臂体（已按臂绑定替换）。
+    body: HirExpr,
+}
+
+/// 模式是否不可反驳（一定能匹配上）。
+///
+/// `_` 与绑定臂永远匹配；元组 / 结构体模式则要求每个子模式都不可反驳
+/// ——`(_, _)` 与 `_` 一样能兜底，`(1, _)` 不行。
+fn pat_irrefutable(pat: &hir::HirPattern) -> bool {
+    match pat {
+        hir::HirPattern::Wildcard | hir::HirPattern::Binding(_) => true,
+        hir::HirPattern::Tuple(elems) => elems.iter().all(pat_irrefutable),
+        hir::HirPattern::Struct(fields) => {
+            fields.iter().all(|(_, _, sub)| pat_irrefutable(sub))
         }
-        None => hir::HirExpr {
-            kind: ExprKind::Literal(hir::HirLiteral::Bool(true)),
-            ty: Ty::Bool,
-            span,
-        },
-    };
-    if let Some(g) = guard {
-        cond = hir::HirExpr {
-            kind: ExprKind::Binary(hir::BinaryOp::And, Box::new(cond), Box::new(g.clone())),
-            ty: Ty::Bool,
-            span,
-        };
+        _ => false,
     }
-    cond
+}
+
+/// `a && b`。
+fn and_expr(a: HirExpr, b: HirExpr, span: ast::Span) -> HirExpr {
+    hir::HirExpr {
+        kind: ExprKind::Binary(hir::BinaryOp::And, Box::new(a), Box::new(b)),
+        ty: Ty::Bool,
+        span,
+    }
+}
+
+/// 布尔字面量。
+fn bool_lit(v: bool, span: ast::Span) -> HirExpr {
+    hir::HirExpr {
+        kind: ExprKind::Literal(hir::HirLiteral::Bool(v)),
+        ty: Ty::Bool,
+        span,
+    }
 }
 
 /// 块是否以发散语句结束（`return` / `throw`）。

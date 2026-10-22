@@ -274,42 +274,30 @@ fn absolutize(p: &Path) -> PathBuf {
 fn collect_use_roots(imports: &[crate::parser::ast::UseDecl]) -> Vec<String> {
     let mut out = Vec::new();
     for imp in imports {
-        walk_use_tree(&imp.tree, &mut Vec::new(), &mut out);
+        if let Some(root) = use_tree_root(&imp.tree) {
+            out.push(root);
+        }
     }
     out
 }
 
-fn walk_use_tree(
-    node: &crate::parser::ast::UseTree,
-    prefix: &mut Vec<String>,
-    out: &mut Vec<String>,
-) {
+/// use 树里最左边的路径段——那就是要加载的模块名。
+///
+/// `use io::println_int;` 与 `use io::{a, b};` 的树形不同（前者是
+/// `Group([Name(io), Name(println_int)])`，后者是
+/// `Group([Name(io), Group([a, b])])`），但要加载的模块都是最左边那一段。
+/// 早先把树里的每个叶子都当成模块名去加载，`use io::println_int;` 于是
+/// 去找一个叫 `println_int` 的模块——标准库根本没法用。
+fn use_tree_root(node: &crate::parser::ast::UseTree) -> Option<String> {
     match node {
-        crate::parser::ast::UseTree::Name(n) => {
-            let full = if prefix.is_empty() {
-                n.clone()
-            } else {
-                format!("{}::{}", prefix.join("::"), n)
-            };
-            out.push(full);
-        }
-        crate::parser::ast::UseTree::Group(items) => {
-            for it in items {
-                walk_use_tree(it, prefix, out);
-            }
-        }
-        // `use foo::{a, b}` 展开成 `Name` 与 `Group`，分组不带前缀，
-        // 顶层模块名已经在 `Name` 上带过来了。
-        crate::parser::ast::UseTree::Glob => {}
-        crate::parser::ast::UseTree::Rename(inner, _) => walk_use_tree(inner, prefix, out),
+        crate::parser::ast::UseTree::Name(n) => Some(n.clone()),
+        crate::parser::ast::UseTree::Group(items) => items.first().and_then(use_tree_root),
+        crate::parser::ast::UseTree::Glob => None,
+        // `use a as b`：重命名不影响要加载哪个模块。
+        crate::parser::ast::UseTree::Rename(_, _) => None,
     }
 }
 
-/// 内容指纹（FNV-1a 64 位，两条独立累加链）。
-///
-/// 不用 `DefaultHasher`：它的取值没有稳定性保证，rustc 升级后同一个文件
-/// 可能算出不同哈希，缓存就会莫名其妙地全部失效（或者更糟，误命中）。
-/// 128 位两条链碰撞概率可以忽略。
 pub fn fingerprint(bytes: &[u8]) -> u64 {
     let mut a: u64 = 0xcbf2_9ce4_8422_2325;
     let mut b: u64 = 0x9e37_79b9_7f4a_7c15;

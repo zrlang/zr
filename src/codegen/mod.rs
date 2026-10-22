@@ -851,6 +851,8 @@ pub fn num_ty_name(t: crate::mir::NumTy) -> &'static str {
         Uint(16) => "u16",
         Uint(32) => "u32",
         Uint(_) => "u64",
+        Float(8) => "f8",
+        Float(16) => "f16",
         Float(32) => "f32",
         Float(_) => "f64",
         Bool => "bool",

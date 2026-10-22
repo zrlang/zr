@@ -1081,12 +1081,16 @@ pub fn peephole(module: SsaModule) -> SsaModule {
                     op,
                     lhs,
                     rhs,
-                    ..
+                    ty,
                 } = instr
                 else {
                     continue;
                 };
                 let (op, lhs, rhs) = (*op, *lhs, *rhs);
+                // 浮点不能套整数的那套恒等式：`x - x` 在 IEEE754 下是 NaN
+                // （Inf - Inf、NaN - NaN），`x + 0` 也会把 -0.0 变成 +0.0。
+                // 所以浮点运算一律不做这些折叠。
+                let is_float = ty.is_float();
                 let b = const_of(&defs, rhs);
                 let repl: Option<Def> = match op {
                     // x + 0 / x - 0 / x | 0 / x ^ 0 -> x
@@ -1094,13 +1098,15 @@ pub fn peephole(module: SsaModule) -> SsaModule {
                     | SsaBinaryOp::Sub
                     | SsaBinaryOp::BitOr
                     | SsaBinaryOp::BitXor
-                        if b.as_ref().and_then(SsaConst::as_int) == Some(0) =>
+                        if !is_float
+                            && b.as_ref().and_then(SsaConst::as_int) == Some(0) =>
                     {
                         Some(Def::Op("copy", vec![lhs]))
                     }
                     // x * 1 / x / 1 -> x
                     SsaBinaryOp::Mul | SsaBinaryOp::Div
-                        if b.as_ref().and_then(SsaConst::as_int) == Some(1) =>
+                        if !is_float
+                            && b.as_ref().and_then(SsaConst::as_int) == Some(1) =>
                     {
                         Some(Def::Op("copy", vec![lhs]))
                     }
@@ -1109,7 +1115,9 @@ pub fn peephole(module: SsaModule) -> SsaModule {
                         Some(Def::Op("copy", vec![lhs]))
                     }
                     // x - x / x ^ x -> 0
-                    SsaBinaryOp::Sub | SsaBinaryOp::BitXor if lhs == rhs => {
+                    SsaBinaryOp::Sub | SsaBinaryOp::BitXor
+                        if !is_float && lhs == rhs =>
+                    {
                         Some(Def::Const(SsaConst::Int(0)))
                     }
                     // x | x -> x
@@ -1347,6 +1355,38 @@ fn replace_operand(instr: &mut SsaInstr, from: SsaValue, to: SsaValue) {
             }
             if *value == from {
                 *value = to;
+            }
+        }
+        // `cast` 的源操作数也要换：内联时被调函数的值号会换成调用点的，
+        // 漏掉这一处，转换就会读到调用点里根本不存在的值号。
+        SsaInstr::Cast { src, .. } => {
+            if *src == from {
+                *src = to;
+            }
+        }
+        SsaInstr::SimdBinary {
+            lhs, rhs, out, ..
+        } => {
+            if *lhs == from {
+                *lhs = to;
+            }
+            if *rhs == from {
+                *rhs = to;
+            }
+            if *out == from {
+                *out = to;
+            }
+        }
+        SsaInstr::Asm { outputs, inputs, .. } => {
+            for (_, addr, _) in outputs.iter_mut() {
+                if *addr == from {
+                    *addr = to;
+                }
+            }
+            for (_, v, _) in inputs.iter_mut() {
+                if *v == from {
+                    *v = to;
+                }
             }
         }
         _ => {}

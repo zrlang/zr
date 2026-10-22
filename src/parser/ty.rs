@@ -181,6 +181,20 @@ impl Parser {
                 self.advance();
                 Ok(Type::F(*w))
             }
+            TokenKind::TyUsize => {
+                self.advance();
+                Ok(Type::Named {
+                    path: vec!["usize".into()],
+                    generics: Vec::new(),
+                })
+            }
+            TokenKind::TyIsize => {
+                self.advance();
+                Ok(Type::Named {
+                    path: vec!["isize".into()],
+                    generics: Vec::new(),
+                })
+            }
             TokenKind::TyBool => {
                 self.advance();
                 Ok(Type::Bool)

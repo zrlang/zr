@@ -21,6 +21,10 @@ fn need_f64(x: f64) -> f64 {
     return x * 100.0;
 }
 
+fn need_usize(x: usize) -> usize {
+    return x;
+}
+
 fn main() -> i32 {
     // --- 后缀决定字面量类型，无注解时也生效 ---
     let a = 1.5f32;
@@ -47,6 +51,11 @@ fn main() -> i32 {
     let z = 7usize;
     let w = 7isize;
     if (z as i32) + (w as i32) != 14 { return 8; }
+
+    // 类型名本身也可用（不只是字面量后缀）。
+    let zt: usize = 7;
+    let wt: isize = -7;
+    if (need_usize(zt) as i32) + (wt as i32) != 0 { return 9; }
 
     return 0;
 }

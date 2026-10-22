@@ -197,7 +197,7 @@ impl Parser {
         let name = self.consume_ident("expected function name")?;
 
         // 泛型参数
-        let _generics = if self.match_kind(&TokenKind::Lt) {
+        let generics = if self.match_kind(&TokenKind::Lt) {
             self.parse_generic_params()?
         } else {
             vec![]
@@ -265,6 +265,7 @@ impl Parser {
 
         Ok(Function {
             name,
+            generics,
             // 属性之前被直接丢掉（`_attrs`），于是 `#[inline]`、`#[test]`
             // 之类只能解析、完全没有语义。必须原样带到 AST 上去。
             attrs,
@@ -390,7 +391,7 @@ impl Parser {
     ) -> Result<TypeDef, CompileError> {
         let _span = self.previous().span;
         let name = self.consume_ident("expected struct name")?;
-        let _generics = if self.match_kind(&TokenKind::Lt) {
+        let generics = if self.match_kind(&TokenKind::Lt) {
             self.parse_generic_params()?
         } else {
             vec![]
@@ -418,8 +419,19 @@ impl Parser {
             self.consume(&TokenKind::Semicolon, "expected ';' after tuple struct")?;
             return Ok(TypeDef::Struct(StructDef {
                 name,
+                generics,
                 attrs,
                 fields,
+            }));
+        }
+
+        // 单元结构体 `struct SystemAllocator;`——没有字段，也没有大括号。
+        if self.match_kind(&TokenKind::Semicolon) {
+            return Ok(TypeDef::Struct(StructDef {
+                name,
+                generics,
+                attrs,
+                fields: Vec::new(),
             }));
         }
 
@@ -446,6 +458,7 @@ impl Parser {
         self.consume(&TokenKind::RBrace, "expected '}' to close struct")?;
         Ok(TypeDef::Struct(StructDef {
             name,
+            generics,
             attrs,
             fields,
         }))
@@ -462,7 +475,7 @@ impl Parser {
     ) -> Result<TypeDef, CompileError> {
         let _span = self.previous().span;
         let name = self.consume_ident("expected enum name")?;
-        let _generics = if self.match_kind(&TokenKind::Lt) {
+        let generics = if self.match_kind(&TokenKind::Lt) {
             self.parse_generic_params()?
         } else {
             vec![]
@@ -487,6 +500,7 @@ impl Parser {
         self.consume(&TokenKind::RBrace, "expected '}' to close enum")?;
         Ok(TypeDef::Enum(EnumDef {
             name,
+            generics,
             repr,
             variants,
         }))
@@ -494,7 +508,7 @@ impl Parser {
 
     fn parse_variant(&mut self) -> Result<Variant, CompileError> {
         let _span = self.peek().span;
-        let _name = self.consume_ident("expected variant name")?;
+        let name = self.consume_ident("expected variant name")?;
         let payload = if self.match_kind(&TokenKind::LParen) {
             let mut types = Vec::new();
             if !self.check(&TokenKind::RParen) {
@@ -522,7 +536,10 @@ impl Parser {
                     name: fname,
                     ty: fty,
                 });
-                self.consume(&TokenKind::Comma, "expected ',' after field")?;
+                // 最后一个字段后面允许省略逗号。
+                if !self.match_kind(&TokenKind::Comma) {
+                    break;
+                }
             }
             self.consume(&TokenKind::RBrace, "expected '}'")?;
             VariantPayload::Struct(fields)
@@ -535,6 +552,7 @@ impl Parser {
             None
         };
         Ok(Variant {
+            name,
             payload,
             discriminant,
         })
@@ -672,7 +690,7 @@ impl Parser {
 
     pub fn parse_impl_block(&mut self, _attrs: Vec<Attribute>) -> Result<ImplBlock, CompileError> {
         let span = self.previous().span;
-        let _generics = if self.match_kind(&TokenKind::Lt) {
+        let generics = if self.match_kind(&TokenKind::Lt) {
             self.parse_generic_params()?
         } else {
             vec![]
@@ -712,6 +730,7 @@ impl Parser {
         }
         self.consume(&TokenKind::RBrace, "expected '}'")?;
         Ok(ImplBlock {
+            generics,
             target,
             trait_type,
             methods,
@@ -741,15 +760,19 @@ impl Parser {
 
     fn parse_generic_param(&mut self) -> Result<GenericParam, CompileError> {
         if self.match_kind(&TokenKind::KwConst) {
-            let _name = self.consume_ident("expected const parameter name")?;
+            let name = self.consume_ident("expected const parameter name")?;
             self.consume(&TokenKind::Colon, "expected ':'")?;
             let _ = self.parse_type()?;
             if self.match_kind(&TokenKind::Eq) {
                 let _ = self.parse_expression()?;
             }
-            Ok(GenericParam::Const)
+            Ok(GenericParam::Const(name))
         } else if matches!(self.peek().kind, TokenKind::Lifetime(_)) {
             // 生命周期参数：`struct Foo<'a> { ... }`
+            let name = match &self.peek().kind {
+                TokenKind::Lifetime(n) => n.clone(),
+                _ => String::new(),
+            };
             self.advance();
             if self.match_kind(&TokenKind::Colon) {
                 // 生命周期约束：目前直接跳过
@@ -761,9 +784,9 @@ impl Parser {
                     self.advance();
                 }
             }
-            Ok(GenericParam::Lifetime)
+            Ok(GenericParam::Lifetime(name))
         } else {
-            let _name = self.consume_ident("expected generic parameter name")?;
+            let name = self.consume_ident("expected generic parameter name")?;
             if self.match_kind(&TokenKind::Colon) {
                 let _ = self.parse_type()?;
                 while self.match_kind(&TokenKind::Plus) {
@@ -773,7 +796,7 @@ impl Parser {
             if self.match_kind(&TokenKind::Eq) {
                 let _ = self.parse_type()?;
             }
-            Ok(GenericParam::Type)
+            Ok(GenericParam::Type(name))
         }
     }
 }

@@ -459,6 +459,8 @@ impl<'a> Lexer<'a> {
                     | "u32"
                     | "u64"
                     | "u128"
+                    | "f8"
+                    | "f16"
                     | "f32"
                     | "f64"
                     | "usize"
@@ -471,7 +473,7 @@ impl<'a> Lexer<'a> {
                 );
             }
             // 浮点字面量只接受浮点后缀，整数反之，避免 `1.5i32` / `1f32`。
-            let suffix_is_float = matches!(s.as_str(), "f32" | "f64");
+            let suffix_is_float = matches!(s.as_str(), "f8" | "f16" | "f32" | "f64");
             if suffix_is_float != is_float {
                 let what = if is_float { "float" } else { "integer" };
                 return Token::new(
@@ -787,7 +789,6 @@ fn keyword(text: &str) -> Option<TokenKind> {
         "fn" => TokenKind::KwFn,
         "let" => TokenKind::KwLet,
         "const" => TokenKind::KwConst,
-        "var" => TokenKind::KwVar,
         "mut" => TokenKind::KwMut,
         "if" => TokenKind::KwIf,
         "else" => TokenKind::KwElse,
@@ -853,8 +854,12 @@ fn keyword(text: &str) -> Option<TokenKind> {
         "u32" => TokenKind::TyU(32),
         "u64" => TokenKind::TyU(64),
         "u128" => TokenKind::TyU(128),
+        "f8" => TokenKind::TyF(8),
+        "f16" => TokenKind::TyF(16),
         "f32" => TokenKind::TyF(32),
         "f64" => TokenKind::TyF(64),
+        "usize" => TokenKind::TyUsize,
+        "isize" => TokenKind::TyIsize,
 
         _ => return None,
     })

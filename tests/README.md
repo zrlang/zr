@@ -40,6 +40,11 @@ cargo test --test zr_language
 | `19_float.zr`        | 浮点 `f64`：算术 / 比较 / NaN 语义 / 取负 / `as` 转换 |
 | `20_f32.zr`          | 浮点 `f32`：算术 / 比较 / 取负 / `f32`↔`f64` / `as` |
 | `21_literal_suffixes.zr` | 字面量类型后缀（`1u8` / `7i8` / `2.5f32` …） |
+| `53_narrow_float.zr`     | 窄浮点 `f8` / `f16`：算术 / 比较 / 跨函数 / 整数互转 / 结构体与数组 / 舍入 / Inf |
+| `54_struct_pattern.zr`   | 结构体模式：字段绑定 / 嵌套模式 / `..` 尾 / guard / `if let` |
+| `55_tuple_pattern.zr`    | 元组：字面量 / 字段访问 / 元组模式 / `(_, _)` 兜底 / `if let` |
+| `56_range_pattern.zr`    | 范围模式：闭区间 / 开区间 / char 范围 / `if let` |
+| `57_enum.zr`             | 枚举：变体构造 / 判别式 / 变体模式 / 穷尽性 / 拷贝语义 |
 | `22_call_preserve.zr` | 跨调用存活的值必须被保住（callee-save / 形参并行搬运） |
 | `23_strings.zr`      | 字符串字面量落 `.rodata`、去重、按地址比较、`str` 作实参跨调用 |
 | `24_pointers.zr`     | 指针解引用 / 索引、取址、指针算术与字符串按字节索引 |

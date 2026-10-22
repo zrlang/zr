@@ -118,7 +118,7 @@ impl Parser {
                 }
                 TokenKind::LBracket => {
                     self.advance(); // [
-                    let index = self.parse_expression()?;
+                    let index = self.parse_nested_expr()?;
                     self.consume(&TokenKind::RBracket, "expected ']'")?;
                     left = Expression::Index(Box::new(left), Box::new(index), op_span);
                     continue;
@@ -206,17 +206,49 @@ impl Parser {
         }
 
         // ===== 块 =====
-        if self.match_kind(&TokenKind::LBrace) {
+        if !self.no_block_expr && self.match_kind(&TokenKind::LBrace) {
             let blk = self.parse_block_contents()?;
             self.consume(&TokenKind::RBrace, "expected '}' to close block")?;
             return Ok(Expression::Block(blk, span));
         }
 
-        // ===== if 表达式 =====
+        // ===== if 表达式（包括 if let） =====
         if self.match_kind(&TokenKind::KwIf) {
-            return self
-                .parse_if()
-                .map(|(c, t, e, s)| Expression::If(c, t, e, s));
+            if self.match_kind(&TokenKind::KwLet) {
+                // if let pattern = expr { ... } else { ... }
+                let span = self.previous().span;
+                let pat = self.parse_pattern()?;
+                self.consume(&TokenKind::Eq, "expected '=' after pattern in if let")?;
+                let saved_block = self.no_block_expr;
+                let saved_struct = self.no_struct_literal;
+                self.no_block_expr = true;
+                self.no_struct_literal = true;
+                let expr = self.parse_expression()?;
+                self.no_block_expr = saved_block;
+                self.no_struct_literal = saved_struct;
+                let then_b = self.parse_block()?;
+                let else_b = if self.match_kind(&TokenKind::KwElse) {
+                    if self.check(&TokenKind::KwIf) {
+                        self.advance();
+                        let (c2, t2, e2, _) = self.parse_if()?;
+                        Some(Box::new(Expression::If(c2, t2, e2, Span::unknown())))
+                    } else if self.check(&TokenKind::LBrace) {
+                        let b = self.parse_block()?;
+                        Some(Box::new(Expression::Block(b, Span::unknown())))
+                    } else {
+                        // else 后面是表达式
+                        let e = self.parse_expression()?;
+                        Some(Box::new(e))
+                    }
+                } else {
+                    None
+                };
+                return Ok(Expression::IfLet(pat, Box::new(expr), then_b, else_b, span));
+            } else {
+                return self
+                    .parse_if()
+                    .map(|(c, t, e, s)| Expression::If(c, t, e, s));
+            }
         }
 
         // ===== match 表达式 =====
@@ -319,7 +351,10 @@ impl Parser {
 
         // ===== comptime =====
         if self.match_kind(&TokenKind::KwComptime) {
+            let saved_block = self.no_block_expr;
+            self.no_block_expr = false;
             let expr = self.parse_expression()?;
+            self.no_block_expr = saved_block;
             return Ok(Expression::Comptime(Box::new(expr), span));
         }
 
@@ -352,9 +387,9 @@ impl Parser {
         if self.match_kind(&TokenKind::Pipe) {
             let mut params = Vec::new();
             if !self.check(&TokenKind::Pipe) {
-                params.push(self.parse_pattern_single()?);
+                params.push(self.parse_lambda_param()?);
                 while self.match_kind(&TokenKind::Comma) {
-                    params.push(self.parse_pattern_single()?);
+                    params.push(self.parse_lambda_param()?);
                 }
             }
             self.consume(&TokenKind::Pipe, "expected '|' after lambda parameters")?;
@@ -460,30 +495,21 @@ impl Parser {
                     }
                     path.push(self.consume_path_segment("expected path segment")?);
                 }
+                // 带结构体载荷的枚举变体：`Shape::Circle { r: 3 }`。
+                // 路径后面跟着 `{` 时按结构体字面量解析（判别条件与单段
+                // 路径的 `Point { .. }` 相同）。
+                if !self.no_struct_literal && self.check(&TokenKind::LBrace) && self.looks_like_struct_literal() {
+                    self.advance(); // {
+                    return self.parse_struct_literal(path, span);
+                }
                 return Ok(Expression::Path(path, span));
             }
             // 结构体字面量：`Point { x: 1, y: 2 }` 或简写 `Point { x, y }`。
             // `{` 后紧跟「标识符」且其后是 `:` 或 `,`/`}` 时才认定，
             // 避免和块语法冲突；`if` / `while` 条件位置由
             // `no_struct_literal` 额外禁用。
-            let looks_like_struct = !self.no_struct_literal
-                && self.check(&TokenKind::LBrace)
-                && self.peek_n(1).is_some_and(|t| {
-                    // `Type { ..base }` 没有字段名，`{` 后面直接是 `..`。
-                    if matches!(t.kind, TokenKind::DotDot) {
-                        return true;
-                    }
-                    matches!(t.kind, TokenKind::Ident(_))
-                        && self
-                            .peek_n(2)
-                            .map(|t| {
-                                matches!(
-                                    t.kind,
-                                    TokenKind::Colon | TokenKind::Comma | TokenKind::RBrace
-                                )
-                            })
-                            .unwrap_or(false)
-                });
+            let looks_like_struct =
+                !self.no_struct_literal && self.check(&TokenKind::LBrace) && self.looks_like_struct_literal();
             if looks_like_struct {
                 self.advance(); // {
                 return self.parse_struct_literal(vec![n], span);
@@ -670,19 +696,55 @@ impl Parser {
                 if self.check(&TokenKind::RBracket) {
                     break;
                 }
-                elems.push(self.parse_expression()?);
+                elems.push(self.parse_nested_expr()?);
             }
         }
         self.consume(&TokenKind::RBracket, "expected ']'")?;
         Ok(Expression::Array(elems, repeat, span))
     }
 
+    /// 当前的 `{` 是不是结构体字面量的开头。
+    ///
+    /// `{` 后紧跟「标识符」且其后是 `:` 或 `,` / `}` 时才认定，避免和块
+    /// 语法冲突；`Type { ..base }` 没有字段名，`{` 后面直接是 `..`。
+    fn looks_like_struct_literal(&self) -> bool {
+        self.peek_n(1).is_some_and(|t| {
+            if matches!(t.kind, TokenKind::DotDot) {
+                return true;
+            }
+            matches!(t.kind, TokenKind::Ident(_))
+                && self
+                    .peek_n(2)
+                    .map(|t| {
+                        matches!(
+                            t.kind,
+                            TokenKind::Colon | TokenKind::Comma | TokenKind::RBrace
+                        )
+                    })
+                    .unwrap_or(false)
+        })
+    }
+
+    /// 解析闭包的一个参数：模式 + 可选的类型标注（`|x: i32|`）。
+    fn parse_lambda_param(&mut self) -> Result<crate::parser::ast::LambdaParam, CompileError> {
+        let pattern = self.parse_pattern_single()?;
+        let ty = if self.match_kind(&TokenKind::Colon) {
+            Some(self.parse_type()?)
+        } else {
+            None
+        };
+        Ok(crate::parser::ast::LambdaParam { pattern, ty })
+    }
+
     /// 解析 `if` / `while` 的条件表达式：禁用结构体字面量。
     fn parse_condition(&mut self) -> Result<Expression, CompileError> {
-        let saved = self.no_struct_literal;
+        let saved_struct = self.no_struct_literal;
+        let saved_block = self.no_block_expr;
         self.no_struct_literal = true;
+        self.no_block_expr = true;
         let cond = self.parse_expression();
-        self.no_struct_literal = saved;
+        self.no_struct_literal = saved_struct;
+        self.no_block_expr = saved_block;
         cond
     }
     fn parse_struct_literal(
@@ -701,7 +763,7 @@ impl Parser {
             let name = self.consume_ident("expected field name")?;
             // 字段简写：`Point { x, y }` 等价于 `Point { x: x, y: y }`
             let value = if self.match_kind(&TokenKind::Colon) {
-                self.parse_expression()?
+                self.parse_nested_expr()?
             } else {
                 Expression::Variable(name.clone(), span)
             };
@@ -731,14 +793,14 @@ impl Parser {
                     let name = name.clone();
                     self.advance(); // ident
                     self.advance(); // :
-                    let value = self.parse_expression()?;
+                    let value = self.parse_nested_expr()?;
                     args.push(Argument::Named(name, value));
                 } else {
-                    let value = self.parse_expression()?;
+                    let value = self.parse_nested_expr()?;
                     args.push(Argument::Pos(value));
                 }
             } else {
-                let value = self.parse_expression()?;
+                let value = self.parse_nested_expr()?;
                 args.push(Argument::Pos(value));
             }
             if !self.match_kind(&TokenKind::Comma) {
@@ -892,7 +954,6 @@ impl Parser {
                 | TokenKind::Amp
                 | TokenKind::Pipe
                 | TokenKind::KwLet
-                | TokenKind::KwVar
                 | TokenKind::KwConst
                 | TokenKind::Ident(_)
         )

@@ -533,15 +533,38 @@ thread_local! {
 /// 那比不缓存糟糕得多。
 fn build_salt(cmd: &Cli, target: &Target, input: &str) -> String {
     format!(
-        "v{}|{}|{:?}|{}|{}|{}|{}",
+        "v{}|{}|{:?}|{}|{}|{}|{}|{}",
         env!("CARGO_PKG_VERSION"),
         target.triple(),
         cmd.opt_level,
         cmd.debug_info,
         if cmd.no_link { "c" } else { "link" },
         if cmd.wat { "wat" } else { "bin" },
-        input
+        input,
+        compiler_identity()
     )
+}
+
+/// 编译器自身的身份：可执行文件的大小与修改时间。
+///
+/// 盐里只带包版本号是不够的：从 git 检出重新构建编译器后包版本没变，
+/// 增量缓存的键也就没变——上个编译器编出来的产物会被当成"没变"直接复用，
+/// 用户拿到的是旧二进制。把可执行文件的大小与修改时间混进盐里，编译器
+/// 一重编，缓存自然失效。
+fn compiler_identity() -> String {
+    std::env::current_exe()
+        .ok()
+        .and_then(|p| std::fs::metadata(&p).ok())
+        .map(|m| {
+            let mtime = m
+                .modified()
+                .ok()
+                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                .map(|d| d.as_nanos())
+                .unwrap_or(0);
+            format!("{}:{}", m.len(), mtime)
+        })
+        .unwrap_or_else(|| "unknown".to_string())
 }
 
 fn compile(input: &str, cmd: &Cli) -> Result<std::path::PathBuf, String> {
@@ -639,6 +662,7 @@ fn compile(input: &str, cmd: &Cli) -> Result<std::path::PathBuf, String> {
     // 32 位目标支持多字长（i64）运算：值走 8 字节栈槽，用两条 32 位指令
     // 计算。未实现的运算（如 i64 乘法/除法）在后端报错，不会静默截断。
     checker.set_max_int_bits(64);
+    checker.set_pointer_bits(target.pointer_size() as u16 * 8);
     let hir = checker.check_program(&ast).map_err(|e| e.to_string())?;
     time_phase(t0, "typeck");
     if cmd.dump_hir {

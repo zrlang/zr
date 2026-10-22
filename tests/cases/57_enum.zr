@@ -1,0 +1,159 @@
+//=============================================================================
+// tests/cases/57_enum.zr — 枚举：构造、判别式与变体模式
+//
+// 枚举值在运行期是"指向一块存储的地址"，这块存储的形状是
+//
+//     [判别式][载荷区]
+//
+// 判别式放在偏移 0（按变体个数挑最小的够用的整数），载荷区紧跟其后，
+// 大小取各变体载荷的最大值——不同变体的载荷类型不同，但值的形状必须
+// 一样，枚举值才能按值拷贝。
+//
+// 覆盖：
+//   - 变体构造（带载荷 / 无载荷）
+//   - 变体模式：判别式比较 + 载荷的绑定
+//   - 载荷里的字面量模式
+//   - 穷尽性：所有变体都覆盖时不必再写 `_` 臂
+//   - 枚举值的拷贝语义、结构体字段、赋值
+//
+// 各个检查拆成小函数：32 位目标（RISC-V / ARM）的栈帧有 2KB 上限，
+// 一个函数里塞太多枚举值会撑爆。
+//=============================================================================
+
+enum Shape {
+    Circle(i32),
+    Rect(i32, i32),
+    /// 结构体载荷的变体。
+    Point { x: i32, y: i32 },
+    Empty,
+}
+
+/// 显式判别式：判别式的值是变体自己的判别式（显式写的那个，或上一个 + 1），
+/// 不是变体的序号。
+enum Level {
+    Low = 5,
+    Mid,
+    High = 10,
+}
+
+struct Holder {
+    shape: Shape,
+    n: i32,
+}
+
+/// 按变体分类：Circle 返回半径的平方，Rect 返回面积，Empty 返回 -1。
+fn area(s: Shape) -> i32 {
+    match s {
+        Shape::Circle(r) => { return r * r; }
+        Shape::Rect(w, h) => { return w * h; }
+        Shape::Point { x, y } => { return x * y; }
+        Shape::Empty => { return -1; }
+    }
+}
+
+/// 载荷里带字面量模式。
+fn classify(s: Shape) -> i32 {
+    match s {
+        Shape::Circle(3) => { return 30; }
+        Shape::Circle(r) => { return r; }
+        Shape::Rect(w, h) => { return w * h; }
+        Shape::Point { x, .. } => { return x; }
+        Shape::Empty => { return -1; }
+    }
+}
+
+/// 各个变体分别对上。
+fn check_variants() -> i32 {
+    let c = Shape::Circle(3);
+    if area(c) != 9 { return 1; }
+    let r = Shape::Rect(2, 5);
+    if area(r) != 10 { return 2; }
+    let e = Shape::Empty;
+    if area(e) != -1 { return 3; }
+    return 0;
+}
+
+/// 载荷里的字面量模式。
+fn check_payload_patterns() -> i32 {
+    let c = Shape::Circle(3);
+    if classify(c) != 30 { return 1; }
+    let c2 = Shape::Circle(7);
+    if classify(c2) != 7 { return 2; }
+    return 0;
+}
+
+/// 拷贝语义：副本与原值互不影响。
+fn check_copy() -> i32 {
+    let a = Shape::Circle(5);
+    let b = a;
+    if area(b) != 25 { return 1; }
+    if area(a) != 25 { return 2; }
+    return 0;
+}
+
+/// 结构体字段。
+fn check_field() -> i32 {
+    let h = Holder { shape: Shape::Circle(7), n: 1 };
+    if area(h.shape) != 49 { return 1; }
+    return 0;
+}
+
+/// 赋值。
+fn check_assign() -> i32 {
+    let mut s = Shape::Empty;
+    s = Shape::Circle(4);
+    if area(s) != 16 { return 1; }
+    return 0;
+}
+
+/// if let 里的变体模式。
+fn check_if_let() -> i32 {
+    let c = Shape::Circle(7);
+    if let Shape::Circle(v) = c {
+        if v != 7 { return 1; }
+    } else {
+        return 2;
+    }
+    return 0;
+}
+
+/// 结构体载荷的变体。
+fn check_struct_payload() -> i32 {
+    let p = Shape::Point { x: 3, y: 4 };
+    if area(p) != 12 { return 1; }
+    if classify(p) != 3 { return 2; }
+    return 0;
+}
+
+/// 显式判别式。
+fn check_discriminant() -> i32 {
+    let low = Level::Low;
+    let mid = Level::Mid;
+    let high = Level::High;
+    // 三个变体的判别式分别是 5 / 6 / 10——互不相同，模式才对得上。
+    match low {
+        Level::Low => {}
+        _ => { return 1; }
+    }
+    match mid {
+        Level::Mid => {}
+        _ => { return 2; }
+    }
+    match high {
+        Level::High => {}
+        _ => { return 3; }
+    }
+    return 0;
+}
+
+fn main() -> i32 {
+    if check_variants() != 0 { return 1; }
+    if check_payload_patterns() != 0 { return 2; }
+    if check_copy() != 0 { return 3; }
+    if check_field() != 0 { return 4; }
+    if check_assign() != 0 { return 5; }
+    if check_if_let() != 0 { return 6; }
+    if check_struct_payload() != 0 { return 7; }
+    if check_discriminant() != 0 { return 8; }
+    return 0;
+}

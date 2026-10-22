@@ -326,6 +326,8 @@ pub enum Expression {
     Block(Block, Span),
     /// `if` 表达式（带可选 `else`）。
     If(Box<Expression>, Block, Option<Box<Expression>>, Span),
+    /// `if let` 表达式：`if let pat = expr { ... } else { ... }`。
+    IfLet(Pattern, Box<Expression>, Block, Option<Box<Expression>>, Span),
     /// `match` 表达式。
     Match(Box<Expression>, Vec<Arm>, Span),
     /// `while` 循环（带可选 `else`）。
@@ -359,7 +361,7 @@ pub enum Expression {
         Span,
     ),
     /// Lambda / 闭包：`|a, b| a + b`。
-    Lambda(Vec<Pattern>, Option<Type>, Block, Span),
+    Lambda(Vec<LambdaParam>, Option<Type>, Block, Span),
     /// `comptime` 块 / 表达式（编译期求值）。
     Comptime(Box<Expression>, Span),
     /// `await` 异步表达式。
@@ -503,7 +505,7 @@ pub enum AssignOp {
 pub enum Statement {
     /// `let` 绑定（不可变）。
     Let(Pattern, Option<Type>, Option<Expression>, Span),
-    /// `var` / `let mut` 可变绑定。
+    /// `let mut` 可变绑定。
     Var(Pattern, Option<Type>, Option<Expression>, Span),
     /// `const` 编译期常量。
     Const(String, Type, Expression, Span),
@@ -555,6 +557,8 @@ pub struct Arm {
 #[derive(Debug, Clone)]
 pub struct Function {
     pub name: String,
+    /// 泛型参数（`fn swap<T>(..)` 里的 `T`）。
+    pub generics: Vec<GenericParam>,
     /// 函数上的属性（`#[inline]` / `#[test]` / `#[no_mangle]` …）。
     pub attrs: Vec<Attribute>,
     pub is_async: bool,
@@ -570,11 +574,11 @@ pub struct Function {
 #[derive(Debug, Clone)]
 pub enum GenericParam {
     /// 生命周期参数：`<'a>`。
-    Lifetime,
+    Lifetime(String),
     /// 类型参数：`<T>` / `<T: Trait>`。
-    Type,
+    Type(String),
     /// 常量参数：`<const N: usize>`。
-    Const,
+    Const(String),
 }
 
 /// `where` 子句谓词。
@@ -626,13 +630,29 @@ pub struct Field {
 #[derive(Debug, Clone)]
 pub struct StructDef {
     pub name: String,
+    /// 泛型参数（`struct Pair<T> { .. }` 里的 `T`）。
+    pub generics: Vec<GenericParam>,
     pub attrs: Vec<Attribute>,
     pub fields: Vec<Field>,
+}
+
+/// 闭包的一个参数：模式 + 可选的类型标注。
+///
+/// `|x: i32| ...` 的 `x: i32`——标注是可选的，不写就靠推断。
+#[derive(Debug, Clone)]
+pub struct LambdaParam {
+    pub pattern: Pattern,
+    pub ty: Option<Type>,
 }
 
 /// 枚举变体。
 #[derive(Debug, Clone)]
 pub struct Variant {
+    /// 变体名（`Shape::Circle` 里的 `Circle`）。
+    ///
+    /// 早先解析完就丢掉了，变体只能按位置编号——`Shape::Circle(1)` 这样的
+    /// 变体构造根本没法按名字找到对应的变体。
+    pub name: String,
     /// payload：无 / 元组 / 结构体。
     pub payload: VariantPayload,
     pub discriminant: Option<Expression>, // 显式赋值
@@ -649,6 +669,8 @@ pub enum VariantPayload {
 #[derive(Debug, Clone)]
 pub struct EnumDef {
     pub name: String,
+    /// 泛型参数（`enum Option<T> { .. }` 里的 `T`）。
+    pub generics: Vec<GenericParam>,
     /// 底层整数类型（默认 `i32`）。
     pub repr: Option<Type>,
     pub variants: Vec<Variant>,
@@ -702,6 +724,8 @@ pub struct AssocType;
 /// impl 块。
 #[derive(Debug, Clone)]
 pub struct ImplBlock {
+    /// 泛型参数（`impl<T> Option<T> { .. }` 里的 `T`）。
+    pub generics: Vec<GenericParam>,
     pub target: Type,             // 实现的目标类型
     pub trait_type: Option<Type>, // `impl Trait for T` 中的 Trait
     pub methods: Vec<Function>,   // impl 中定义的方法
@@ -756,6 +780,7 @@ impl Spanned for Expression {
             Expression::Labeled(_, _, s) => *s,
             Expression::Goto(_, s) => *s,
             Expression::Intrinsic(_, _, _, s) => *s,
+            Expression::IfLet(_, _, _, _, s) => *s,
         }
     }
 }

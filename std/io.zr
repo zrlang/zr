@@ -1,61 +1,93 @@
 //=============================================================================
-// std/io.zr — 格式化输出、错误流与基础 IO
+// std/io.zr — 格式化输出、输入与基础 IO
 //
-// 所有格式化输出都通过 `zr_write` 系统调用完成。本节提供面向用户的
-// `print!` / `println!` 宏风格的辅助函数，以及数值 → 字符串的格式化。
+// 输出的规则与 Rust 对齐：
+//
+//   - `{}`  是 Display：整数按十进制；浮点用"最短的能原样读回来的十进制"
+//     （1.0 打成 "1"、0.1 打成 "0.1"、2.675 打成 "2.675"）；布尔是
+//     true / false；字符串原样；字符原样。
+//   - `{:?}` 是 Debug：字符串加双引号、字符加单引号、浮点在整数值上补
+//     ".0"（1.0 打成 "1.0"）。
+//   - `{:x}` / `{:X}` 是十六进制（小写 / 大写）。
+//   - 格式串里的 `\n` `\r` `\t` `\\` `\"` `\'` `\0` 按转义处理；
+//     `{{` 与 `}}` 是字面的花括号。
+//
+// 用法：
+//
+//   io::println_fmt("x = {}, y = {}\n", &[io::fmt_int(x), io::fmt_int(y)]);
+//   io::print_fmt("pi = {}\n", &[io::fmt_float(3.14)]);
+//
+// 这个模块是**自足**的：不依赖 core，因此单独 `use io::...` 就能用。
 //=============================================================================
 
-use core::{
-    zr_write, zr_read, zr_exit,
-    STDIN_FD, STDOUT_FD, STDERR_FD,
-    Option, Result, panic,
-};
-use string::String;
+//----- 外部运行时（由编译器/运行时提供）----------------------------------------
+
+/// 向标准输出 / 错误流写入一段字节。返回写入的字节数，出错时返回 -1。
+extern "C" {
+    fn zr_write(fd: i32, buf: *const u8, count: usize) -> isize;
+}
+
+/// 从文件描述符读取。返回读取的字节数，0 表示 EOF，-1 表示出错。
+extern "C" {
+    fn zr_read(fd: i32, buf: *mut u8, count: usize) -> isize;
+}
+
+/// 打开文件。`mode`：0 = 只读，1 = 写（截断），2 = 追加。
+/// 返回文件描述符，出错时返回 -1。
+extern "C" {
+    fn zr_open(path: *const u8, mode: i32) -> isize;
+}
+
+/// 关闭文件描述符。成功返回 0，出错返回 -1。
+extern "C" {
+    fn zr_close(fd: i32) -> i32;
+}
+
+/// 终止程序，返回给定的退出码。
+extern "C" {
+    fn zr_exit(code: i32) -> !;
+}
+
+//----- 常用文件描述符常量------------------------------------------------------
+
+pub const STDIN_FD:  i32 = 0;
+pub const STDOUT_FD: i32 = 1;
+pub const STDERR_FD: i32 = 2;
 
 //=============================================================================
 // 底层字节写入
 //=============================================================================
 
-/// 把一段字节写到给定的文件描述符。
-pub fn write_bytes(fd: i32, bytes: []const u8) -> isize {
+/// 把一段字节写到给定的文件描述符，返回写入的字节数。
+pub fn write_bytes(fd: i32, bytes: str) -> isize {
     return zr_write(fd, bytes.ptr, bytes.len);
 }
 
-/// 写一个 C 风格以 NUL 结尾的字符串。
-pub fn write_cstr(fd: i32, s: *const u8) {
-    let mut len = 0;
-    while s[len] != 0 { len = len + 1; }
-    zr_write(fd, s, len);
-}
-
-/// 写一个单字节。
+/// 写一个字节。
 pub fn write_byte(fd: i32, b: u8) {
-    zr_write(fd, &b, 1);
+    zr_write(fd, &b as *const u8, 1);
 }
 
-/// 写一个字符（UTF-8 编码，可能占多个字节）。
+/// 写一个字符（ASCII 范围）。
 pub fn write_char(fd: i32, c: char) {
-    // 简化：只支持 ASCII 范围，Unicode 按需扩展。
     write_byte(fd, c as u8);
 }
 
 //=============================================================================
-// 数值格式化（内部）
+// 数值格式化
 //=============================================================================
 
 /// 把无符号 64 位整数格式化为十进制，写入 `fd`。
-/// 返回写入的字节数。
 pub fn write_uint(fd: i32, mut n: u64) -> usize {
     if n == 0 {
         write_byte(fd, b'0');
         return 1;
     }
-    // 倒序生成数字到一个小缓冲
     let mut buf: [u8; 24] = [0; 24];
     let mut i = 24;
     while n > 0 {
         i = i - 1;
-        buf[i] = (n % 10) as u8 + b'0';
+        buf[i] = ((n % 10) as u8 + b'0') as u8;
         n = n / 10;
     }
     let count = 24 - i;
@@ -84,11 +116,11 @@ pub fn write_hex(fd: i32, mut n: u64, upper: bool) -> usize {
         i = i - 1;
         let d = (n % 16) as u8;
         buf[i] = if d < 10 {
-            d + b'0'
+            (d + b'0') as u8
         } else if upper {
-            d - 10 + b'A'
+            (d - 10 + b'A') as u8
         } else {
-            d - 10 + b'a'
+            (d - 10 + b'a') as u8
         };
         n = n / 16;
     }
@@ -97,18 +129,423 @@ pub fn write_hex(fd: i32, mut n: u64, upper: bool) -> usize {
     return count;
 }
 
+/// f64 的最大值（用来判断是不是无穷）。
+const F64_MAX: f64 = 1.7976931348623157e308;
+
+/// 按 Rust 的 Display 规则写出一个 f64，返回写入的字节数。
+///
+/// Rust 的 `{}` 对浮点用**最短的能原样读回来的十进制**：1.0 打成 "1"，
+/// 0.1 打成 "0.1"，2.675 打成 "2.675"（尽管它的二进制值是
+/// 2.67499999999999982）。做法是：先算出十进制数字，再从 1 位有效数字
+/// 开始试，看读回来是不是同一个值。
+pub fn write_float(fd: i32, v: f64) -> usize {
+    let mut count = 0;
+
+    // NaN
+    if v != v {
+        write_bytes(fd, "NaN");
+        return 3;
+    }
+    // 正负无穷
+    if v > F64_MAX {
+        write_bytes(fd, "inf");
+        return 3;
+    }
+    if v < -F64_MAX {
+        write_bytes(fd, "-inf");
+        return 4;
+    }
+
+    // 符号（-0.0 也要带负号：1.0 / v < 0 能把它认出来）
+    let mut val = v;
+    let mut neg = false;
+    if val < 0.0 {
+        neg = true;
+        val = -val;
+    } else if val == 0.0 && 1.0 / val < 0.0 {
+        neg = true;
+    }
+    if neg {
+        write_byte(fd, b'-');
+        count = count + 1;
+    }
+
+    // 0 单独处理：Rust 打成 "0"（不是 "0.0"）
+    if val == 0.0 {
+        write_byte(fd, b'0');
+        return count + 1;
+    }
+
+    // 整数部分
+    let mut int_part = val as u64;
+    let mut frac = val - (int_part as f64);
+    count = count + write_uint(fd, int_part);
+
+    // 小数部分：反复乘 10 取位。最多 17 位——f64 的十进制有效位就这么多。
+    let mut digits: [u8; 20] = [0; 20];
+    let mut ndigits = 0;
+    while ndigits < 17 && frac > 0.0 {
+        frac = frac * 10.0;
+        let mut d = frac as u64;
+        if d > 9 {
+            d = 9;
+        }
+        frac = frac - (d as f64);
+        digits[ndigits] = (d as u8) + b'0';
+        ndigits = ndigits + 1;
+    }
+
+    // 从 1 位小数开始试：读回来还是同一个值就用它。
+    // 这样 2.675 会打成 "2.675" 而不是 "2.6749999999999998"。
+    let mut used = 0;
+    while used < ndigits {
+        used = used + 1;
+        // 候选值 = 整数部分 + 前 used 位小数（下一位 >= 5 则进位）
+        let mut d: u64 = 0;
+        let mut k = 0;
+        while k < used {
+            d = d * 10 + ((digits[k] - b'0') as u64);
+            k = k + 1;
+        }
+        if used < ndigits && digits[used] >= b'5' {
+            d = d + 1;
+        }
+        let mut scale = 1.0;
+        let mut p = 0;
+        while p < used {
+            scale = scale * 10.0;
+            p = p + 1;
+        }
+        let candidate = (int_part as f64) + (d as f64) / scale;
+        if candidate == val {
+            break;
+        }
+    }
+    if used == 0 {
+        used = ndigits;
+    }
+
+    // 就近舍入：下一位 >= 5 就进位（进位要往回传）。
+    //
+    // 这一步必须落到**要打印的数字**上——候选值是按四舍五入算的，打印
+    // 未经四舍五入的数字就会把 2.675 打成 2.674。
+    if used < ndigits && digits[used] >= b'5' {
+        let mut i = used;
+        let mut carry = true;
+        while i > 0 && carry {
+            i = i - 1;
+            if digits[i] == b'9' {
+                digits[i] = b'0';
+            } else {
+                digits[i] = digits[i] + 1;
+                carry = false;
+            }
+        }
+        if carry {
+            // 全部是 9：进位到整数部分
+            int_part = int_part + 1;
+        }
+    }
+
+    // 去掉尾随的 0（Rust 的输出没有多余的 0）
+    while used > 1 && digits[used - 1] == b'0' {
+        used = used - 1;
+    }
+
+    // 有小数就写小数点
+    if used > 0 {
+        write_byte(fd, b'.');
+        count = count + 1;
+        let mut i = 0;
+        while i < used {
+            write_byte(fd, digits[i]);
+            count = count + 1;
+            i = i + 1;
+        }
+    }
+    return count;
+}
+
 //=============================================================================
-// 高层打印 API（用户面向）
+// 格式化参数
+//=============================================================================
+
+/// `print_fmt` / `println_fmt` 的参数。
+///
+/// 做成结构体而不是枚举：参数要放进数组里传，而数组元素走的是"按元素
+/// 大小逐个拷贝"的路径，枚举那套（判别式 + 变体载荷）还没走通。
+///
+/// 字符串按 (指针, 长度) 传——切片在 zr 里是地址表示的，直接传切片会
+/// 丢长度。
+pub struct FormatArg {
+    /// 种类：0=int 1=uint 2=float 3=bool 4=str 5=char 6=hex
+    pub kind: i32,
+    /// 整数 / 字符的值。
+    pub int_value: i64,
+    /// 浮点的值。
+    pub float_value: f64,
+    /// 字符串的指针。
+    pub str_ptr: *const u8,
+    /// 字符串的长度。
+    pub str_len: usize,
+}
+
+/// 一个整数参数。
+pub fn fmt_int(n: i64) -> FormatArg {
+    return FormatArg { kind: 0, int_value: n, float_value: 0.0, str_ptr: 0 as *const u8, str_len: 0 };
+}
+
+/// 一个无符号整数参数。
+pub fn fmt_uint(n: u64) -> FormatArg {
+    return FormatArg { kind: 1, int_value: n as i64, float_value: 0.0, str_ptr: 0 as *const u8, str_len: 0 };
+}
+
+/// 一个浮点参数。
+pub fn fmt_float(n: f64) -> FormatArg {
+    return FormatArg { kind: 2, int_value: 0, float_value: n, str_ptr: 0 as *const u8, str_len: 0 };
+}
+
+/// 一个布尔参数。
+pub fn fmt_bool(b: bool) -> FormatArg {
+    return FormatArg { kind: 3, int_value: if b { 1 } else { 0 }, float_value: 0.0, str_ptr: 0 as *const u8, str_len: 0 };
+}
+
+/// 一个字符串参数。
+pub fn fmt_str(s: str) -> FormatArg {
+    return FormatArg { kind: 4, int_value: 0, float_value: 0.0, str_ptr: s.ptr, str_len: s.len };
+}
+
+/// 一个字符参数。
+pub fn fmt_char(c: char) -> FormatArg {
+    return FormatArg { kind: 5, int_value: c as i64, float_value: 0.0, str_ptr: 0 as *const u8, str_len: 0 };
+}
+
+/// 一个十六进制参数。
+pub fn fmt_hex(n: u64) -> FormatArg {
+    return FormatArg { kind: 6, int_value: n as i64, float_value: 0.0, str_ptr: 0 as *const u8, str_len: 0 };
+}
+
+//=============================================================================
+// 格式化输出
+//=============================================================================
+
+/// 格式串里的规格。
+///
+/// 用整数而不是枚举：规格只有一个、取值就那么几个，枚举反而多一层间接。
+const SPEC_DISPLAY: i32 = 0;
+const SPEC_DEBUG: i32 = 1;
+const SPEC_HEX_LOWER: i32 = 2;
+const SPEC_HEX_UPPER: i32 = 3;
+
+/// 按 Rust 的规则把格式串里的 `{}` / `{:?}` / `{:x}` 替换成参数并输出。
+pub fn print_fmt(fmt: str, args: *const FormatArg, nargs: usize) {
+    let mut ai = 0;
+    let mut i = 0;
+    while i < fmt.len {
+        let c = fmt.ptr[i];
+        if c == b'{' {
+            // `{{` 是字面的花括号
+            if i + 1 < fmt.len && fmt.ptr[i + 1] == b'{' {
+                write_byte(STDOUT_FD, b'{');
+                i = i + 2;
+                continue;
+            }
+            // 找规格：`{` 之后到 `}` 之间的内容（":" 之后是规格）
+            let mut j = i + 1;
+            let mut spec = SPEC_DISPLAY;
+            if j < fmt.len && fmt.ptr[j] == b':' {
+                j = j + 1;
+                if j < fmt.len && fmt.ptr[j] == b'?' {
+                    spec = SPEC_DEBUG;
+                    j = j + 1;
+                } else if j < fmt.len && fmt.ptr[j] == b'x' {
+                    spec = SPEC_HEX_LOWER;
+                    j = j + 1;
+                } else if j < fmt.len && fmt.ptr[j] == b'X' {
+                    spec = SPEC_HEX_UPPER;
+                    j = j + 1;
+                }
+            }
+            if j < fmt.len && fmt.ptr[j] == b'}' {
+                if ai < nargs {
+                    write_arg(STDOUT_FD, &args[ai], spec);
+                    ai = ai + 1;
+                }
+                i = j + 1;
+                continue;
+            }
+            // 不是合法的占位符：原样输出
+            write_byte(STDOUT_FD, c);
+            i = i + 1;
+            continue;
+        }
+        if c == b'}' {
+            // `}}` 是字面的花括号
+            if i + 1 < fmt.len && fmt.ptr[i + 1] == b'}' {
+                write_byte(STDOUT_FD, b'}');
+                i = i + 2;
+                continue;
+            }
+            write_byte(STDOUT_FD, c);
+            i = i + 1;
+            continue;
+        }
+        if c == b'\\' {
+            // 转义序列
+            i = i + 1;
+            if i < fmt.len {
+                let e = fmt.ptr[i];
+                if e == b'n' {
+                    write_byte(STDOUT_FD, b'\n');
+                } else if e == b'r' {
+                    write_byte(STDOUT_FD, b'\r');
+                } else if e == b't' {
+                    write_byte(STDOUT_FD, b'\t');
+                } else if e == b'0' {
+                    write_byte(STDOUT_FD, 0);
+                } else if e == b'\\' {
+                    write_byte(STDOUT_FD, b'\\');
+                } else if e == b'"' {
+                    write_byte(STDOUT_FD, b'"');
+                } else if e == b'\'' {
+                    write_byte(STDOUT_FD, b'\'');
+                } else {
+                    // 不认识的转义：原样输出反斜杠与该字符
+                    write_byte(STDOUT_FD, b'\\');
+                    write_byte(STDOUT_FD, e);
+                }
+                i = i + 1;
+            }
+            continue;
+        }
+        write_byte(STDOUT_FD, c);
+        i = i + 1;
+    }
+}
+
+/// 同 `print_fmt`，但末尾补一个换行。
+pub fn println_fmt(fmt: str, args: *const FormatArg, nargs: usize) {
+    print_fmt(fmt, args, nargs);
+    write_byte(STDOUT_FD, b'\n');
+}
+
+/// 按规格写出一个参数。
+fn write_arg(fd: i32, arg: &FormatArg, spec: i32) {
+    if arg.kind == 0 {
+        if spec == SPEC_HEX_LOWER {
+            write_hex(fd, arg.int_value as u64, false);
+        } else if spec == SPEC_HEX_UPPER {
+            write_hex(fd, arg.int_value as u64, true);
+        } else {
+            write_int(fd, arg.int_value);
+        }
+        return;
+    }
+    if arg.kind == 1 {
+        if spec == SPEC_HEX_LOWER {
+            write_hex(fd, arg.int_value as u64, false);
+        } else if spec == SPEC_HEX_UPPER {
+            write_hex(fd, arg.int_value as u64, true);
+        } else {
+            write_uint(fd, arg.int_value as u64);
+        }
+        return;
+    }
+    if arg.kind == 2 {
+        if spec == SPEC_DEBUG {
+            write_float_debug(fd, arg.float_value);
+        } else {
+            write_float(fd, arg.float_value);
+        }
+        return;
+    }
+    if arg.kind == 3 {
+        if arg.int_value != 0 { write_bytes(fd, "true"); } else { write_bytes(fd, "false"); }
+        return;
+    }
+    if arg.kind == 4 {
+        if spec == SPEC_DEBUG {
+            // Debug：字符串加引号，里面的引号与反斜杠要转义
+            write_byte(fd, b'"');
+            write_escaped(fd, arg.str_ptr, arg.str_len);
+            write_byte(fd, b'"');
+        } else {
+            zr_write(fd, arg.str_ptr, arg.str_len);
+        }
+        return;
+    }
+    if arg.kind == 5 {
+        if spec == SPEC_DEBUG {
+            write_byte(fd, b'\'');
+            write_escaped(fd, (arg.int_value as u8) as *const u8, 1);
+            write_byte(fd, b'\'');
+        } else {
+            write_char(fd, arg.int_value as i64 as char);
+        }
+        return;
+    }
+    if spec == SPEC_HEX_UPPER {
+        write_hex(fd, arg.int_value as u64, true);
+    } else {
+        write_hex(fd, arg.int_value as u64, false);
+    }
+}
+
+/// Debug 格式里的转义：引号、反斜杠与控制字符。
+fn write_escaped(fd: i32, p: *const u8, len: usize) {
+    let mut i = 0;
+    while i < len {
+        let c = (*p)[i];
+        if c == b'"' {
+            write_bytes(fd, "\\\"");
+        } else if c == b'\\' {
+            write_bytes(fd, "\\\\");
+        } else if c == b'\n' {
+            write_bytes(fd, "\\n");
+        } else if c == b'\t' {
+            write_bytes(fd, "\\t");
+        } else if c == b'\r' {
+            write_bytes(fd, "\\r");
+        } else {
+            write_byte(fd, c);
+        }
+        i = i + 1;
+    }
+}
+
+/// Debug 格式的浮点：整数值要补 ".0"（Rust 的 `{:?}` 就是这样）。
+fn write_float_debug(fd: i32, v: f64) {
+    // 整数值要补 ".0"（Rust 的 `{:?}` 就是这样）。
+    //
+    // "是不是整数值"要在写之前算好——写完再回头看返回值不牢靠。
+    let whole = is_whole_float(v);
+    write_float(fd, v);
+    if whole {
+        write_bytes(fd, ".0");
+    }
+}
+
+/// 浮点是不是整数值（Debug 要补 ".0"）。
+fn is_whole_float(v: f64) -> bool {
+    if v != v {
+        return false;
+    }
+    let f = v - (v as i64 as f64);
+    return f == 0.0;
+}
+
+//=============================================================================
+// 简单打印
 //=============================================================================
 
 /// 打印一段字符串，不换行。
-pub fn print(s: []const u8) {
-    write_bytes(STDOUT_FD, s);
+pub fn print(s: str) {
+    zr_write(STDOUT_FD, s.ptr, s.len);
 }
 
 /// 打印一段字符串并换行。
-pub fn println(s: []const u8) {
-    write_bytes(STDOUT_FD, s);
+pub fn println(s: str) {
+    zr_write(STDOUT_FD, s.ptr, s.len);
     write_byte(STDOUT_FD, b'\n');
 }
 
@@ -123,138 +560,155 @@ pub fn println_char(c: char) {
     write_byte(STDOUT_FD, b'\n');
 }
 
-/// 打印十进制整数并换行。
+/// 打印一个十进制整数，不换行。
+pub fn print_int(n: i64) {
+    write_int(STDOUT_FD, n);
+}
+
+/// 打印一个十进制整数并换行。
 pub fn println_int(n: i64) {
     write_int(STDOUT_FD, n);
     write_byte(STDOUT_FD, b'\n');
 }
 
-/// 打印无符号整数并换行。
+/// 打印一个无符号整数并换行。
 pub fn println_uint(n: u64) {
     write_uint(STDOUT_FD, n);
     write_byte(STDOUT_FD, b'\n');
 }
 
-/// 打印布尔值。
+/// 打印一个浮点数并换行（Rust 的 Display 规则）。
+pub fn println_float(n: f64) {
+    write_float(STDOUT_FD, n);
+    write_byte(STDOUT_FD, b'\n');
+}
+
+/// 打印一个布尔值。
 pub fn print_bool(b: bool) {
     if b { print("true"); } else { print("false"); }
 }
 
-/// 打印十六进制整数。
+/// 打印一个十六进制整数。
 pub fn print_hex_int(n: i64) {
     write_hex(STDOUT_FD, n as u64, false);
 }
 
 /// 向标准错误打印并换行。
-pub fn eprintln(s: []const u8) {
-    write_bytes(STDERR_FD, s);
+pub fn eprintln(s: str) {
+    zr_write(STDERR_FD, s.ptr, s.len);
     write_byte(STDERR_FD, b'\n');
 }
 
 /// 向标准错误打印（无换行）。
-pub fn eprint(s: []const u8) {
-    write_bytes(STDERR_FD, s);
+pub fn eprint(s: str) {
+    zr_write(STDERR_FD, s.ptr, s.len);
 }
 
 //=============================================================================
-// 格式化（简化版格式化宏）
+// 输入
 //=============================================================================
 
-/// 把一组参数按给定格式串打印。
-/// 格式串中的 `{}` 会被顺序替换为对应参数。这是 `print!` 宏的底层。
+/// 从标准输入读一段字节，返回读到的字节数（0 表示 EOF）。
 ///
-/// 用法：`print_fmt("x={}, y={}", &[arg1, arg2])`
-/// 支持的类型通过 `FormatArg` 枚举传入。
-pub enum FormatArg<'a> {
-    Int(i64),
-    Uint(u64),
-    Bool(bool),
-    Str([]const u8),
-    Char(char),
-    Hex(u64),
+/// 读到 EOF 或者出错时返回 0。
+pub fn read_bytes(buf: *mut u8, cap: usize) -> usize {
+    if cap == 0 {
+        return 0;
+    }
+    let n = zr_read(STDIN_FD, buf, cap);
+    if n <= 0 {
+        return 0;
+    }
+    return n as usize;
 }
 
-pub fn print_fmt(fmt: []const u8, args: &[FormatArg]) {
-    let mut ai = 0;
+/// 从标准输入读一行（去掉行尾的 `\r\n` 或 `\n`），返回读到的字节数。
+///
+/// 缓冲区不够时截断（剩下的部分留在输入里）。
+pub fn read_line(buf: *mut u8, cap: usize) -> usize {
+    let mut n = 0;
+    let mut one: [u8; 1] = [0; 1];
+    while n < cap {
+        let got = zr_read(STDIN_FD, &one[0] as *const u8 as *mut u8, 1);
+        if got <= 0 {
+            break;
+        }
+        if one[0] == b'\n' {
+            break;
+        }
+        buf[n] = one[0];
+        n = n + 1;
+    }
+    // 去掉行尾的 `\r`
+    if n > 0 && buf[n - 1] == b'\r' {
+        n = n - 1;
+    }
+    return n;
+}
+
+/// 从标准输入读一行，丢掉换行符，**返回长度**。
+///
+/// 与 `read_line` 相同，只是名字更贴近 Rust 的 `read_line`。
+pub fn stdin_read_line(buf: *mut u8, cap: usize) -> usize {
+    return read_line(buf, cap);
+}
+
+//=============================================================================
+// 文件
+//=============================================================================
+
+/// 打开一个文件，返回文件描述符；出错时返回 -1。
+///
+/// 路径以 NUL 结尾（Rust 的 `CString` 惯例）。`mode`：
+/// 0 = 只读，1 = 写（存在则截断），2 = 追加。
+pub fn file_open(path: str, mode: i32) -> i32 {
+    // 运行时要求 NUL 结尾：临时拼一份。
+    let mut buf: [u8; 1024] = [0; 1024];
+    if path.len >= 1024 {
+        return -1;
+    }
     let mut i = 0;
-    while i < fmt.len {
-        let c = fmt.ptr[i];
-        if c == b'{' && i + 1 < fmt.len && fmt.ptr[i + 1] == b'}' {
-            // 替换一个参数
-            if ai < args.len {
-                match args[ai] {
-                    FormatArg::Int(n)  => { write_int(STDOUT_FD, n); }
-                    FormatArg::Uint(n) => { write_uint(STDOUT_FD, n); }
-                    FormatArg::Bool(b) => { print_bool(b); }
-                    FormatArg::Str(s)  => { print(s); }
-                    FormatArg::Char(c) => { write_char(STDOUT_FD, c); }
-                    FormatArg::Hex(n)  => { write_hex(STDOUT_FD, n, false); }
-                }
-                ai = ai + 1;
-            }
-            i = i + 2;
-        } else {
-            write_byte(STDOUT_FD, c);
-            i = i + 1;
-        }
+    while i < path.len {
+        buf[i] = path.ptr[i];
+        i = i + 1;
     }
+    buf[path.len] = 0;
+    let fd = zr_open(&buf[0] as *const u8, mode);
+    if fd < 0 {
+        return -1;
+    }
+    return fd as i32;
 }
 
-//=============================================================================
-// 缓冲写入器
-//=============================================================================
-
-/// 带缓冲的写入器，减少系统调用次数。
-pub struct BufWriter {
-    pub fd:     i32,
-    pub buf:    [u8; 4096],
-    pub filled: usize,
+/// 读文件。返回读到的字节数，0 表示 EOF，出错返回 -1。
+pub fn file_read(fd: i32, buf: *mut u8, cap: usize) -> isize {
+    return zr_read(fd, buf, cap);
 }
 
-impl BufWriter {
-    pub fn new(fd: i32) -> BufWriter {
-        return BufWriter { fd, buf: [0; 4096], filled: 0 };
-    }
-
-    /// 写入一段字节，必要时先刷入缓冲。
-    pub fn write(self: &mut BufWriter, bytes: []const u8) {
-        if self.filled + bytes.len > 4096 {
-            self.flush();
-        }
-        if bytes.len > 4096 {
-            // 直接写入，不走缓冲
-            zr_write(self.fd, bytes.ptr, bytes.len);
-            return;
-        }
-        let mut i = 0;
-        while i < bytes.len {
-            self.buf[self.filled] = bytes.ptr[i];
-            self.filled = self.filled + 1;
-            i = i + 1;
-        }
-    }
-
-    /// 把缓冲内容刷入底层 fd。
-    pub fn flush(self: &mut BufWriter) {
-        if self.filled > 0 {
-            zr_write(self.fd, &self.buf[0] as *const u8, self.filled);
-            self.filled = 0;
-        }
-    }
+/// 写文件。返回写入的字节数，出错返回 -1。
+pub fn file_write(fd: i32, bytes: str) -> isize {
+    return zr_write(fd, bytes.ptr, bytes.len);
 }
 
-//=============================================================================
-// 进程控制
-//=============================================================================
-
-/// 正常退出，返回退出码。
-pub fn exit(code: i32) -> ! {
-    zr_exit(code);
+/// 关闭文件。成功返回 true。
+pub fn file_close(fd: i32) -> bool {
+    if fd < 0 {
+        return false;
+    }
+    return zr_close(fd) == 0;
 }
 
-/// 标准退出码。
-pub mod status {
-    pub const SUCCESS: i32 = 0;
-    pub const FAILURE: i32 = 1;
-    pub const USAGE:   i32 = 64;
+/// 读整个文件的内容，返回读到的字节数。
+///
+/// 内容写进 `buf`；文件比 `buf` 大时只读前 `cap` 字节。
+pub fn file_read_all(fd: i32, buf: *mut u8, cap: usize) -> usize {
+    let mut total = 0;
+    while total < cap {
+        let n = zr_read(fd, &buf[total] as *const u8 as *mut u8, cap - total);
+        if n <= 0 {
+            break;
+        }
+        total = total + (n as usize);
+    }
+    return total;
 }

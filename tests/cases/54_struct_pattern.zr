@@ -1,0 +1,91 @@
+//=============================================================================
+// tests/cases/54_struct_pattern.zr — 结构体模式（match / if let）
+//
+// 结构体模式把 match 的条件拆到字段上：`P { x: 1, y: v }` 的匹配条件是
+// `p.x == 1`，绑定 `v` 取的是 `p.y`。此前类型检查把子模式丢掉了，模式只剩
+// "是个结构体"这一条信息——`if let P { x: 1 } = p` 于是恒成立（静默算错）。
+//
+// 覆盖：
+//   - 完全匹配 / 部分匹配（`..` 尾）
+//   - 字段绑定、嵌套结构体模式
+//   - guard 里用字段绑定
+//   - `if let` 里的结构体模式与字段绑定
+//   - 不匹配时落到下一条臂 / else 分支
+//=============================================================================
+
+struct P {
+    x: i32,
+    y: i32,
+}
+
+struct Q {
+    p: P,
+    tag: i32,
+}
+
+/// 按 x 与 y 的关系分类。
+fn classify(p: P) -> i32 {
+    match p {
+        P { x: 1, y: 2 } => { return 0; }
+        P { x: 1, y: v } => { return v; }
+        P { x: 0, .. } => { return 100; }
+        _ => { return 200; }
+    }
+}
+
+fn main() -> i32 {
+    // --- 完全匹配 ---
+    let a = P { x: 1, y: 2 };
+    match a {
+        P { x: 1, y: 2 } => { return 0; }
+        _ => { return 1; }
+    }
+
+    // --- 各条臂按顺序命中 ---
+    let b = P { x: 1, y: 2 };
+    if classify(b) != 0 { return 2; }
+    let c = P { x: 1, y: 7 };
+    if classify(c) != 7 { return 3; }
+    let d = P { x: 0, y: 5 };
+    if classify(d) != 100 { return 4; }
+    let e = P { x: 9, y: 9 };
+    if classify(e) != 200 { return 5; }
+
+    // --- 嵌套结构体模式 ---
+    let q = Q { p: P { x: 1, y: 2 }, tag: 9 };
+    match q {
+        Q { p: P { x: 1, y: 2 }, tag: t } => {
+            if t != 9 { return 6; }
+        }
+        _ => { return 7; }
+    }
+
+    // --- guard 里用字段绑定 ---
+    let f = P { x: 5, y: 7 };
+    match f {
+        P { x: v, y: w } if v > w => { return 8; }
+        P { x: v, y: w } if v < w => { return 9; }
+        _ => { return 10; }
+    }
+
+    // --- 或模式 + 结构体模式 ---
+    let h = P { x: 2, y: 2 };
+    match h {
+        P { x: 1 } | P { x: 2 } => { return 14; }
+        _ => { return 15; }
+    }
+
+    // --- if let 里的结构体模式与字段绑定 ---
+    let g = P { x: 1, y: 7 };
+    if let P { x: 1, y: v } = g {
+        if v != 7 { return 11; }
+    } else {
+        return 12;
+    }
+    // 不匹配时走 else（绑定在 else 分支里不可见，与 Rust 一致）。
+    if let P { x: 2, y: v } = g {
+        return 13;
+    } else {
+        return 0;
+    }
+}
