@@ -314,6 +314,8 @@ pub enum Expression {
     Assign(Box<Expression>, AssignOp, Box<Expression>, Span),
     /// 调用。
     Call(Box<Expression>, Vec<Argument>, Span),
+    /// 带 turbofish 的泛型引用：`size_of::<T>` / `Foo::<i32>::new`。
+    Turbofish(Box<Expression>, Vec<Type>, Span),
     /// 宏调用：`name!(...)`。
     ///
     /// 参数先按**记号序列**存着，等整份程序解析完再由宏展开阶段
@@ -788,6 +790,7 @@ impl Spanned for Expression {
             Expression::Unary(_, _, s) => *s,
             Expression::Assign(_, _, _, s) => *s,
             Expression::Call(_, _, s) => *s,
+            Expression::Turbofish(_, _, s) => *s,
             Expression::MacroCall { span, .. } => *span,
             Expression::Index(_, _, s) => *s,
             Expression::Field(_, _, s) => *s,

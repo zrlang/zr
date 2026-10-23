@@ -612,18 +612,19 @@ impl Parser {
                 // 泛型实参（turbofish）：`size_of::<T>()` 的 `::<T>`
                 if self.check(&TokenKind::Lt) {
                     self.advance();
-                    let _args = self.parse_generic_args()?;
+                    let type_args = self.parse_generic_args()?;
+                    let inner = Expression::Turbofish(
+                        Box::new(Expression::Variable(n, span)),
+                        type_args,
+                        span,
+                    );
                     // turbofish 后面必定跟着调用
                     if self.match_kind(&TokenKind::LParen) {
                         let args = self.parse_call_args()?;
                         self.consume(&TokenKind::RParen, "expected ')'")?;
-                        return Ok(Expression::Call(
-                            Box::new(Expression::Variable(n, span)),
-                            args,
-                            span,
-                        ));
+                        return Ok(Expression::Call(Box::new(inner), args, span));
                     }
-                    return Ok(Expression::Variable(n, span));
+                    return Ok(inner);
                 }
                 // 路径：`a::b::c`
                 let mut path = vec![n];

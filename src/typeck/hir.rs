@@ -28,6 +28,8 @@ pub struct HirModule {
     pub consts: HashMap<DefId, HirConst>,
     /// 类型 DefId → 用户实现的 Drop 析构函数名。
     pub drop_impls: HashMap<DefId, String>,
+    /// 泛型类型定义的类型参数占位符（按声明顺序），MIR 布局按实参替换。
+    pub generic_params: HashMap<DefId, Vec<Ty>>,
 }
 
 // ======================================================================

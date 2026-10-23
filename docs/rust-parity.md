@@ -49,13 +49,13 @@
 | 数组 → 切片 强转 | 自动强转 | ✅ | `let s: []const i32 = arr;`、`f(arr)`（形参 `[]T`）都自动补 `(ptr, len)`；`arr[1..3]` / `arr[1..]` / `arr[..3]` / `arr[..]` / `arr[1..=3]` 均产生切片 |
 | `(T, U)` 元组 | 可用 | 🟡 | 直接写元组类型可用；但**经类型别名后取 `.0` 失败**：``zr: no field `0` on type `type#75` `` |
 | `struct` | 可用 | ✅ | 具名字段、元组结构体、嵌套字段、`impl` 方法、`impl Drop`、字段按值拷贝均正常 |
-| `enum`（带载荷） | 可用 | 🟡 | 非泛型枚举的判别式与载荷**完全正常**（含 `f64` 载荷、struct 载荷变体）；**泛型枚举的载荷恒为 0**（见 #3） |
+| `enum`（带载荷） | 可用 | ✅ | 判别式与载荷正常（含 `f64` 载荷、struct 载荷变体）；泛型枚举按实例单态化，`Option<T>` / `Result<T, E>` 的载荷也能正确读写 |
 | `union` | 只能声明 | ❌ | `union U { i: i32 }` 能声明，但构造报 ``zr: `U` is not a struct ``；字段读写也没有安全的入口 |
 | `*const T` / `*mut T` | 可用 | ✅ | 裸指针可用；`*p = v` 走指针语义 |
 | `&T` / `&mut T` | 可用 | 🟡 | 语义上 `&T` 是只读指针（``zr: cannot assign through an immutable pointer (use `&mut` and a `*mut` type) ``），`&mut T` 可写；但**`let` 注解里的 `&T` 被解析成 `*const T`**：`let r: &i32 = &x;` → ``zr: type mismatch: expected `*const i32`, found `&i32` `` |
-| `Option<T>` / `Result<T, E>` | 存在但载荷丢失 | 🟡 | 在 `std::core` 里；`is_some()` / `unwrap()` 等判定正确，**但取值恒为 0**（泛型枚举载荷 bug，见 #3） |
-| 泛型函数 | 不可用 | ❌ | **不做单态化**：调用点生成未实例化的符号，链接期报 `zr: linker: linking ... requires the platform linker`；`nm` 可见未定义符号 `_identity`。`std::core` 里的 `min` / `max` / `clamp` / `swap` 同样链接失败 |
-| 泛型类型 | 值会丢 | ❌ | `struct Wrapper<T> { value: T }` 的 `w.value` 恒为 0；`impl<T> Wrapper<T>` 的方法能链接但取不到值 |
+| `Option<T>` / `Result<T, E>` | 可用 | ✅ | 在 `std::core` 里；`is_some()` / `is_none()` / `is_ok()` / `is_err()` / `unwrap()` / `unwrap_or()` / `map()` 与模式匹配均正常（`?` 仍是占位实现，见 P0 #3） |
+| 泛型函数 | 可用 | ✅ | 按调用点单态化（含递归泛型）；类型实参从实参 / 期望返回类型推断。泛型约束（`T: Ord`、`where`）只解析不检查，实例化后按具体类型检查方法调用 |
+| 泛型类型 | 可用 | ✅ | 泛型结构体 / 枚举 + `impl<T> Type<T>` 的方法均可用（`Vec<T>`、`Option<T>` 等）；字段与载荷类型按类型实参替换 |
 | `trait` | 可用 | ✅ | `trait` + `impl Trait for Type` 正常（`std::core` 的 `Eq`/`Ord`/`Copy`/`Clone`/`Display` 都在用） |
 | 关联类型 | 可用 | ✅ | `type Output;` + `type Output = i32;` 正常，`Self::Output` 能取到 |
 | `impl` 块 | 可用 | ✅ | 关联函数、`self` / `&self` / `&mut self` 三种接收者、`Self` 类型均可 |
@@ -69,8 +69,9 @@
 
 | Rust 的写法 | zr 的现状 | 状态 | 说明 |
 |------|------|------|------|
-| `let x: Option<i32> = ...;` | 泛型实参被丢弃 | ❌ | ``zr: type mismatch: expected `type#98`, found `type#98<i32>` ``；**任何** `let` 注解里的 `<...>` 都会丢（本地泛型类型同样如此） |
-| `fn f(x: Option<i32>)` | 可用 | 🟡 | 签名里实参保留，但载荷仍为 0（泛型枚举 bug） |
+| `let x: Option<i32> = ...;` | 可用 | ✅ | 类型注解里的泛型实参保留，字段 / 载荷类型按实参替换 |
+| `fn f(x: Option<i32>)` | 可用 | ✅ | 签名与函数体一致 |
+| `Option::<i32>::None` | 不支持 | ❌ | turbofish 只在**调用位置**生效（`size_of::<T>()`、`Foo::<i32>::new()`）；类型路径上的 `::<>` 解析失败。无上下文的 `Option::None` 需要 `let` 注解 |
 
 ---
 
@@ -218,8 +219,7 @@
 
 7. **枚举的内存布局与 Rust 一致。**
    zr 的枚举是 `[判别式][载荷区]`，`Auto` 判别式按变体个数挑最小够用的整数，
-   变体模式先比判别式再看载荷——这部分和 Rust 一样。
-   ⚠️ 但**泛型枚举的载荷存取目前恒返回 0**，这是待修的 bug（见「待办缺口」P0 #4），不是设计。
+   变体模式先比判别式再看载荷——这部分和 Rust 一样（泛型枚举按实例替换载荷类型）。
 
 8. **窄浮点 `f8` / `f16` 是 zr 自创的。**
    `f16` 兼容 IEEE 754 binary16；`f8` 是 zr 自定义（1 符号 + 4 指数 + 3 尾数，偏置 7），
@@ -229,9 +229,10 @@
    `fn f() -> i32!i32` 能写，`f()!` 的解包运算符解析不了；
    Rust 风格的 `?` 又只是占位实现（见下）。
 
-10. **`Option` / `Result` 的判定方法可用，取值方法不可信。**
-    `is_some()` / `is_none()` / `is_ok()` / `is_err()` 返回正确，
-    `unwrap()` / `unwrap_or()` / 模式绑定拿到的却是 0（同 #7，是 bug）。
+10. **`Option` / `Result` 的方法与模式匹配都可用。**
+    `is_some()` / `is_none()` / `is_ok()` / `is_err()` / `unwrap()` /
+    `unwrap_or()` / `map()` 均返回正确结果；唯一例外是 `?` 运算符仍是占位实现
+    （见 P0 #3）。
 
 ---
 
@@ -273,44 +274,30 @@
 3. **`?` 运算符是占位实现。**
    后缀 `?` 在解析期被替换成解引用（`src/parser/expr.rs`）。
    既不传播错误也不取到值：`Err` 分支不会被选中，成功路径返回未初始化内存。
-   影响面：所有错误传播路径；目前 `core::Result` 基本不可用。
-
-4. **泛型枚举载荷恒为 0。**
-   `Option<T>` / `Result<T, E>` / 任何 `enum X<T> { V(T) }` 的载荷取值都是 0
-   （判别式正确，只有载荷错）。
-   ```zr
-   let o = Option::Some(7);
-   match o { Option::Some(v) => ..., }   // v == 0，不是 7
-   ```
-   影响面：`Option` / `Result` / 一切泛型枚举与泛型结构体（泛型结构体的字段同样恒为 0）。
-
-5. **泛型函数不做单态化。**
-   `fn identity<T>(x: T) -> T` 的调用点生成未实例化符号，链接期才失败
-   （`nm` 可见未定义符号 `_identity`）。`std::core` 的 `min` / `max` / `clamp` /
-   `swap` / `assert_eq` 同受影响，等于整个 `std::core` 的一半不可用。
-   注：`src/typeck/mod.rs` 的注释说「用到它时再报"未实现"」，但 `generic_fn_span`
-   这个字段**只写不读**，报错路径没有接上，所以退化成了链接错误。
+   影响面：所有 `?` 错误传播；`Result` 本身（`match` / 方法）可用。
 
 ### P1 — 明确报错或明显缺失的功能（能用不了，但至少看得见）
 
-6. **`#[derive(...)]` 完全不可用**：结构体上报 `undefined name`，枚举上被静默忽略。
-7. **静态变量 `static mut` 没有生成数据符号** → 链接失败。
-8. **类型别名在 `let` 注解里不展开**、**`let` 注解里的泛型实参被丢弃** →
-   `let x: Option<i32> = ...` 这类写法全线报错。
-9. **没有 `unsafe` 关键字**（README「指针与 unsafe」一节已过期）、
+4. **`#[derive(...)]` 完全不可用**：结构体上报 `undefined name`，枚举上被静默忽略。
+5. **静态变量 `static mut` 没有生成数据符号** → 链接失败。
+6. **类型别名在 `let` 注解里不展开**：`type MyInt = i32; let m: MyInt = 5;`
+   报 ``type mismatch: expected `i32`, found `type#2` ``（函数签名里的别名可用）。
+7. **没有 `unsafe` 关键字**（README「指针与 unsafe」一节已过期）、
    **没有 `dyn` 关键字**（trait 对象不可用，`std::error` 因此导入不了）。
-10. **没有借用检查 / 移动检查**（README「所有权系统」「借用检查」两节与实际不符）。
-11. **`try` / `catch` / `throw` / `defer` 解析但不执行**：`defer` 的块从不运行，
+8. **没有借用检查 / 移动检查**（README「所有权系统」「借用检查」两节与实际不符）。
+9. **`try` / `catch` / `throw` / `defer` 解析但不执行**：`defer` 的块从不运行，
     `throw` 既不抛也不中止 —— 建议先改成编译期明确报错。
-12. **没有元数据 / 临时文件 API**：目录、路径、时间已可用（`std/fs.zr`、
+10. **没有元数据 / 临时文件 API**：目录、路径、时间已可用（`std/fs.zr`、
     `std/path.zr`），但权限、时间戳、`tempfile` 仍缺。
-13. **浮点 `Display` 在 |v| ≥ 2⁶⁴ 时输出 `.0`**（`std/io.zr` 的 `write_float`）。
-14. **格式规格只支持 `{}` `{:?}` `{:x}` `{:X}`**，宽度 / 精度 / 对齐 / 填充会被原样打印。
-15. **`println` 不检查参数类型**：`println(42)` 编译通过、运行段错误。
-16. **闭包未实现**（README 已记录）：`closures are not implemented yet`。
-17. **`i128` / `u128` 在 64 位目标上不可用**（需要寄存器对拆分）。
-18. **泛型单态化缺失**：泛型函数 / 泛型结构体 / 泛型枚举的载荷仍按 `Infer` 处理，
-    `Option<T>`、`Result<T, E>` 以及 `std::core` 的 `min` / `max` 等基本不可用。
+11. **浮点 `Display` 在 |v| ≥ 2⁶⁴ 时输出 `.0`**（`std/io.zr` 的 `write_float`）。
+12. **格式规格只支持 `{}` `{:?}` `{:x}` `{:X}`**，宽度 / 精度 / 对齐 / 填充会被原样打印。
+13. **`println` 不检查参数类型**：`println(42)` 编译通过、运行段错误。
+14. **闭包未实现**（README 已记录）：`closures are not implemented yet`。
+15. **`i128` / `u128` 在 64 位目标上不可用**（需要寄存器对拆分）。
+16. **泛型推断与约束的边界**：类型参数只从实参和期望返回类型推断，不看作法体
+    （`let v = Vec::new(); v.push(1)` 推不出 `T`，需要 `let v: Vec<i32>` 注解）；
+    类型路径上的 turbofish（`Option::<i32>::None`）不支持；`T: Trait` / `where`
+    约束只解析不检查，实例化后按具体类型报"方法/字段缺失"。
 
 ---
 

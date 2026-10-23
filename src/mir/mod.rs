@@ -324,6 +324,7 @@ pub fn lower(hir: &HirModule) -> MirModule {
                 &hir.type_defs,
                 &drop_impls,
                 &fn_params,
+                &hir.generic_params,
             ));
         }
     }

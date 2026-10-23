@@ -24,6 +24,7 @@ pub fn lower_function(
     type_defs: &HashMap<hir::DefId, hir::HirTypeDef>,
     drop_impls: &HashMap<hir::DefId, String>,
     fn_params: &HashMap<String, Vec<hir::Ty>>,
+    generic_params: &HashMap<hir::DefId, Vec<hir::Ty>>,
 ) -> MirFunction {
     let mut b = Builder::new(
         func.name.clone(),
@@ -32,6 +33,7 @@ pub fn lower_function(
         type_defs.clone(),
         drop_impls.clone(),
         fn_params.clone(),
+        generic_params.clone(),
     );
     // 先扫出被取地址的局部变量：它们不能住在寄存器里，必须固定到栈槽。
     if let Some(body) = &func.body {
@@ -67,6 +69,15 @@ pub fn lower_function(
             b.param_names.push(hidden.clone());
             b.ret_struct = Some((actual_ret.clone(), layout.size));
             b.hidden_ret = Some(hidden);
+        } else if let hir::Ty::Named(id, args) = actual_ret {
+            // 枚举没有 `StructLayout`（变体载荷各异），但同样需要一个
+            // 调用方提供的返回槽：返回指向自己栈帧的指针会立刻失效。
+            if let Some(el) = enum_layout(&b, *id, args) {
+                let hidden = format!("arg_{}", func.params.len());
+                b.param_names.push(hidden.clone());
+                b.ret_bytes = Some((el.size, el.align));
+                b.hidden_ret = Some(hidden);
+            }
         }
     } else if matches!(actual_ret, hir::Ty::Array(..) | hir::Ty::Named(..)) {
         // 异步函数没有调用方返回槽：结果先写进堆帧的输出区，await 再把
@@ -123,6 +134,13 @@ pub fn lower_function(
             tail = Some(MirValue::Var(dst));
         }
     }
+    if let (Some((size, align)), Some(dst)) = (b.ret_bytes, b.hidden_ret.clone()) {
+        if let Some(value) = tail.take() {
+            b.consume_temp(&value);
+            copy_bytes_into(&mut b, value, MirValue::Var(dst.clone()), size, align);
+            tail = Some(MirValue::Var(dst));
+        }
+    }
 
     // 终结入口块：尾表达式的值即函数返回值。先把仍存活的局部量
     // 逆序析构；显式 `return` 已经清理过的情况 term 已存在，不再重复。
@@ -138,7 +156,7 @@ pub fn lower_function(
         is_async: func.is_async,
         param_types: {
             let mut tys: Vec<NumTy> = func.params.iter().map(|p| reg_ty_of(&p.ty)).collect();
-            if b.ret_array.is_some() || b.ret_struct.is_some() {
+            if b.hidden_ret.is_some() {
                 tys.push(NumTy::Uint(64));
             }
             tys
@@ -514,7 +532,11 @@ fn lower_expr(b: &mut Builder, expr: &HirExpr) -> MirValue {
             args,
         } => {
             // 枚举值在运行期是"指向一块存储的地址"：判别式 + 载荷区。
-            let Some(layout) = enum_layout(b, *def_id) else {
+            let targs: Vec<hir::Ty> = match &expr.ty {
+                hir::Ty::Named(id, a) if id == def_id => a.clone(),
+                _ => Vec::new(),
+            };
+            let Some(layout) = enum_layout(b, *def_id, &targs) else {
                 return MirValue::Unit;
             };
             let addr = b.synthetic_storage(layout.size);
@@ -528,8 +550,9 @@ fn lower_expr(b: &mut Builder, expr: &HirExpr) -> MirValue {
                 reg_ty_of(&layout.tag_ty),
             ));
             // 载荷按变体的字段偏移写。
-            let field_tys = variant_field_tys_of(b, *def_id, *index);
-            let offsets = variant_field_offsets(b, *def_id, *index).unwrap_or_default();
+            let field_tys = variant_field_tys_of(b, *def_id, *index, &targs);
+            let offsets =
+                variant_field_offsets(b, *def_id, *index, &targs).unwrap_or_default();
             for (i, arg) in args.iter().enumerate() {
                 let Some(off) = offsets.get(i).copied() else {
                     continue;
@@ -546,10 +569,10 @@ fn lower_expr(b: &mut Builder, expr: &HirExpr) -> MirValue {
         }
         hir::ExprKind::EnumTag(value) => {
             // 判别式在偏移 0。
-            let hir::Ty::Named(def_id, _) = &value.ty else {
+            let hir::Ty::Named(def_id, targs) = &value.ty else {
                 return MirValue::Unit;
             };
-            let Some(layout) = enum_layout(b, *def_id) else {
+            let Some(layout) = enum_layout(b, *def_id, targs) else {
                 return MirValue::Unit;
             };
             let base = lower_expr(b, value);
@@ -568,13 +591,13 @@ fn lower_expr(b: &mut Builder, expr: &HirExpr) -> MirValue {
             index,
         } => {
             // 载荷字段的偏移随变体而变，所以要按变体算。
-            let hir::Ty::Named(def_id, _) = &value.ty else {
+            let hir::Ty::Named(def_id, targs) = &value.ty else {
                 return MirValue::Unit;
             };
-            let Some(layout) = enum_layout(b, *def_id) else {
+            let Some(layout) = enum_layout(b, *def_id, targs) else {
                 return MirValue::Unit;
             };
-            let Some(offsets) = variant_field_offsets(b, *def_id, *variant) else {
+            let Some(offsets) = variant_field_offsets(b, *def_id, *variant, targs) else {
                 return MirValue::Unit;
             };
             let Some(off) = offsets.get(*index).copied() else {
@@ -582,7 +605,7 @@ fn lower_expr(b: &mut Builder, expr: &HirExpr) -> MirValue {
             };
             let base = lower_expr(b, value);
             let at = offset_addr(b, base, layout.payload_off + off);
-            let field_tys = variant_field_tys_of(b, *def_id, *variant);
+            let field_tys = variant_field_tys_of(b, *def_id, *variant, targs);
             let Some(field_ty) = field_tys.get(*index).cloned() else {
                 return MirValue::Unit;
             };
@@ -778,6 +801,13 @@ fn lower_expr(b: &mut Builder, expr: &HirExpr) -> MirValue {
                     rv = Some(MirValue::Var(dst));
                 }
             }
+            if let (Some((size, align)), Some(dst)) = (b.ret_bytes, b.hidden_ret.clone()) {
+                if let Some(value) = rv.take() {
+                    b.consume_temp(&value);
+                    copy_bytes_into(b, value, MirValue::Var(dst.clone()), size, align);
+                    rv = Some(MirValue::Var(dst));
+                }
+            }
             if b.async_ret_bytes.is_some() {
                 if let Some(value) = &rv {
                     b.consume_temp(value);
@@ -860,6 +890,12 @@ fn lower_expr(b: &mut Builder, expr: &HirExpr) -> MirValue {
                 let dst = b.synthetic_storage(layout.size);
                 mir_args.push(MirValue::Var(dst.clone()));
                 dest = Some(MirValue::Var(dst));
+            } else if let hir::Ty::Named(id, args) = &expr.ty {
+                if let Some(el) = enum_layout(b, *id, args) {
+                    let dst = b.synthetic_storage(el.size);
+                    mir_args.push(MirValue::Var(dst.clone()));
+                    dest = Some(MirValue::Var(dst));
+                }
             }
             // 调用表达式的类型就是被调函数的返回类型
             let ty = num_ty_of(&expr.ty);
@@ -910,6 +946,12 @@ fn lower_expr(b: &mut Builder, expr: &HirExpr) -> MirValue {
                 let dst = b.synthetic_storage(layout.size);
                 mir_args.push(MirValue::Var(dst.clone()));
                 dest = Some(MirValue::Var(dst));
+            } else if let hir::Ty::Named(id, args) = &expr.ty {
+                if let Some(el) = enum_layout(b, *id, args) {
+                    let dst = b.synthetic_storage(el.size);
+                    mir_args.push(MirValue::Var(dst.clone()));
+                    dest = Some(MirValue::Var(dst));
+                }
             }
             let ty = num_ty_of(&expr.ty);
             b.current_block_mut().instrs.push(MirInstr::CallIndirect(
@@ -993,7 +1035,7 @@ fn lower_expr(b: &mut Builder, expr: &HirExpr) -> MirValue {
         // 解引用只需把地址原样传下去。
         Deref(inner) => {
             let addr = lower_expr(b, inner);
-            if struct_layout(b, &expr.ty).is_some() {
+            if is_aggregate(b, &expr.ty) {
                 return addr;
             }
             if let Some(bits) = narrow_bits_of(&expr.ty) {
@@ -1010,7 +1052,7 @@ fn lower_expr(b: &mut Builder, expr: &HirExpr) -> MirValue {
         // 结构体/数组元素本身以地址表示，直接把这个地址当值。
         Index(recv, idx) => {
             let addr = lower_index_addr(b, recv, idx, &expr.ty);
-            if struct_layout(b, &expr.ty).is_some() || array_info(b, &expr.ty).is_some() {
+            if is_aggregate(b, &expr.ty) || array_info(b, &expr.ty).is_some() {
                 return addr;
             }
             if let Some(bits) = narrow_bits_of(&expr.ty) {
@@ -1055,7 +1097,7 @@ fn lower_expr(b: &mut Builder, expr: &HirExpr) -> MirValue {
         // `&place`：取位置地址。结构体/数组值本身已经是指向存储的地址，
         // 再对“保存该地址的槽”取地址会多解一层。
         AddrOf(place) => {
-            if struct_layout(b, &place.ty).is_some() || array_info(b, &place.ty).is_some() {
+            if is_aggregate(b, &place.ty) || array_info(b, &place.ty).is_some() {
                 return lower_expr(b, place);
             }
             match &place.kind {
@@ -1280,6 +1322,8 @@ pub(super) struct Builder {
     types: HashMap<hir::DefId, hir::HirTypeDef>,
     /// 类型 DefId → 用户 Drop 析构函数名。
     drops: HashMap<hir::DefId, String>,
+    /// 泛型类型定义的占位符参数（布局 / 字段偏移按实参替换）。
+    generic_params: HashMap<hir::DefId, Vec<hir::Ty>>,
     /// 词法作用域栈，每层记录该作用域内需要 Drop 的局部量。
     drop_scopes: Vec<Vec<DropLocal>>,
     /// 合成局部 id 的起点（数组字面量等没有源码局部变量的存储）。
@@ -1294,6 +1338,8 @@ pub(super) struct Builder {
     hidden_ret: Option<String>,
     /// 同步函数按值返回结构体时的 `(类型, 字节大小)`。
     ret_struct: Option<(hir::Ty, i128)>,
+    /// 按字节整块返回的聚合（枚举）：(大小, 对齐)。
+    ret_bytes: Option<(i128, i128)>,
     /// 当前语句创建的 Drop 临时量；语句结束时逆序析构未移出的项。
     temp_drops: Vec<TempDrop>,
     /// 异步函数按值返回聚合类型时的输出字节数。
@@ -1351,6 +1397,7 @@ impl Builder {
         types: HashMap<hir::DefId, hir::HirTypeDef>,
         drops: HashMap<hir::DefId, String>,
         fn_params: HashMap<String, Vec<hir::Ty>>,
+        generic_params: HashMap<hir::DefId, Vec<hir::Ty>>,
     ) -> Self {
         let _ = name;
         Self {
@@ -1364,11 +1411,13 @@ impl Builder {
             const_values,
             types,
             drops,
+            generic_params,
             drop_scopes: Vec::new(),
             addr_taken: HashSet::new(),
             ret_array: None,
             hidden_ret: None,
             ret_struct: None,
+            ret_bytes: None,
             temp_drops: Vec::new(),
             async_ret_bytes: None,
         }
@@ -1949,7 +1998,20 @@ fn binary_result_ty(
     rhs_ty: &hir::Ty,
 ) -> NumTy {
     use hir::BinaryOp::*;
-    if matches!(op, Eq | Ne | Lt | Gt | Le | Ge | And | Or) {
+    if matches!(op, Lt | Gt | Le | Ge) {
+        // 比较结果的寄存器类型仍是 bool，但把**无符号操作数**的类型带下去，
+        // 后端据此选 `setb`/`seta`（而不是 `setl`/`setg`）。
+        let l = reg_ty_of(lhs_ty);
+        if matches!(l, NumTy::Uint(_)) {
+            return l;
+        }
+        let r = reg_ty_of(rhs_ty);
+        if matches!(r, NumTy::Uint(_)) {
+            return r;
+        }
+        return NumTy::Bool;
+    }
+    if matches!(op, Eq | Ne | And | Or) {
         return NumTy::Bool;
     }
     let t = reg_ty_of(expr_ty);
@@ -2125,6 +2187,64 @@ fn align_up(n: i128, align: i128) -> i128 {
     }
 }
 
+/// 用类型定义的泛型实参替换类型里的占位符。
+fn subst_generic(
+    b: &Builder,
+    def_id: DefId,
+    args: &[hir::Ty],
+    ty: &hir::Ty,
+) -> hir::Ty {
+    let Some(params) = b.generic_params.get(&def_id) else {
+        return ty.clone();
+    };
+    if params.len() != args.len() {
+        return ty.clone();
+    }
+    let map: HashMap<hir::InferId, hir::Ty> = params
+        .iter()
+        .zip(args)
+        .filter_map(|(p, a)| match p {
+            hir::Ty::Infer(id) => Some((id.clone(), a.clone())),
+            _ => None,
+        })
+        .collect();
+    subst_infer_ty(ty, &map)
+}
+
+/// 递归替换 `Ty::Infer` 占位符。
+fn subst_infer_ty(ty: &hir::Ty, map: &HashMap<hir::InferId, hir::Ty>) -> hir::Ty {
+    use hir::Ty;
+    match ty {
+        Ty::Infer(id) => map.get(id).cloned().unwrap_or_else(|| ty.clone()),
+        Ty::Named(id, args) => {
+            Ty::Named(*id, args.iter().map(|t| subst_infer_ty(t, map)).collect())
+        }
+        Ty::Pointer(t, m) => Ty::Pointer(Box::new(subst_infer_ty(t, map)), *m),
+        Ty::Reference(t, m) => Ty::Reference(Box::new(subst_infer_ty(t, map)), *m),
+        Ty::Array(t, len) => Ty::Array(Box::new(subst_infer_ty(t, map)), len.clone()),
+        Ty::Slice(t, m) => Ty::Slice(Box::new(subst_infer_ty(t, map)), *m),
+        Ty::Tuple(ts) => Ty::Tuple(ts.iter().map(|t| subst_infer_ty(t, map)).collect()),
+        Ty::Function {
+            params,
+            ret,
+            is_async,
+            abi,
+        } => Ty::Function {
+            params: params.iter().map(|t| subst_infer_ty(t, map)).collect(),
+            ret: Box::new(subst_infer_ty(ret, map)),
+            is_async: *is_async,
+            abi: abi.clone(),
+        },
+        Ty::Optional(t) => Ty::Optional(Box::new(subst_infer_ty(t, map))),
+        Ty::ErrorUnion(t, e) => Ty::ErrorUnion(
+            Box::new(subst_infer_ty(t, map)),
+            Box::new(subst_infer_ty(e, map)),
+        ),
+        Ty::Pin(t) => Ty::Pin(Box::new(subst_infer_ty(t, map))),
+        _ => ty.clone(),
+    }
+}
+
 fn type_size_align(b: &Builder, ty: &hir::Ty, depth: usize) -> Option<(i128, i128)> {
     use hir::Ty;
     if depth > 32 {
@@ -2157,9 +2277,9 @@ fn type_size_align(b: &Builder, ty: &hir::Ty, depth: usize) -> Option<(i128, i12
             }
             (align_up(off, align), align)
         }
-        Ty::Named(id, _) => {
+        Ty::Named(id, args) => {
             // 枚举：判别式 + 载荷区。
-            if let Some(el) = enum_layout(b, *id) {
+            if let Some(el) = enum_layout(b, *id, args) {
                 return Some((el.size, el.align));
             }
             let hs = match b.types.get(id)? {
@@ -2169,7 +2289,8 @@ fn type_size_align(b: &Builder, ty: &hir::Ty, depth: usize) -> Option<(i128, i12
             let mut off = 0i128;
             let mut align = 1i128;
             for f in &hs.fields {
-                let (sz, al) = type_size_align(b, &f.ty, depth + 1)?;
+                let fty = subst_generic(b, *id, args, &f.ty);
+                let (sz, al) = type_size_align(b, &fty, depth + 1)?;
                 off = align_up(off, al);
                 off += sz;
                 align = align.max(al);
@@ -2199,8 +2320,8 @@ fn struct_layout(b: &Builder, ty: &hir::Ty) -> Option<StructLayout> {
             names,
         });
     }
-    let id = match ty {
-        hir::Ty::Named(id, _) => *id,
+    let (id, args) = match ty {
+        hir::Ty::Named(id, args) => (*id, args.clone()),
         hir::Ty::Reference(inner, _) | hir::Ty::Pointer(inner, _) => {
             return struct_layout(b, inner);
         }
@@ -2215,9 +2336,10 @@ fn struct_layout(b: &Builder, ty: &hir::Ty) -> Option<StructLayout> {
     let mut off = 0i128;
     let mut align = 1i128;
     for (idx, f) in hs.fields.iter().enumerate() {
-        let (sz, al) = type_size_align(b, &f.ty, 0)?;
+        let fty = subst_generic(b, id, &args, &f.ty);
+        let (sz, al) = type_size_align(b, &fty, 0)?;
         off = align_up(off, al);
-        fields.push((off, f.ty.clone()));
+        fields.push((off, fty));
         names.insert(f.name.clone(), idx);
         off += sz;
         align = align.max(al);
@@ -2319,7 +2441,7 @@ fn variant_field_tys(v: &hir::HirVariant) -> Vec<hir::Ty> {
 }
 
 /// 枚举的布局。
-fn enum_layout(b: &Builder, def_id: DefId) -> Option<EnumLayout> {
+fn enum_layout(b: &Builder, def_id: DefId, args: &[hir::Ty]) -> Option<EnumLayout> {
     let hir::HirTypeDef::Enum(he) = b.types.get(&def_id)? else {
         return None;
     };
@@ -2329,7 +2451,10 @@ fn enum_layout(b: &Builder, def_id: DefId) -> Option<EnumLayout> {
     let mut payload_size = 0i128;
     let mut payload_align = 1i128;
     for v in &he.variants {
-        let tys = variant_field_tys(v);
+        let tys: Vec<hir::Ty> = variant_field_tys(v)
+            .iter()
+            .map(|t| subst_generic(b, def_id, args, t))
+            .collect();
         let layout = tuple_layout(b, &tys)?;
         payload_size = payload_size.max(layout.size);
         for t in &tys {
@@ -2357,7 +2482,7 @@ fn is_aggregate(b: &Builder, ty: &hir::Ty) -> bool {
         return true;
     }
     match ty {
-        hir::Ty::Named(def_id, _) => enum_layout(b, *def_id).is_some(),
+        hir::Ty::Named(def_id, args) => enum_layout(b, *def_id, args).is_some(),
         _ => false,
     }
 }
@@ -2374,7 +2499,12 @@ fn variant_discriminant(b: &Builder, def_id: DefId, variant: usize) -> i128 {
 }
 
 /// 某个变体的载荷字段类型（按声明顺序）。
-fn variant_field_tys_of(b: &Builder, def_id: DefId, variant: usize) -> Vec<hir::Ty> {
+fn variant_field_tys_of(
+    b: &Builder,
+    def_id: DefId,
+    variant: usize,
+    args: &[hir::Ty],
+) -> Vec<hir::Ty> {
     let Some(hir::HirTypeDef::Enum(he)) = b.types.get(&def_id) else {
         return Vec::new();
     };
@@ -2382,15 +2512,26 @@ fn variant_field_tys_of(b: &Builder, def_id: DefId, variant: usize) -> Vec<hir::
         return Vec::new();
     };
     variant_field_tys(v)
+        .iter()
+        .map(|t| subst_generic(b, def_id, args, t))
+        .collect()
 }
 
 /// 某个变体的载荷字段偏移（相对载荷区起点）。
-fn variant_field_offsets(b: &Builder, def_id: DefId, variant: usize) -> Option<Vec<i128>> {
+fn variant_field_offsets(
+    b: &Builder,
+    def_id: DefId,
+    variant: usize,
+    args: &[hir::Ty],
+) -> Option<Vec<i128>> {
     let hir::HirTypeDef::Enum(he) = b.types.get(&def_id)? else {
         return None;
     };
     let v = he.variants.get(variant)?;
-    let tys = variant_field_tys(v);
+    let tys: Vec<hir::Ty> = variant_field_tys(v)
+        .iter()
+        .map(|t| subst_generic(b, def_id, args, t))
+        .collect();
     let layout = tuple_layout(b, &tys)?;
     Some(layout.fields.iter().map(|(off, _)| *off).collect())
 }
@@ -2441,8 +2582,8 @@ fn copy_value_into(b: &mut Builder, src: MirValue, dst: MirValue, ty: &hir::Ty) 
         copy_array_into(b, src, &elem, n, dst);
         return;
     }
-    if let hir::Ty::Named(def_id, _) = ty {
-        if let Some(el) = enum_layout(b, *def_id) {
+    if let hir::Ty::Named(def_id, args) = ty {
+        if let Some(el) = enum_layout(b, *def_id, args) {
             copy_bytes_into(b, src, dst, el.size, el.align);
             return;
         }
@@ -2477,8 +2618,8 @@ fn store_value(b: &mut Builder, at: MirValue, value: MirValue, ty: &hir::Ty) {
         return;
     }
     // 枚举：整块按字节复制。
-    if let hir::Ty::Named(def_id, _) = ty {
-        if let Some(el) = enum_layout(b, *def_id) {
+    if let hir::Ty::Named(def_id, args) = ty {
+        if let Some(el) = enum_layout(b, *def_id, args) {
             copy_bytes_into(b, value, at, el.size, el.align);
             return;
         }
@@ -2540,8 +2681,8 @@ fn copy_struct_into(b: &mut Builder, src: MirValue, layout: &StructLayout, dst: 
 /// 结构体按值拷贝：返回一块新存储的地址。
 fn copy_struct_value(b: &mut Builder, src: MirValue, ty: &hir::Ty) -> MirValue {
     // 枚举：整块按字节复制（不同变体的载荷类型不同，逐字段复制做不到）。
-    if let hir::Ty::Named(def_id, _) = ty {
-        if let Some(el) = enum_layout(b, *def_id) {
+    if let hir::Ty::Named(def_id, args) = ty {
+        if let Some(el) = enum_layout(b, *def_id, args) {
             b.consume_temp(&src);
             let dst = b.synthetic_storage(el.size);
             copy_bytes_into(b, src, MirValue::Var(dst.clone()), el.size, el.align);

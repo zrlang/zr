@@ -42,7 +42,7 @@ impl<T> Vec<T> {
     pub fn filled(count: usize, value: T) -> Vec<T>
     where T: Copy
     {
-        let mut v = Vec::with_capacity(count);
+        let mut v: Vec<T> = Vec::with_capacity(count);
         let mut i = 0;
         while i < count {
             v.push(value);
@@ -233,7 +233,7 @@ impl<T> Vec<T> {
 
 /// 用给定元素填满一个 Vec 到指定长度。
 pub fn vec_from_array<T: Copy>(arr: []const T) -> Vec<T> {
-    let mut v = Vec::with_capacity(arr.len);
+    let mut v: Vec<T> = Vec::with_capacity(arr.len);
     let mut i = 0;
     while i < arr.len {
         v.push(arr.ptr[i]);

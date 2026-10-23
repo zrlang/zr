@@ -152,6 +152,11 @@ pub struct TypeChecker {
     mono_cache: HashMap<(DefId, String), DefId>,
     /// 已登记、等待检查函数体的单态实例。
     mono_pending: Vec<MonoInstance>,
+    /// 泛型类型定义（结构体 / 枚举）的类型参数占位符，按声明顺序。
+    ///
+    /// 字段 / 载荷类型里出现的就是这些 `Ty::Infer`；`Ty::Named(id, args)`
+    /// 取值时用 `args` 替换它们。
+    type_generic_params: HashMap<DefId, Vec<Ty>>,
 }
 
 /// 一次泛型单态化：用 `subst` 里的具体类型替换泛型参数。
@@ -210,6 +215,7 @@ impl Default for TypeChecker {
             generic_names: HashMap::new(),
             mono_cache: HashMap::new(),
             mono_pending: Vec::new(),
+            type_generic_params: HashMap::new(),
         }
     }
 }
@@ -396,6 +402,7 @@ impl TypeChecker {
             type_defs: self.type_defs.clone(),
             consts: self.consts.clone(),
             drop_impls,
+            generic_params: self.type_generic_params.clone(),
         })
     }
 
@@ -862,8 +869,9 @@ impl TypeChecker {
 
     fn check_struct_def(&mut self, s: &AstStruct) -> Result<()> {
         // 泛型参数先绑上：字段里的 `T` 是类型变量。
-        self.push_type_params(&s.generics, ast::Span::unknown());
+        let scope = self.push_type_params(&s.generics, ast::Span::unknown());
         let def_id = self.find_def(&s.name)?;
+        self.record_type_generics(def_id, &s.generics, &scope);
         let mut fields = Vec::new();
         let mut offsets = OffsetTracker::new();
 
@@ -891,13 +899,17 @@ impl TypeChecker {
             hs.fields = fields;
             hs.repr = repr;
         }
+        // 泛型参数的占位符不能泄漏到后续定义：以前这里不 pop，`impl<T>`
+        // 方法的 `T` 靠"上一次 struct 检查残留的作用域"碰巧解析。
+        self.type_params.pop();
         Ok(())
     }
 
     fn check_enum_def(&mut self, e: &ast::EnumDef) -> Result<()> {
         // 泛型参数先绑上：变体载荷里的 `T` 是类型变量。
-        self.push_type_params(&e.generics, ast::Span::unknown());
+        let scope = self.push_type_params(&e.generics, ast::Span::unknown());
         let def_id = self.find_def(&e.name)?;
+        self.record_type_generics(def_id, &e.generics, &scope);
         let mut variants = Vec::new();
 
         // 判别式：显式写的用那个值，没写的沿用上一个 + 1（和 Rust 一样）。
@@ -1005,6 +1017,7 @@ impl TypeChecker {
                 }
             });
         }
+        self.type_params.pop();
         Ok(())
     }
 
@@ -1064,6 +1077,23 @@ impl TypeChecker {
 
     fn check_impls(&mut self, prog: &Program) -> Result<()> {
         for ib in &prog.impls {
+            // `impl<T> Option<T>` 的目标类型里有泛型参数，转换前要先绑上。
+            // 以前这里靠 `check_type_defs` 里残留的作用域碰巧能解析，把
+            // 泄漏修掉之后必须显式 push。
+            if !ib.generics.is_empty() {
+                self.push_type_params(&ib.generics, ib.span);
+            }
+            let result = self.check_impl_block(ib);
+            if !ib.generics.is_empty() {
+                self.type_params.pop();
+            }
+            result?;
+        }
+        Ok(())
+    }
+
+    fn check_impl_block(&mut self, ib: &ast::ImplBlock) -> Result<()> {
+        {
             let target = self.ast_to_hir_type(&ib.target)?;
             // `Drop` 是编译器内建 trait，不要求用户先声明它。
             let is_drop = ib
@@ -1119,7 +1149,7 @@ impl TypeChecker {
                     where_clause: Vec::new(),
                     span: ib.span,
                 });
-                continue;
+                return Ok(());
             }
             let trait_id = if let Some(tt) = &ib.trait_type {
                 match self.ast_to_hir_type(tt)? {
@@ -1289,8 +1319,14 @@ impl TypeChecker {
             }
             let id = self.find_def(&f.name)?;
             // 泛型函数的体跳过：类型参数是推断变量，按它检查只会报一堆
-            // 假错。函数体留空，用到它时再报"未实现"。
-            if !f.generics.is_empty() {
+            // 假错。函数体留空，用到它时再按具体类型单态化检查。
+            // `impl<T>` 里的方法同理（`impl_generics` 由展开阶段记录）。
+            let impl_gens = self
+                .impl_generics
+                .get(&f.name)
+                .cloned()
+                .unwrap_or_default();
+            if !f.generics.is_empty() || !impl_gens.is_empty() {
                 if self.generic_fn_span.is_none() {
                     self.generic_fn_span = Some(ast::Span::unknown());
                 }
@@ -1355,6 +1391,9 @@ impl TypeChecker {
             }
             self.pop_scope();
             if self.impl_targets.contains_key(&f.name) {
+                self.type_params.pop();
+            }
+            if !impl_gens.is_empty() {
                 self.type_params.pop();
             }
         }
@@ -1594,10 +1633,13 @@ impl TypeChecker {
                     ExprKind::Def(id)
                 }
             }
+            Expression::Turbofish(inner, _, _) => {
+                return self.check_expr_raw(inner, expected);
+            }
             Expression::Path(path, _) => {
                 // 无载荷的枚举变体可以直接当值用：`Shape::Circle`。
                 if let Some((def_id, index)) = self.enum_variant_target_path(path, span) {
-                    return self.check_enum_variant_init(def_id, index, &[], span);
+                    return self.check_enum_variant_init(def_id, index, &[], expected, span);
                 }
                 let id = self.resolve_path(path, span)?;
                 ExprKind::Def(id)
@@ -2764,46 +2806,90 @@ impl TypeChecker {
         def_id: DefId,
         index: usize,
         args: &[ast::Argument],
+        expected: &Ty,
         span: ast::Span,
     ) -> Result<HirExpr> {
-        let field_tys = self.variant_field_types(def_id, index).ok_or_else(|| {
+        let raw_tys = self.variant_field_types(def_id, index).ok_or_else(|| {
             CompileError::internal("enum variant missing type definition").with_span(span)
         })?;
-        if args.len() != field_tys.len() {
+        if args.len() != raw_tys.len() {
             return Err(CompileError::type_error(format!(
                 "enum variant constructor expects {} arguments, found {}",
-                field_tys.len(),
+                raw_tys.len(),
                 args.len()
             ))
             .with_span(span));
         }
-        let mut hir_args = Vec::with_capacity(args.len());
-        for (arg, ty) in args.iter().zip(&field_tys) {
-            let ast::Argument::Pos(expr) = arg else {
-                return Err(CompileError::type_error(
-                    "enum variant constructor does not accept named arguments",
-                )
-                .with_span(span));
-            };
-            let checked = self.check_expr(expr, ty)?;
-            self.check_partial_move(&checked, expr.span())?;
-            hir_args.push(checked);
-        }
+        let (targs, hir_args) =
+            self.check_ctor_args(def_id, &raw_tys, args, expected, span)?;
         Ok(HirExpr {
             kind: ExprKind::EnumVariant {
                 def_id,
                 index,
                 args: hir_args,
             },
-            ty: Ty::Named(def_id, Vec::new()),
+            ty: Ty::Named(def_id, targs),
             span,
         })
+    }
+
+    /// 构造器实参检查：先定下泛型实参，再按替换后的字段类型检查每个实参。
+    fn check_ctor_args(
+        &mut self,
+        def_id: DefId,
+        raw_tys: &[Ty],
+        args: &[ast::Argument],
+        expected: &Ty,
+        span: ast::Span,
+    ) -> Result<(Vec<Ty>, Vec<HirExpr>)> {
+        let provided: Vec<Ty> = match self.infer.resolve(expected) {
+            Ty::Named(id, a) if id == def_id => a,
+            _ => Vec::new(),
+        };
+        let mut checked = Vec::with_capacity(args.len());
+        let mut actuals = Vec::with_capacity(args.len());
+        for (arg, ty) in args.iter().zip(raw_tys) {
+            let ast::Argument::Pos(expr) = arg else {
+                return Err(CompileError::type_error(
+                    "constructor does not accept named arguments",
+                )
+                .with_span(span));
+            };
+            let aty = if provided.is_empty() {
+                self.infer.fresh_infer(span)
+            } else {
+                ty.clone()
+            };
+            let h = self.check_expr(expr, &aty)?;
+            self.check_partial_move(&h, expr.span())?;
+            actuals.push(h.ty.clone());
+            checked.push(h);
+        }
+        let targs = self.collect_type_args(def_id, &provided, raw_tys, &actuals, span)?;
+        if provided.is_empty() {
+            // 未标注时第一遍是按推断变量检查的，现在有了具体实参，重新
+            // 按替换后的类型检查一遍（数组→切片之类的强转需要它）。
+            let mut rechecked = Vec::with_capacity(args.len());
+            for (arg, ty) in args.iter().zip(raw_tys) {
+                let ast::Argument::Pos(expr) = arg else {
+                    continue;
+                };
+                let want = self.subst_def_ty(def_id, &targs, ty);
+                let h = self.check_expr(expr, &want)?;
+                rechecked.push(h);
+            }
+            if rechecked.len() == checked.len() {
+                checked = rechecked;
+            }
+        }
+        Ok((targs, checked))
     }
 
     fn check_tuple_struct_init(
         &mut self,
         type_id: DefId,
         args: &[ast::Argument],
+        expected: &Ty,
         span: ast::Span,
     ) -> Result<HirExpr> {
         let hir::HirTypeDef::Struct(s) = self
@@ -2822,21 +2908,17 @@ impl TypeChecker {
             ))
             .with_span(span));
         }
-        let mut fields = Vec::with_capacity(args.len());
-        for (field, arg) in s.fields.iter().zip(args) {
-            let ast::Argument::Pos(expr) = arg else {
-                return Err(CompileError::type_error(
-                    "tuple struct constructor does not accept named arguments",
-                )
-                .with_span(span));
-            };
-            let arg = self.check_expr(expr, &field.ty)?;
-            self.check_partial_move(&arg, expr.span())?;
-            fields.push((field.name.clone(), arg));
-        }
+        let raw_tys: Vec<Ty> = s.fields.iter().map(|f| f.ty.clone()).collect();
+        let (targs, checked) = self.check_ctor_args(type_id, &raw_tys, args, expected, span)?;
+        let fields: Vec<(String, HirExpr)> = s
+            .fields
+            .iter()
+            .zip(checked)
+            .map(|(f, arg)| (f.name.clone(), arg))
+            .collect();
         Ok(HirExpr {
             kind: ExprKind::Struct(fields),
-            ty: Ty::Named(type_id, Vec::new()),
+            ty: Ty::Named(type_id, targs),
             span,
         })
     }
@@ -2916,6 +2998,7 @@ impl TypeChecker {
         path: &[String],
         fields: &[(String, Expression)],
         base: Option<&Expression>,
+        expected: &Ty,
         span: ast::Span,
     ) -> Result<HirExpr> {
         let variant_name = path.last().cloned().unwrap_or_default();
@@ -2946,6 +3029,43 @@ impl TypeChecker {
             )
             .with_span(span));
         }
+        let raw_tys: Vec<Ty> = var_fields.iter().map(|f| f.ty.clone()).collect();
+        let provided: Vec<Ty> = match self.infer.resolve(expected) {
+            Ty::Named(id, a) if id == enum_id => a,
+            _ => Vec::new(),
+        };
+        let targs = if provided.len() == raw_tys.len() && !raw_tys.is_empty() {
+            provided
+        } else {
+            // 从各字段的实参类型推断。
+            let mut actuals = Vec::new();
+            for (name, expr) in fields {
+                let Some(idx) = var_fields.iter().position(|f| &f.name == name) else {
+                    return Err(CompileError::name_error(format!(
+                        "no field `{}` on variant `{}`",
+                        name, variant_name
+                    ))
+                    .with_span(span));
+                };
+                let aty = self.infer.fresh_infer(span);
+                let h = self.check_expr(expr, &aty)?;
+                actuals.push((idx, self.infer.resolve(&h.ty)));
+            }
+            let params = self
+                .type_generic_params
+                .get(&enum_id)
+                .cloned()
+                .unwrap_or_default();
+            let mut out: Vec<Option<Ty>> = vec![None; params.len()];
+            for (idx, aty) in &actuals {
+                if let Some(raw) = raw_tys.get(*idx) {
+                    self.bind_type_args(raw, aty, &params, &mut out, span)?;
+                }
+            }
+            out.into_iter()
+                .map(|o| o.unwrap_or(Ty::Infer(InferId(0))))
+                .collect()
+        };
         // 实参按字段的**声明顺序**排（写出来的顺序不作数）。
         let mut args: Vec<Option<HirExpr>> = vec![None; var_fields.len()];
         for (name, expr) in fields {
@@ -2963,7 +3083,8 @@ impl TypeChecker {
                 ))
                 .with_span(span));
             }
-            let checked = self.check_expr(expr, &var_fields[idx].ty)?;
+            let want = self.subst_def_ty(enum_id, &targs, &var_fields[idx].ty);
+            let checked = self.check_expr(expr, &want)?;
             self.check_partial_move(&checked, expr.span())?;
             args[idx] = Some(checked);
         }
@@ -2984,7 +3105,7 @@ impl TypeChecker {
                 index,
                 args: hir_args,
             },
-            ty: Ty::Named(enum_id, Vec::new()),
+            ty: Ty::Named(enum_id, targs),
             span,
         })
     }
@@ -2993,15 +3114,11 @@ impl TypeChecker {
     /// 还是 `impl` 方法调用。引用/指针自动穿透。
     fn lookup_field(&self, ty: &Ty, name: &str) -> Option<(Ty, FieldIndex)> {
         match ty {
-            Ty::Named(id, _) => {
-                let hir::HirTypeDef::Struct(s) = self.type_defs.get(id)? else {
-                    return None;
-                };
-                s.fields
-                    .iter()
-                    .find(|f| f.name == name)
-                    .map(|f| (f.ty.clone(), FieldIndex::Named(f.index)))
-            }
+            Ty::Named(id, args) => self
+                .struct_field_tys(*id, args)
+                .into_iter()
+                .find(|(n, _, _)| n == name)
+                .map(|(_, ty, index)| (ty, FieldIndex::Named(index))),
             Ty::Tuple(tys) => {
                 let idx = name.parse::<usize>().ok()?;
                 tys.get(idx).cloned().map(|t| (t, FieldIndex::Pos(idx)))
@@ -3037,6 +3154,90 @@ impl TypeChecker {
         Some(method)
     }
 
+    /// 显式 turbofish 的泛型调用：`size_of::<T>()`、`Foo::<i32>::new(..)`。
+    ///
+    /// 返回 `None` 表示不是泛型函数，交回普通调用路径处理。
+    fn check_turbofish_call(
+        &mut self,
+        inner: &Expression,
+        targs: &[ast::Type],
+        args: &[ast::Argument],
+        span: ast::Span,
+    ) -> Result<Option<HirExpr>> {
+        let base = match inner {
+            Expression::Variable(name, _) => match self.resolve_name(name, span) {
+                Ok(id) => id,
+                Err(_) => return Ok(None),
+            },
+            Expression::Path(path, _) => match self.resolve_path(path, span) {
+                Ok(id) => id,
+                Err(_) => return Ok(None),
+            },
+            _ => return Ok(None),
+        };
+        let Some(names) = self.generic_names.get(&base).cloned() else {
+            return Ok(None);
+        };
+        let Some(ast_fn) = self.generic_asts.get(&base).cloned() else {
+            return Ok(None);
+        };
+        let mut ty_args = Vec::with_capacity(targs.len());
+        for t in targs {
+            ty_args.push(self.ast_to_hir_type(t)?);
+        }
+        if ty_args.len() != names.len() {
+            return Err(CompileError::type_error(format!(
+                "expected {} type argument(s) for `{}`, found {}",
+                names.len(),
+                ast_fn.name,
+                ty_args.len()
+            ))
+            .with_span(span));
+        }
+        // 编译期内建：`size_of` / `align_of` 直接算成字面量。
+        if ast_fn.body.is_none() && matches!(ast_fn.name.as_str(), "size_of" | "align_of") {
+            let ty = &ty_args[0];
+            let value = if ast_fn.name == "size_of" {
+                self.infer.size_of(ty)
+            } else {
+                self.infer.align_of(ty)
+            };
+            return Ok(Some(HirExpr {
+                kind: ExprKind::Literal(hir::HirLiteral::Int(value as i128)),
+                ty: Ty::Uint(self.pointer_bits as u16),
+                span,
+            }));
+        }
+        let id = self.instantiate_generic(base, &ast_fn, &names, &ty_args, span)?;
+        let sig = self
+            .functions
+            .get(&id)
+            .cloned()
+            .ok_or_else(|| CompileError::internal("instantiated signature missing"))?;
+        let mut hir_args = Vec::with_capacity(args.len());
+        for (i, arg) in args.iter().enumerate() {
+            let e = match arg {
+                ast::Argument::Pos(e) | ast::Argument::Named(_, e) => e,
+            };
+            let pty = match sig.params.get(i) {
+                Some(p) => p.ty.clone(),
+                None => self.infer.fresh_infer(span),
+            };
+            let h = self.check_expr(e, &pty)?;
+            self.check_partial_move(&h, e.span())?;
+            hir_args.push(h);
+        }
+        Ok(Some(HirExpr {
+            kind: ExprKind::Call {
+                callee: id,
+                args: hir_args,
+                result: self.alloc_local(),
+            },
+            ty: sig.return_type,
+            span,
+        }))
+    }
+
     fn check_method_call(
         &mut self,
         method: hir::DefId,
@@ -3044,6 +3245,9 @@ impl TypeChecker {
         args: &[ast::Argument],
         span: ast::Span,
     ) -> Result<HirExpr> {
+        if self.generic_names.contains_key(&method) {
+            return self.check_generic_method_call(method, receiver, args, span);
+        }
         let sig = self.functions.get(&method).cloned().ok_or_else(|| {
             CompileError::internal(format!(
                 "impl method {:?} missing from function table",
@@ -3093,6 +3297,88 @@ impl TypeChecker {
         })
     }
 
+    /// 泛型 `impl` 方法的调用：按 receiver 的具体类型单态化。
+    fn check_generic_method_call(
+        &mut self,
+        base: hir::DefId,
+        receiver: HirExpr,
+        args: &[ast::Argument],
+        span: ast::Span,
+    ) -> Result<HirExpr> {
+        let ast_fn = self
+            .generic_asts
+            .get(&base)
+            .cloned()
+            .ok_or_else(|| CompileError::internal("generic method missing AST"))?;
+        let names = self.generic_names.get(&base).cloned().unwrap_or_default();
+        let mut subst: HashMap<String, Ty> = HashMap::new();
+        // receiver 的具体类型决定 impl 的泛型实参。
+        let recv_ty = self.infer.resolve(&receiver.ty);
+        let recv_inner = match &recv_ty {
+            Ty::Reference(inner, _) | Ty::Pointer(inner, _) => (**inner).clone(),
+            _ => recv_ty.clone(),
+        };
+        if let Some(target) = self.impl_targets.get(&ast_fn.name).cloned() {
+            self.match_generic_ast(&target, &recv_inner, &names, &mut subst, span)?;
+        }
+        let mut hir_args = Vec::with_capacity(args.len() + 1);
+        hir_args.push(receiver);
+        for (i, arg) in args.iter().enumerate() {
+            let e = match arg {
+                ast::Argument::Pos(e) | ast::Argument::Named(_, e) => e,
+            };
+            let aty = self.infer.fresh_infer(span);
+            let h = self.check_expr(e, &aty)?;
+            self.check_partial_move(&h, e.span())?;
+            if let Some(p) = ast_fn.params.get(i) {
+                self.match_generic_ast(&p.ty, &h.ty, &names, &mut subst, span)?;
+            }
+            hir_args.push(h);
+        }
+        let mut ordered = Vec::with_capacity(names.len());
+        for n in &names {
+            match subst.get(n) {
+                Some(t) => ordered.push(self.infer.resolve(t)),
+                None => {
+                    return Err(CompileError::type_error(format!(
+                        "cannot infer type parameter `{n}` for `{}`",
+                        ast_fn.name
+                    ))
+                    .with_span(span))
+                }
+            }
+        }
+        let id = self.instantiate_generic(base, &ast_fn, &names, &ordered, span)?;
+        let sig = self.functions.get(&id).cloned();
+        let ret = sig
+            .as_ref()
+            .map(|f| f.return_type.clone())
+            .unwrap_or(Ty::Unit);
+        let mut final_args = Vec::with_capacity(hir_args.len());
+        final_args.push(hir_args.remove(0));
+        for (i, arg) in args.iter().enumerate() {
+            let e = match arg {
+                ast::Argument::Pos(e) | ast::Argument::Named(_, e) => e,
+            };
+            let pty = match sig.as_ref().and_then(|s| s.params.get(i + 1)) {
+                Some(p) => p.ty.clone(),
+                None => self.infer.fresh_infer(span),
+            };
+            let h = self.check_expr(e, &pty)?;
+            self.check_partial_move(&h, e.span())?;
+            final_args.push(h);
+        }
+        Ok(HirExpr {
+            kind: ExprKind::Call {
+                callee: id,
+                args: final_args,
+                result: self.alloc_local(),
+            },
+            ty: ret,
+            span,
+        })
+    }
+
     /// 标量索引 `x[i]`：结果是元素类型。`str` 按字节索引得到 `u8`。
     fn check_index_scalar(
         &mut self,
@@ -3128,17 +3414,24 @@ impl TypeChecker {
         &mut self,
         callee: &Expression,
         args: &[ast::Argument],
-        _expected: &Ty,
+        expected: &Ty,
         span: ast::Span,
     ) -> Result<HirExpr> {
+        // `size_of::<T>()` 之类显式给出类型实参的调用。
+        if let Expression::Turbofish(inner, targs, _) = callee {
+            if let Some(call) = self.check_turbofish_call(inner, targs, args, span)? {
+                return Ok(call);
+            }
+        }
+
         // 元组结构体构造：`Point(1, 2)` 语法上是把类型名当函数调用。
         if let Some(type_id) = self.tuple_struct_target(callee) {
-            return self.check_tuple_struct_init(type_id, args, span);
+            return self.check_tuple_struct_init(type_id, args, expected, span);
         }
 
         // 枚举变体构造：`Shape::Circle(5)` 同样是"把变体名当函数调用"。
         if let Some((def_id, index)) = self.enum_variant_target(callee) {
-            return self.check_enum_variant_init(def_id, index, args, span);
+            return self.check_enum_variant_init(def_id, index, args, expected, span);
         }
 
         // `expr.method(args)` 在语法上就是 `Call(Field(expr, method), args)`。
@@ -3149,11 +3442,18 @@ impl TypeChecker {
             let recv_ty = self.infer_expr_ty(receiver)?;
             let recv = self.check_expr(receiver, &recv_ty)?;
             let recv_ty = self.infer.resolve(&recv.ty);
-            if self.lookup_field(&recv_ty, name).is_none() {
+            // `v.len()` 与 `v.len` 的区分：带括号时方法优先（Rust 语义）。
+            // 只有当同名字段本身是函数指针时才按字段调用。
+            let field = self.lookup_field(&recv_ty, name);
+            let field_is_fn = field
+                .as_ref()
+                .is_some_and(|(t, _)| matches!(self.infer.resolve(t), Ty::Function { .. }));
+            if !field_is_fn {
                 if let Some(method_id) = self.lookup_method(&recv_ty, name) {
                     return self.check_method_call(method_id, recv, args, span);
                 }
-            } else if let Some((ty, _)) = self.lookup_field(&recv_ty, name) {
+            }
+            if let Some((ty, _)) = field {
                 prepared_callee = Some(HirExpr {
                     kind: ExprKind::Field(Box::new(recv), name.clone()),
                     ty,
@@ -3172,7 +3472,7 @@ impl TypeChecker {
         };
         // 泛型函数：按实参类型生成单态实例，调用点直接指向实例。
         if let ExprKind::Def(id) = &callee_hir.kind {
-            if let Some(call) = self.try_instantiate_call(*id, args, span)? {
+            if let Some(call) = self.try_instantiate_call(*id, args, expected, span)? {
                 return Ok(call);
             }
         }
@@ -3247,6 +3547,42 @@ impl TypeChecker {
     ) -> Result<HirExpr> {
         let s_ty = self.infer_expr_ty(scrutinee)?;
         let s = self.check_expr(scrutinee, &s_ty)?;
+        // scrutinee 只求值一次：先绑到一个匿名局部，各臂都读这个局部。
+        // 否则带副作用的 scrutinee（`match v.pop() { .. }`）会被执行多次。
+        let scrut_ty0 = self.infer.resolve(&s.ty);
+        let scrut_local = self.alloc_local();
+        self.locals.insert(scrut_local, scrut_ty0.clone());
+        self.infer.locals.insert(scrut_local, scrut_ty0.clone());
+        let s_local = HirExpr {
+            kind: ExprKind::Local(scrut_local),
+            ty: scrut_ty0.clone(),
+            span,
+        };
+        // 模式匹配 `&T` / `*const T` 时自动穿透一层：聚合值在运行期本来
+        // 就是地址，引用可以直接当值；标量才需要显式解引用。
+        let (scrut_ty, s_local) = match &scrut_ty0 {
+            Ty::Reference(inner, _) | Ty::Pointer(inner, _) => {
+                let inner = self.infer.resolve(inner);
+                if self.ty_is_aggregate(&inner) {
+                    (
+                        inner.clone(),
+                        HirExpr {
+                            kind: ExprKind::Local(scrut_local),
+                            ty: inner,
+                            span,
+                        },
+                    )
+                } else {
+                    let d = HirExpr {
+                        kind: ExprKind::Deref(Box::new(s_local)),
+                        ty: inner.clone(),
+                        span,
+                    };
+                    (inner, d)
+                }
+            }
+            _ => (scrut_ty0, s_local),
+        };
         // 或模式先在臂级展开：`3 | 4 => b` 变成两条"3 => b"、"4 => b"。
         //
         // 每条臂记四样东西：模式（穷尽性检查用）、模式自身的匹配条件、
@@ -3261,7 +3597,7 @@ impl TypeChecker {
             let mut alts_ast: Vec<&AstPattern> = Vec::new();
             push_or_alts(&arm.pattern, &mut alts_ast);
             for alt in &alts_ast {
-                match self.lower_pattern(alt, &s.ty) {
+                match self.lower_pattern(alt, &scrut_ty) {
                     Ok(pat) => alts_hir.push(pat),
                     Err(e) => {
                         self.pop_scope();
@@ -3282,7 +3618,7 @@ impl TypeChecker {
                 // 臂绑定没有"先赋值再读"的独立存储，直接内联取值表达式是
                 // 唯一等价的降级（scrutinee 重复求值是本实现已知的限定，
                 // 见下）。
-                let (cond, binds) = self.pat_match(&s, &pat, span)?;
+                let (cond, binds) = self.pat_match(&s_local, &pat, span)?;
                 let mut g = guard.clone();
                 let mut b2 = body.clone();
                 for (local, value) in &binds {
@@ -3307,7 +3643,7 @@ impl TypeChecker {
         );
         if !last_unconditional {
             // bool 的字面量覆盖（true / false 各一条）也算穷尽。
-            let bool_covered = matches!(self.infer.resolve(&s.ty), Ty::Bool) && {
+            let bool_covered = matches!(scrut_ty, Ty::Bool) && {
                 let mut seen = [false, false];
                 for arm in &lowered {
                     if let hir::HirPattern::Literal(v) = &arm.pattern {
@@ -3322,7 +3658,7 @@ impl TypeChecker {
             };
             // 枚举：所有变体都被覆盖也算穷尽（和 Rust 一样，不用再写 `_` 臂）。
             // 被匹配的值可能是引用 / 指针——穿透一层看它的目标类型。
-            let scrutinee_ty = match &s.ty {
+            let scrutinee_ty = match &scrut_ty {
                 Ty::Reference(inner, _) | Ty::Pointer(inner, _) => inner.as_ref(),
                 other => other,
             };
@@ -3398,22 +3734,33 @@ impl TypeChecker {
                 tail: Some(Box::new(node)),
             });
         }
-        match chain {
+        let node = match chain {
             Some(mut last) => match last.tail.take() {
-                Some(node) => Ok(*node),
+                Some(node) => *node,
                 // 整条链就是单个有返回块的臂体（如 `_ => { return 3; }`）。
-                None => Ok(hir::HirExpr {
+                None => hir::HirExpr {
                     kind: ExprKind::Block(last),
-                    ty,
+                    ty: ty.clone(),
                     span,
-                }),
+                },
             },
-            None => Ok(hir::HirExpr {
+            None => hir::HirExpr {
                 kind: ExprKind::Match,
-                ty,
+                ty: ty.clone(),
                 span,
+            },
+        };
+        Ok(hir::HirExpr {
+            kind: ExprKind::Block(hir::HirBlock {
+                stmts: vec![hir::HirStmt::Let {
+                    local: scrut_local,
+                    init: Some(Box::new(s)),
+                }],
+                tail: Some(Box::new(node)),
             }),
-        }
+            ty,
+            span,
+        })
     }
 
     /// 模式与某个值的匹配：返回 (匹配条件, 绑定替换)。
@@ -3506,10 +3853,10 @@ impl TypeChecker {
             hir::HirPattern::Variant { index, args } => {
                 // 条件：判别式等于变体下标。
                 // 被匹配的值可能是引用 / 指针——穿透一层看它的目标类型。
-                let def_id = match &scrutinee.ty {
-                    Ty::Named(id, _) => *id,
+                let (def_id, targs) = match &scrutinee.ty {
+                    Ty::Named(id, a) => (*id, a.clone()),
                     Ty::Reference(inner, _) | Ty::Pointer(inner, _) => match inner.as_ref() {
-                        Ty::Named(id, _) => *id,
+                        Ty::Named(id, a) => (*id, a.clone()),
                         _ => {
                             return Err(CompileError::type_error(
                                 "enum variant pattern matched against a non-enum value",
@@ -3546,7 +3893,9 @@ impl TypeChecker {
                     span,
                 };
                 // 载荷的绑定：变体 `index` 的第 i 个载荷字段。
-                let field_tys = self.variant_field_types(def_id, *index).unwrap_or_default();
+                let field_tys = self
+                    .variant_field_types_args(def_id, *index, &targs)
+                    .unwrap_or_default();
                 let mut binds: Vec<(hir::LocalId, HirExpr)> = Vec::new();
                 let mut conds: Vec<HirExpr> = vec![eq];
                 for (i, sub) in args.iter().enumerate() {
@@ -3629,7 +3978,7 @@ impl TypeChecker {
         path: &[String],
         fields: &[(String, Expression)],
         base: Option<&Expression>,
-        _expected: &Ty,
+        expected: &Ty,
         span: ast::Span,
     ) -> Result<HirExpr> {
         // 枚举变体的结构体载荷：`Shape::Circle { r: 3 }`。
@@ -3642,13 +3991,13 @@ impl TypeChecker {
                     Some(hir::HirTypeDef::Enum(_))
                 ) {
                     return self.check_enum_struct_variant_init(
-                        enum_id, path, fields, base, span,
+                        enum_id, path, fields, base, expected, span,
                     );
                 }
             }
         }
         let def_id = self.resolve_path(path, span)?;
-        let field_tys: Vec<(String, Ty)> = match self.type_defs.get(&def_id) {
+        let raw_field_tys: Vec<(String, Ty)> = match self.type_defs.get(&def_id) {
             Some(hir::HirTypeDef::Struct(s)) => s
                 .fields
                 .iter()
@@ -3662,7 +4011,53 @@ impl TypeChecker {
                 .with_span(span))
             }
         };
-        let target_ty = Ty::Named(def_id, Vec::new());
+        // 泛型实参：优先用注解 / 上下文给出的类型，否则从字段值推。
+        let provided: Vec<Ty> = match self.infer.resolve(expected) {
+            Ty::Named(id, a) if id == def_id => a,
+            _ => Vec::new(),
+        };
+        let params = self
+            .type_generic_params
+            .get(&def_id)
+            .cloned()
+            .unwrap_or_default();
+        let targs: Vec<Ty> = if params.is_empty() {
+            Vec::new()
+        } else if provided.len() == params.len() {
+            provided
+        } else {
+            let mut out: Vec<Option<Ty>> = vec![None; params.len()];
+            for (name, expr) in fields {
+                if let Some(idx) = raw_field_tys.iter().position(|(n, _)| n == name) {
+                    let aty = self.infer.fresh_infer(span);
+                    let h = self.check_expr(expr, &aty)?;
+                    // 用表达式**实际**的类型：`aty` 是期望类型，字面量检查
+                    // 不一定把它绑定成 i32，拿它推泛型会得到未解推断变量。
+                    let actual = self.infer.resolve(&h.ty);
+                    self.bind_type_args(&raw_field_tys[idx].1, &actual, &params, &mut out, span)?;
+                }
+            }
+            let mut args = Vec::with_capacity(params.len());
+            for (i, o) in out.into_iter().enumerate() {
+                match o {
+                    Some(t) => args.push(self.infer.resolve(&t)),
+                    None => {
+                        return Err(CompileError::type_error(format!(
+                            "cannot infer type parameter #{} for `{}`",
+                            i,
+                            path.join("::")
+                        ))
+                        .with_span(span))
+                    }
+                }
+            }
+            args
+        };
+        let field_tys: Vec<(String, Ty)> = raw_field_tys
+            .iter()
+            .map(|(n, t)| (n.clone(), self.subst_def_ty(def_id, &targs, t)))
+            .collect();
+        let target_ty = Ty::Named(def_id, targs);
         // 结构体更新语法 `..base`：为了不让 base 表达式被重复求值，目前要求
         // 它是位置表达式（局部量 / 字段 / 索引 / 解引用）。Drop 类型禁止
         // 更新——逐字段复制会重复析构同一份资源。
@@ -3793,13 +4188,16 @@ impl TypeChecker {
 
     fn check_field_access(&self, ty: &Ty, name: &str, span: ast::Span) -> Result<(Ty, FieldIndex)> {
         match ty {
-            Ty::Named(id, _) => {
-                if let Some(hir::HirTypeDef::Struct(s)) = self.type_defs.get(id) {
-                    for f in &s.fields {
-                        if f.name == name {
-                            return Ok((f.ty.clone(), FieldIndex::Named(f.index)));
-                        }
-                    }
+            Ty::Named(id, args) => {
+                // 字段类型必须按结构体的类型实参替换（`Vec<T>.data` 在
+                // `Vec<i32>` 上是 `*mut i32`，不是 `*mut T`）。
+                if let Some((f, index)) = self
+                    .struct_field_tys(*id, args)
+                    .into_iter()
+                    .find(|(n, _, _)| n == name)
+                    .map(|(_, f, index)| (f, index))
+                {
+                    return Ok((f, FieldIndex::Named(index)));
                 }
                 Err(CompileError::name_error(format!(
                     "no field `{}` on type `{}`",
@@ -3832,8 +4230,23 @@ impl TypeChecker {
                 .with_span(span)),
             },
             // 切片 / 字符串在运行期是 (ptr, len) 一对，可以取这两个字段。
-            Ty::Str | Ty::Slice(..) => match name {
-                "ptr" => Ok((Ty::Pointer(Box::new(Ty::Uint(8)), hir::Mutability::Immutable), FieldIndex::Named(0))),
+            Ty::Str => match name {
+                "ptr" => Ok((
+                    Ty::Pointer(Box::new(Ty::Uint(8)), hir::Mutability::Immutable),
+                    FieldIndex::Named(0),
+                )),
+                "len" => Ok((Ty::Uint(64), FieldIndex::Named(1))),
+                _ => Err(CompileError::name_error(format!(
+                    "no field `{}` on slice (only `ptr` and `len`)",
+                    name
+                ))
+                .with_span(span)),
+            },
+            Ty::Slice(elem, mutability) => match name {
+                "ptr" => Ok((
+                    Ty::Pointer(elem.clone(), *mutability),
+                    FieldIndex::Named(0),
+                )),
                 "len" => Ok((Ty::Uint(64), FieldIndex::Named(1))),
                 _ => Err(CompileError::name_error(format!(
                     "no field `{}` on slice (only `ptr` and `len`)",
@@ -4115,6 +4528,204 @@ impl TypeChecker {
         None
     }
 
+    /// 记录一个泛型类型定义的类型参数占位符（按声明顺序）。
+    fn record_type_generics(
+        &mut self,
+        def_id: DefId,
+        generics: &[ast::GenericParam],
+        scope: &HashMap<String, Ty>,
+    ) {
+        let params: Vec<Ty> = generics
+            .iter()
+            .filter_map(|g| match g {
+                ast::GenericParam::Type(n) => scope.get(n).cloned(),
+                _ => None,
+            })
+            .collect();
+        if !params.is_empty() {
+            self.type_generic_params.insert(def_id, params);
+        }
+    }
+
+    /// 用 `args` 替换类型定义 `def_id` 里的泛型占位符。
+    fn subst_def_ty(&self, def_id: DefId, args: &[Ty], ty: &Ty) -> Ty {
+        let Some(params) = self.type_generic_params.get(&def_id) else {
+            return ty.clone();
+        };
+        if params.len() != args.len() {
+            return ty.clone();
+        }
+        let map: HashMap<InferId, Ty> = params
+            .iter()
+            .zip(args)
+            .filter_map(|(p, a)| match p {
+                Ty::Infer(id) => Some((*id, a.clone())),
+                _ => None,
+            })
+            .collect();
+        self.subst_infer(ty, &map)
+    }
+
+    /// 把类型里出现的占位符 `InferId` 替换成具体类型。
+    fn subst_infer(&self, ty: &Ty, map: &HashMap<InferId, Ty>) -> Ty {
+        match ty {
+            Ty::Infer(id) => map.get(id).cloned().unwrap_or_else(|| ty.clone()),
+            Ty::Named(id, args) => Ty::Named(
+                *id,
+                args.iter().map(|t| self.subst_infer(t, map)).collect(),
+            ),
+            Ty::Pointer(t, m) => Ty::Pointer(Box::new(self.subst_infer(t, map)), *m),
+            Ty::Reference(t, m) => Ty::Reference(Box::new(self.subst_infer(t, map)), *m),
+            Ty::Array(t, len) => Ty::Array(Box::new(self.subst_infer(t, map)), len.clone()),
+            Ty::Slice(t, m) => Ty::Slice(Box::new(self.subst_infer(t, map)), *m),
+            Ty::Tuple(ts) => Ty::Tuple(ts.iter().map(|t| self.subst_infer(t, map)).collect()),
+            Ty::Function {
+                params,
+                ret,
+                is_async,
+                abi,
+            } => Ty::Function {
+                params: params.iter().map(|t| self.subst_infer(t, map)).collect(),
+                ret: Box::new(self.subst_infer(ret, map)),
+                is_async: *is_async,
+                abi: abi.clone(),
+            },
+            Ty::Optional(t) => Ty::Optional(Box::new(self.subst_infer(t, map))),
+            Ty::ErrorUnion(t, e) => Ty::ErrorUnion(
+                Box::new(self.subst_infer(t, map)),
+                Box::new(self.subst_infer(e, map)),
+            ),
+            Ty::Pin(t) => Ty::Pin(Box::new(self.subst_infer(t, map))),
+            _ => ty.clone(),
+        }
+    }
+
+    /// 结构体的字段类型（按 `args` 替换泛型参数）。
+    fn struct_field_tys(&self, def_id: DefId, args: &[Ty]) -> Vec<(String, Ty, usize)> {
+        let Some(hir::HirTypeDef::Struct(s)) = self.type_defs.get(&def_id) else {
+            return Vec::new();
+        };
+        s.fields
+            .iter()
+            .map(|f| (f.name.clone(), self.subst_def_ty(def_id, args, &f.ty), f.index))
+            .collect()
+    }
+
+    /// 类型在运行期是否以"指向存储的地址"表示。
+    fn ty_is_aggregate(&self, ty: &Ty) -> bool {
+        match ty {
+            Ty::Tuple(_) | Ty::Array(..) | Ty::Slice(..) | Ty::Str => true,
+            Ty::Named(id, _) => matches!(
+                self.type_defs.get(id),
+                Some(hir::HirTypeDef::Struct(_)) | Some(hir::HirTypeDef::Enum(_))
+            ),
+            _ => false,
+        }
+    }
+
+    /// 枚举变体的载荷类型（按 `args` 替换泛型参数）。
+    fn variant_field_types_args(
+        &self,
+        def_id: DefId,
+        index: usize,
+        args: &[Ty],
+    ) -> Option<Vec<Ty>> {
+        self.variant_field_types(def_id, index)
+            .map(|ts| ts.iter().map(|t| self.subst_def_ty(def_id, args, t)).collect())
+    }
+
+    /// 把"含占位符的字段类型"和实际值类型做结构匹配，填 `out`。
+    fn bind_type_args(
+        &mut self,
+        pat: &Ty,
+        actual: &Ty,
+        params: &[Ty],
+        out: &mut Vec<Option<Ty>>,
+        span: ast::Span,
+    ) -> Result<()> {
+        let actual = self.infer.resolve(actual);
+        if let Ty::Infer(id) = pat {
+            if let Some(i) = params
+                .iter()
+                .position(|p| matches!(p, Ty::Infer(pid) if pid == id))
+            {
+                match out[i].clone() {
+                    Some(prev) => {
+                        self.infer.unify(&prev, &actual, span)?;
+                    }
+                    None => out[i] = Some(actual),
+                }
+            }
+            return Ok(());
+        }
+        match (pat, &actual) {
+            (Ty::Pointer(p, _), Ty::Pointer(a, _))
+            | (Ty::Pointer(p, _), Ty::Reference(a, _))
+            | (Ty::Reference(p, _), Ty::Pointer(a, _))
+            | (Ty::Reference(p, _), Ty::Reference(a, _))
+            | (Ty::Slice(p, _), Ty::Slice(a, _))
+            | (Ty::Array(p, _), Ty::Array(a, _))
+            | (Ty::Optional(p), Ty::Optional(a))
+            | (Ty::Pin(p), Ty::Pin(a)) => self.bind_type_args(p, a, params, out, span),
+            (Ty::ErrorUnion(p1, p2), Ty::ErrorUnion(a1, a2)) => {
+                self.bind_type_args(p1, a1, params, out, span)?;
+                self.bind_type_args(p2, a2, params, out, span)
+            }
+            (Ty::Tuple(ps), Ty::Tuple(as_)) => {
+                for (p, a) in ps.iter().zip(as_) {
+                    self.bind_type_args(p, a, params, out, span)?;
+                }
+                Ok(())
+            }
+            (Ty::Named(pd, pa), Ty::Named(ad, aa)) if pd == ad => {
+                for (p, a) in pa.iter().zip(aa) {
+                    self.bind_type_args(p, a, params, out, span)?;
+                }
+                Ok(())
+            }
+            _ => Ok(()),
+        }
+    }
+
+    /// 由字段 / 载荷的实参类型推断类型定义的泛型实参。
+    ///
+    /// `provided` 是显式给出的（比如 `let x: Option<i32>` 的注解）；为空时
+    /// 从 `pats[i]` 与 `actuals[i]` 的结构匹配里推。
+    fn collect_type_args(
+        &mut self,
+        def_id: DefId,
+        provided: &[Ty],
+        pats: &[Ty],
+        actuals: &[Ty],
+        span: ast::Span,
+    ) -> Result<Vec<Ty>> {
+        let params = self
+            .type_generic_params
+            .get(&def_id)
+            .cloned()
+            .unwrap_or_default();
+        if params.is_empty() {
+            return Ok(Vec::new());
+        }
+        if provided.len() == params.len() {
+            return Ok(provided.to_vec());
+        }
+        let mut out: Vec<Option<Ty>> = vec![None; params.len()];
+        for (p, a) in pats.iter().zip(actuals) {
+            self.bind_type_args(p, a, &params, &mut out, span)?;
+        }
+        let mut args = Vec::with_capacity(params.len());
+        for o in out {
+            match o {
+                Some(t) => args.push(self.infer.resolve(&t)),
+                // 推不出来的参数先留一个推断变量：`Option::None` 自己没有
+                // 载荷，`T` 要靠上下文（同一调用的其它实参 / 返回值）定。
+                None => args.push(self.infer.fresh_infer(span)),
+            }
+        }
+        Ok(args)
+    }
+
     /// 把一组"泛型参数名 → 具体类型"压进类型作用域。
     fn push_type_scope(&mut self, subst: &[(String, Ty)]) {
         let scope: HashMap<String, Ty> = subst.iter().cloned().collect();
@@ -4192,8 +4803,11 @@ impl TypeChecker {
                 Ok(())
             }
             AstType::Slice(inner, _) => {
-                if let Ty::Slice(a, _) = &actual {
-                    self.match_generic_ast(inner, a, names, subst, span)?;
+                match &actual {
+                    Ty::Slice(a, _) | Ty::Array(a, _) => {
+                        self.match_generic_ast(inner, a, names, subst, span)?;
+                    }
+                    _ => {}
                 }
                 Ok(())
             }
@@ -4242,6 +4856,7 @@ impl TypeChecker {
         &mut self,
         base: DefId,
         args: &[ast::Argument],
+        expected: &Ty,
         span: ast::Span,
     ) -> Result<Option<HirExpr>> {
         let Some(ast_fn) = self.generic_asts.get(&base).cloned() else {
@@ -4270,6 +4885,15 @@ impl TypeChecker {
             self.match_generic_ast(&p.ty, &h.ty, &names, &mut subst, span)?;
             hir_args.push(h);
         }
+        // 返回值 / 上下文里没出现在参数上的类型参数（`Vec::new()` 的 `T`
+        // 来自 `let v: Vec<i32>`）。
+        if subst.len() < names.len() {
+            let want = self.infer.resolve(expected);
+            if !matches!(want, Ty::Infer(_) | Ty::Unit) {
+                self.match_generic_ast(&ast_fn.return_type, &want, &names, &mut subst, span)
+                    .ok();
+            }
+        }
         let mut ordered = Vec::with_capacity(names.len());
         for n in &names {
             match subst.get(n) {
@@ -4283,46 +4907,69 @@ impl TypeChecker {
                 }
             }
         }
-        let key = format!("{:?}", ordered);
-        let existing = self.mono_cache.get(&(base, key.clone())).copied();
-        let inst_id = match existing {
-            Some(id) => id,
-            None => {
-                if self.mono_cache.len() > 512 {
-                    return Err(CompileError::type_error(
-                        "monomorphization recursion limit reached",
-                    )
-                    .with_span(span));
-                }
-                let name = format!("{}__mono{}", ast_fn.name, self.next_def);
-                let id = self.alloc_def(name);
-                let subst_pairs: Vec<(String, Ty)> =
-                    names.iter().cloned().zip(ordered.iter().cloned()).collect();
-                self.mono_cache.insert((base, key), id);
-                self.mono_pending.push(MonoInstance {
-                    base,
-                    id,
-                    subst: subst_pairs.clone(),
-                });
-                let sig = self.build_instance_signature(&ast_fn, id, &subst_pairs)?;
-                self.functions.insert(id, sig);
-                id
-            }
-        };
-        let ret = self
-            .functions
-            .get(&inst_id)
+        let inst_id = self.instantiate_generic(base, &ast_fn, &names, &ordered, span)?;
+        let sig = self.functions.get(&inst_id).cloned();
+        let ret = sig
+            .as_ref()
             .map(|f| f.return_type.clone())
             .unwrap_or(Ty::Unit);
+        // 第二遍：按具体参数类型重新检查实参，让数组→切片、`&mut` 之类的
+        // 隐式转换真正发生（第一遍用的还是推断变量）。
+        let mut final_args = Vec::with_capacity(hir_args.len());
+        for (i, arg) in args.iter().enumerate() {
+            let e = match arg {
+                ast::Argument::Pos(e) | ast::Argument::Named(_, e) => e,
+            };
+            let pty = match sig.as_ref().and_then(|s| s.params.get(i)) {
+                Some(p) => p.ty.clone(),
+                None => self.infer.fresh_infer(span),
+            };
+            let h = self.check_expr(e, &pty)?;
+            self.check_partial_move(&h, e.span())?;
+            final_args.push(h);
+        }
         Ok(Some(HirExpr {
             kind: ExprKind::Call {
                 callee: inst_id,
-                args: hir_args,
+                args: final_args,
                 result: self.alloc_local(),
             },
             ty: ret,
             span,
         }))
+    }
+
+    /// 取得（或新建）一个单态实例的 DefId，并登记待检查的函数体。
+    fn instantiate_generic(
+        &mut self,
+        base: DefId,
+        ast_fn: &ast::Function,
+        names: &[String],
+        ordered: &[Ty],
+        span: ast::Span,
+    ) -> Result<DefId> {
+        let key = format!("{:?}", ordered);
+        if let Some(id) = self.mono_cache.get(&(base, key.clone())).copied() {
+            return Ok(id);
+        }
+        if self.mono_cache.len() > 512 {
+            return Err(
+                CompileError::type_error("monomorphization recursion limit reached")
+                    .with_span(span),
+            );
+        }
+        let name = format!("{}__mono{}", ast_fn.name, self.next_def);
+        let id = self.alloc_def(name);
+        let subst: Vec<(String, Ty)> = names.iter().cloned().zip(ordered.iter().cloned()).collect();
+        self.mono_cache.insert((base, key), id);
+        self.mono_pending.push(MonoInstance {
+            base,
+            id,
+            subst: subst.clone(),
+        });
+        let sig = self.build_instance_signature(ast_fn, id, &subst)?;
+        self.functions.insert(id, sig);
+        Ok(id)
     }
 
     /// 按具体类型生成单态实例的签名（参数类型 / 返回类型）。
@@ -4335,7 +4982,13 @@ impl TypeChecker {
         let saved = std::mem::take(&mut self.type_params);
         self.push_type_scope(subst);
         let ret = self.ast_to_hir_type(&ast_fn.return_type)?;
-        let mut params = Vec::with_capacity(ast_fn.params.len());
+        let mut params = Vec::with_capacity(ast_fn.params.len() + 1);
+        if let Some(ty) = self.receiver_ty(ast_fn)? {
+            params.push(hir::HirParam {
+                local: self.alloc_local(),
+                ty,
+            });
+        }
         for p in &ast_fn.params {
             let ty = self.ast_to_hir_type(&p.ty)?;
             params.push(hir::HirParam {
@@ -4433,7 +5086,11 @@ impl TypeChecker {
     /// 泛型还没有单态化，声明里的类型参数只能当成推断变量：声明本身能过
     /// 类型检查，但按它布局 / 生成代码是不对的（`Option<T>` 的大小取决于
     /// `T`）。用到泛型的地方会另行报错。
-    fn push_type_params(&mut self, generics: &[ast::GenericParam], span: ast::Span) {
+    fn push_type_params(
+        &mut self,
+        generics: &[ast::GenericParam],
+        span: ast::Span,
+    ) -> HashMap<String, Ty> {
         let mut scope = HashMap::new();
         // 所有参数（类型 / 生命周期 / const）共用一个名字空间做重名检查：
         // 重名是笔误，早点报出来比在用到的地方冒出一堆推断错误强。
@@ -4457,7 +5114,8 @@ impl TypeChecker {
                 scope.insert(name.clone(), ty);
             }
         }
-        self.type_params.push(scope);
+        self.type_params.push(scope.clone());
+        scope
     }
 
     /// 变体的判别式值（显式写的那个，或上一个 + 1）。
@@ -4906,7 +5564,14 @@ impl TypeChecker {
                 let id = self
                     .resolve_path(path, ast::Span::unknown())
                     .unwrap_or(DefId(0));
-                Ty::Named(id, Vec::new())
+                // 泛型结构体字面量的类型实参要从字段值推，先给个推断变量，
+                // 不能直接写 `Named(id, [])`（那会和 `Named(id, [i32])`
+                // 统一失败）。
+                if self.type_generic_params.contains_key(&id) {
+                    self.infer.fresh_infer(e.span())
+                } else {
+                    Ty::Named(id, Vec::new())
+                }
             }
             Expression::Tuple(elems, _) => Ty::Tuple(
                 elems

@@ -319,6 +319,12 @@ pub fn assert_eq<T: Eq>(a: T, b: T, msg: []const u8) {
 // 内存管理（重新导出运行时符号）
 //=============================================================================
 
+/// 编译期内建：类型 `T` 的字节大小。
+pub fn size_of<T>() -> usize;
+
+/// 编译期内建：类型 `T` 的对齐。
+pub fn align_of<T>() -> usize;
+
 pub fn alloc(size: usize, align: usize) -> *mut void {
     zr_alloc(size, align)
 }

@@ -1,0 +1,98 @@
+use core::{Option, Result, min, max, clamp, swap};
+use collections::Vec;
+
+struct Pair<T> {
+    a: T,
+    b: T,
+}
+
+fn identity<T>(x: T) -> T {
+    return x;
+}
+
+fn max3<T: Ord>(a: T, b: T, c: T) -> T {
+    return max(max(a, b), c);
+}
+
+fn unwrap_or<T>(o: Option<T>, d: T) -> T {
+    match o {
+        Option::Some(v) => return v,
+        Option::None => return d,
+    }
+}
+
+fn inc(x: i32) -> i32 {
+    return x + 1;
+}
+
+fn by_ref(o: &Option<i32>) -> i32 {
+    match o {
+        Option::Some(v) => return v,
+        Option::None => return 0,
+    }
+}
+
+fn classify<T>(o: Option<T>) -> i32 {
+    match o {
+        Option::Some(_) => return 1,
+        Option::None => return 0,
+    }
+}
+
+fn main() -> i32 {
+    if identity(7) != 7 { return 1; }
+    if identity(9 as i64) != 9 as i64 { return 2; }
+
+    let p = Pair { a: 3, b: 4 };
+    let q = Pair { a: 1 as i64, b: 2 as i64 };
+    if p.a + p.b != 7 { return 3; }
+    if q.a + q.b != 3 as i64 { return 4; }
+
+    if max3(3, 9, 5) != 9 { return 5; }
+    if min(4, 2) != 2 { return 6; }
+    if clamp(11, 0, 10) != 10 { return 7; }
+
+    if unwrap_or(Option::Some(5), 0) != 5 { return 8; }
+    if unwrap_or(Option::None, 7) != 7 { return 9; }
+    if classify(Option::Some(1)) != 1 { return 10; }
+    let none: Option<i32> = Option::None;
+    if classify(none) != 0 { return 11; }
+
+    let r: Result<i32, i32> = Result::Ok(9);
+    match r {
+        Result::Ok(v) => { if v != 9 { return 12; } }
+        Result::Err(_) => return 13,
+    }
+
+    let mut x = 1;
+    let mut y = 2;
+    swap(&mut x, &mut y);
+    if x != 2 || y != 1 { return 14; }
+
+    let mut v: Vec<i32> = Vec::new();
+    v.push(3);
+    v.push(1);
+    v.push(2);
+    if v.len() != 3 { return 15; }
+    if !v.contains(2) { return 16; }
+    match v.pop() {
+        Option::Some(n) => { if n != 2 { return 17; } }
+        Option::None => return 18,
+    }
+
+    let mut w: Vec<i64> = Vec::new();
+    w.push(7 as i64);
+    if w.len() != 1 { return 19; }
+    if w.get(0) != 7 as i64 { return 20; }
+
+    let a = Option::Some(7);
+    if !a.is_some() { return 21; }
+    if a.unwrap() != 7 { return 22; }
+    if a.map(inc).unwrap() != 8 { return 23; }
+    let b: Option<i32> = Option::None;
+    if b.is_none() != true { return 24; }
+    if b.unwrap_or(5) != 5 { return 25; }
+    if by_ref(&a) != 7 { return 26; }
+
+    return 0;
+}

@@ -1480,6 +1480,7 @@ fn emit_binary(
         // 除法 / 取模：`rax` 放被除数，`rdx` 放余数（`cqo` 写 rdx）
         // -------------------------------------------------------------
         Div | Rem => {
+            let unsigned = matches!(ty, NumTy::Uint(_));
             // 被除数 → rax
             match location_of(lhs) {
                 Location::Reg(_) => emit_mov_rr(unit, SCRATCH_AX, alloc_reg(lhs)),
@@ -1491,8 +1492,10 @@ fn emit_binary(
             // 分配池里的寄存器就得先 push 保护——push 让 rsp 偏移 8，之后
             // 所有 `[rsp+disp]` 形式的栈槽访问全部读错地址。
             let divisor = match location_of(rhs) {
-                Location::Reg(_) => emit_divrem_reg(unit, dst, alloc_reg(rhs), op == Rem),
-                Location::Stack(slot) => emit_divrem_mem(unit, dst, slot, op == Rem),
+                Location::Reg(_) => {
+                    emit_divrem_reg(unit, dst, alloc_reg(rhs), op == Rem, unsigned)
+                }
+                Location::Stack(slot) => emit_divrem_mem(unit, dst, slot, op == Rem, unsigned),
             };
             if result_spilled {
                 if let Location::Stack(slot) = location_of(result) {
@@ -1525,8 +1528,15 @@ fn emit_binary(
                 }
                 Location::Stack(slot) => emit_load_slot(unit, SCRATCH_CX, slot),
             }
-            // 4 = shl, 7 = sar（算术右移：IR 的 Shr 是有符号的）
-            let code = if op == Shl { 4 } else { 7 };
+            // 4 = shl, 5 = shr（逻辑右移，无符号）, 7 = sar（算术右移）
+            let unsigned = matches!(ty, NumTy::Uint(_));
+            let code = if op == Shl {
+                4
+            } else if unsigned {
+                5
+            } else {
+                7
+            };
             let mut rex = 0x48u8;
             if dst.rex_bit() {
                 rex |= 0x01;
@@ -1551,7 +1561,8 @@ fn emit_binary(
             let l = load_scratch(unit, lhs, SCRATCH_AX);
             let r = load_scratch(unit, rhs, SCRATCH_DX);
             emit_cmp_rr(unit, l, r);
-            emit_setcc(unit, condition_code(op), SCRATCH_AX);
+            let unsigned = matches!(ty, NumTy::Uint(_));
+            emit_setcc(unit, condition_code(op, unsigned), SCRATCH_AX);
             emit_movzx(unit, dst, SCRATCH_AX);
             if result_spilled {
                 if let Location::Stack(slot) = location_of(result) {
@@ -1723,17 +1734,28 @@ fn emit_binary_float(
 }
 
 /// `mov rax, l; cqo; idiv r`（除数在寄存器里），结果写到 `dst`。
-fn emit_divrem_reg(unit: &mut CompilationUnit, dst: Gpr, r: Gpr, want_rem: bool) -> Gpr {
-    // 必须用 `cqo`（rax 的符号扩展进 rdx），**不能**用 `xor edx, edx`：
-    // 后者只在被除数为非负时等价。负数除法会算出完全错误的商和余数。
-    emit2(unit, 0x48, 0x99); // cqo
+fn emit_divrem_reg(
+    unit: &mut CompilationUnit,
+    dst: Gpr,
+    r: Gpr,
+    want_rem: bool,
+    unsigned: bool,
+) -> Gpr {
+    if unsigned {
+        // `xor edx, edx` 把 rdx 清零（被除数按无符号处理），再用 `/6 = DIV`。
+        emit2(unit, 0x31, 0xd2);
+    } else {
+        // 必须用 `cqo`（rax 的符号扩展进 rdx），**不能**用 `xor edx, edx`：
+        // 后者只在被除数为非负时等价。负数除法会算出完全错误的商和余数。
+        emit2(unit, 0x48, 0x99); // cqo
+    }
     let mut rex = 0x48u8;
     if r.rex_bit() {
         rex |= 0x01;
     }
     emit1(unit, rex);
     emit1(unit, 0xf7);
-    modrm(unit, 3, 7, r.bits()); // /7 = IDIV
+    modrm(unit, 3, if unsigned { 6 } else { 7 }, r.bits()); // /6 = DIV, /7 = IDIV
     let src = if want_rem { SCRATCH_DX } else { SCRATCH_AX };
     if dst != src {
         emit_mov_rr(unit, dst, src);
@@ -1742,12 +1764,22 @@ fn emit_divrem_reg(unit: &mut CompilationUnit, dst: Gpr, r: Gpr, want_rem: bool)
 }
 
 /// `mov rax, l; cqo; idiv qword ptr [rsp+disp32]`（除数溢出到栈上）。
-fn emit_divrem_mem(unit: &mut CompilationUnit, dst: Gpr, slot: usize, want_rem: bool) -> Gpr {
-    emit2(unit, 0x48, 0x99); // cqo
+fn emit_divrem_mem(
+    unit: &mut CompilationUnit,
+    dst: Gpr,
+    slot: usize,
+    want_rem: bool,
+    unsigned: bool,
+) -> Gpr {
+    if unsigned {
+        emit2(unit, 0x31, 0xd2); // xor edx, edx
+    } else {
+        emit2(unit, 0x48, 0x99); // cqo
+    }
     emit1(unit, 0x48); // REX.W
     emit1(unit, 0xf7);
-    // mod=10 (disp32), reg=111 (/7 = IDIV), rm=100 (SIB)
-    modrm(unit, 2, 7, 4);
+    // mod=10 (disp32), reg=/6 DIV 或 /7 IDIV, rm=100 (SIB)
+    modrm(unit, 2, if unsigned { 6 } else { 7 }, 4);
     // SIB: scale=00, index=100 (无索引), base=100 (rsp)
     emit1(unit, 0b00_100_100);
     emit4(unit, (slot * 8) as u32);
@@ -1862,11 +1894,15 @@ fn alu_opcode(op: SsaBinaryOp) -> Option<u8> {
 }
 
 /// 返回条件码（用于 setcc）。
-fn condition_code(op: SsaBinaryOp) -> u8 {
+fn condition_code(op: SsaBinaryOp, unsigned: bool) -> u8 {
     use SsaBinaryOp::*;
     match op {
         Eq => 0x94, // sete
         Ne => 0x95, // setne
+        Lt if unsigned => 0x92, // setb（无符号小于）
+        Ge if unsigned => 0x93, // setae
+        Le if unsigned => 0x96, // setbe
+        Gt if unsigned => 0x97, // seta
         Lt => 0x9c, // setl（有符号小于）
         Gt => 0x9f, // setg
         Le => 0x9e, // setle

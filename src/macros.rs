@@ -207,6 +207,7 @@ fn expand_in_expr(
     match expr {
         Expression::MacroCall { .. } => unreachable!(),
         Expression::Literal(..) | Expression::Variable(..) | Expression::Path(..) => Ok(()),
+        Expression::Turbofish(inner, _, _) => expand_in_expr(inner, defs, def_lines, changed),
         Expression::Binary(a, _, b, _) => {
             expand_in_expr(a, defs, def_lines, changed)?;
             expand_in_expr(b, defs, def_lines, changed)
