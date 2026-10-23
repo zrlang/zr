@@ -1,0 +1,59 @@
+//=============================================================================
+// tests/cases/67_unsigned_ops.zr — 无符号高位的比较 / 移位 / 除法 / 取模
+//
+// 后端曾经对所有整数都用有符号指令：`u64` 最高位置 1 时（>= 2^63）会被当成
+// 负数，`a > b`、`a >> n`、`a / b`、`a % b` 全部算错。这里用函数调用把值
+// 传进去，避免常量折叠掩盖问题，并对比有符号负数的行为。
+//=============================================================================
+
+fn u_gt(a: u64, b: u64) -> bool { return a > b; }
+fn u_lt(a: u64, b: u64) -> bool { return a < b; }
+fn u_ge(a: u64, b: u64) -> bool { return a >= b; }
+fn u_le(a: u64, b: u64) -> bool { return a <= b; }
+fn u_shr(a: u64, n: u64) -> u64 { return a >> n; }
+fn u_shl(a: u64, n: u64) -> u64 { return a << n; }
+fn u_div(a: u64, b: u64) -> u64 { return a / b; }
+fn u_rem(a: u64, b: u64) -> u64 { return a % b; }
+
+fn s_shr(a: i64, n: i64) -> i64 { return a >> n; }
+fn s_div(a: i64, b: i64) -> i64 { return a / b; }
+fn s_rem(a: i64, b: i64) -> i64 { return a % b; }
+
+fn u32_gt(a: u32, b: u32) -> bool { return a > b; }
+fn u32_shr(a: u32, n: u32) -> u32 { return a >> n; }
+fn u32_div(a: u32, b: u32) -> u32 { return a / b; }
+
+fn main() -> i32 {
+    let hi: u64 = 9223372036854775808; // 2^63
+    let one: u64 = 1;
+
+    // --- 比较：最高位为 1 的无符号数必须大于任何小数 ---
+    if !u_gt(hi, one) { return 1; }
+    if u_lt(hi, one) { return 2; }
+    if !u_ge(hi, one) { return 3; }
+    if u_le(hi, one) { return 4; }
+    if u_gt(one, hi) { return 5; }
+    if !u_lt(one, hi) { return 6; }
+
+    // --- 逻辑右移：高位补 0，而不是补符号位 ---
+    if u_shr(hi, one) != 4611686018427387904 { return 7; }
+    if u_shl(one, 63u64) != hi { return 8; }
+
+    // --- 无符号除法 / 取模 ---
+    if u_div(hi, 2u64) != 4611686018427387904 { return 9; }
+    if u_rem(hi, 3u64) != 2 { return 10; }
+    if u_div(18446744073709551615, 2u64) != 9223372036854775807 { return 11; }
+
+    // --- 有符号仍走算术右移 / 有符号除法 ---
+    if s_shr(-8, 1) != -4 { return 12; }
+    if s_div(-7, 2) != -3 { return 13; }
+    if s_rem(-7, 2) != -1 { return 14; }
+
+    // --- u32 的最高位 ---
+    let h32: u32 = 2147483648; // 2^31
+    if !u32_gt(h32, 1u32) { return 15; }
+    if u32_shr(h32, 1u32) != 1073741824 { return 16; }
+    if u32_div(h32, 2u32) != 1073741824 { return 17; }
+
+    return 0;
+}

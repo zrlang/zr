@@ -368,7 +368,8 @@ pub fn emit_elf(target: &Target, unit: &CompilationUnit, path: &std::path::Path)
     let text_base = align_up(target.image_base(), align);
     // `.rodata` 紧跟在 `.text` 之后，与 `assemble_elf` 的布局一致。
     let rodata_base = align_up(text_base + unit.code.len() as u64, align);
-    crate::codegen::objfile::apply_relocations(&mut unit, text_base, rodata_base);
+    let data_base = align_up(rodata_base + unit.rodata.len() as u64, align);
+    crate::codegen::objfile::apply_relocations(&mut unit, text_base, rodata_base, data_base);
     let bytes = assemble_elf(target, &unit)?;
     std::fs::write(path, &bytes)
 }
@@ -551,6 +552,7 @@ fn symbol_to_elf(sym: &Symbol, name_offset: u32, is_64: bool, thumb: bool) -> Ve
     let shndx = match sym.section {
         SymbolSection::Text => 1u16,   // 节表索引 1 = .text
         SymbolSection::Rodata => 2u16, // 节表索引 2 = .rodata
+        SymbolSection::Data => 3u16,   // 节表索引 3 = .data
         SymbolSection::Undefined => 0,
     };
     // st_value。Thumb 的函数符号要带 bit 0：那是"这个地址是 Thumb 状态"

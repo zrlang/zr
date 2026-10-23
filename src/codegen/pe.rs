@@ -260,11 +260,19 @@ fn build_coff_symbols(unit: &CompilationUnit) -> (Vec<u8>, Vec<u8>) {
 
         symbols.extend_from_slice(&name_field);
         symbols.extend_from_slice(&(sym.offset as u32).to_le_bytes());
-        // 段号：0 = 未定义，1 = .text，2 = .rodata（与节表顺序一致）。
+        // 段号：0 = 未定义，1 = .text，2 = .rodata / .data（与节表顺序一致）。
+        // `.rodata` 为空时 `.data` 会前移一节。
         let section_number: i16 = match sym.section {
             SymbolSection::Undefined => 0,
             SymbolSection::Text => 1,
             SymbolSection::Rodata => 2,
+            SymbolSection::Data => {
+                if unit.rodata.is_empty() {
+                    2
+                } else {
+                    3
+                }
+            }
         };
         symbols.extend_from_slice(&section_number.to_le_bytes());
         let symbol_type: u16 = match sym.kind {

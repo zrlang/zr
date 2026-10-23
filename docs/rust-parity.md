@@ -24,13 +24,13 @@
 
 | Rust 的写法 | zr 的现状 | 状态 | 说明 |
 |------|------|------|------|
-| `i8` / `i16` / `i32` / `i64` | 全部可用 | ✅ | 字面量后缀（`42u64`）、类型推导、`as` 截断转换都与 Rust 一致 |
-| `u8` / `u16` / `u32` | 可用 | 🟡 | 算术正确，但 `u64` 的高位问题见下行 |
-| `u64` | 可用但高位出错 | 🟡 | **≥ 2⁶³ 的 `u64` 比较、`>>`、`/`、`%` 按有符号处理**，结果错误（详见「待办缺口」#1） |
+| `i8` / `i16` / `i32` / `i64` | 全部可用 | ✅ | 字面量后缀（`42u64`）、类型推导、`as` 截断转换都与 Rust 一致；实参位置允许隐式拓宽（`i32` → `i64`） |
+| `u8` / `u16` / `u32` | 全部可用 | ✅ | 字面量后缀、推导、`as` 截断转换、比较 / 移位 / 除法均按无符号处理 |
+| `u64` | 全部可用 | ✅ | 比较用 `setb`/`seta`、右移用逻辑右移、除法用 `div`（含 ≥ 2⁶³ 的值）；有符号仍走 `setl`/`sar`/`idiv` |
 | `i128` / `u128` | 编译期报错 | ❌ | `zr: 128 位整数在当前目标上尚未实现：该目标只有 64 位寄存器，编译器暂时还不能把宽整数拆成寄存器对。现在生成的是静默截断的代码，所以直接报错。`（64 位目标上恒定失败） |
 | `isize` / `usize` | 可用 | ✅ | 宽度等于目标指针宽度 |
-| `f32` / `f64` | 可用 | ✅ | 算术、比较、字面量后缀（`3.14f32`）正常 |
-| `f8` / `f16` | 可用（zr 自定义格式） | 🟡 | 窄浮点按 IEEE 754 binary16 / zr 自定义 8 位格式实现；**隐式转 `f64` 的调用点转换是错的**（见 #2） |
+| `f32` / `f64` | 可用 | ✅ | 算术、比较、字面量后缀（`3.14f32`）正常；实参位置允许 `f32` / 整数 → `f64` 的隐式拓宽，反向窄化需 `as` |
+| `f8` / `f16` | 可用（zr 自定义格式） | ✅ | 窄浮点按 IEEE 754 binary16 / zr 自定义 8 位格式实现；传给 `f32` / `f64` 形参时会自动拓宽 |
 | `bool` | 可用 | ✅ | 只有 `true` / `false`，没有 `bool` 的整数转换 |
 | `char` | 可用 | ✅ | 4 字节 Unicode 标量，`'A'`、`'\n'` 等转义正常 |
 | `str` | 可用 | 🟡 | zr 的 `str` 是 `{ptr: *const u8, len: usize}` 结构体，**不是 Rust 的胖指针**；`&str` 与 `str` 不是同一个类型 |
@@ -53,13 +53,13 @@
 | `union` | 只能声明 | ❌ | `union U { i: i32 }` 能声明，但构造报 ``zr: `U` is not a struct ``；字段读写也没有安全的入口 |
 | `*const T` / `*mut T` | 可用 | ✅ | 裸指针可用；`*p = v` 走指针语义 |
 | `&T` / `&mut T` | 可用 | 🟡 | 语义上 `&T` 是只读指针（``zr: cannot assign through an immutable pointer (use `&mut` and a `*mut` type) ``），`&mut T` 可写；但**`let` 注解里的 `&T` 被解析成 `*const T`**：`let r: &i32 = &x;` → ``zr: type mismatch: expected `*const i32`, found `&i32` `` |
-| `Option<T>` / `Result<T, E>` | 可用 | ✅ | 在 `std::core` 里；`is_some()` / `is_none()` / `is_ok()` / `is_err()` / `unwrap()` / `unwrap_or()` / `map()` 与模式匹配均正常（`?` 仍是占位实现，见 P0 #3） |
+| `Option<T>` / `Result<T, E>` | 可用 | ✅ | 在 `std::core` 里；`is_some()` / `is_none()` / `is_ok()` / `is_err()` / `unwrap()` / `unwrap_or()` / `map()`、模式匹配与后缀 `?` 均正常 |
 | 泛型函数 | 可用 | ✅ | 按调用点单态化（含递归泛型）；类型实参从实参 / 期望返回类型推断。泛型约束（`T: Ord`、`where`）只解析不检查，实例化后按具体类型检查方法调用 |
 | 泛型类型 | 可用 | ✅ | 泛型结构体 / 枚举 + `impl<T> Type<T>` 的方法均可用（`Vec<T>`、`Option<T>` 等）；字段与载荷类型按类型实参替换 |
 | `trait` | 可用 | ✅ | `trait` + `impl Trait for Type` 正常（`std::core` 的 `Eq`/`Ord`/`Copy`/`Clone`/`Display` 都在用） |
 | 关联类型 | 可用 | ✅ | `type Output;` + `type Output = i32;` 正常，`Self::Output` 能取到 |
 | `impl` 块 | 可用 | ✅ | 关联函数、`self` / `&self` / `&mut self` 三种接收者、`Self` 类型均可 |
-| `type` 别名 | 半可用 | 🟡 | **函数签名里可用**（`fn f(x: MyInt)`），**`let` 注解里不可用**：`let m: MyInt = 5;` → ``zr: type mismatch: expected `i32`, found `type#70` ``（别名被当成独立名义类型，不做展开） |
+| `type` 别名 | 可用（非泛型） | ✅ | 在**使用点展开**：`let x: MyInt`、结构体字段、数组 / 指针、`Vec<MyInt>`、别名套别名、前向引用都正常；**泛型别名 `type V<T> = Vec<T>` 仍不支持**（目标里的 `T` 找不到） |
 | 生命周期标注 `'a` | 解析后丢弃 | 🟡 | `&'a T`、`struct S<'a>` 能写，但类型检查阶段直接丢掉标注（`src/parser/ty.rs`），**没有任何借用/存活检查** |
 | `dyn Trait` / trait 对象 | 不支持 | ❌ | 词法器里**没有 `dyn` 关键字**：`&dyn Speak` → `zr: expected ')': expected RParen, found Ident("Speak")` |
 | auto trait | 不支持 | ❌ | 无 auto trait 机制、无 blanket impl 语法 |
@@ -115,10 +115,10 @@
 | 函数指针 `fn(T) -> R` | 可用 | ✅ | 取址、传参、返回值、存进结构体字段都行（x86-64 专属，其它后端明确报错） |
 | 闭包 `\|x\| x * factor` | 不支持 | ❌ | `zr: closures are not implemented yet (captures are not lowered)`（README 已记录） |
 | `impl Trait` 参数 | 不支持 | ❌ | `fn f(op: impl Fn(T) -> T)` → `zr: expected ')': expected LParen`；`impl Fn(T) -> T` 这种 trait 路径参数写不了 |
-| `?` 运算符 | 语法保留，语义是占位 | ❌ | **后缀 `?` 在解析期被替换成解引用**（`src/parser/expr.rs`：`left = Expression::Unary(UnaryOp::Deref, ...); // placeholder`）。后果：不传播错误（`Err` 分支不会被选中）、成功时返回**未初始化内存**。`let v = inner(x)?;` 得到垃圾值 |
-| `try` / `catch` | 不支持 | ❌ | `catch` 必须带模式，带了又解析不过：`zr: expected pattern, found LBrace` / `zr: expected field name: expected Ident(""), found IntLiteral(2, None)` |
-| `throw` | 解析但不执行 | ❌ | `let v = throw 5;` 能编译，`v` 恒为 0，异常不传播也不中止 |
-| `defer` | 解析但不执行 | ❌ | `defer { ... }` 能编译，但块**从不执行** |
+| `?` 运算符 | 可用 | ✅ | 对 `Result<T, E>` / `Option<T>` 生效：成功取载荷，失败从当前函数 `return Err(e)` / `return None`。返回类型必须是同一种枚举，错误类型必须一致（没有 `From` 转换） |
+| `try` / `catch` | 明确报错 | ❌ | 语法能解析，类型检查报 `` `try` / `catch` is not implemented yet; use the postfix `?` operator ... `` |
+| `throw` | 明确报错 | ❌ | 类型检查报 `` `throw` is not implemented yet; return `Err(...)` instead `` |
+| `defer` | 明确报错 | ❌ | 类型检查报 `` `defer` is not implemented yet (the block would never run) ... `` |
 | `async fn` / `.await` | 可用 | ✅ | Rust 风格受限降级：future 帧在堆上，`.await` 轮询；`async fn main` 入口执行器可用（实测 `count(5).await` → 10，`double(10).await` → 20） |
 | `comptime` | 可用 | ✅ | `let v = comptime 1 + 2;` → 3 |
 | `unsafe { }` | 不支持 | ❌ | **词法器里没有 `unsafe` 关键字**；README「指针与 unsafe」一节写的写法目前无法编译（`zr: expected ';' after binding: expected Semicolon, found LBrace`） |
@@ -143,7 +143,7 @@
 | `#[derive(Debug, Clone, Copy)]` | 完全不可用 | ❌ | **结构体上直接报错**：``zr: undefined name `P` ``（derive 在阶段 0 生成 impl，此时类型名还没登记）；**枚举上被静默忽略**（`src/typeck/mod.rs` 对非 struct 的 `attrs` 硬编码成 `&[]`），`e.clone()` → ``zr: no field `clone` on type `type#70` `` |
 | `#[repr(C)]` / `#[repr(u8)]` | 可用 | ✅ | |
 | `#[inline(...)]` / `#[link(...)]` / `#[test]` | 可用 | ✅ | `#[test]` 的函数会被编进产物并在 `main` 前调用 |
-| `static mut X: i32 = 0;` | 不可用 | ❌ | 静态量**没有生成数据符号**：`nm` 显示 `U _COUNTER`（未定义）→ 链接失败；赋值也报 `zr: expression is not assignable (expected variable, field, deref, or index)` |
+| `static` / `static mut` | 标量可用 | ✅ | 初值能折成字面量的**标量**静态量会写进 `.data`：读、写、复合赋值、`&STATIC` / `&mut STATIC` 都正常。聚合静态量（结构体 / 数组 / 枚举）暂不生成数据，读取时明确报错；`static mut` 赋值不需要 `let mut`，非 `mut` 静态量赋值报错 |
 | `extern "C" { ... }` 块 | 可用 | ✅ | `extern "C" fn ...`（Rust 风格的带体定义）不支持：`zr: expected '{' after extern: expected LBrace, found KwFn` |
 
 ---
@@ -154,7 +154,7 @@
 
 | Rust 的写法 | zr 的现状 | 状态 | 说明 |
 |------|------|------|------|
-| `println!("...")` 宏 | `println(s: str)` 普通函数 | 🟡 | zr 的 `println` 是**函数不是宏**：`println!("{}", 1)` 解析失败（`zr: expected '}' to close block: expected RBrace, found Bang`）；且**参数类型不检查**：`println(42)` 能编译，运行时段错误（exit 139） |
+| `println!("...")` 宏 | `println(s: str)` 普通函数 | 🟡 | zr 的 `println` 是**函数不是宏**：`println!("{}", 1)` 解析失败（`zr: expected '}' to close block: expected RBrace, found Bang`）。参数类型现在会检查：`println(42)` 报 `type mismatch: expected `str`, found `i32`` |
 | `print!` / `println!` 格式化 `{}` | `println_fmt(fmt, &[FormatArg], n)` | 🟡 | 支持 `{}`、`{:?}`、`{:x}`、`{:X}` 与 `{{` / `}}` 转义；**不支持宽度 / 精度 / 对齐 / 填充**：`"{:>8}"`、`"{:04}"`、`"{:.2}"` 会被**原样打印**（不报错） |
 | `Display` 浮点格式 | 大数出错 | ❌ | `1.0e300` 打印成 `.0`（`std/io.zr` 的 `write_float` 用 `val as u64` 取整数部分，溢出后全丢）。`1.0`→`1`、`3.5`→`3.5`、`1.0/3.0`→`0.3333333333333333`、`0.1+0.2`→`0.30000000000000004`、`-0.0`→`-0` 与 Rust 一致 |
 | `eprintln!` / `eprint!` | `eprintln(s)` / `eprint(s)` | ✅ | 写到 STDERR |
@@ -227,12 +227,11 @@
 
 9. **错误处理保留了 Zig 风格的 `T!E` 类型，但没保留运算符。**
    `fn f() -> i32!i32` 能写，`f()!` 的解包运算符解析不了；
-   Rust 风格的 `?` 又只是占位实现（见下）。
+   Rust 风格的 `?` 只对 `Result` / `Option` 生效，不作用于 `T!E`。
 
 10. **`Option` / `Result` 的方法与模式匹配都可用。**
     `is_some()` / `is_none()` / `is_ok()` / `is_err()` / `unwrap()` /
-    `unwrap_or()` / `map()` 均返回正确结果；唯一例外是 `?` 运算符仍是占位实现
-    （见 P0 #3）。
+    `unwrap_or()` / `map()`、模式匹配与后缀 `?` 均返回正确结果。
 
 ---
 
@@ -243,58 +242,25 @@
 
 ### P0 — 静默出错，必须先修
 
-1. **无符号 64 位高位运算错误。**
-   `u64` 的 `>` `<` `>=` `<=` 用的是有符号条件码（`setl` / `setg`），
-   `>>` 用的是算术右移（`sar`），`/` `%` 用的是有符号 `idiv`
-   （`src/codegen/encoder.rs` 的 `condition_code()` 与移位/除法发射处）。
-   于是 **≥ 2⁶³ 的 `u64` 比较、`>>`、`/`、`%` 全部给出错误结果**。
-   实测（`-O0` 与 `-O2` 都错）：
-   ```zr
-   let a: u64 = 9223372036854775808;
-   let b: u64 = 1;
-   a > b            // 实测 false，应为 true
-   a >> 1           // 实测 ≠ 4611686018427387904
-   a / 2            // 实测 ≠ 4611686018427387904
-   ```
-   连带影响：`std::io::write_uint` 的 `while n > 0` 也用这个比较，
-   所以 **`println_uint` 打印任何 ≥ 2⁶³ 的 `u64` 会输出空行**。
-   影响面：所有无符号大数运算、哈希、时间戳、文件偏移。
-
-2. **隐式窄浮点 → `f64` 的实参转换错误。**
-   把 `f32` / `f16` / `f8` 直接传给 `f64` 形参时，位模式被当成 `f64` 解释，
-   结果是 `0.0`（显式写 `as f64` 则正确）。
-   ```zr
-   fn takes_f64(x: f64) -> f64 { return x; }
-   let a: f32 = 3.5;
-   takes_f64(a)     // 实测 0.0，应为 3.5
-   a as f64         // 实测 3.5，正确
-   ```
-   影响面：所有窄浮点跨精度的调用。
-
-3. **`?` 运算符是占位实现。**
-   后缀 `?` 在解析期被替换成解引用（`src/parser/expr.rs`）。
-   既不传播错误也不取到值：`Err` 分支不会被选中，成功路径返回未初始化内存。
-   影响面：所有 `?` 错误传播；`Result` 本身（`match` / 方法）可用。
+（当前没有已知的 P0 问题。）
 
 ### P1 — 明确报错或明显缺失的功能（能用不了，但至少看得见）
 
-4. **`#[derive(...)]` 完全不可用**：结构体上报 `undefined name`，枚举上被静默忽略。
-5. **静态变量 `static mut` 没有生成数据符号** → 链接失败。
-6. **类型别名在 `let` 注解里不展开**：`type MyInt = i32; let m: MyInt = 5;`
-   报 ``type mismatch: expected `i32`, found `type#2` ``（函数签名里的别名可用）。
-7. **没有 `unsafe` 关键字**（README「指针与 unsafe」一节已过期）、
+1. **`#[derive(...)]` 只登记 trait 标记，不生成方法**：结构体 / 枚举都能编译，
+   `T: Clone` 之类的约束也能满足，但 `#[derive(Clone)]` 不会生成 `.clone()`，
+   `#[derive(PartialEq)]` 不会生成 `==`（比较仍报类型不匹配）。可接受的
+   derive 名：`Debug` `Clone` `Copy` `PartialEq` `Eq` `PartialOrd` `Ord`
+   `Hash` `Default`；其它名字报 `cannot derive ...`。
+2. **没有 `unsafe` 关键字**（README「指针与 unsafe」一节已过期）、
    **没有 `dyn` 关键字**（trait 对象不可用，`std::error` 因此导入不了）。
-8. **没有借用检查 / 移动检查**（README「所有权系统」「借用检查」两节与实际不符）。
-9. **`try` / `catch` / `throw` / `defer` 解析但不执行**：`defer` 的块从不运行，
-    `throw` 既不抛也不中止 —— 建议先改成编译期明确报错。
-10. **没有元数据 / 临时文件 API**：目录、路径、时间已可用（`std/fs.zr`、
+3. **没有借用检查 / 移动检查**（README「所有权系统」「借用检查」两节与实际不符）。
+4. **没有元数据 / 临时文件 API**：目录、路径、时间已可用（`std/fs.zr`、
     `std/path.zr`），但权限、时间戳、`tempfile` 仍缺。
-11. **浮点 `Display` 在 |v| ≥ 2⁶⁴ 时输出 `.0`**（`std/io.zr` 的 `write_float`）。
-12. **格式规格只支持 `{}` `{:?}` `{:x}` `{:X}`**，宽度 / 精度 / 对齐 / 填充会被原样打印。
-13. **`println` 不检查参数类型**：`println(42)` 编译通过、运行段错误。
-14. **闭包未实现**（README 已记录）：`closures are not implemented yet`。
-15. **`i128` / `u128` 在 64 位目标上不可用**（需要寄存器对拆分）。
-16. **泛型推断与约束的边界**：类型参数只从实参和期望返回类型推断，不看作法体
+5. **浮点 `Display` 在 |v| ≥ 2⁶⁴ 时输出 `.0`**（`std/io.zr` 的 `write_float`）。
+6. **格式规格只支持 `{}` `{:?}` `{:x}` `{:X}`**，宽度 / 精度 / 对齐 / 填充会被原样打印。
+7. **闭包未实现**（README 已记录）：`closures are not implemented yet`。
+8. **`i128` / `u128` 在 64 位目标上不可用**（需要寄存器对拆分）。
+9. **泛型推断与约束的边界**：类型参数只从实参和期望返回类型推断，不看作法体
     （`let v = Vec::new(); v.push(1)` 推不出 `T`，需要 `let v: Vec<i32>` 注解）；
     类型路径上的 turbofish（`Option::<i32>::None`）不支持；`T: Trait` / `where`
     约束只解析不检查，实例化后按具体类型报"方法/字段缺失"。

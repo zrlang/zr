@@ -699,13 +699,6 @@ fn emit_madd(unit: &mut CompilationUnit, rd: Reg, rn: Reg, rm: Reg, ra: u8) {
 }
 
 /// `sdiv xd, xn, xm`
-fn emit_sdiv(unit: &mut CompilationUnit, rd: Reg, rn: Reg, rm: Reg) {
-    insn(
-        unit,
-        0x9ac0_0c00 | (rm.bits() as u32) << 16 | (rn.bits() as u32) << 5 | rd.bits() as u32,
-    );
-}
-
 /// `msub xd, xn, xm, xa`：`xa - xn * xm`（取模用）。
 fn emit_msub(unit: &mut CompilationUnit, rd: Reg, rn: Reg, rm: Reg, ra: u8) {
     insn(
@@ -818,6 +811,12 @@ mod cc {
     ///
     /// `fcmp` 对 NaN 置 C=1、Z=0，于是 `ls` 为假，符合 IEEE754。
     pub const LS: u32 = 0b1001;
+    /// 无符号大于（C=1 且 Z=0）。
+    pub const HI: u32 = 0b1000;
+    /// 无符号大于等于（C=1）。
+    pub const HS: u32 = 0b0010;
+    /// 无符号小于（C=0）。
+    pub const LO: u32 = 0b0011;
 }
 
 /// 基本块标签：`<函数名>.bb<编号>`。
@@ -1096,7 +1095,7 @@ fn emit_instr(unit: &mut CompilationUnit, instr: &SsaInstr) {
             if float_slot(*lhs).is_some() || float_slot(*rhs).is_some() || ty.is_float() {
                 emit_binary_float(unit, *result, *op, *lhs, *rhs, *ty);
             } else {
-                emit_binary(unit, *result, *op, *lhs, *rhs);
+                emit_binary(unit, *result, *op, *lhs, *rhs, *ty);
             }
         }
         SsaInstr::Call {
@@ -1235,10 +1234,12 @@ fn emit_binary(
     op: SsaBinaryOp,
     lhs: SsaValue,
     rhs: SsaValue,
+    ty: NumTy,
 ) {
     let dst = out_reg(result);
     let rn = val_reg(unit, lhs);
     let rm = val_reg2(unit, rhs);
+    let unsigned = matches!(ty, NumTy::Uint(_));
 
     use SsaBinaryOp::*;
     match op {
@@ -1264,19 +1265,24 @@ fn emit_binary(
             );
         }
         Mul => emit_madd(unit, dst, rn, rm, XZR),
-        Div => emit_sdiv(unit, dst, rn, rm),
+        Div => emit_div(unit, dst, rn, rm, unsigned),
         Rem => {
             // q = l / r; 余数 = l - q * r
-            emit_sdiv(unit, dst, rn, rm);
+            emit_div(unit, dst, rn, rm, unsigned);
             emit_msub(unit, dst, dst, rm, rn.bits());
         }
         Shl => emit_dp2(unit, 0x9ac0_2000, dst, rn, rm), // lslv
-        // LSRV 是逻辑右移；右移一律取算术（ASRV），和 x86-64 的 sar 一致：
-        // IR 只有一个 Shr，而整数字面量默认 i32，对有符号数要补符号位。
-        Shr => emit_dp2(unit, 0x9ac0_2800, dst, rn, rm), // asrv
+        // 无符号用 LSRV（逻辑右移），有符号用 ASRV（算术右移）。
+        Shr => emit_dp2(
+            unit,
+            if unsigned { 0x9ac0_2400 } else { 0x9ac0_2800 },
+            dst,
+            rn,
+            rm,
+        ),
         Eq | Ne | Lt | Gt | Le | Ge => {
             emit_cmp(unit, rn, rm);
-            emit_cset(unit, dst, condition_code(op));
+            emit_cset(unit, dst, condition_code(op, unsigned));
         }
     }
     put_out(unit, result);
@@ -1402,17 +1408,27 @@ fn emit_cast_float(
 }
 
 /// 比较运算对应的条件码（供 `cset` 使用）。
-fn condition_code(op: SsaBinaryOp) -> u32 {
+fn condition_code(op: SsaBinaryOp, unsigned: bool) -> u32 {
     use SsaBinaryOp::*;
     match op {
         Eq => cc::EQ,
         Ne => cc::NE,
+        Lt if unsigned => cc::LO,
+        Ge if unsigned => cc::HS,
+        Gt if unsigned => cc::HI,
+        Le if unsigned => cc::LS,
         Lt => cc::LT,
         Ge => cc::GE,
         Gt => cc::GT,
         Le => cc::LE,
         _ => cc::EQ,
     }
+}
+
+/// 有符号/无符号除法：`sdiv` / `udiv`。
+fn emit_div(unit: &mut CompilationUnit, dst: Reg, rn: Reg, rm: Reg, unsigned: bool) {
+    let base = if unsigned { 0x9ac0_0800 } else { 0x9ac0_0c00 };
+    emit_dp2(unit, base, dst, rn, rm);
 }
 
 /// 发射程序入口：调用 `main` 后退出进程。
@@ -2064,6 +2080,7 @@ mod tests {
             SsaBinaryOp::Rem,
             SsaValue(0),
             SsaValue(1),
+            NumTy::Int(64),
         );
         assert!(!u.code.is_empty());
     }

@@ -25,6 +25,7 @@ pub fn lower_function(
     drop_impls: &HashMap<hir::DefId, String>,
     fn_params: &HashMap<String, Vec<hir::Ty>>,
     generic_params: &HashMap<hir::DefId, Vec<hir::Ty>>,
+    statics: &HashMap<hir::DefId, (String, hir::Ty)>,
 ) -> MirFunction {
     let mut b = Builder::new(
         func.name.clone(),
@@ -34,6 +35,7 @@ pub fn lower_function(
         drop_impls.clone(),
         fn_params.clone(),
         generic_params.clone(),
+        statics.clone(),
     );
     // 先扫出被取地址的局部变量：它们不能住在寄存器里，必须固定到栈槽。
     if let Some(body) = &func.body {
@@ -298,6 +300,28 @@ fn lower_expr(b: &mut Builder, expr: &HirExpr) -> MirValue {
         // 的处理：它没有存储，也就没有"读一个全局"这种运行时操作。
         Def(id) => match b.const_values.get(id) {
             Some(value) => value.clone(),
+            None if b.statics.contains_key(id) => {
+                let (symbol, ty) = b.statics.get(id).cloned().unwrap();
+                let addr = b.temp();
+                b.current_block_mut()
+                    .instrs
+                    .push(MirInstr::FuncAddr(addr.clone(), symbol));
+                if is_scalar_ty(&ty) {
+                    let out = b.temp();
+                    let num = num_ty_of(&ty);
+                    b.current_block_mut().instrs.push(MirInstr::Load(
+                        out.clone(),
+                        MirValue::Var(addr),
+                        num,
+                    ));
+                    b.register_temp(MirValue::Var(out.clone()), &expr.ty);
+                    MirValue::Var(out)
+                } else {
+                    // 聚合值在运行期就是地址。
+                    b.register_temp(MirValue::Var(addr.clone()), &expr.ty);
+                    MirValue::Var(addr)
+                }
+            }
             None => {
                 // 函数名作为一等值：取符号地址，供函数指针调用/传参。
                 if let Some(fn_name) = b.functions.get(id).cloned() {
@@ -434,6 +458,16 @@ fn lower_expr(b: &mut Builder, expr: &HirExpr) -> MirValue {
                         }
                     }
                     store_value(b, addr, v, &lhs.ty);
+                    MirValue::Unit
+                }
+                // `static mut X = v`：写到数据符号的地址。
+                Def(id) if b.statics.contains_key(id) => {
+                    let (symbol, _) = b.statics.get(id).cloned().unwrap();
+                    let addr = b.temp();
+                    b.current_block_mut()
+                        .instrs
+                        .push(MirInstr::FuncAddr(addr.clone(), symbol));
+                    store_value(b, MirValue::Var(addr), v, &lhs.ty);
                     MirValue::Unit
                 }
                 // `s.field = v`：结构体值以“指向存储的地址”表示。
@@ -1109,6 +1143,15 @@ fn lower_expr(b: &mut Builder, expr: &HirExpr) -> MirValue {
                         .push(MirInstr::SlotAddr(name.clone(), id.0, 8));
                     MirValue::Var(name)
                 }
+                // `&STATIC`：数据符号本身的地址。
+                Def(id) if b.statics.contains_key(id) => {
+                    let (symbol, _) = b.statics.get(id).cloned().unwrap();
+                    let name = b.temp();
+                    b.current_block_mut()
+                        .instrs
+                        .push(MirInstr::FuncAddr(name.clone(), symbol));
+                    MirValue::Var(name)
+                }
                 // `&*p` 就是 `p`。
                 Deref(inner) => lower_expr(b, inner),
                 // `&p[i]` 就是 `p + i*size`。
@@ -1305,6 +1348,8 @@ pub(super) struct Builder {
     next_temp: u32,
     /// DefId → 函数名（由降级入口注入）。
     functions: HashMap<hir::DefId, String>,
+    /// DefId → (数据符号名, 类型)：全局 `static` 变量。
+    statics: HashMap<hir::DefId, (String, hir::Ty)>,
     /// 函数名 → 形参类型。实参按引用传递时要直接传地址，不能复制/移动。
     fn_params: HashMap<String, Vec<hir::Ty>>,
     /// 正在展开的循环（由内到外）：`(回边目标块, 出口块)`。
@@ -1398,6 +1443,7 @@ impl Builder {
         drops: HashMap<hir::DefId, String>,
         fn_params: HashMap<String, Vec<hir::Ty>>,
         generic_params: HashMap<hir::DefId, Vec<hir::Ty>>,
+        statics: HashMap<hir::DefId, (String, hir::Ty)>,
     ) -> Self {
         let _ = name;
         Self {
@@ -1407,6 +1453,7 @@ impl Builder {
             next_temp: 0,
             loops: Vec::new(),
             functions,
+            statics,
             fn_params,
             const_values,
             types,
@@ -2033,6 +2080,21 @@ fn binary_result_ty(
 fn is_float_arith(op: hir::BinaryOp) -> bool {
     use hir::BinaryOp::*;
     matches!(op, Add | Sub | Mul | Div | Rem)
+}
+
+/// 标量（有固定寄存器宽度），与聚合值（运行期是地址）相对。
+fn is_scalar_ty(ty: &hir::Ty) -> bool {
+    matches!(
+        ty,
+        hir::Ty::Int(_)
+            | hir::Ty::Uint(_)
+            | hir::Ty::Float(_)
+            | hir::Ty::Bool
+            | hir::Ty::Char
+            | hir::Ty::Pointer(..)
+            | hir::Ty::Reference(..)
+            | hir::Ty::Function { .. }
+    )
 }
 
 fn num_ty_of(ty: &hir::Ty) -> NumTy {

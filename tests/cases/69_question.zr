@@ -1,0 +1,114 @@
+//=============================================================================
+// tests/cases/69_question.zr — 后缀 `?` 错误传播
+//
+// 早先 `?` 在解析期被替换成解引用：既不传播错误也不取到值。现在类型检查
+// 阶段把它脱糖成
+//     let tmp = expr;
+//     if tmp 是 Ok/Some { 载荷 } else { return Err(e) / None }
+// 对 `Result<T, E>` 与 `Option<T>` 都生效，并要求当前函数的返回类型是
+// 同一种枚举（错误类型必须一致，没有 `From` 转换）。
+//=============================================================================
+
+use core::{Option, Result};
+
+fn parse(x: i32) -> Result<i32, i32> {
+    if x < 0 { return Result::Err(42); }
+    return Result::Ok(x + 1);
+}
+
+fn twice(x: i32) -> Result<i32, i32> {
+    let a = parse(x)?;
+    let b = parse(a)?;
+    return Result::Ok(b);
+}
+
+fn via_var(x: i32) -> Result<i32, i32> {
+    let r = parse(x);
+    let v = r?;
+    return Result::Ok(v * 2);
+}
+
+fn check_only(x: i32) -> Result<(), i32> {
+    let v = parse(x)?;
+    if v > 100 { return Result::Err(-2); }
+    return Result::Ok(());
+}
+
+fn in_loop(x: i32) -> Result<i32, i32> {
+    let mut i = 0;
+    loop {
+        let v = parse(x - i)?;
+        if v > 0 { return Result::Ok(v); }
+        i = i + 1;
+    }
+}
+
+fn inferred_err() -> Result<i32, i32> {
+    let x = Result::Ok(1)?;
+    return Result::Ok(x + 1);
+}
+
+fn id<T>(x: T) -> Result<T, i32> {
+    return Result::Ok(x);
+}
+
+fn chain<T>(x: T) -> Result<T, i32> {
+    let a = id(x)?;
+    let b = id(a)?;
+    return Result::Ok(b);
+}
+
+fn opt(x: i32) -> Option<i32> {
+    if x < 0 { return Option::None; }
+    return Option::Some(x + 1);
+}
+
+fn opt_twice(x: i32) -> Option<i32> {
+    let a = opt(x)?;
+    let b = opt(a)?;
+    return Option::Some(b);
+}
+
+fn main() -> i32 {
+    match twice(1) {
+        Result::Ok(v) => { if v != 3 { return 1; } }
+        Result::Err(_) => { return 2; }
+    }
+    match twice(-1) {
+        Result::Ok(_) => { return 3; }
+        Result::Err(e) => { if e != 42 { return 4; } }
+    }
+    match via_var(5) {
+        Result::Ok(v) => { if v != 12 { return 5; } }
+        Result::Err(_) => { return 6; }
+    }
+    match check_only(5) {
+        Result::Ok(_) => {}
+        Result::Err(_) => { return 7; }
+    }
+    match check_only(500) {
+        Result::Ok(_) => { return 8; }
+        Result::Err(e) => { if e != -2 { return 9; } }
+    }
+    match in_loop(3) {
+        Result::Ok(v) => { if v != 4 { return 10; } }
+        Result::Err(_) => { return 11; }
+    }
+    match inferred_err() {
+        Result::Ok(v) => { if v != 2 { return 12; } }
+        Result::Err(_) => { return 13; }
+    }
+    match chain(7) {
+        Result::Ok(v) => { if v != 7 { return 14; } }
+        Result::Err(_) => { return 15; }
+    }
+    match opt_twice(1) {
+        Option::Some(v) => { if v != 3 { return 16; } }
+        Option::None => { return 17; }
+    }
+    match opt_twice(-1) {
+        Option::Some(_) => { return 18; }
+        Option::None => {}
+    }
+    return 0;
+}

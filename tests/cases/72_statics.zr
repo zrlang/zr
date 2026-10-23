@@ -1,0 +1,57 @@
+//=============================================================================
+// tests/cases/72_statics.zr — 全局 `static` / `static mut`
+//
+// 早先静态量只有类型信息、没有数据符号：读取被降级成"取函数地址"，
+// 链接时报 `undefined _LIMIT`，`*&COUNTER` 直接段错误。现在标量静态量
+// （初值能折成字面量）会写进 `.data`，读写走普通 Load/Store。
+//=============================================================================
+
+static LIMIT: i32 = 40;
+static mut COUNTER: i32 = 0;
+static mut TOTAL: u64 = 9000000000;
+static RATIO: f64 = 2.5;
+static FLAG: bool = true;
+
+// 初值允许编译期运算。
+static mut OFFSET: i32 = 1 + 2 * 3;
+
+// 聚合静态量暂不支持（没有数据符号），但只要不读取就允许声明。
+struct Marker { x: i32 }
+static UNUSED: Marker = Marker { x: 0 };
+
+fn bump() -> i32 {
+    COUNTER = COUNTER + 1;
+    return COUNTER;
+}
+
+fn read_limit() -> i32 { return LIMIT; }
+
+fn main() -> i32 {
+    if read_limit() != 40 { return 1; }
+    if LIMIT + 2 != 42 { return 2; }
+
+    if COUNTER != 0 { return 3; }
+    COUNTER = 5;
+    if COUNTER != 5 { return 4; }
+    COUNTER += 2;
+    if COUNTER != 7 { return 5; }
+    if bump() != 8 { return 6; }
+
+    if TOTAL != 9000000000 { return 7; }
+    TOTAL = TOTAL + 1;
+    if TOTAL != 9000000001 { return 8; }
+
+    if RATIO != 2.5 { return 9; }
+    if !FLAG { return 10; }
+
+    if OFFSET != 7 { return 11; }
+
+    let p: *mut i32 = &mut COUNTER;
+    *p = 100;
+    if COUNTER != 100 { return 12; }
+
+    let q: *const i32 = &LIMIT;
+    if *q != 40 { return 13; }
+
+    return 0;
+}

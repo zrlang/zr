@@ -207,6 +207,8 @@ pub enum SymbolSection {
     Text,
     /// `.rodata`：只读数据（字符串字面量等）。
     Rodata,
+    /// `.data`：可写数据（`static` / `static mut`）。
+    Data,
     /// 未定义：外部符号，交由平台链接器解析。
     Undefined,
 }
@@ -266,9 +268,28 @@ impl CompilationUnit {
 /// 逐字节可复现的产物，字符串字面量在并行之前按确定顺序统一登记进
 /// `.rodata`，各线程只做查表；片段按函数顺序（连续分块）合并，符号 /
 /// 重定位顺序与单线程一致。
-pub fn compile(target: &Target, module: &SsaModule) -> Result<CompilationUnit, String> {
+pub fn compile(
+    target: &Target,
+    module: &SsaModule,
+    statics: &[crate::mir::MirStatic],
+) -> Result<CompilationUnit, String> {
     let mut unit = CompilationUnit::new();
     unit.is_thumb = target.is_arm32_thumb();
+
+    // 0. 全局静态量：按声明顺序放进 `.data`，并登记符号。重定位按符号名
+    //    解析，所以只要符号表里有定义，代码里的 `FuncAddr` 就能指到它。
+    for st in statics {
+        let offset = unit.data.len();
+        unit.data.extend_from_slice(&st.bytes);
+        unit.symbols.push(Symbol {
+            name: st.name.clone(),
+            section: SymbolSection::Data,
+            offset,
+            size: st.bytes.len(),
+            global: true,
+            kind: SymbolKind::Object,
+        });
+    }
 
     // 0. 先把所有字符串字面量按确定顺序登记进 `.rodata`。并行发射时每个
     //    函数只查表（`intern_string` 命中已有条目），不再改共享的字符串池，

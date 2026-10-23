@@ -1,0 +1,50 @@
+//=============================================================================
+// tests/cases/70_type_alias.zr — 类型别名在使用点展开
+//
+// `type MyInt = i32;` 之后，`MyInt` 不是独立的名义类型：`let x: MyInt = 5`
+// 必须与 `i32` 完全等价。早先别名只在函数签名里“碰巧”可用，`let` 注解会
+// 报 `type mismatch: expected i32, found type#N`。别名目标延迟到所有类型名
+// 登记完之后再转换，因此也支持前向引用。
+//=============================================================================
+
+use collections::Vec;
+
+type MyInt = i32;
+type MyInt2 = MyInt;
+type IntArr = [i32; 3];
+type IntPtr = *const MyInt;
+
+type Forward = Later;
+
+struct P { a: MyInt, b: MyInt2 }
+struct Later { x: i32 }
+
+fn takes(x: MyInt) -> MyInt2 { return x; }
+
+fn main() -> i32 {
+    let m: MyInt2 = 5;
+    if takes(m) != 5 { return 1; }
+
+    let arr: IntArr = [1, 2, 3];
+    if arr[2] != 3 { return 2; }
+
+    let x: MyInt = 7;
+    let p: IntPtr = &x;
+    if *p != 7 { return 3; }
+
+    let s: P = P { a: 1, b: 2 };
+    if s.a + s.b != 3 { return 4; }
+
+    let mut v: Vec<MyInt> = Vec::new();
+    v.push(9);
+    if v.len() != 1 { return 5; }
+    if v.get(0) != 9 { return 6; }
+
+    let c: MyInt = 65;
+    if (c as u8) != 65 { return 7; }
+
+    // 前向引用：别名写在被引用类型之前。
+    let f: Forward = Later { x: 11 };
+    if f.x != 11 { return 8; }
+    return 0;
+}

@@ -1,0 +1,33 @@
+//=============================================================================
+// tests/cases/71_derive.zr — `#[derive(..)]` 至少不再让类型消失
+//
+// 早先 `#[derive(..)]` 的处理发生在声明收集**之前**，`find_def` 查不到刚
+// 声明的类型，于是整个结构体变成 "undefined name"。枚举的属性在解析阶段
+// 被丢掉，derive 被静默忽略。现在属性处理放到声明收集之后，枚举也保留
+// 属性；derive 目前只登记 trait 标记（不生成 `clone` / `==` 等方法）。
+//=============================================================================
+
+#[derive(Clone, Copy)]
+struct P { x: i32, y: i32 }
+
+#[derive(Debug, PartialEq, Eq, Hash)]
+enum E { A, B(i32) }
+
+trait Show { fn show(&self) -> i32; }
+
+impl Show for E { fn show(&self) -> i32 { return 7; } }
+
+fn needs_clone<T: Clone>(x: T) -> i32 { return 0; }
+
+fn main() -> i32 {
+    let a = P { x: 1, y: 2 };
+    let b = a;
+    if a.x + b.x + a.y + b.y != 6 { return 1; }
+
+    let e: E = E::B(3);
+    if e.show() != 7 { return 2; }
+    if needs_clone(e) != 0 { return 3; }
+
+    // `#[derive(..)]` 里的未知名字仍要报错，而不是被忽略。
+    return 0;
+}

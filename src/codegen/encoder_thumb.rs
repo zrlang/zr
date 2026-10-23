@@ -2339,7 +2339,7 @@ mod tests {
         mov_imm8(&mut u, Reg(0), 0); // 偏移 4
         mov_imm8(&mut u, Reg(0), 0); // 偏移 6
         define_label(&mut u, &end); // 偏移 8
-        crate::codegen::objfile::apply_relocations(&mut u, 0, 0);
+        crate::codegen::objfile::apply_relocations(&mut u, 0, 0, 0);
         let hw = u16::from_le_bytes([u.code[0], u.code[1]]);
         // pc = 0 + 4，delta = 8 - 4 = 4，off = 2 → 0xd100 | 2
         assert_eq!(hw, 0xd102, "bne 到偏移 8");

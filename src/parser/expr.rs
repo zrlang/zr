@@ -214,10 +214,10 @@ impl Parser {
 
             // 二元运算符
             if let Some((_, right_bp)) = self.infix_binding_power(&op_kind) {
-                // 处理 `?`（后缀）作为单独的后缀运算符
+                // 后缀 `?`：错误传播。真正语义在类型检查阶段脱糖。
                 if op_kind == TokenKind::Question {
                     self.advance();
-                    left = Expression::Unary(UnaryOp::Deref, Box::new(left), op_span); // placeholder
+                    left = Expression::Question(Box::new(left), op_span);
                     continue;
                 }
 

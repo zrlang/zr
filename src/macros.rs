@@ -212,7 +212,9 @@ fn expand_in_expr(
             expand_in_expr(a, defs, def_lines, changed)?;
             expand_in_expr(b, defs, def_lines, changed)
         }
-        Expression::Unary(_, a, _) => expand_in_expr(a, defs, def_lines, changed),
+        Expression::Unary(_, a, _) | Expression::Question(a, _) => {
+            expand_in_expr(a, defs, def_lines, changed)
+        }
         Expression::Assign(a, _, b, _) => {
             expand_in_expr(a, defs, def_lines, changed)?;
             expand_in_expr(b, defs, def_lines, changed)

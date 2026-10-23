@@ -423,8 +423,13 @@ impl<'a> InferCtxt<'a> {
             }
         }
         // 检查类型定义上是否用 `#[derive(..)]` 声明了这个 trait
-        if let Some(hir::HirTypeDef::Struct(s)) = self.type_defs.get(&type_id) {
-            for attr in &s.attrs {
+        let derive_attrs: Option<&[hir::HirAttr]> = match self.type_defs.get(&type_id) {
+            Some(hir::HirTypeDef::Struct(s)) => Some(&s.attrs),
+            Some(hir::HirTypeDef::Enum(e)) => Some(&e.attrs),
+            _ => None,
+        };
+        if let Some(attrs) = derive_attrs {
+            for attr in attrs {
                 // 早先这里只判断"有没有 derive 属性"就返回成功，
                 // 等于 `#[derive(Clone)]` 能满足**任何** trait。只认
                 // 列表里真正写出来的那个 trait 名。
@@ -451,6 +456,10 @@ impl<'a> InferCtxt<'a> {
     // ===== 错误消息辅助 =====
 
     fn type_mismatch(&self, expected: &Ty, found: &Ty, span: Span) -> CompileError {
+        eprintln!("DEBUG-TM expected={:?} found={:?}", expected, found);
+        if let Ty::Named(id, _) = expected {
+            if id.0 == 94 { panic!("TM94 found={:?}", found); }
+        }
         CompileError::type_error(format!(
             "type mismatch: expected `{}`, found `{}`",
             self.type_name(expected),

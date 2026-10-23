@@ -310,6 +310,8 @@ pub enum Expression {
     Binary(Box<Expression>, BinaryOp, Box<Expression>, Span),
     /// 一元运算。
     Unary(UnaryOp, Box<Expression>, Span),
+    /// 后缀 `?`：错误传播（`Result` / `Option`）。
+    Question(Box<Expression>, Span),
     /// 赋值（含复合赋值 `+=` 等）。
     Assign(Box<Expression>, AssignOp, Box<Expression>, Span),
     /// 调用。
@@ -707,6 +709,8 @@ pub enum VariantPayload {
 #[derive(Debug, Clone)]
 pub struct EnumDef {
     pub name: String,
+    /// 属性（`#[derive(..)]` 等）。
+    pub attrs: Vec<Attribute>,
     /// 泛型参数（`enum Option<T> { .. }` 里的 `T`）。
     pub generics: Vec<GenericParam>,
     /// 底层整数类型（默认 `i32`）。
@@ -737,6 +741,8 @@ pub struct ConstDecl {
 #[derive(Debug, Clone)]
 pub struct StaticDecl {
     pub name: String,
+    /// 是否 `static mut`。
+    pub is_mut: bool,
     pub ty: Type,
     pub init: Expression,
 }
@@ -788,6 +794,7 @@ impl Spanned for Expression {
             Expression::Path(_, s) => *s,
             Expression::Binary(_, _, _, s) => *s,
             Expression::Unary(_, _, s) => *s,
+            Expression::Question(_, s) => *s,
             Expression::Assign(_, _, _, s) => *s,
             Expression::Call(_, _, s) => *s,
             Expression::Turbofish(_, _, s) => *s,

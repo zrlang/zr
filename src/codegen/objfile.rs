@@ -137,6 +137,7 @@ pub fn symbol_addresses(
     unit: &CompilationUnit,
     text_base: u64,
     rodata_base: u64,
+    data_base: u64,
 ) -> HashMap<String, u64> {
     unit.symbols
         .iter()
@@ -146,6 +147,7 @@ pub fn symbol_addresses(
             // `text_base`，只读数据段用 `rodata_base`。
             let base = match s.section {
                 SymbolSection::Rodata => rodata_base,
+                SymbolSection::Data => data_base,
                 _ => text_base,
             };
             (s.name.clone(), base + s.offset as u64)
@@ -159,8 +161,13 @@ pub fn symbol_addresses(
 /// - `PcRel32`：立即数字段整体就是位移，x86-64 的 `call/jmp/jcc` 都如此；
 /// - `Branch26`：AArch64 的 26 位字面量嵌在指令自身的 [25:0] 位里，
 ///   因此必须"读-改-写"，保留高 6 位操作码。
-pub fn apply_relocations(unit: &mut CompilationUnit, text_base: u64, rodata_base: u64) {
-    let addrs = symbol_addresses(unit, text_base, rodata_base);
+pub fn apply_relocations(
+    unit: &mut CompilationUnit,
+    text_base: u64,
+    rodata_base: u64,
+    data_base: u64,
+) {
+    let addrs = symbol_addresses(unit, text_base, rodata_base, data_base);
 
     for reloc in &unit.relocations {
         let Some(&target) = addrs.get(reloc.symbol.as_str()) else {
@@ -475,7 +482,7 @@ mod tests {
     fn pcrel32_uses_next_instruction_address() {
         let (mut unit, relocs) = unit_with_one_call();
         unit.relocations = relocs;
-        apply_relocations(&mut unit, 0x400000, 0);
+        apply_relocations(&mut unit, 0x400000, 0, 0);
         // main 在 0x400000，call 在 0x400000，下一条指令 0x400005，
         // 因此位移应为 -5。
         assert_eq!(i32::from_le_bytes(unit.code[1..5].try_into().unwrap()), -5);
@@ -498,7 +505,7 @@ mod tests {
         });
         unit.relocations
             .push(Relocation::new(8, 8, 4, "main", RelocationKind::Branch26));
-        apply_relocations(&mut unit, 0x1000, 0);
+        apply_relocations(&mut unit, 0x1000, 0, 0);
         let word = u32::from_le_bytes(unit.code[8..12].try_into().unwrap());
         assert_eq!(word >> 26, 0b100101, "bl 操作码应保留");
         // 向后跳 8 字节 = -2 条指令，按 26 位补码编码。
@@ -515,7 +522,7 @@ mod tests {
         let (mut unit, relocs) = unit_with_one_call();
         unit.relocations = vec![Relocation::new(1, 0, 5, "zr_exit", RelocationKind::PcRel32)];
         let _ = relocs;
-        apply_relocations(&mut unit, 0x400000, 0);
+        apply_relocations(&mut unit, 0x400000, 0, 0);
         assert_eq!(unit.code[1..5], [0, 0, 0, 0]);
     }
 
@@ -563,7 +570,7 @@ mod tests {
         });
         unit.relocations
             .push(Relocation::new(12, 12, 4, "main", RelocationKind::RiscVJal));
-        apply_relocations(&mut unit, 0x1000, 0);
+        apply_relocations(&mut unit, 0x1000, 0, 0);
         let word = u32::from_le_bytes(unit.code[12..16].try_into().unwrap());
         // 字节差 -12（imm = 0x1FFFF4）→ imm[20]=1（→[31]）、imm[10:1]=0x3FA
         // （→[30:21]）、imm[11]=1（→[20]）、imm[19:12]=0xFF（原位），ra=1
@@ -588,7 +595,7 @@ mod tests {
         });
         unit.relocations
             .push(Relocation::new(8, 8, 4, "bb1", RelocationKind::RiscVBranch));
-        apply_relocations(&mut unit, 0x2000, 0);
+        apply_relocations(&mut unit, 0x2000, 0, 0);
         let word = u32::from_le_bytes(unit.code[8..12].try_into().unwrap());
         // 字节差 +8：imm[4:1] = 4 → [11:8] = 4，其余段为 0
         assert_eq!(word, 0x0002_8463);
@@ -613,7 +620,7 @@ mod tests {
         let mut reloc = Relocation::new(3, 0, 7, ".Lstr0", RelocationKind::RipRel32);
         reloc.addend = -4;
         unit.relocations.push(reloc);
-        apply_relocations(&mut unit, 0x40_0000, 0x41_0000);
+        apply_relocations(&mut unit, 0x40_0000, 0x41_0000, 0);
         let disp = i32::from_le_bytes(unit.code[3..7].try_into().unwrap());
         // 下一条指令地址 + disp 必须等于 .rodata 的地址。
         assert_eq!(0x40_0000 + 7 + disp as i64, 0x41_0000);
@@ -647,7 +654,7 @@ mod tests {
             ".Lstr0",
             RelocationKind::AddAbsLo12,
         ));
-        apply_relocations(&mut unit, 0x40_0000, 0x40_1000);
+        apply_relocations(&mut unit, 0x40_0000, 0x40_1000, 0);
         let adrp = u32::from_le_bytes(unit.code[0..4].try_into().unwrap());
         let add = u32::from_le_bytes(unit.code[4..8].try_into().unwrap());
         // 目标页 0x401000 − 指令页 0x400000 = 1 页。
@@ -686,7 +693,7 @@ mod tests {
             ".Lstr0",
             RelocationKind::ArmMovtAbs,
         ));
-        apply_relocations(&mut unit, 0x0800_0000, 0x0800_0000);
+        apply_relocations(&mut unit, 0x0800_0000, 0x0800_0000, 0);
         let movw = u32::from_le_bytes(unit.code[0..4].try_into().unwrap());
         let movt = u32::from_le_bytes(unit.code[4..8].try_into().unwrap());
         // 目标 = 0x08000000 + 0x1a6 = 0x080001a6：movw 装低 16 位 0x01a6，

@@ -399,11 +399,13 @@ impl Symtab {
                     entry.extend_from_slice(&0u64.to_le_bytes()); // n_value
                     push_bucket(&mut buckets, &mut names, 2, &entry, name);
                 }
-                SymbolSection::Text | SymbolSection::Rodata => {
+                SymbolSection::Text | SymbolSection::Rodata | SymbolSection::Data => {
                     entry.push(if sym.global { N_SECT | N_EXT } else { N_SECT });
-                    // n_sect：1 = __text，2 = __rodata（与 section 表顺序一致）。
+                    // n_sect：1 = __text，2 = __rodata，3 = __data
+                    // （与 section 表顺序一致）。
                     entry.push(match sym.section {
                         SymbolSection::Rodata => 2,
+                        SymbolSection::Data => 3,
                         _ => 1,
                     });
                     entry.extend_from_slice(&0u16.to_le_bytes());

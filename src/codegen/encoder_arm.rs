@@ -459,6 +459,10 @@ mod cc {
     pub const CC: u32 = 0b0011;
     /// 进位置位（无符号"高于或等于"，用于 `n >= 32`）。
     pub const CS: u32 = 0b0010;
+    /// 无符号大于（C=1 且 Z=0）。
+    pub const HI: u32 = 0b1000;
+    /// 无符号小于等于（C=0 或 Z=1）。
+    pub const LS: u32 = 0b1001;
 }
 
 /// 数据处理操作码。
@@ -735,10 +739,11 @@ fn emit_mls(unit: &mut CompilationUnit, rd: Reg, lhs: Reg, rhs: Reg, acc: Reg) {
 }
 
 /// `sdiv rd, rn, rm`
-fn emit_sdiv(unit: &mut CompilationUnit, rd: Reg, rn: Reg, rm: Reg) {
+fn emit_div(unit: &mut CompilationUnit, rd: Reg, rn: Reg, rm: Reg, unsigned: bool) {
+    let base = if unsigned { 0xe730_f010 } else { 0xe710_f010 };
     insn(
         unit,
-        0xe710_f010 | (rd.bits() as u32) << 16 | (rm.bits() as u32) << 8 | rn.bits() as u32,
+        base | (rd.bits() as u32) << 16 | (rm.bits() as u32) << 8 | rn.bits() as u32,
     );
 }
 
@@ -1254,14 +1259,16 @@ fn emit_compare_wide(
     op: SsaBinaryOp,
     lhs: SsaValue,
     rhs: SsaValue,
+    ty: NumTy,
 ) {
+    let unsigned = matches!(ty, NumTy::Uint(_));
     wide_load(unit, lhs, SPILL_SRC, SPILL_SRC2);
     wide_load2(unit, rhs, MUL_TMP_A, SPILL_DST);
     emit_cmp(unit, SPILL_SRC, MUL_TMP_A);
     emit_cmp_cond(unit, cc::EQ, SPILL_SRC2, SPILL_DST);
     let dst = out_reg(result);
-    emit_mov_cond(unit, condition_code(op), dst, 1);
-    emit_mov_cond(unit, inverse_condition_code(op), dst, 0);
+    emit_mov_cond(unit, condition_code(op, unsigned), dst, 1);
+    emit_mov_cond(unit, inverse_condition_code(op, unsigned), dst, 0);
     put_out(unit, result);
 }
 
@@ -1321,6 +1328,7 @@ fn emit_divrem_wide_const(
     op: SsaBinaryOp,
     lhs: SsaValue,
     divisor: i128,
+    unsigned: bool,
 ) {
     let mag = divisor.unsigned_abs();
     let k = mag.trailing_zeros();
@@ -1330,12 +1338,16 @@ fn emit_divrem_wide_const(
     wide_load(unit, lhs, SPILL_SRC, SPILL_SRC2);
     if op == SsaBinaryOp::Div {
         if k > 0 {
-            // 64 位逻辑右移 k 位：lo = (lo >> k) | (hi << (32-k))，hi = hi >> k
-            // （hi 用算术右移，负数除法向下取整，符合语言语义）。
+            // 64 位右移 k 位：lo = (lo >> k) | (hi << (32-k))，hi = hi >> k
+            // （有符号的 hi 用算术右移，负数除法向下取整；无符号用逻辑右移）。
             emit_shift_imm(unit, Shift::Lsr, SPILL_DST, SPILL_SRC, k);
             emit_shift_imm(unit, Shift::Lsl, MUL_TMP_A, SPILL_SRC2, 32 - k);
             emit_op3(unit, op::ORR, SPILL_SRC, SPILL_DST, MUL_TMP_A);
-            emit_asr_imm(unit, SPILL_SRC2, SPILL_SRC2, k);
+            if unsigned {
+                emit_shift_imm(unit, Shift::Lsr, SPILL_SRC2, SPILL_SRC2, k);
+            } else {
+                emit_asr_imm(unit, SPILL_SRC2, SPILL_SRC2, k);
+            }
         }
     } else {
         if k > 0 {
@@ -1377,7 +1389,9 @@ fn emit_shift_wide(
     op: SsaBinaryOp,
     lhs: SsaValue,
     rhs: SsaValue,
+    ty: NumTy,
 ) {
+    let unsigned = matches!(ty, NumTy::Uint(_));
     // 64 位值由 lo/hi 两个字组成，移位用 `cmp count,#32` 分出两段，再用
     // ARM 的条件执行把两段接在一起（`cc::CC` = n<32、`cc::CS` = n>=32）。
     // 寄存器：r9=lo、r10=hi、r11=计数、r12=暂存。
@@ -1402,17 +1416,22 @@ fn emit_shift_wide(
             emit_shift_by_reg_cond(unit, cc::CS, hi, lo, cnt, Shift::Lsl);
             emit_mov_cond(unit, cc::CS, lo, 0);
         }
-        // 右移一律取算术（与 32 位路径、x86-64 的 sar 一致）。
+        // 有符号右移用算术（ASR，补符号位）；无符号用逻辑（LSR，补 0）。
         SsaBinaryOp::Shr => {
-            // n<32：lo = (lo >> n) | (hi << (32-n))；hi = hi >>s n
+            let shr = if unsigned { Shift::Lsr } else { Shift::Asr };
+            // n<32：lo = (lo >> n) | (hi << (32-n))；hi = hi >> n
             emit_shift_by_reg_cond(unit, cc::CC, lo, lo, cnt, Shift::Lsr);
             emit_rsb_imm_cond(unit, cc::CC, tmp, cnt, 32);
             emit_orr_shifted_reg(unit, cc::CC, lo, lo, hi, tmp, Shift::Lsl);
-            emit_shift_by_reg_cond(unit, cc::CC, hi, hi, cnt, Shift::Asr);
-            // n>=32：lo = hi >>s (n-32)；hi = 符号位填满
+            emit_shift_by_reg_cond(unit, cc::CC, hi, hi, cnt, shr);
+            // n>=32：lo = hi >> (n-32)；hi = 符号位填满（无符号为 0）
             emit_sub_imm_cond(unit, cc::CS, cnt, cnt, 32);
-            emit_shift_by_reg_cond(unit, cc::CS, lo, hi, cnt, Shift::Asr);
-            emit_shift_imm_cond(unit, cc::CS, Shift::Asr, hi, hi, 31);
+            emit_shift_by_reg_cond(unit, cc::CS, lo, hi, cnt, shr);
+            if unsigned {
+                emit_mov_cond(unit, cc::CS, hi, 0);
+            } else {
+                emit_shift_imm_cond(unit, cc::CS, Shift::Asr, hi, hi, 31);
+            }
         }
         _ => crate::codegen::unsupported_binary_op(op),
     }
@@ -1794,12 +1813,19 @@ fn emit_instr(unit: &mut CompilationUnit, instr: &SsaInstr) {
                     SsaBinaryOp::Div | SsaBinaryOp::Rem => {
                         let d = CONSTS.with(|c| c.borrow().get(&rhs.id()).copied());
                         match d {
-                            Some(d) => emit_divrem_wide_const(unit, *result, *op, *lhs, d),
+                            Some(d) => emit_divrem_wide_const(
+                                unit,
+                                *result,
+                                *op,
+                                *lhs,
+                                d,
+                                matches!(*ty, NumTy::Uint(_)),
+                            ),
                             None => crate::codegen::unsupported_binary_op(*op),
                         }
                     }
                     SsaBinaryOp::Shl | SsaBinaryOp::Shr => {
-                        emit_shift_wide(unit, *result, *op, *lhs, *rhs)
+                        emit_shift_wide(unit, *result, *op, *lhs, *rhs, *ty)
                     }
                     SsaBinaryOp::BitAnd | SsaBinaryOp::And => {
                         emit_bitop_wide(unit, *result, op::AND, *lhs, *rhs)
@@ -1815,12 +1841,14 @@ fn emit_instr(unit: &mut CompilationUnit, instr: &SsaInstr) {
                     | SsaBinaryOp::Lt
                     | SsaBinaryOp::Gt
                     | SsaBinaryOp::Le
-                    | SsaBinaryOp::Ge => emit_compare_wide(unit, *result, *op, *lhs, *rhs),
+                    | SsaBinaryOp::Ge => {
+                        emit_compare_wide(unit, *result, *op, *lhs, *rhs, *ty)
+                    }
                 }
             } else if float_slot(*lhs).is_some() || float_slot(*rhs).is_some() || ty.is_float() {
                 emit_binary_float(unit, *result, *op, *lhs, *rhs, *ty);
             } else {
-                emit_binary(unit, *result, *op, *lhs, *rhs);
+                emit_binary(unit, *result, *op, *lhs, *rhs, *ty);
             }
         }
         SsaInstr::Call {
@@ -2075,10 +2103,12 @@ fn emit_binary(
     op: SsaBinaryOp,
     lhs: SsaValue,
     rhs: SsaValue,
+    ty: NumTy,
 ) {
     let dst = out_reg(result);
     let rn = val_reg(unit, lhs);
     let rm = val_reg2(unit, rhs);
+    let unsigned = matches!(ty, NumTy::Uint(_));
     use SsaBinaryOp::*;
     match op {
         Add => emit_op3(unit, op::ADD, dst, rn, rm),
@@ -2087,7 +2117,7 @@ fn emit_binary(
         BitOr | Or => emit_op3(unit, op::ORR, dst, rn, rm),
         BitXor => emit_op3(unit, op::EOR, dst, rn, rm),
         Mul => emit_mul(unit, dst, rn, rm),
-        Div => emit_sdiv(unit, dst, rn, rm),
+        Div => emit_div(unit, dst, rn, rm, unsigned),
         // 余数 = l - (l / r) * r。ARM 的 MLS 规定 Rd == Rn 时 UNPREDICTABLE，
         // 而商通常就想落在 dst 里；所以整条序列只用平台寄存器 r11/r12 做
         // 中转，不碰分配池，再一次性搬回 dst（dst 溢出时 r12 就是
@@ -2095,21 +2125,33 @@ fn emit_binary(
         Rem => {
             // 商 → r11；r12 = rn − r11·rm；dst 再接管。传参对应 gas
             // （Rd, Rn, Rm, Ra）：被减数是 rn，落在 acc 位。
-            emit_sdiv(unit, MUL_TMP_A, rn, rm);
+            emit_div(unit, MUL_TMP_A, rn, rm, unsigned);
             emit_mls(unit, SPILL_DST, MUL_TMP_A, rm, rn);
             emit_mov_rr(unit, dst, SPILL_DST);
         }
         Shl => emit_shift_by_reg(unit, dst, rn, rm, Shift::Lsl),
-        // 右移一律取算术（ASR），与 x86-64 的 sar 一致：IR 只有一个 Shr，
-        // 而整数字面量默认 i32，对有符号数必须补符号位。
-        Shr => emit_shift_by_reg(unit, dst, rn, rm, Shift::Asr),
-        Eq | Ne | Lt | Gt | Le | Ge => emit_compare(unit, dst, op, rn, rm),
+        // 无符号用逻辑右移（LSR），有符号用算术右移（ASR）。
+        Shr => emit_shift_by_reg(
+            unit,
+            dst,
+            rn,
+            rm,
+            if unsigned { Shift::Lsr } else { Shift::Asr },
+        ),
+        Eq | Ne | Lt | Gt | Le | Ge => emit_compare(unit, dst, op, rn, rm, unsigned),
     }
     put_out(unit, result);
 }
 
 /// 比较运算：把 0/1 写入 `dst`（靠 ARM 的条件执行）。
-fn emit_compare(unit: &mut CompilationUnit, dst: Reg, op: SsaBinaryOp, rn: Reg, rm: Reg) {
+fn emit_compare(
+    unit: &mut CompilationUnit,
+    dst: Reg,
+    op: SsaBinaryOp,
+    rn: Reg,
+    rm: Reg,
+    unsigned: bool,
+) {
     use SsaBinaryOp::*;
     match op {
         // 相等可以用异或后测零，省一次 compare 的依赖。
@@ -2120,16 +2162,20 @@ fn emit_compare(unit: &mut CompilationUnit, dst: Reg, op: SsaBinaryOp, rn: Reg, 
         }
         _ => emit_cmp(unit, rn, rm),
     }
-    emit_mov_cond(unit, condition_code(op), dst, 1);
-    emit_mov_cond(unit, inverse_condition_code(op), dst, 0);
+    emit_mov_cond(unit, condition_code(op, unsigned), dst, 1);
+    emit_mov_cond(unit, inverse_condition_code(op, unsigned), dst, 0);
 }
 
 /// 比较运算对应的条件码。
-fn condition_code(op: SsaBinaryOp) -> u32 {
+fn condition_code(op: SsaBinaryOp, unsigned: bool) -> u32 {
     use SsaBinaryOp::*;
     match op {
         Eq => cc::EQ,
         Ne => cc::NE,
+        Lt if unsigned => cc::CC,
+        Ge if unsigned => cc::CS,
+        Gt if unsigned => cc::HI,
+        Le if unsigned => cc::LS,
         Lt => cc::LT,
         Ge => cc::GE,
         Gt => cc::GT,
@@ -2139,10 +2185,14 @@ fn condition_code(op: SsaBinaryOp) -> u32 {
 }
 
 /// 条件的反码。
-fn inverse_condition_code(op: SsaBinaryOp) -> u32 {
+fn inverse_condition_code(op: SsaBinaryOp, unsigned: bool) -> u32 {
     match op {
         SsaBinaryOp::Eq => cc::NE,
         SsaBinaryOp::Ne => cc::EQ,
+        SsaBinaryOp::Lt if unsigned => cc::CS,
+        SsaBinaryOp::Ge if unsigned => cc::CC,
+        SsaBinaryOp::Gt if unsigned => cc::LS,
+        SsaBinaryOp::Le if unsigned => cc::HI,
         SsaBinaryOp::Lt => cc::GE,
         SsaBinaryOp::Ge => cc::LT,
         SsaBinaryOp::Gt => cc::LE,
@@ -2196,7 +2246,7 @@ fn emit_binary_float(
                 _ => cc::AL,
             };
             emit_mov_cond(unit, cc, dst, 1);
-            emit_mov_cond(unit, inverse_condition_code(op), dst, 0);
+            emit_mov_cond(unit, inverse_condition_code(op, false), dst, 0);
             put_out(unit, result);
         }
         _ => crate::codegen::unsupported_binary_op(op),
@@ -2409,7 +2459,7 @@ mod tests {
         };
         let mut unit = empty_unit();
         emit_function(&Target::parse("arm-none-eabi").unwrap(), &mut unit, &func);
-        crate::codegen::objfile::apply_relocations(&mut unit, 0, 0);
+        crate::codegen::objfile::apply_relocations(&mut unit, 0, 0, 0);
 
         let word_at = |off: usize| u32::from_le_bytes(unit.code[off..off + 4].try_into().unwrap());
         let block_off = |n: usize| {
@@ -2568,7 +2618,7 @@ mod tests {
         let cases: Vec<(&str, Vec<u8>)> = vec![
             ("sdiv r1,r4,r7", {
                 let mut u = empty_unit();
-                emit_sdiv(&mut u, r(1), r(4), r(7));
+                emit_div(&mut u, r(1), r(4), r(7), false);
                 u.code
             }),
             ("mul r1,r4,r7", {
@@ -2948,7 +2998,7 @@ mod tests {
     #[test]
     fn comparison_uses_conditional_execution() {
         let mut u = empty_unit();
-        emit_compare(&mut u, Reg::R0, SsaBinaryOp::Lt, Reg(1), Reg(2));
+        emit_compare(&mut u, Reg::R0, SsaBinaryOp::Lt, Reg(1), Reg(2), false);
         let words: Vec<u32> = u
             .code
             .chunks(4)
@@ -2998,6 +3048,7 @@ mod tests {
             SsaBinaryOp::Rem,
             SsaValue(0),
             SsaValue(1),
+            NumTy::Int(64),
         );
         // 余数避开 MLS 的 Rd==Rn UNPREDICTABLE：商落 r11（MUL_TMP_A），
         // 余数先落 r12（SPILL_DST）再搬回分配寄存器 r3。

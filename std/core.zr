@@ -287,7 +287,7 @@ pub const STDERR_FD: i32 = 2;
 //=============================================================================
 
 /// 无条件终止程序，并打印消息。
-pub fn panic(msg: []const u8) -> ! {
+pub fn panic(msg: str) -> ! {
     zr_panic(msg.ptr, msg.len);
 }
 

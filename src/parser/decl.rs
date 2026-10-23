@@ -418,14 +418,19 @@ impl Parser {
         _attrs: Vec<Attribute>,
     ) -> Result<StaticDecl, CompileError> {
         let _span = self.previous().span;
-        let _mutable = self.match_kind(&TokenKind::KwMut);
+        let is_mut = self.match_kind(&TokenKind::KwMut);
         let name = self.consume_ident("expected static name")?;
         self.consume(&TokenKind::Colon, "expected ':'")?;
         let ty = self.parse_type()?;
         self.consume(&TokenKind::Eq, "expected '='")?;
         let init = self.parse_expression()?;
         self.consume(&TokenKind::Semicolon, "expected ';'")?;
-        Ok(StaticDecl { name, ty, init })
+        Ok(StaticDecl {
+            name,
+            is_mut,
+            ty,
+            init,
+        })
     }
 
     // ==================================================================
@@ -519,7 +524,7 @@ impl Parser {
     pub fn parse_enum_def(
         &mut self,
         _visibility: Visibility,
-        _attrs: Vec<Attribute>,
+        attrs: Vec<Attribute>,
     ) -> Result<TypeDef, CompileError> {
         let _span = self.previous().span;
         let name = self.consume_ident("expected enum name")?;
@@ -548,6 +553,7 @@ impl Parser {
         self.consume(&TokenKind::RBrace, "expected '}' to close enum")?;
         Ok(TypeDef::Enum(EnumDef {
             name,
+            attrs,
             generics,
             repr,
             variants,

@@ -37,6 +37,16 @@ pub fn mangled_symbol(name: &str) -> String {
 #[derive(Debug, Clone, Default)]
 pub struct MirModule {
     pub functions: Vec<MirFunction>,
+    /// 全局静态量（`.data` 里的数据符号）。只有标量、初值可折叠的才有。
+    pub statics: Vec<MirStatic>,
+}
+
+/// 一个已初始化的全局静态量。
+#[derive(Debug, Clone)]
+pub struct MirStatic {
+    pub name: String,
+    /// 小端编码的初值字节。
+    pub bytes: Vec<u8>,
 }
 
 /// 一个 MIR 函数。
@@ -290,6 +300,20 @@ pub fn lower(hir: &HirModule) -> MirModule {
         })
         .collect();
 
+    // 静态量：标量 + 可折叠初值 → 直接编码成数据字节。其它静态量没有
+    // 数据符号，读取时类型检查阶段已经报错。
+    let mut statics = Vec::new();
+    let mut static_metas: HashMap<hir::DefId, (String, hir::Ty)> = HashMap::new();
+    for st in &hir.statics {
+        let Some(lit) = &st.const_value else { continue };
+        let Some(bytes) = scalar_bytes(&st.ty, lit) else { continue };
+        static_metas.insert(st.id, (st.name.clone(), st.ty.clone()));
+        statics.push(MirStatic {
+            name: st.name.clone(),
+            bytes,
+        });
+    }
+
     let mut functions = Vec::with_capacity(hir.functions.len());
     // 形参表按**改名后**的函数名索引：MIR 里调用点用的是改名后的名字，
     // 这里也必须用同一个名字，否则查不到形参类型 —— `&mut self` 会被当成
@@ -325,6 +349,7 @@ pub fn lower(hir: &HirModule) -> MirModule {
                 &drop_impls,
                 &fn_params,
                 &hir.generic_params,
+                &static_metas,
             ));
         }
     }
@@ -335,7 +360,7 @@ pub fn lower(hir: &HirModule) -> MirModule {
         functions.push(narrow::narrow_to_f32_fn(bits));
     }
 
-    let mut module = MirModule { functions };
+    let mut module = MirModule { functions, statics };
     async_lower::lower_module(&mut module);
     // `#[test]`：用合成的测试桩替换掉用户写的 `main`
     let names: Vec<String> = hir
@@ -346,4 +371,31 @@ pub fn lower(hir: &HirModule) -> MirModule {
         .collect();
     test_harness::install(&mut module, &names);
     module
+}
+
+/// 把标量字面量编码成小端字节。非标量返回 `None`。
+fn scalar_bytes(ty: &hir::Ty, lit: &hir::HirLiteral) -> Option<Vec<u8>> {
+    let value: i128 = match lit {
+        hir::HirLiteral::Int(v) => *v,
+        hir::HirLiteral::Bool(v) => *v as i128,
+        hir::HirLiteral::Char(c) => *c as i128,
+        hir::HirLiteral::Float(f) => {
+            return match ty {
+                hir::Ty::Float(32) => Some((*f as f32).to_bits().to_le_bytes().to_vec()),
+                hir::Ty::Float(64) => Some(f.to_bits().to_le_bytes().to_vec()),
+                _ => None,
+            }
+        }
+        _ => return None,
+    };
+    let width = match ty {
+        hir::Ty::Int(w) | hir::Ty::Uint(w) => (*w as usize) / 8,
+        hir::Ty::Bool | hir::Ty::Char => 1,
+        hir::Ty::Pointer(..) | hir::Ty::Reference(..) => 8,
+        _ => return None,
+    };
+    if width == 0 || width > 16 {
+        return None;
+    }
+    Some(value.to_le_bytes()[..width].to_vec())
 }

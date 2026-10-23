@@ -30,6 +30,19 @@ pub struct HirModule {
     pub drop_impls: HashMap<DefId, String>,
     /// 泛型类型定义的类型参数占位符（按声明顺序），MIR 布局按实参替换。
     pub generic_params: HashMap<DefId, Vec<Ty>>,
+    /// 全局 `static` 变量（按 DefId 排序）。只有标量、且初值能折成字面量
+    /// 的静态量才会生成数据符号。
+    pub statics: Vec<HirStaticDef>,
+}
+
+/// 一个全局静态量。
+#[derive(Debug, Clone)]
+pub struct HirStaticDef {
+    pub id: DefId,
+    pub name: String,
+    pub ty: Ty,
+    /// 初值折叠后的字面量；折不出来就是 `None`（读取时会报错）。
+    pub const_value: Option<HirLiteral>,
 }
 
 // ======================================================================
@@ -254,12 +267,6 @@ pub enum ExprKind {
     Continue(Option<String>),
     /// `return`。
     Return(Option<Box<HirExpr>>),
-    /// `defer` 延迟表达式。
-    Defer,
-    /// `try` / `catch`。
-    Try,
-    /// `throw`。
-    Throw,
     /// 数组字面量（元素按源码顺序保存）。
     Array(Vec<HirExpr>),
     /// 元组字面量：各元素按源码顺序保存。
@@ -583,6 +590,7 @@ pub struct HirStruct {
 #[derive(Debug, Clone)]
 pub struct HirEnum {
     pub name: String,
+    pub attrs: Vec<HirAttr>,
     pub repr: IntegerRepr,
     pub variants: Vec<HirVariant>,
 }
@@ -661,6 +669,9 @@ pub struct HirConst {
 pub struct HirStatic {
     pub ty: Ty,
     pub init: Box<HirExpr>,
+    pub is_mut: bool,
+    /// 初值折叠后的字面量（`static X: i32 = 1 + 2;` 也能折出来）。
+    pub const_value: Option<HirLiteral>,
 }
 
 /// HIR trait 定义。

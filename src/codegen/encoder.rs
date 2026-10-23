@@ -3281,7 +3281,7 @@ mod tests {
     fn division_sign_extends_before_idiv() {
         let mut u = unit();
         // 除数在 r8（ALLOCATABLE[2]），被除数由调用方预先放进 rax。
-        emit_divrem_reg(&mut u, ALLOCATABLE[0], ALLOCATABLE[2], false);
+        emit_divrem_reg(&mut u, ALLOCATABLE[0], ALLOCATABLE[2], false, false);
         // 必须是 `cqo`（rax 的符号扩展进 rdx:rax），不能是 `xor edx, edx`——
         // 后者只在被除数非负时等价，负数除法会算错。
         assert_eq!(&u.code[0..2], &[0x48, 0x99], "cqo");
@@ -3291,7 +3291,7 @@ mod tests {
     #[test]
     fn spilled_divisor_uses_the_memory_operand() {
         let mut u = unit();
-        emit_divrem_mem(&mut u, ALLOCATABLE[0], 3, false);
+        emit_divrem_mem(&mut u, ALLOCATABLE[0], 3, false, false);
         assert_eq!(&u.code[0..2], &[0x48, 0x99], "cqo");
         // REX.W + idiv /7 + modrm(mod=10,reg=111,rm=SIB) + SIB(rsp) + disp32
         assert_eq!(&u.code[2..6], &[0x48, 0xf7, 0b10_111_100, 0b00_100_100]);

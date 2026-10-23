@@ -738,7 +738,7 @@ fn compile(input: &str, cmd: &Cli) -> Result<std::path::PathBuf, String> {
     }
 
     // 8. 代码生成（按目标架构选择指令后端）
-    let unit = codegen::compile(&target, &ssa_module)?;
+    let unit = codegen::compile(&target, &ssa_module, &mir_module.statics)?;
 
     // 8.5 机器码转储（--dump-asm）
     if cmd.dump_asm {

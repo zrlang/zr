@@ -1914,7 +1914,7 @@ mod tests {
             &mut unit,
             &func,
         );
-        crate::codegen::objfile::apply_relocations(&mut unit, 0, 0);
+        crate::codegen::objfile::apply_relocations(&mut unit, 0, 0, 0);
 
         let word_at = |off: usize| u32::from_le_bytes(unit.code[off..off + 4].try_into().unwrap());
         let block_off = |n: usize| {
@@ -1994,7 +1994,7 @@ mod tests {
         let rhs = SsaValue(7);
         let dst = SsaValue(8);
         emit_binary(&mut unit, dst, SsaBinaryOp::Shl, lhs, rhs);
-        crate::codegen::objfile::apply_relocations(&mut unit, 0, 0);
+        crate::codegen::objfile::apply_relocations(&mut unit, 0, 0, 0);
 
         let words: Vec<u32> = unit
             .code
