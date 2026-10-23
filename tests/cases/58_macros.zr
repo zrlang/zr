@@ -1,0 +1,78 @@
+//=============================================================================
+// tests/cases/58_macros.zr — `macro_rules!` 声明式宏
+//
+// 覆盖：
+//   - 单臂 / 多臂（先匹配到的胜出）
+//   - `$x:expr` / `$x:ident` / `$x:ty` / `$x:tt` 片段
+//   - 展开结果是表达式 / 语句
+//   - 宏套宏
+//   - 宏定义来自 `use` 引入的标准库模块
+//=============================================================================
+
+// 单臂：把参数翻倍。
+macro_rules! double {
+    ($x:expr) => { $x * 2 };
+}
+
+// 多臂：字面量优先于通用臂。
+macro_rules! classify {
+    (0) => { 100 };
+    ($n:expr) => { 200 };
+}
+
+// `$ty` 片段：按类型产生零值。
+macro_rules! zero_of {
+    ($t:ty) => { 0 as $t };
+}
+
+// `$ty` + `$expr`：带类型的转换。
+macro_rules! as_type {
+    ($t:ty, $v:expr) => { $v as $t };
+}
+
+// 展开成语句（不是表达式）。
+macro_rules! check {
+    ($cond:expr, $code:expr) => { if $cond { return $code; } };
+}
+
+// `$tt` 片段：单个记号。
+macro_rules! ident_of {
+    ($i:tt) => { $i };
+}
+
+// 宏套宏：展开结果里还有宏调用。
+macro_rules! quad {
+    ($x:expr) => { double!(double!($x)) };
+}
+
+fn main() -> i32 {
+    // 单臂。
+    let d = double!(21);
+    if d != 42 { return 1; }
+
+    // 多臂：字面量臂先命中。
+    let c0 = classify!(0);
+    if c0 != 100 { return 2; }
+    let c5 = classify!(5);
+    if c5 != 200 { return 3; }
+
+    // `$ty` 片段。
+    let z = zero_of!(i64);
+    if z != 0 { return 4; }
+    let t = as_type!(i64, 7);
+    if t != 7 { return 5; }
+
+    // 展开成语句。
+    check!(d != 42, 6);
+    check!(c0 != 100, 7);
+
+    // `$tt` 片段：单个记号（这里替换成一个已存在的局部变量名）。
+    let id = ident_of!(d);
+    if id != 42 { return 8; }
+
+    // 宏套宏。
+    let q = quad!(3);
+    if q != 12 { return 9; }
+
+    return 0;
+}

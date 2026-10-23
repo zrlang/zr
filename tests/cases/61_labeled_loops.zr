@@ -1,0 +1,127 @@
+//=============================================================================
+// tests/cases/61_labeled_loops.zr — 带标签的 break / continue 与嵌套循环
+//
+// 覆盖：
+//   - Zig 风格标签 `outer: loop { .. }` / `outer: while .. { .. }`
+//   - Rust 风格标签 `'outer: loop { .. }`
+//   - `break label` / `continue label` 跳到指定循环
+//   - 无标签的 break / continue 仍作用于最内层
+//   - 嵌套循环里 `loop { while .. { } break; }` —— break 必须落在
+//     外层循环的出口，而不是被循环体的回边冲掉（曾经是死循环）
+//
+// 每个检查拆成小函数：32 位目标的栈帧有上限。
+//=============================================================================
+
+/// 无条件跳出的最外层循环之后再执行下一句。
+fn check_break_outer_after_inner() -> i32 {
+    let mut n: i32 = 0;
+    loop {
+        let mut i: i32 = 0;
+        while i < 3 {
+            i = i + 1;
+            n = n + 1;
+        }
+        break;
+    }
+    // 内层 while 跑 3 次。
+    if n != 3 { return 1; }
+    return 0;
+}
+
+/// `continue outer` 跳过内层剩余部分，重新进入外层循环。
+fn check_continue_outer() -> i32 {
+    let mut total: i32 = 0;
+    let mut a: i32 = 0;
+    'outer: while a < 4 {
+        a = a + 1;
+        let mut b: i32 = 0;
+        while b < 4 {
+            b = b + 1;
+            if b == 2 { continue 'outer; }
+            total = total + 1;
+        }
+    }
+    // a=1 与 a=2 各贡献 1（b=1），a=3 时 b=1 后 continue（贡献 1），
+    // a=4 同理贡献 1 —— 共 4。
+    if total != 4 { return 1; }
+    return 0;
+}
+
+/// `break outer` 从内层直接跳出外层。
+fn check_break_outer_from_inner() -> i32 {
+    let mut n: i32 = 0;
+    let mut a: i32 = 0;
+    outer: loop {
+        a = a + 1;
+        let mut b: i32 = 0;
+        while b < 10 {
+            b = b + 1;
+            if b == 2 { break outer; }
+            n = n + 1;
+        }
+    }
+    // 只跑一轮：b=1 时 n+1，b=2 时跳出。
+    if a != 1 { return 1; }
+    if n != 1 { return 2; }
+    return 0;
+}
+
+/// Zig 风格的 `label:` 作用在 while 上。
+fn check_zig_label_while() -> i32 {
+    let mut out: i32 = 0;
+    let mut i: i32 = 0;
+    outer: while i < 5 {
+        i = i + 1;
+        if i == 3 { break outer; }
+        out = out + i;
+    }
+    if out != 3 { return 1; }
+    return 0;
+}
+
+/// 无标签的 break / continue 仍然只看最内层。
+fn check_unlabeled_innermost() -> i32 {
+    let mut n: i32 = 0;
+    let mut i: i32 = 0;
+    while i < 3 {
+        i = i + 1;
+        let mut j: i32 = 0;
+        while j < 10 {
+            j = j + 1;
+            if j == 2 { break; }
+            n = n + 1;
+        }
+        n = n + 100;
+    }
+    // 每轮内层贡献 1，再 +100，共 3*101。
+    if n != 303 { return 1; }
+    return 0;
+}
+
+/// `continue` 在嵌套循环里只影响内层：内层完整跑完。
+fn check_unlabeled_continue() -> i32 {
+    let mut n: i32 = 0;
+    let mut i: i32 = 0;
+    while i < 3 {
+        i = i + 1;
+        let mut j: i32 = 0;
+        while j < 5 {
+            j = j + 1;
+            if j == 3 { continue; }
+            n = n + 1;
+        }
+    }
+    // 每轮内层贡献 4，共 12。
+    if n != 12 { return 1; }
+    return 0;
+}
+
+fn main() -> i32 {
+    if check_break_outer_after_inner() != 0 { return 1; }
+    if check_continue_outer() != 0 { return 2; }
+    if check_break_outer_from_inner() != 0 { return 3; }
+    if check_zig_label_while() != 0 { return 4; }
+    if check_unlabeled_innermost() != 0 { return 5; }
+    if check_unlabeled_continue() != 0 { return 6; }
+    return 0;
+}

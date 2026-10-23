@@ -49,13 +49,17 @@ impl Parser {
                 ty = Type::ErrorUnion(Box::new(ty), Box::new(err_ty));
             } else if self.match_kind(&TokenKind::LBracket) {
                 if self.match_kind(&TokenKind::RBracket) {
-                    // `[]T` → 切片（需要重新解析元素类型放在前面）
-                    // 语法约定：先写 `[]T` 表示切片，这里采用「元素类型在后」
-                    // 简化实现：假定 `[T]` 为数组，长度由后续 `;` 提供
+                    // `[]T` / `[]const T` / `[]mut T` → 切片（元素类型在后）。
                     let _ = ty;
+                    let mutability = if self.match_kind(&TokenKind::KwMut) {
+                        Mutability::Mutable
+                    } else {
+                        let _ = self.match_kind(&TokenKind::KwConst);
+                        Mutability::Immutable
+                    };
                     let elem = self.parse_type()?;
                     self.consume(&TokenKind::RBracket, "expected ']'")?;
-                    ty = Type::Slice(Box::new(elem), crate::parser::ast::Mutability::Immutable);
+                    ty = Type::Slice(Box::new(elem), mutability);
                 } else {
                     let elem = self.parse_type()?;
                     if self.match_kind(&TokenKind::Semicolon) {
@@ -136,14 +140,16 @@ impl Parser {
         // 数组 / 切片：`[T; N]` / `[T]`
         if self.match_kind(&TokenKind::LBracket) {
             if self.match_kind(&TokenKind::RBracket) {
-                // `[]const T` / `[]T` —— 右括号已经吃掉了，这里只解析元素
-                // 类型，不再消费第二个右括号。
-                let _ = self.match_kind(&TokenKind::KwConst);
+                // `[]const T` / `[]mut T` / `[]T` —— 右括号已经吃掉了，
+                // 这里只解析元素类型，不再消费第二个右括号。
+                let mutability = if self.match_kind(&TokenKind::KwMut) {
+                    Mutability::Mutable
+                } else {
+                    let _ = self.match_kind(&TokenKind::KwConst);
+                    Mutability::Immutable
+                };
                 let elem = self.parse_type()?;
-                return Ok(Type::Slice(
-                    Box::new(elem),
-                    crate::parser::ast::Mutability::Immutable,
-                ));
+                return Ok(Type::Slice(Box::new(elem), mutability));
             }
             let elem = self.parse_type()?;
             let len = if self.match_kind(&TokenKind::Semicolon) {

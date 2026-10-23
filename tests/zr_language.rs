@@ -155,12 +155,16 @@ fn main() -> i32 {
 #[test]
 fn extern_c_write_prints_string_literal() {
     let zr = env!("CARGO_BIN_EXE_zr");
+    // 运行时里的 `zr_write(fd, buf, count)` 收的是**瘦指针** `*const u8`。
+    // zr 的 `str` 是胖指针（数据指针 + 长度，占两个寄存器），直接当实参
+    // 传过去寄存器会对不上——所以这里按真实签名声明，再取 `s.ptr`。
     let source = r#"extern "C" {
-    fn zr_write(fd: i32, buf: str, count: i64) -> i64;
+    fn zr_write(fd: i32, buf: *const u8, count: i64) -> i64;
 }
 
 fn main() -> i32 {
-    let n = zr_write(1, "hello, extern!\n", 15);
+    let s = "hello, extern!\n";
+    let n = zr_write(1, s.ptr, 15);
     if n != 15 { return 1; }
     return 0;
 }

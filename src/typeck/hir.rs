@@ -217,23 +217,39 @@ pub enum ExprKind {
     /// 索引表达式必须保留。早先只存了 receiver，`s[i]` 的 `i` 在类型检查
     /// 之后就被丢弃，MIR 侧无从计算地址。
     Index(Box<HirExpr>, Box<HirExpr>),
+    /// 定长数组到切片的隐式转换：`[T; N]` -> `[]T`。
+    ///
+    /// 运行期要补出 `(ptr, len)` 这对胖指针，不是空操作。
+    ArrayToSlice(Box<HirExpr>),
+    /// 切片：`receiver[start..end]` / `[..end]` / `[start..]` / `[..]`。
+    ///
+    /// 结果在运行期是 `(ptr, len)` 一对。缺失的边界是 `None`；
+    /// `inclusive` 表示源语法用了 `..=`。
+    IndexRange(
+        Box<HirExpr>,
+        Option<Box<HirExpr>>,
+        Option<Box<HirExpr>>,
+        bool,
+    ),
     /// 块表达式。
     Block(HirBlock),
     /// `if` 表达式。
     If(Box<HirExpr>, HirBlock, Option<HirBlock>),
     /// `match` 表达式（已验证穷尽性）。
     Match,
-    /// `while` 循环。
-    While(Box<HirExpr>, HirBlock),
-    /// `loop` 无限循环。
-    Loop(HirBlock),
-    /// `break`（含标签与值）：跳到最内层循环的出口。
-    Break,
-    /// `continue`：跳回最内层循环的回边。
+    /// `while` 循环。第一个字段是可选标签（`outer: while ..`）。
+    While(Option<String>, Box<HirExpr>, HirBlock),
+    /// `loop` 无限循环。第一个字段是可选标签（`outer: loop ..`）。
+    Loop(Option<String>, HirBlock),
+    /// `break`：跳到对应循环的出口。
+    ///
+    /// 携带可选标签：`break 'outer` 跳指定循环，无标签跳最内层。
+    Break(Option<String>),
+    /// `continue`：跳回对应循环的回边。
     ///
     /// 必须和 `Break` 分开。之前两者共用 `Break`，于是 `continue` 会跳出
-    /// 循环而不是回到循环头。
-    Continue,
+    /// 循环而不是回到循环头。携带可选标签，语义同 `Break`。
+    Continue(Option<String>),
     /// `return`。
     Return(Option<Box<HirExpr>>),
     /// `defer` 延迟表达式。

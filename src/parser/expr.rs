@@ -54,6 +54,86 @@ impl Parser {
         self.parse_expr_bp(Prec(0))
     }
 
+    /// 解析方括号里的内容：`i`、`a..b`、`a..=b`、`a..`、`..b`、`..`。
+    ///
+    /// 开区间用一个空元组 `()` 当"缺失边界"的哨兵（类型检查阶段转为
+    /// `IndexRange` 的 `None`）。解析起点时用略高于 `..` 的绑定力，避免
+    /// `..` 被当成普通的二元范围运算吃掉右侧直到 `]`。
+    fn parse_index_operand(&mut self) -> Result<Expression, CompileError> {
+        let span = self.peek().span;
+        let missing = || Expression::Tuple(Vec::new(), span);
+        let starts_open = self.check(&TokenKind::DotDot) || self.check(&TokenKind::DotDotEq);
+        if starts_open {
+            let inclusive = self.match_kind(&TokenKind::DotDotEq);
+            if !inclusive {
+                self.advance(); // `..`
+            }
+            let end = if self.check(&TokenKind::RBracket) {
+                missing()
+            } else {
+                self.parse_expr_bp(Prec(Prec::OR.0 + 1))?
+            };
+            let op = if inclusive {
+                BinaryOp::RangeInclusive
+            } else {
+                BinaryOp::Range
+            };
+            return Ok(Expression::Binary(
+                Box::new(missing()),
+                op,
+                Box::new(end),
+                span,
+            ));
+        }
+
+        let start = self.parse_expr_bp(Prec(Prec::OR.0 + 1))?;
+        let has_range = self.check(&TokenKind::DotDot) || self.check(&TokenKind::DotDotEq);
+        if !has_range {
+            return Ok(start);
+        }
+        let inclusive = self.match_kind(&TokenKind::DotDotEq);
+        if !inclusive {
+            self.advance(); // `..`
+        }
+        let end = if self.check(&TokenKind::RBracket) {
+            missing()
+        } else {
+            self.parse_expr_bp(Prec(Prec::OR.0 + 1))?
+        };
+        let op = if inclusive {
+            BinaryOp::RangeInclusive
+        } else {
+            BinaryOp::Range
+        };
+        Ok(Expression::Binary(
+            Box::new(start),
+            op,
+            Box::new(end),
+            span,
+        ))
+    }
+
+    /// 解析 `break` / `continue` 后面可能跟的循环标签。
+    ///
+    /// - `'outer`（Lifetime token）无条件当标签；
+    /// - 裸标识符只有在与外层已声明的标签同名时才算标签，
+    ///   否则留给"带值的 break"（`loop { break 42; }`）。
+    fn parse_loop_label(&mut self) -> Option<String> {
+        if let TokenKind::Lifetime(name) = &self.peek().kind {
+            let name = name.clone();
+            self.advance();
+            return Some(name);
+        }
+        if let TokenKind::Ident(name) = &self.peek().kind {
+            if self.labels.iter().rev().any(|l| l == name) {
+                let name = name.clone();
+                self.advance();
+                return Some(name);
+            }
+        }
+        None
+    }
+
     /// 解析表达式，直到遇到优先级 ≤ `min_prec` 的运算符为止。
     fn parse_expr_bp(&mut self, min_prec: Prec) -> Result<Expression, CompileError> {
         let mut left = self.parse_prefix()?;
@@ -118,7 +198,7 @@ impl Parser {
                 }
                 TokenKind::LBracket => {
                     self.advance(); // [
-                    let index = self.parse_nested_expr()?;
+                    let index = self.parse_index_operand()?;
                     self.consume(&TokenKind::RBracket, "expected ']'")?;
                     left = Expression::Index(Box::new(left), Box::new(index), op_span);
                     continue;
@@ -260,9 +340,7 @@ impl Parser {
 
         // ===== while 表达式 =====
         if self.match_kind(&TokenKind::KwWhile) {
-            return self
-                .parse_while()
-                .map(|(c, b, e, s)| Expression::While(c, b, e, s));
+            return self.parse_while();
         }
 
         // ===== for 表达式 =====
@@ -278,8 +356,8 @@ impl Parser {
 
         // ===== break / continue / return =====
         if self.match_kind(&TokenKind::KwBreak) {
-            let label = None;
-            let value = if self.check_expr_start() {
+            let label = self.parse_loop_label();
+            let value = if label.is_none() && self.check_expr_start() {
                 Some(Box::new(self.parse_expression()?))
             } else {
                 None
@@ -287,7 +365,8 @@ impl Parser {
             return Ok(Expression::Break(label, value, span));
         }
         if self.match_kind(&TokenKind::KwContinue) {
-            return Ok(Expression::Continue(None, span));
+            let label = self.parse_loop_label();
+            return Ok(Expression::Continue(label, span));
         }
         if self.match_kind(&TokenKind::KwReturn) {
             let value = if !self.check(&TokenKind::Semicolon)
@@ -411,7 +490,20 @@ impl Parser {
             return Ok(Expression::Lambda(params, ret, body, span));
         }
 
-        // ===== 有标签的块 =====
+        // ===== 有标签的块 / 循环 =====
+        //
+        // 标签语法同时接受 Zig 风格的 `outer: loop { .. }` 和 Rust 风格的
+        // `'outer: loop { .. }`。`break` / `continue` 里的标签在解析期记在
+        // `self.labels` 里，用来和"带值的 break"区分。
+        if let TokenKind::Lifetime(label) = &kind {
+            let label = label.clone();
+            self.advance(); // 'label
+            self.consume(&TokenKind::Colon, "expected ':' after label")?;
+            self.labels.push(label.clone());
+            let expr = self.parse_expression()?;
+            self.labels.pop();
+            return Ok(Expression::Labeled(label, Box::new(expr), span));
+        }
         if let TokenKind::Ident(name) = &kind {
             if self
                 .peek_n(1)
@@ -421,7 +513,9 @@ impl Parser {
                 let label = name.clone();
                 self.advance(); // ident
                 self.advance(); // :
+                self.labels.push(label.clone());
                 let expr = self.parse_expression()?;
+                self.labels.pop();
                 return Ok(Expression::Labeled(label, Box::new(expr), span));
             }
         }
@@ -468,6 +562,51 @@ impl Parser {
                 }
                 self.consume(&TokenKind::RParen, "expected ')' to close `intrinsic!`")?;
                 return Ok(Expression::Intrinsic(kind, types, operands, span));
+            }
+            // ===== `macro_rules!` 宏调用 =====
+            // 形如：`double!(21)`、`max!(a, b)`。
+            //
+            // 参数按**记号序列**原样收集：宏的匹配模式是记号级的
+            // （`($x:expr)`），要等整份程序解析完、宏定义都齐了之后
+            // 才能匹配并展开，所以这里不能直接解析成表达式。
+            if self.check(&TokenKind::Bang) {
+                self.advance(); // !
+                // 允许 `name! { ... }` 与 `name! [ ... ]` 两种定界符。
+                let close = match self.peek().kind {
+                    TokenKind::LParen => TokenKind::RParen,
+                    TokenKind::LBrace => TokenKind::RBrace,
+                    TokenKind::LBracket => TokenKind::RBracket,
+                    _ => {
+                        return Err(self.expected(
+                            "expected '(', '{' or '[' after macro name",
+                            &self.peek().kind,
+                        ))
+                    }
+                };
+                self.advance(); // 开定界符
+                let mut args: Vec<TokenKind> = Vec::new();
+                let mut depth: i32 = 0;
+                loop {
+                    if self.is_at_end() {
+                        return Err(self.expected("unterminated macro call", &close));
+                    }
+                    if self.check(&close) && depth == 0 {
+                        self.advance(); // 闭定界符
+                        break;
+                    }
+                    let k = self.advance().kind;
+                    match &k {
+                        TokenKind::LParen | TokenKind::LBrace | TokenKind::LBracket => depth += 1,
+                        TokenKind::RParen | TokenKind::RBrace | TokenKind::RBracket => depth -= 1,
+                        _ => {}
+                    }
+                    args.push(k);
+                }
+                return Ok(Expression::MacroCall {
+                    name: n,
+                    args,
+                    span,
+                });
             }
             if self.match_kind(&TokenKind::ColonColon) {
                 // 泛型实参（turbofish）：`size_of::<T>()` 的 `::<T>`
@@ -635,10 +774,61 @@ impl Parser {
         Ok((expr, arms, span))
     }
 
-    fn parse_while(
-        &mut self,
-    ) -> Result<(Box<Expression>, Block, Option<Block>, Span), CompileError> {
+    fn parse_while(&mut self) -> Result<Expression, CompileError> {
         let span = self.previous().span;
+
+        // `while let PAT = EXPR { body }`：脱糖成
+        // `loop { if let PAT = EXPR { body } else { break; } }`。
+        // 这样每轮都重新求值 EXPR，`continue` 也自然回到循环头。
+        if self.match_kind(&TokenKind::KwLet) {
+            let pat = self.parse_pattern()?;
+            self.consume(&TokenKind::Eq, "expected '=' after pattern in while let")?;
+            let saved_block = self.no_block_expr;
+            let saved_struct = self.no_struct_literal;
+            self.no_block_expr = true;
+            self.no_struct_literal = true;
+            let scrutinee = self.parse_expression()?;
+            self.no_block_expr = saved_block;
+            self.no_struct_literal = saved_struct;
+            let body = self.parse_block()?;
+            // 先把被匹配值绑到一个临时量：每轮只求值一次，且让
+            // 枚举/结构体的聚合返回值先落到局部量里（直接在
+            // `EnumTag(<调用>)` 里用会在 MIR 侧降成 Unit）。
+            let scrut_name = format!("__while_let_{}", span.start);
+            let bind_scrut = Statement::Let(
+                Pattern::Binding(
+                    scrut_name.clone(),
+                    crate::parser::ast::Mutability::Immutable,
+                    None,
+                    span,
+                ),
+                None,
+                Some(scrutinee),
+                span,
+            );
+            let break_expr = Expression::Break(None, None, span);
+            let else_block = Block {
+                stmts: vec![Statement::Expr(break_expr, span)],
+                tail: None,
+                span,
+            };
+            let scrut_ref = Expression::Variable(scrut_name, span);
+            let iflet = Expression::IfLet(
+                pat,
+                Box::new(scrut_ref),
+                body,
+                Some(Box::new(Expression::Block(else_block, span))),
+                span,
+            );
+            let loop_block = Block {
+                stmts: vec![bind_scrut, Statement::Expr(iflet, span)],
+                tail: None,
+                span,
+            };
+            // 脱糖完成，`else` 分支由 `break` 提供。
+            return Ok(Expression::Loop(loop_block, span));
+        }
+
         let cond = Box::new(self.parse_condition()?);
         let body = self.parse_block()?;
         let else_body = if self.match_kind(&TokenKind::KwElse) {
@@ -646,7 +836,7 @@ impl Parser {
         } else {
             None
         };
-        Ok((cond, body, else_body, span))
+        Ok(Expression::While(cond, body, else_body, span))
     }
 
     fn parse_for(&mut self) -> Result<Expression, CompileError> {
@@ -1016,7 +1206,7 @@ impl Parser {
 
     /// 尝试解析一个类型。若当前 token 不是有效的类型开头，则返回 None 且不消耗 token。
     /// 与 `parse_type` 的区别：失败时不报错、不前进。
-    fn try_parse_type(&mut self) -> Option<Type> {
+    pub fn try_parse_type(&mut self) -> Option<Type> {
         // 通过 peek 判断是否是类型开头：标识符、基础类型关键字、'*'、'&'、'('、'[' 等。
         use crate::lexer::TokenKind::*;
         match self.peek().kind {

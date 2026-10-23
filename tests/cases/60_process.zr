@@ -1,0 +1,36 @@
+//=============================================================================
+// tests/cases/60_process.zr — 进程
+//
+// 覆盖：
+//   - 取当前进程 ID
+//   - fork 后父子进程走不同的分支
+//   - wait 回收子进程
+//=============================================================================
+
+use process::{fork, id, wait, exit};
+use io::write_bytes;
+
+fn main() -> i32 {
+    // 当前进程 ID：正数。
+    let my_pid = id();
+    if my_pid <= 0 { return 1; }
+
+    // fork：子进程返回 0，父进程返回子进程 PID。
+    let pid = fork();
+    if pid < 0 { return 2; }
+
+    if pid == 0 {
+        // 子进程：直接退出，退出码 7。
+        exit(7);
+    }
+
+    // 父进程：等待子进程结束。
+    let mut status: i32 = 0;
+    let got = wait(pid, &mut status, 0);
+    if got != pid { return 3; }
+
+    // 子进程退出码被编码进 status：POSIX 的 wait 状态是 `code << 8`。
+    if ((status >> 8) & 0xff) != 7 { return 4; }
+
+    return 0;
+}

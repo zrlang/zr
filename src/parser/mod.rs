@@ -52,6 +52,11 @@ pub struct Parser {
     /// 的起始（Rust 的 "no struct literal in condition position" 规则）。
     no_struct_literal: bool,
     no_block_expr: bool,
+    /// 当前正在解析的循环标签栈（由内向外）。
+    ///
+    /// 用来区分 `break outer;`（跳标签）和 `loop { break value; }`
+    /// （带值的 break）：只有标识符与已声明的标签同名时才当标签。
+    labels: Vec<String>,
 }
 
 impl Parser {
@@ -62,6 +67,7 @@ impl Parser {
             pos: 0,
             no_struct_literal: false,
             no_block_expr: false,
+            labels: Vec::new(),
         }
     }
 
@@ -545,6 +551,16 @@ impl Parser {
         } else {
             None
         };
+        // `let PAT = EXPR else { .. };` —— 模式不匹配时执行 else 块。
+        // else 必须发散，所以只允许带初始化的形式。
+        if self.match_kind(&TokenKind::KwElse) {
+            let Some(init_expr) = init else {
+                return Err(CompileError::new("`let ... else` needs an initializer").with_span(span));
+            };
+            let else_block = self.parse_block()?;
+            self.consume(&TokenKind::Semicolon, "expected ';' after `let ... else`")?;
+            return Ok(Statement::LetElse(pattern, ty, init_expr, else_block, span));
+        }
         self.consume(&TokenKind::Semicolon, "expected ';' after binding")?;
         // 根据可变性返回 Let 或 Var
         if mutable
@@ -765,16 +781,19 @@ impl Parser {
 
 /// 判断表达式是否"自带块"——这类表达式在语句位置可以省略分号。
 fn is_block_like(expr: &Expression) -> bool {
-    matches!(
-        expr,
+    match expr {
         Expression::If(..)
-            | Expression::IfLet(..)
-            | Expression::Match(..)
-            | Expression::While(..)
-            | Expression::For(..)
-            | Expression::Loop(..)
-            | Expression::Block(..)
-    )
+        | Expression::IfLet(..)
+        | Expression::Match(..)
+        | Expression::While(..)
+        | Expression::For(..)
+        | Expression::Loop(..)
+        | Expression::Block(..) => true,
+        // 标签只是循环/块的修饰：`outer: loop { .. }` 在语句位置
+        // 同样不需要分号，按内层表达式判断。
+        Expression::Labeled(_, inner, _) => is_block_like(inner),
+        _ => false,
+    }
 }
 
 /// cfg 谓词的解析结果。

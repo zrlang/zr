@@ -2,15 +2,18 @@
 // std/thread.zr — 线程支持
 //
 // 提供 Rust 风格的线程 API：
-//   thread::spawn(|| { ... })
-//   thread::current().id()
-//   thread::sleep(duration)
+//   thread::start_thread(fn)
+//   thread::current_id()
+//   thread::sleep_ms(n)
+//
+// 平台支持：Linux 用 `clone` 系统调用起真线程；macOS 目前的运行时只提供
+// 占位实现（`zr_thread_create` 返回 ENOSYS），调用会 panic。
 //=============================================================================
 
 //----- 外部运行时符号 ----------------------------------------------------------
 
 extern "C" {
-    fn zr_thread_create(start: fn(*mut void), arg: *mut void) -> i32;
+    fn zr_thread_create(start: fn(*mut void), arg: *mut void) -> *mut void;
     fn zr_thread_join(thread: *mut void, retval: *mut *mut void) -> i32;
     fn zr_thread_self() -> u64;
     fn zr_panic(msg: *const u8, len: usize) -> !;
@@ -18,14 +21,17 @@ extern "C" {
     fn zr_dealloc(ptr: *mut void, size: usize, align: usize);
 }
 
-/// 内置函数
+/// ThreadHandle 的大小：一个函数指针（8 字节）+ 一个 i32（4 字节）。
 fn size_of_thread_handle() -> usize {
-    16  // ThreadHandle 大小
+    16
 }
 
 /// 线程句柄
 pub struct Thread {
+    /// 运行时的线程句柄槽（`zr_thread_create` 返回）。
     handle: *mut void,
+    /// 用户函数与它的返回值槽。
+    slot: *mut ThreadHandle,
     joined: bool,
 }
 
@@ -47,21 +53,18 @@ pub fn sleep_ms(ms: u64) {
 
 /// 启动一个新线程
 pub fn start_thread(f: fn()) -> Thread {
-    let handle = alloc_thread_handle();
-    let result = zr_thread_create(thread_entry_impl, handle as *mut void);
-    if result != 0 {
-        dealloc_thread_handle(handle);
+    let slot = alloc_thread_handle();
+    (*slot).func = f;
+    let handle = zr_thread_create(thread_entry_impl, slot as *mut void);
+    if handle == 0 as *mut void {
+        dealloc_thread_handle(slot);
         let msg = "thread spawn failed";
         zr_panic(msg.ptr, msg.len);
     }
-    Thread { handle, joined: false }
+    Thread { handle, slot, joined: false }
 }
 
-// 线程入口点
-extern "C" {
-    fn thread_entry(arg: *mut void);
-}
-
+/// 线程真正跑的函数：从句柄里取出用户给的函数并调用。
 fn thread_entry_impl(arg: *mut void) {
     let handle = arg as *mut ThreadHandle;
     let f = (*handle).func;
@@ -69,6 +72,7 @@ fn thread_entry_impl(arg: *mut void) {
     (*handle).result = 0;
 }
 
+/// 线程启动时用的数据结构：一个函数指针 + 一个返回值槽。
 struct ThreadHandle {
     func: fn(),
     result: i32,
@@ -84,17 +88,11 @@ fn dealloc_thread_handle(ptr: *mut ThreadHandle) {
 }
 
 impl Thread {
+    /// 等待线程结束，返回 0 表示成功。
     pub fn join(self) -> i32 {
         let mut retval: *mut void = 0 as *mut void;
         let result = zr_thread_join(self.handle, &mut retval);
         self.joined = true;
         result
-    }
-}
-
-impl Drop for Thread {
-    fn drop(&mut self) {
-        if !self.joined {
-        }
     }
 }

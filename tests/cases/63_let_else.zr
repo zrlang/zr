@@ -1,0 +1,87 @@
+//=============================================================================
+// tests/cases/63_let_else.zr — `let ... else` 绑定
+//
+// `let PAT = EXPR else { .. };` 的语义：
+//   - EXPR 求值一次，落到一个临时量；
+//   - PAT 匹配则把各绑定写进当前作用域，继续执行后面的语句；
+//   - 不匹配则执行 else 块（必须发散：return / break / panic 等）。
+//
+// 覆盖：
+//   - 枚举变体模式的绑定
+//   - 不匹配时走 else
+//   - 带类型标注
+//   - 循环体内使用
+//   - else 里不能引用模式绑定（编译期就该报错，这里只验证正向用法）
+//=============================================================================
+
+enum Step {
+    Value(i32),
+    Done,
+}
+
+fn mk(i: i32) -> Step {
+    if i < 3 { return Step::Value(i + 1); }
+    return Step::Done;
+}
+
+/// 匹配成功：绑定可用。
+fn check_match() -> i32 {
+    let s = mk(1);
+    let Step::Value(v) = s else { return 1; };
+    if v != 2 { return 2; }
+    return 0;
+}
+
+/// 不匹配：走 else。
+fn check_else() -> i32 {
+    let s = mk(9);
+    let Step::Value(v) = s else { return 42; };
+    // 走不到这里。
+    return v;
+}
+
+/// 带类型标注。
+fn check_annotated() -> i32 {
+    let s: Step = mk(0);
+    let Step::Value(v) = s else { return 1; };
+    if v != 1 { return 2; }
+    return 0;
+}
+
+/// 循环体内每轮都可绑定。
+fn check_in_loop() -> i32 {
+    let mut n: i32 = 0;
+    let mut i: i32 = 0;
+    while i < 3 {
+        let s = mk(i);
+        let Step::Value(v) = s else { return 1; };
+        n = n + v;
+        i = i + 1;
+    }
+    // v 依次是 1、2、3。
+    if n != 6 { return 2; }
+    return 0;
+}
+
+/// else 里可以 break 外层循环。
+fn check_else_break() -> i32 {
+    let mut n: i32 = 0;
+    let mut i: i32 = 0;
+    loop {
+        let s = mk(i);
+        let Step::Value(v) = s else { break; };
+        n = n + v;
+        i = i + 1;
+    }
+    if n != 6 { return 1; }
+    return 0;
+}
+
+fn main() -> i32 {
+    if check_match() != 0 { return 1; }
+    if check_else() != 42 { return 2; }
+    if check_annotated() != 0 { return 3; }
+    if check_in_loop() != 0 { return 4; }
+    if check_else_break() != 0 { return 5; }
+    return 0;
+}

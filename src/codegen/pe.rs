@@ -345,7 +345,7 @@ mod tests {
         let mut unit = sample_unit(OutputKind::Relocatable);
         unit.relocations
             .push(Relocation::new(1, 0, 5, "zr_exit", RelocationKind::PcRel32));
-        crate::codegen::objfile::add_extern_symbols(&mut unit, target.os());
+        crate::codegen::objfile::add_extern_symbols(&mut unit, target(Arch::X86_64).os());
         let bytes = assemble_coff(&target(Arch::X86_64), &unit).unwrap();
 
         // 节头的 NumberOfRelocations 应为 1

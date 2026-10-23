@@ -18,7 +18,20 @@ pub mod narrow;
 pub mod test_harness;
 
 use crate::typeck::hir::{self, HirModule};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+
+/// zr 用户函数在目标文件里的符号名。
+///
+/// 模块系统把名字摊平了，同一个名字在全局命名空间里只可能出现一次，
+/// 于是 `process::fork` 里的函数会占用 `fork` 这个符号——和 libc 撞名。
+/// 链接器按先到先得解析，运行时里的 `call _fork` 会被绑到 zr 的 fork，
+/// 于是 `fork` → `zr_process_fork` → `fork` 无限递归。
+///
+/// 加 `z_` 前缀把 zr 的符号挪出 C 符号空间；`main` 是进程入口、
+/// `extern "C"` 声明的函数由外部提供，两者都不改名。
+pub fn mangled_symbol(name: &str) -> String {
+    format!("z_{name}")
+}
 
 /// 一个 MIR 模块。
 #[derive(Debug, Clone, Default)]
@@ -234,13 +247,64 @@ pub enum MirUnaryOp {
 /// 1. 为每个函数建立基本块（入口块 + 控制流拆分的后续块）。
 /// 2. 把 HIR 表达式逐条降级为 MIR 指令，控制结构脱糖为终结器。
 pub fn lower(hir: &HirModule) -> MirModule {
+    // zr 定义的用户函数要改符号名。
+    //
+    // 模块系统把名字**摊平**了：`process::fork` 里的函数在目标文件里的
+    // 符号名就是 `fork`。而 `fork` 恰好也是 libc 的符号名——链接器会让
+    // 运行时的 `call _fork` 调到 zr 的 fork，fork 又调 zr_process_fork，
+    // 递归到爆栈。`exec` / `wait` / `exit` / `write` / `read` 全是同样的坑。
+    //
+    // 规则：
+    // - `main` 保持原样（进程入口符号）；
+    // - `extern "C"` 声明的函数保持原样（由 C 提供，zr 不定义它们）；
+    // - 其余 zr 函数加 `z_` 前缀，落到 C 符号空间之外。
+    let mut user_fns: HashSet<String> = HashSet::new();
+    for f in &hir.functions {
+        if f.body.is_none() {
+            continue; // extern 声明：符号由外部提供
+        }
+        if f.name == "main" {
+            continue; // 入口符号
+        }
+        user_fns.insert(f.name.clone());
+    }
+    let mut def_names = hir.def_names.clone();
+    if !user_fns.is_empty() {
+        for name in def_names.values_mut() {
+            if user_fns.contains(name) {
+                *name = mangled_symbol(name);
+            }
+        }
+    }
+    // Drop 析构函数的映射表里存的也是函数名，要一起改。
+    let drop_impls: HashMap<hir::DefId, String> = hir
+        .drop_impls
+        .iter()
+        .map(|(ty, name)| {
+            let name = if user_fns.contains(name) {
+                mangled_symbol(name)
+            } else {
+                name.clone()
+            };
+            (*ty, name)
+        })
+        .collect();
+
     let mut functions = Vec::with_capacity(hir.functions.len());
+    // 形参表按**改名后**的函数名索引：MIR 里调用点用的是改名后的名字，
+    // 这里也必须用同一个名字，否则查不到形参类型 —— `&mut self` 会被当成
+    // 按值实参，方法里对 self 的修改就落在副本上，调用方看不到。
     let fn_params: HashMap<String, Vec<hir::Ty>> = hir
         .functions
         .iter()
         .map(|f| {
+            let name = if user_fns.contains(&f.name) {
+                mangled_symbol(&f.name)
+            } else {
+                f.name.clone()
+            };
             (
-                f.name.clone(),
+                name,
                 f.params.iter().map(|p| p.ty.clone()).collect(),
             )
         })
@@ -248,13 +312,17 @@ pub fn lower(hir: &HirModule) -> MirModule {
 
     for func in &hir.functions {
         if let Some(body) = &func.body {
+            let mut func = func.clone();
+            if user_fns.contains(&func.name) {
+                func.name = mangled_symbol(&func.name);
+            }
             functions.push(builder::lower_function(
-                func,
+                &func,
                 body,
-                &hir.def_names,
+                &def_names,
                 &hir.consts,
                 &hir.type_defs,
-                &hir.drop_impls,
+                &drop_impls,
                 &fn_params,
             ));
         }

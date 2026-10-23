@@ -314,6 +314,17 @@ pub enum Expression {
     Assign(Box<Expression>, AssignOp, Box<Expression>, Span),
     /// 调用。
     Call(Box<Expression>, Vec<Argument>, Span),
+    /// 宏调用：`name!(...)`。
+    ///
+    /// 参数先按**记号序列**存着，等整份程序解析完再由宏展开阶段
+    /// 匹配 `macro_rules!` 的臂并把展开结果解析成真正的表达式。
+    MacroCall {
+        /// 宏名（不含 `!`）。
+        name: String,
+        /// 括号内的记号序列（已去掉最外层括号）。
+        args: Vec<crate::lexer::TokenKind>,
+        span: Span,
+    },
     /// 索引：`a[i]`。
     Index(Box<Expression>, Box<Expression>, Span),
     /// 字段访问：`a.b`。
@@ -507,6 +518,11 @@ pub enum Statement {
     Let(Pattern, Option<Type>, Option<Expression>, Span),
     /// `let mut` 可变绑定。
     Var(Pattern, Option<Type>, Option<Expression>, Span),
+    /// `let PAT = EXPR else { .. };` —— 模式不匹配时走 else 分支。
+    ///
+    /// else 分支必须发散（`return` / `break` / `panic` 等），
+    /// 这样后续语句里模式的绑定才一定已经初始化。
+    LetElse(Pattern, Option<Type>, Expression, Block, Span),
     /// `const` 编译期常量。
     Const(String, Type, Expression, Span),
     /// 表达式语句（结果被丢弃，除非是 `;` 结尾的块）。
@@ -530,8 +546,28 @@ pub enum ModuleItem {
 }
 
 /// 声明式宏定义。
+///
+/// `macro_rules! name { (pattern) => { body }; ... }`
+/// 宏体是**记号序列**（token 序列），不是 AST：展开要在语法分析之前
+/// 把记号拼回去，因此这里保留原始 token。`TokenKind` 自带文本
+/// （`Ident(String)` / `IntLiteral(..)` 等），所以只存 kind 就够了。
 #[derive(Debug, Clone)]
-pub struct MacroDef;
+pub struct MacroDef {
+    /// 宏名（不含 `!`）。
+    pub name: String,
+    /// 各条展开臂。调用时自上而下匹配第一条命中的。
+    pub arms: Vec<MacroArm>,
+    pub span: Span,
+}
+
+/// 宏的一条展开臂。
+#[derive(Debug, Clone)]
+pub struct MacroArm {
+    /// 左侧匹配模式（记号序列）。
+    pub pattern: Vec<crate::lexer::TokenKind>,
+    /// 右侧展开体（记号序列）。
+    pub body: Vec<crate::lexer::TokenKind>,
+}
 
 /// 块 = 一系列语句，最后一个表达式可选。
 #[derive(Debug, Clone, Default)]
@@ -752,6 +788,7 @@ impl Spanned for Expression {
             Expression::Unary(_, _, s) => *s,
             Expression::Assign(_, _, _, s) => *s,
             Expression::Call(_, _, s) => *s,
+            Expression::MacroCall { span, .. } => *span,
             Expression::Index(_, _, s) => *s,
             Expression::Field(_, _, s) => *s,
             Expression::AddrOf(_, _, s) => *s,

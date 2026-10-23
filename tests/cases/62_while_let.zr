@@ -1,0 +1,87 @@
+//=============================================================================
+// tests/cases/62_while_let.zr — `while let` 循环
+//
+// `while let PAT = EXPR { body }` 的语义是每轮重新求值 EXPR，
+// 匹配则执行 body，不匹配则退出循环。等价于
+//
+//     loop { let tmp = EXPR; if let PAT = tmp { body } else { break; } }
+//
+// 覆盖：
+//   - 枚举变体模式作为循环条件
+//   - 循环体里的绑定可用（且是每轮的当前值）
+//   - `continue` 回到循环头、重新求值
+//   - 与循环标签配合
+//=============================================================================
+
+enum Step {
+    Value(i32),
+    Done,
+}
+
+fn step(i: i32) -> Step {
+    if i < 3 { return Step::Value(i); }
+    return Step::Done;
+}
+
+/// 累加 0+1+2，遇到 Done 退出。
+fn check_sum() -> i32 {
+    let mut n: i32 = 0;
+    let mut i: i32 = 0;
+    while let Step::Value(v) = step(i) {
+        n = n + v;
+        i = i + 1;
+    }
+    if n != 3 { return 1; }
+    if i != 3 { return 2; }
+    return 0;
+}
+
+/// 循环体里 `continue` 仍然重新求值被匹配值。
+fn check_continue() -> i32 {
+    let mut count: i32 = 0;
+    let mut i: i32 = 0;
+    while let Step::Value(v) = step(i) {
+        i = i + 1;
+        if v == 1 { continue; }
+        count = count + 1;
+    }
+    // v=0、v=2 计入，v=1 被跳过。
+    if count != 2 { return 1; }
+    return 0;
+}
+
+/// 与标签配合：从 while let 内部跳出外层循环。
+fn check_labeled() -> i32 {
+    let mut n: i32 = 0;
+    let mut i: i32 = 0;
+    outer: loop {
+        while let Step::Value(v) = step(i) {
+            i = i + 1;
+            if v == 2 { break outer; }
+            n = n + v;
+        }
+    }
+    // v=0、v=1 累加，v=2 时跳出。
+    if n != 1 { return 1; }
+    return 0;
+}
+
+/// 条件一开始就不成立：循环体一次也不执行。
+fn check_never_enters() -> i32 {
+    let mut n: i32 = 0;
+    let mut i: i32 = 100;
+    while let Step::Value(v) = step(i) {
+        n = n + v;
+        i = i + 1;
+    }
+    if n != 0 { return 1; }
+    return 0;
+}
+
+fn main() -> i32 {
+    if check_sum() != 0 { return 1; }
+    if check_continue() != 0 { return 2; }
+    if check_labeled() != 0 { return 3; }
+    if check_never_enters() != 0 { return 4; }
+    return 0;
+}

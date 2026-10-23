@@ -412,7 +412,7 @@ pub fn add_extern_symbols(unit: &mut CompilationUnit, target_os: crate::codegen:
         .collect();
     missing.dedup();
 
-    let prefix = if target_os == crate::codegen::target::Os::Macos || target_os == crate::codegen::target::Os::Ios {
+    let prefix = if target_os == crate::codegen::target::Os::Darwin || target_os == crate::codegen::target::Os::Ios {
         "_"
     } else {
         ""

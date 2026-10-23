@@ -256,3 +256,83 @@ heap_cursor:
 #else
     .zero 4
 #endif
+#==============================================================================
+# 文件系统 / 路径 / 时间原语：本平台暂未实现，统一返回 -1。
+# 符号必须存在，否则 `use fs` 的程序链接失败。
+#==============================================================================
+    .text
+
+    .globl zr_mkdir
+zr_mkdir:
+    li      a0, -1
+    ret
+
+    .globl zr_rmdir
+zr_rmdir:
+    li      a0, -1
+    ret
+
+    .globl zr_unlink
+zr_unlink:
+    li      a0, -1
+    ret
+
+    .globl zr_rename
+zr_rename:
+    li      a0, -1
+    ret
+
+    .globl zr_path_exists
+zr_path_exists:
+    li      a0, -1
+    ret
+
+    .globl zr_is_dir
+zr_is_dir:
+    li      a0, -1
+    ret
+
+    .globl zr_file_size
+zr_file_size:
+    li      a0, -1
+    ret
+
+    .globl zr_readdir_count
+zr_readdir_count:
+    li      a0, -1
+    ret
+
+    .globl zr_readdir_name
+zr_readdir_name:
+    li      a0, -1
+    ret
+
+    .globl zr_getcwd
+zr_getcwd:
+    li      a0, -1
+    ret
+
+    .globl zr_kill
+zr_kill:
+    li      a0, -1
+    ret
+
+    .globl zr_execvp
+zr_execvp:
+    li      a0, -1
+    ret
+
+    .globl zr_sleep_ms
+zr_sleep_ms:
+    li      a0, -1
+    ret
+
+    .globl zr_time_ns
+zr_time_ns:
+    li      a0, -1
+    ret
+
+    .globl zr_time_unix_ns
+zr_time_unix_ns:
+    li      a0, -1
+    ret

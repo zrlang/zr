@@ -166,3 +166,83 @@ _zr_dealloc:
 _zr_realloc:
     mov     x1, x2              // realloc(ptr, new_size)
     b       _realloc
+#==============================================================================
+# 文件系统 / 路径 / 时间原语：本平台暂未实现，统一返回 -1。
+# 符号必须存在，否则 `use fs` 的程序链接失败。
+#==============================================================================
+    .text
+
+    .globl _zr_mkdir
+_zr_mkdir:
+    mov     x0, #-1
+    ret
+
+    .globl _zr_rmdir
+_zr_rmdir:
+    mov     x0, #-1
+    ret
+
+    .globl _zr_unlink
+_zr_unlink:
+    mov     x0, #-1
+    ret
+
+    .globl _zr_rename
+_zr_rename:
+    mov     x0, #-1
+    ret
+
+    .globl _zr_path_exists
+_zr_path_exists:
+    mov     x0, #-1
+    ret
+
+    .globl _zr_is_dir
+_zr_is_dir:
+    mov     x0, #-1
+    ret
+
+    .globl _zr_file_size
+_zr_file_size:
+    mov     x0, #-1
+    ret
+
+    .globl _zr_readdir_count
+_zr_readdir_count:
+    mov     x0, #-1
+    ret
+
+    .globl _zr_readdir_name
+_zr_readdir_name:
+    mov     x0, #-1
+    ret
+
+    .globl _zr_getcwd
+_zr_getcwd:
+    mov     x0, #-1
+    ret
+
+    .globl _zr_kill
+_zr_kill:
+    mov     x0, #-1
+    ret
+
+    .globl _zr_execvp
+_zr_execvp:
+    mov     x0, #-1
+    ret
+
+    .globl _zr_sleep_ms
+_zr_sleep_ms:
+    mov     x0, #-1
+    ret
+
+    .globl _zr_time_ns
+_zr_time_ns:
+    mov     x0, #-1
+    ret
+
+    .globl _zr_time_unix_ns
+_zr_time_unix_ns:
+    mov     x0, #-1
+    ret

@@ -272,7 +272,7 @@ impl<'a> ComptimeEvaluator<'a> {
                 }
             }
 
-            ExprKind::While(cond, body) => loop {
+            ExprKind::While(_, cond, body) => loop {
                 self.step()?;
                 let c = self.eval_value(cond, env)?;
                 if !truthy(&c) {
@@ -285,7 +285,7 @@ impl<'a> ComptimeEvaluator<'a> {
                 }
             },
 
-            ExprKind::Loop(body) => loop {
+            ExprKind::Loop(_, body) => loop {
                 self.step()?;
                 match self.eval_block(body, env)? {
                     Flow::Break => return Ok(Flow::Value(HirLiteral::Int(0))),
@@ -294,8 +294,8 @@ impl<'a> ComptimeEvaluator<'a> {
                 }
             },
 
-            ExprKind::Break => Ok(Flow::Break),
-            ExprKind::Continue => Ok(Flow::Continue),
+            ExprKind::Break(_) => Ok(Flow::Break),
+            ExprKind::Continue(_) => Ok(Flow::Continue),
 
             ExprKind::Return(value) => {
                 let v = match value {
@@ -713,8 +713,8 @@ fn describe(kind: &ExprKind) -> &'static str {
         ExprKind::Deref(_) => "dereference",
         ExprKind::AddrOf(_) => "address-of",
         ExprKind::Index(..) => "indexing",
-        ExprKind::Break => "`break`",
-        ExprKind::Continue => "`continue`",
+        ExprKind::Break(_) => "`break`",
+        ExprKind::Continue(_) => "`continue`",
         ExprKind::Defer => "`defer`",
         ExprKind::Try => "`try`",
         ExprKind::Throw => "`throw`",
@@ -892,6 +892,19 @@ impl<'a> AstEvaluator<'a> {
         let base = env.len();
         for stmt in &block.stmts {
             match stmt {
+                ast::Statement::LetElse(pat, _, init, _, _) => {
+                    let value = self.value_of(init, env)?;
+                    match pat {
+                        ast::Pattern::Binding(name, _, None, _) => env.push((name.clone(), value)),
+                        other => {
+                            return Err(ComptimeError::new(format!(
+                                "destructuring binding ({}) is not supported in \
+                                 compile-time evaluation",
+                                pattern_kind(other)
+                            )));
+                        }
+                    }
+                }
                 ast::Statement::Let(pat, _, init, _) | ast::Statement::Var(pat, _, init, _) => {
                     let Some(init) = init else { continue };
                     let value = self.value_of(init, env)?;
@@ -1396,12 +1409,12 @@ fn children_mut(expr: &mut HirExpr) -> Vec<&mut HirExpr> {
             out
         }
         ExprKind::Block(b) => block_children_mut(b),
-        ExprKind::While(c, b) => {
+        ExprKind::While(_, c, b) => {
             let mut out = vec![c.as_mut()];
             out.extend(block_children_mut(b));
             out
         }
-        ExprKind::Loop(b) => block_children_mut(b),
+        ExprKind::Loop(_, b) => block_children_mut(b),
         ExprKind::Return(Some(e)) => vec![e.as_mut()],
         ExprKind::Call { args, .. } => args.iter_mut().collect(),
         _ => Vec::new(),

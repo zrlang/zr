@@ -82,29 +82,59 @@ impl Parser {
     // ==================================================================
 
     pub fn parse_macro_rules(&mut self, _attrs: Vec<Attribute>) -> Result<MacroDef, CompileError> {
-        let _span = self.previous().span;
-        let _name = self.consume_ident("expected macro name")?;
+        let span = self.previous().span;
+        let name = self.consume_ident("expected macro name")?;
         self.consume(&TokenKind::LBrace, "expected '{' after macro name")?;
 
+        let mut arms: Vec<MacroArm> = Vec::new();
         while !self.check(&TokenKind::RBrace) && !self.is_at_end() {
-            // 解析 lhs（匹配模式），直到 `=>`
+            // 左侧：匹配模式，收集到 `=>` 为止（保留括号等结构）。
+            let mut pattern: Vec<TokenKind> = Vec::new();
             while !self.check(&TokenKind::Rocket) && !self.is_at_end() {
-                self.advance();
+                pattern.push(self.advance().kind);
             }
             self.consume(&TokenKind::Rocket, "expected '=>' in macro arm")?;
-            // 解析 rhs（展开），直到 `;` 或 `}`
-            while !self.check(&TokenKind::Semicolon)
-                && !self.check(&TokenKind::RBrace)
-                && !self.is_at_end()
-            {
-                self.advance();
+
+            // 右侧：展开体，收集到臂结束为止。
+            //
+            // 结束条件：顶层遇到 `;` 或 `}`。括号内的 `;`/`}` 属于
+            // 嵌套结构，要按深度计数，不能提前收尾。
+            let mut body: Vec<TokenKind> = Vec::new();
+            let mut depth: i32 = 0;
+            loop {
+                if self.is_at_end() {
+                    break;
+                }
+                let kind = self.peek().kind.clone();
+                match &kind {
+                    TokenKind::LParen | TokenKind::LBrace | TokenKind::LBracket => {
+                        depth += 1;
+                    }
+                    TokenKind::RParen | TokenKind::RBrace | TokenKind::RBracket => {
+                        if depth == 0 {
+                            // 顶层 `}`：宏体结束（外层大括号）。
+                            break;
+                        }
+                        depth -= 1;
+                    }
+                    TokenKind::Semicolon if depth == 0 => {
+                        // 顶层 `;`：一条臂结束。
+                        self.advance();
+                        break;
+                    }
+                    _ => {}
+                }
+                body.push(self.advance().kind);
             }
-            // 可选的分号
-            self.match_kind(&TokenKind::Semicolon);
+            arms.push(MacroArm { pattern, body });
         }
         self.consume(&TokenKind::RBrace, "expected '}' to close macro")?;
 
-        Ok(MacroDef)
+        Ok(MacroDef {
+            name,
+            arms,
+            span,
+        })
     }
 
     // ==================================================================
@@ -340,9 +370,27 @@ impl Parser {
         };
         let _lhs = self.parse_type()?;
         self.consume(&TokenKind::Colon, "expected ':' in where predicate")?;
-        let _negated = self.match_kind(&TokenKind::Bang);
-        let _ = self.parse_type()?;
+        self.parse_where_bound()?;
+        // 多边界 `T: Copy + Clone`
+        while self.match_kind(&TokenKind::Plus) {
+            self.parse_where_bound()?;
+        }
         Ok(WherePred)
+    }
+
+    /// 解析单个 trait / 生命周期边界。
+    ///
+    /// `'a` / `'static` 不是类型，`parse_type` 会把它当"生命周期前缀"跳过
+    /// 然后去解析本不存在的类型（`where T: 'static {` 报 `expected type,
+    /// found LBrace`）。这里单独消费。
+    fn parse_where_bound(&mut self) -> Result<(), CompileError> {
+        let _negated = self.match_kind(&TokenKind::Bang);
+        if let TokenKind::Lifetime(_) = self.peek().kind {
+            self.advance();
+            return Ok(());
+        }
+        let _ = self.parse_type()?;
+        Ok(())
     }
 
     // ==================================================================

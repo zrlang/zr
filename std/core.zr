@@ -256,14 +256,14 @@ pub fn min<T: Ord>(a: T, b: T) -> T {
 
 /// 两数取大。
 pub fn max<T: Ord>(a: T, b: T) -> T {
-    if a.gt(b) { return a; }
-    return b;
+    if a.lt(b) { return b; }
+    return a;
 }
 
 /// 将 `value` 钳制在 `[lo, hi]` 范围内。
 pub fn clamp<T: Ord>(value: T, lo: T, hi: T) -> T {
     if value.lt(lo) { return lo; }
-    if value.gt(hi) { return hi; }
+    if hi.lt(value) { return hi; }
     return value;
 }
 
@@ -310,7 +310,7 @@ pub fn assert(cond: bool, msg: []const u8) {
 
 /// 两个值不等时终止程序。
 pub fn assert_eq<T: Eq>(a: T, b: T, msg: []const u8) {
-    if a.ne(b) {
+    if !a.eq(b) {
         panic(msg);
     }
 }

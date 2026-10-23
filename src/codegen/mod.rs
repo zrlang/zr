@@ -681,6 +681,18 @@ fn linker_commands(
                     .arg(format!("-Wl,-e,{}", target.entry_symbol()));
                 if let Some(lib) = runtime_lib {
                     c.arg(lib);
+                    // 也直接链接运行时 .o 文件，确保 Mach-O 符号存根正确生成
+                    // 静态库名格式: libzrrt-<flavor>.a, 对应 .o 文件: <flavor>.o
+                    let lib_path = std::path::Path::new(lib);
+                    if let Some(stem) = lib_path.file_stem().and_then(|s| s.to_str()) {
+                        if let Some(flavor) = stem.strip_prefix("libzrrt-") {
+                            let obj_name = format!("{}.o", flavor);
+                            let obj_path = lib_path.with_file_name(obj_name);
+                            if obj_path.exists() {
+                                c.arg(&obj_path);
+                            }
+                        }
+                    }
                 }
                 commands.push(c);
             }

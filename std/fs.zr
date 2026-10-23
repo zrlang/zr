@@ -1,0 +1,221 @@
+//=============================================================================
+// std/fs.zr — 文件系统
+//
+// 与 Rust 的 `std::fs` 对齐的薄封装。路径用 `str` 传入，内部复制成
+// NUL 结尾的字节串再交给运行时（与 io::file_open 的约定一致）。
+//
+//   fs::create_dir(path)          -> bool   创建目录
+//   fs::remove_dir(path)          -> bool   删除空目录
+//   fs::remove_file(path)         -> bool   删除文件
+//   fs::rename(from, to)          -> bool   重命名 / 移动
+//   fs::exists(path)              -> bool   路径是否存在
+//   fs::is_dir(path)              -> bool   是否是目录
+//   fs::file_size(path)           -> i64    文件字节数，出错 -1
+//   fs::read_dir_count(path)      -> i64    条目个数（不含 "." / ".."）
+//   fs::read_dir_name(path, i, buf, cap) -> i64  第 i 项名字长度，出错 -1
+//   fs::current_dir(buf, cap)     -> i64    当前目录长度，出错 -1
+//
+// 目录遍历跳过 "." 与 ".."：下标 0..count-1 直接对应真实条目。
+//=============================================================================
+
+//----- 外部运行时 -------------------------------------------------------------
+
+extern "C" {
+    fn zr_mkdir(path: *const u8) -> i32;
+}
+
+extern "C" {
+    fn zr_rmdir(path: *const u8) -> i32;
+}
+
+extern "C" {
+    fn zr_unlink(path: *const u8) -> i32;
+}
+
+extern "C" {
+    fn zr_rename(from: *const u8, to: *const u8) -> i32;
+}
+
+extern "C" {
+    fn zr_path_exists(path: *const u8) -> i32;
+}
+
+extern "C" {
+    fn zr_is_dir(path: *const u8) -> i32;
+}
+
+extern "C" {
+    fn zr_file_size(path: *const u8) -> i64;
+}
+
+extern "C" {
+    fn zr_readdir_count(path: *const u8) -> i64;
+}
+
+extern "C" {
+    fn zr_readdir_name(path: *const u8, index: usize, buf: *mut u8, cap: usize) -> i64;
+}
+
+extern "C" {
+    fn zr_getcwd(buf: *mut u8, cap: usize) -> i64;
+}
+
+//----- 辅助 -------------------------------------------------------------------
+
+/// 把 `path` 复制进 `buf` 并补 NUL。放不下返回 false。
+fn to_cstr(path: str, buf: *mut u8, cap: usize) -> bool {
+    if path.len >= cap {
+        return false;
+    }
+    let mut i = 0;
+    while i < path.len {
+        buf[i] = path.ptr[i];
+        i = i + 1;
+    }
+    buf[path.len] = 0;
+    return true;
+}
+
+/// 两个路径都转成 NUL 结尾。任一个放不下返回 false。
+fn to_two_cstr(a: str, b: str, ba: *mut u8, bb: *mut u8, cap: usize) -> bool {
+    if !to_cstr(a, ba, cap) {
+        return false;
+    }
+    return to_cstr(b, bb, cap);
+}
+
+//----- 目录 / 文件操作 --------------------------------------------------------
+
+/// 创建目录（权限 0777，受 umask 影响）。父目录必须已存在。
+pub fn create_dir(path: str) -> bool {
+    let mut buf: [u8; 1024] = [0; 1024];
+    if !to_cstr(path, &mut buf[0], 1024) {
+        return false;
+    }
+    return zr_mkdir(&buf[0] as *const u8) == 0;
+}
+
+/// 删除空目录。
+pub fn remove_dir(path: str) -> bool {
+    let mut buf: [u8; 1024] = [0; 1024];
+    if !to_cstr(path, &mut buf[0], 1024) {
+        return false;
+    }
+    return zr_rmdir(&buf[0] as *const u8) == 0;
+}
+
+/// 删除文件（不能删目录）。
+pub fn remove_file(path: str) -> bool {
+    let mut buf: [u8; 1024] = [0; 1024];
+    if !to_cstr(path, &mut buf[0], 1024) {
+        return false;
+    }
+    return zr_unlink(&buf[0] as *const u8) == 0;
+}
+
+/// 重命名或移动文件 / 目录。
+pub fn rename(from: str, to: str) -> bool {
+    let mut a: [u8; 1024] = [0; 1024];
+    let mut b: [u8; 1024] = [0; 1024];
+    if !to_two_cstr(from, to, &mut a[0], &mut b[0], 1024) {
+        return false;
+    }
+    return zr_rename(&a[0] as *const u8, &b[0] as *const u8) == 0;
+}
+
+/// 路径是否存在。
+pub fn exists(path: str) -> bool {
+    let mut buf: [u8; 1024] = [0; 1024];
+    if !to_cstr(path, &mut buf[0], 1024) {
+        return false;
+    }
+    return zr_path_exists(&buf[0] as *const u8) == 1;
+}
+
+/// 路径是否是目录（不存在返回 false）。
+pub fn is_dir(path: str) -> bool {
+    let mut buf: [u8; 1024] = [0; 1024];
+    if !to_cstr(path, &mut buf[0], 1024) {
+        return false;
+    }
+    return zr_is_dir(&buf[0] as *const u8) == 1;
+}
+
+/// 文件字节数；不存在或出错返回 -1。
+pub fn file_size(path: str) -> i64 {
+    let mut buf: [u8; 1024] = [0; 1024];
+    if !to_cstr(path, &mut buf[0], 1024) {
+        return -1;
+    }
+    return zr_file_size(&buf[0] as *const u8);
+}
+
+//----- 目录遍历 ---------------------------------------------------------------
+
+/// 目录里的条目个数（不含 "." 与 ".."）。出错返回 -1。
+pub fn read_dir_count(path: str) -> i64 {
+    let mut buf: [u8; 1024] = [0; 1024];
+    if !to_cstr(path, &mut buf[0], 1024) {
+        return -1;
+    }
+    return zr_readdir_count(&buf[0] as *const u8);
+}
+
+/// 把第 `index` 个条目的名字写进 `buf`（不含结尾 NUL），返回名字长度。
+///
+/// 失败返回 -1：下标越界、目录打不开、或名字比 `cap` 长。
+pub fn read_dir_name(path: str, index: usize, buf: *mut u8, cap: usize) -> i64 {
+    let mut pb: [u8; 1024] = [0; 1024];
+    if !to_cstr(path, &mut pb[0], 1024) {
+        return -1;
+    }
+    return zr_readdir_name(&pb[0] as *const u8, index, buf, cap);
+}
+
+//----- 当前目录 ---------------------------------------------------------------
+
+/// 把当前工作目录写进 `buf`，返回长度（不含 NUL）；失败返回 -1。
+pub fn current_dir(buf: *mut u8, cap: usize) -> i64 {
+    return zr_getcwd(buf, cap);
+}
+
+//----- 原始指针接口 -----------------------------------------------------------
+//
+// 路径必须是 NUL 结尾。适合调用方自己拼好路径（例如 path::join 之后补 0），
+// 避免为了构造 `str` 再复制一遍。语义与上面的 `str` 版本完全一致。
+
+pub fn create_dir_raw(path: *const u8) -> bool {
+    return zr_mkdir(path) == 0;
+}
+
+pub fn remove_dir_raw(path: *const u8) -> bool {
+    return zr_rmdir(path) == 0;
+}
+
+pub fn remove_file_raw(path: *const u8) -> bool {
+    return zr_unlink(path) == 0;
+}
+
+pub fn rename_raw(from: *const u8, to: *const u8) -> bool {
+    return zr_rename(from, to) == 0;
+}
+
+pub fn exists_raw(path: *const u8) -> bool {
+    return zr_path_exists(path) == 1;
+}
+
+pub fn is_dir_raw(path: *const u8) -> bool {
+    return zr_is_dir(path) == 1;
+}
+
+pub fn file_size_raw(path: *const u8) -> i64 {
+    return zr_file_size(path);
+}
+
+pub fn read_dir_count_raw(path: *const u8) -> i64 {
+    return zr_readdir_count(path);
+}
+
+pub fn read_dir_name_raw(path: *const u8, index: usize, buf: *mut u8, cap: usize) -> i64 {
+    return zr_readdir_name(path, index, buf, cap);
+}

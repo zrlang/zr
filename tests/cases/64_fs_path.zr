@@ -1,0 +1,187 @@
+//=============================================================================
+// tests/cases/64_fs_path.zr — 文件系统与路径
+//
+// 覆盖：
+//   - 目录的创建 / 判断 / 删除
+//   - 文件写入后的大小、重命名、删除
+//   - 目录遍历（跳过 "." 与 ".."）
+//   - 当前工作目录
+//   - 路径拼接、归一化、扩展名
+//=============================================================================
+
+use fs::{
+    create_dir_raw, remove_dir_raw, remove_file_raw, rename_raw,
+    exists_raw, is_dir_raw, file_size_raw, read_dir_count_raw,
+    read_dir_name_raw, current_dir,
+};
+use path::{join, normalize, has_extension, basename_off, basename_len, is_absolute};
+use io::{file_write, file_close, write_bytes};
+
+extern "C" {
+    fn zr_open(path: *const u8, mode: i32) -> isize;
+}
+
+fn cstr(dst: *mut u8, s: str) -> usize {
+    let mut i = 0;
+    while i < s.len {
+        dst[i] = s.ptr[i];
+        i = i + 1;
+    }
+    dst[s.len] = 0;
+    return s.len;
+}
+
+fn eq(buf: *mut u8, n: usize, s: str) -> bool {
+    if n != s.len {
+        return false;
+    }
+    let mut i = 0;
+    while i < n {
+        if buf[i] != s.ptr[i] {
+            return false;
+        }
+        i = i + 1;
+    }
+    return true;
+}
+
+fn main() -> i32 {
+    let base = "/tmp/zr_fs_case";
+    let mut base_buf: [u8; 128] = [0; 128];
+    cstr(&mut base_buf[0], base);
+
+    let mut fa: [u8; 128] = [0; 128];
+    let mut fb: [u8; 128] = [0; 128];
+    let na = join(base, "a.txt", &mut fa[0], 127);
+    let nb = join(base, "b.txt", &mut fb[0], 127);
+    if na == 0 || nb == 0 {
+        return 1;
+    }
+    fa[na] = 0;
+    fb[nb] = 0;
+
+    // 幂等清理
+    remove_file_raw(&fa[0] as *const u8);
+    remove_file_raw(&fb[0] as *const u8);
+    remove_dir_raw(&base_buf[0] as *const u8);
+
+    // 目录
+    if !create_dir_raw(&base_buf[0] as *const u8) {
+        return 2;
+    }
+    if !exists_raw(&base_buf[0] as *const u8) {
+        return 3;
+    }
+    if !is_dir_raw(&base_buf[0] as *const u8) {
+        return 4;
+    }
+    if exists_raw(&fa[0] as *const u8) {
+        return 5;
+    }
+
+    // 写文件
+    let fd = zr_open(&fa[0] as *const u8, 1);
+    if fd < 0 {
+        return 6;
+    }
+    let msg = "hello";
+    if file_write(fd as i32, msg) != 5 {
+        return 7;
+    }
+    file_close(fd as i32);
+
+    if file_size_raw(&fa[0] as *const u8) != 5 {
+        return 8;
+    }
+
+    // 目录遍历：空目录里只有这一个文件，"." 与 ".." 被跳过。
+    if read_dir_count_raw(&base_buf[0] as *const u8) != 1 {
+        return 9;
+    }
+    let mut name: [u8; 64] = [0; 64];
+    let nl = read_dir_name_raw(&base_buf[0] as *const u8, 0, &mut name[0], 64);
+    if nl != 5 {
+        return 10;
+    }
+    if !eq(&mut name[0], 5, "a.txt") {
+        return 11;
+    }
+
+    // 重命名
+    if !rename_raw(&fa[0] as *const u8, &fb[0] as *const u8) {
+        return 12;
+    }
+    if exists_raw(&fa[0] as *const u8) {
+        return 13;
+    }
+    if file_size_raw(&fb[0] as *const u8) != 5 {
+        return 14;
+    }
+
+    // 删除
+    if !remove_file_raw(&fb[0] as *const u8) {
+        return 15;
+    }
+    if !remove_dir_raw(&base_buf[0] as *const u8) {
+        return 16;
+    }
+    if exists_raw(&base_buf[0] as *const u8) {
+        return 17;
+    }
+
+    // 当前目录
+    let mut cwd: [u8; 512] = [0; 512];
+    let cl = current_dir(&mut cwd[0], 512);
+    if cl <= 0 {
+        return 18;
+    }
+    if cwd[0] != 47 {
+        return 19;
+    }
+
+    // 路径
+    if !is_absolute("/x") {
+        return 20;
+    }
+    if is_absolute("x") {
+        return 21;
+    }
+    let p = "/a/b/c.txt";
+    if basename_off(p) != 5 {
+        return 22;
+    }
+    if basename_len(p) != 5 {
+        return 23;
+    }
+    if !has_extension("x.tar.zr", "zr") {
+        return 24;
+    }
+    if has_extension(".bashrc", "bashrc") {
+        return 25;
+    }
+    if has_extension("a.b/c", "b") {
+        return 26;
+    }
+
+    let mut o: [u8; 128] = [0; 128];
+    let n1 = normalize("/a//b/./../c", &mut o[0], 128);
+    if !eq(&mut o[0], n1, "/a/c") {
+        return 27;
+    }
+    let n2 = normalize("a/b/..", &mut o[0], 128);
+    if !eq(&mut o[0], n2, "a") {
+        return 28;
+    }
+    let n3 = normalize("", &mut o[0], 128);
+    if !eq(&mut o[0], n3, ".") {
+        return 29;
+    }
+    let n4 = join("/x", "/y", &mut o[0], 128);
+    if !eq(&mut o[0], n4, "/y") {
+        return 30;
+    }
+
+    let ok = "fs/path ok\n";
+    write_bytes(1, ok);
+    return 0;
+}

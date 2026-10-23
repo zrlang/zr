@@ -262,6 +262,8 @@ pub enum TokenKind {
     Comma,
     /// `;`
     Semicolon,
+    /// `$`（`macro_rules!` 的元变量前缀）
+    Dollar,
     /// `:`
     Colon,
     /// `_`（通配符模式 / 忽略绑定）

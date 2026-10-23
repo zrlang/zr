@@ -62,7 +62,7 @@ pub fn lower_function(
                 b.hidden_ret = Some(hidden);
             }
         }
-        if let Some(layout) = struct_layout(&b, actual_ret) {
+        if let Some(layout) = aggregate_layout(&b, actual_ret) {
             let hidden = format!("arg_{}", func.params.len());
             b.param_names.push(hidden.clone());
             b.ret_struct = Some((actual_ret.clone(), layout.size));
@@ -302,6 +302,31 @@ fn lower_expr(b: &mut Builder, expr: &HirExpr) -> MirValue {
             }
             if let Some(v) = lower_pointer_arith(b, *op, lhs, rhs) {
                 return v;
+            }
+            // `str` 相等比较：两侧的值都是"胖指针"（数据指针 + 长度），
+            // 存在各自的槽里。直接比较**槽地址**比的是两个局部变量的
+            // 住址，不是字符串内容——`"a" == "a"` 恒为 false。
+            //
+            // zr 的 `str` 相等按**数据指针**比较：字符串字面量在 `.rodata`
+            // 里去重存放，内容相同的字面量共享同一个槽，因此按地址比较
+            // 与按内容比较对字面量而言结果一致，而后者对运行时拼出来的
+            // 字符串也正确。
+            if matches!(op, hir::BinaryOp::Eq | hir::BinaryOp::Ne) {
+                if matches!(lhs.ty, hir::Ty::Str) && matches!(rhs.ty, hir::Ty::Str) {
+                    let l = lower_expr(b, lhs);
+                    let r = lower_expr(b, rhs);
+                    let lptr = load_str_ptr(b, l);
+                    let rptr = load_str_ptr(b, r);
+                    let name = format!("t{}", b.temp_id());
+                    b.current_block_mut().instrs.push(MirInstr::Binary(
+                        name.clone(),
+                        lptr,
+                        convert_binary(*op),
+                        rptr,
+                        NumTy::Uint(64),
+                    ));
+                    return MirValue::Var(name);
+                }
             }
             // 结果类型：优先用表达式自身的类型，推断没解出来时退回看操作数。
             let ty = binary_result_ty(*op, &expr.ty, &lhs.ty, &rhs.ty);
@@ -653,7 +678,7 @@ fn lower_expr(b: &mut Builder, expr: &HirExpr) -> MirValue {
                 MirValue::Unit
             }
         }
-        While(cond, body) => {
+        While(label, cond, body) => {
             let header = b.new_block();
             let body_bb = b.new_block();
             let exit = b.new_block();
@@ -696,6 +721,7 @@ fn lower_expr(b: &mut Builder, expr: &HirExpr) -> MirValue {
                 header,
                 exit,
                 drop_depth: b.drop_scopes.len(),
+                label: label.clone(),
             });
             let _ = lower_block(b, body);
             b.loops.pop();
@@ -704,7 +730,7 @@ fn lower_expr(b: &mut Builder, expr: &HirExpr) -> MirValue {
             b.current = exit;
             MirValue::Unit
         }
-        Loop(body) => {
+        Loop(label, body) => {
             let head = b.new_block();
             let exit = b.new_block();
             b.current_block_mut().term = Some(MirTerminator::Goto(head));
@@ -713,10 +739,14 @@ fn lower_expr(b: &mut Builder, expr: &HirExpr) -> MirValue {
                 header: head,
                 exit,
                 drop_depth: b.drop_scopes.len(),
+                label: label.clone(),
             });
             let _ = lower_block(b, body);
             b.loops.pop();
-            b.current_block_mut().term = Some(MirTerminator::Goto(head));
+            // 只在块还"开着"时补回边。循环体末尾若无条件写了 `break` /
+            // `return`，块已经有终结符了；这里再无条件覆盖会把 `break`
+            // 的出口跳转冲掉，整个循环退化成死循环。
+            b.terminate_if_open(MirTerminator::Goto(head));
             b.current = exit;
             MirValue::Unit
         }
@@ -826,7 +856,7 @@ fn lower_expr(b: &mut Builder, expr: &HirExpr) -> MirValue {
                 let dst = b.synthetic_storage(n * size);
                 mir_args.push(MirValue::Var(dst.clone()));
                 dest = Some(MirValue::Var(dst));
-            } else if let Some(layout) = struct_layout(b, &expr.ty) {
+            } else if let Some(layout) = aggregate_layout(b, &expr.ty) {
                 let dst = b.synthetic_storage(layout.size);
                 mir_args.push(MirValue::Var(dst.clone()));
                 dest = Some(MirValue::Var(dst));
@@ -876,7 +906,7 @@ fn lower_expr(b: &mut Builder, expr: &HirExpr) -> MirValue {
                 let dst = b.synthetic_storage(n * size);
                 mir_args.push(MirValue::Var(dst.clone()));
                 dest = Some(MirValue::Var(dst));
-            } else if let Some(layout) = struct_layout(b, &expr.ty) {
+            } else if let Some(layout) = aggregate_layout(b, &expr.ty) {
                 let dst = b.synthetic_storage(layout.size);
                 mir_args.push(MirValue::Var(dst.clone()));
                 dest = Some(MirValue::Var(dst));
@@ -940,19 +970,20 @@ fn lower_expr(b: &mut Builder, expr: &HirExpr) -> MirValue {
             // 这一步已经是一个 `Int(42)`。
             mir_literal(folded, &expr.ty)
         }
-        Break => {
-            // `break` 终结当前块并跳到最内层循环的出口。用 `terminate_if_open`
+        Break(label) => {
+            // `break` 终结当前块并跳到对应循环的出口。带标签时从内向外
+            // 找第一个匹配标签的循环，否则取最内层。用 `terminate_if_open`
             // 是为了不覆盖已经终结的块（比如 `if c { break; }` 里 if 自己刚
             // 写完跳转）。
-            if let Some(ctx) = b.loops.last().copied() {
+            if let Some(ctx) = find_loop(b, label.as_deref()).cloned() {
                 b.emit_drops_from(ctx.drop_depth);
                 b.terminate_if_open(MirTerminator::Goto(ctx.exit));
             }
             MirValue::Unit
         }
-        Continue => {
+        Continue(label) => {
             // `continue` 跳回循环头（回边），而不是像 `break` 那样跳出口。
-            if let Some(ctx) = b.loops.last().copied() {
+            if let Some(ctx) = find_loop(b, label.as_deref()).cloned() {
                 b.emit_drops_from(ctx.drop_depth);
                 b.terminate_if_open(MirTerminator::Goto(ctx.header));
             }
@@ -992,6 +1023,35 @@ fn lower_expr(b: &mut Builder, expr: &HirExpr) -> MirValue {
                 .push(MirInstr::Load(name.clone(), addr, ty));
             MirValue::Var(name)
         }
+        // `[T; N]` 隐式转 `[]T`：数组本身就是元素存储地址，补上长度即可。
+        ArrayToSlice(inner) => {
+            let arr = lower_expr(b, inner);
+            let n = match &inner.ty {
+                hir::Ty::Array(_, len) => hir::array_len_value(len).unwrap_or(0),
+                _ => 0,
+            };
+            let addr = b.synthetic_storage(16);
+            let len_at = offset_addr(b, MirValue::Var(addr.clone()), 8);
+            b.current_block_mut().instrs.push(MirInstr::Store(
+                MirValue::Var(addr.clone()),
+                arr,
+                NumTy::Uint(64),
+            ));
+            b.current_block_mut()
+                .instrs
+                .push(MirInstr::Store(len_at, MirValue::Int(n), NumTy::Uint(64)));
+            b.register_temp(MirValue::Var(addr.clone()), &expr.ty);
+            MirValue::Var(addr)
+        }
+        // `s[a..b]` / `s[..b]` / `s[a..]` / `s[..]`：构造 `(ptr, len)`。
+        IndexRange(recv, start, end, inclusive) => lower_index_range(
+            b,
+            recv,
+            start.as_deref(),
+            end.as_deref(),
+            *inclusive,
+            &expr.ty,
+        ),
         // `&place`：取位置地址。结构体/数组值本身已经是指向存储的地址，
         // 再对“保存该地址的槽”取地址会多解一层。
         AddrOf(place) => {
@@ -1258,7 +1318,7 @@ fn const_values(consts: &HashMap<hir::DefId, HirConst>) -> HashMap<hir::DefId, M
 }
 
 /// 一个 `break` / `continue` 各自的目标块。
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 struct LoopCtx {
     /// `continue` 的落点（循环头）。
     header: usize,
@@ -1266,6 +1326,21 @@ struct LoopCtx {
     exit: usize,
     /// 进入循环体前的作用域深度；break/continue 只清理更内层的作用域。
     drop_depth: usize,
+    /// 循环标签（`outer: loop`）。无标签的 `break` / `continue` 取最内层。
+    label: Option<String>,
+}
+
+/// 按标签找循环上下文：`Some(label)` 从内向外找名字匹配的，
+/// `None` 取最内层。
+fn find_loop<'a>(b: &'a Builder, label: Option<&str>) -> Option<&'a LoopCtx> {
+    match label {
+        None => b.loops.last(),
+        Some(name) => b
+            .loops
+            .iter()
+            .rev()
+            .find(|ctx| ctx.label.as_deref() == Some(name)),
+    }
 }
 
 impl Builder {
@@ -2154,6 +2229,20 @@ fn struct_layout(b: &Builder, ty: &hir::Ty) -> Option<StructLayout> {
     })
 }
 
+/// **值聚合**的布局：结构体 / 元组 / 字符串 / 切片。
+///
+/// 与 [`struct_layout`] 的区别：**指向结构体的指针不是值聚合**。
+/// `*mut T` 是一个 8 字节的瘦指针，按值传递、返回都不需要调用方提供
+/// 返回槽。`struct_layout` 会把 `*mut T` 递归成 `T` 的布局（那是字段
+/// 访问 `p.field` 需要的），所以凡是"这个类型要按聚合方式传/返回"的地方
+/// 都必须用本函数，否则 `*mut T` 会被错当成 `T` 整块拷贝。
+fn aggregate_layout(b: &Builder, ty: &hir::Ty) -> Option<StructLayout> {
+    match ty {
+        hir::Ty::Pointer(..) | hir::Ty::Reference(..) | hir::Ty::Function { .. } => None,
+        _ => struct_layout(b, ty),
+    }
+}
+
 /// 元组的布局：字段按序排、各自对齐，末尾补齐到最大对齐。
 ///
 /// 字段名用下标的十进制写法（"0" / "1" …），与 `t.0` 的访问方式一致。
@@ -2459,13 +2548,26 @@ fn copy_struct_value(b: &mut Builder, src: MirValue, ty: &hir::Ty) -> MirValue {
             return MirValue::Var(dst);
         }
     }
-    let Some(layout) = struct_layout(b, ty) else {
+    let Some(layout) = aggregate_layout(b, ty) else {
         return src;
     };
     b.consume_temp(&src);
     let dst = b.synthetic_storage(layout.size);
     copy_struct_into(b, src, &layout, MirValue::Var(dst.clone()));
     MirValue::Var(dst)
+}
+
+/// 从一个 `str` 值的存储地址里取出它的数据指针（胖指针的第一个字段）。
+///
+/// `str` 的运行时表示是 `{ ptr: *const u8, len: usize }`，存放在一块
+/// 16 字节的存储里。比较两个 `str` 时要比较的是数据指针，不是这块
+/// 存储的地址。
+fn load_str_ptr(b: &mut Builder, addr: MirValue) -> MirValue {
+    let name = format!("t{}", b.temp_id());
+    b.current_block_mut()
+        .instrs
+        .push(MirInstr::Load(name.clone(), addr, NumTy::Uint(64)));
+    MirValue::Var(name)
 }
 
 /// 地址 + 字节偏移；偏移为 0 时直接复用原地址。
@@ -2565,7 +2667,15 @@ fn array_info(b: &Builder, ty: &hir::Ty) -> Option<(hir::Ty, i128, i128)> {
 /// `elem_ty` 是**元素**类型（不是 receiver 类型），用来定缩放系数：
 /// `s[i]`（str）缩放 1，`p[i]`（`*i32`）缩放 4。
 fn lower_index_addr(b: &mut Builder, recv: &HirExpr, idx: &HirExpr, elem_ty: &hir::Ty) -> MirValue {
-    let base = lower_expr(b, recv);
+    let mut base = lower_expr(b, recv);
+    // `str` 的运行时表示是 `{ ptr: *const u8, len: usize }`，存在一块
+    // 16 字节的存储里；`str` 的值就是**这块存储的地址**。
+    //
+    // 按字节索引要的是数据指针，不是这块存储的地址——直接拿存储地址
+    // 加偏移，读到的是胖指针自己的字节（指针的低位），不是字符。
+    if matches!(recv.ty, hir::Ty::Str | hir::Ty::Slice(..)) {
+        base = load_str_ptr(b, base);
+    }
     let index = lower_expr(b, idx);
     let size = type_size(b, elem_ty);
     let scaled = if size == 1 {
@@ -2590,6 +2700,76 @@ fn lower_index_addr(b: &mut Builder, recv: &HirExpr, idx: &HirExpr, elem_ty: &hi
         NumTy::Int(64),
     ));
     MirValue::Var(name)
+}
+
+/// 降级切片表达式 `s[a..b]`。
+///
+/// 结果是一块 16 字节的合成存储 `{ ptr, len }`。三种接收者：
+///   - 定长数组：值本身就是元素存储的地址，长度是编译期常量；
+///   - `str` / 切片：值是指向 `{ptr, len}` 存储的地址，先把它读出来；
+///   - 裸指针 / 引用：只有基址，没有长度，因此 `[a..]` 无法确定终点。
+fn lower_index_range(
+    b: &mut Builder,
+    recv: &HirExpr,
+    start: Option<&HirExpr>,
+    end: Option<&HirExpr>,
+    inclusive: bool,
+    result_ty: &hir::Ty,
+) -> MirValue {
+    let elem_ty = match result_ty {
+        hir::Ty::Slice(inner, _) => (**inner).clone(),
+        hir::Ty::Str => hir::Ty::Uint(8),
+        _ => return MirValue::Unit,
+    };
+    let elem_size = type_size(b, &elem_ty).max(1);
+
+    let recv_val = lower_expr(b, recv);
+    let (base_ptr, base_len) = match &recv.ty {
+        hir::Ty::Array(_, len) => {
+            let n = hir::array_len_value(len).unwrap_or(0);
+            (recv_val, Some(MirValue::Int(n)))
+        }
+        hir::Ty::Str | hir::Ty::Slice(..) => {
+            let ptr = load_str_ptr(b, recv_val.clone());
+            let len_at = offset_addr(b, recv_val, 8);
+            let len = load_str_ptr(b, len_at);
+            (ptr, Some(len))
+        }
+        hir::Ty::Pointer(..) | hir::Ty::Reference(..) => (recv_val, None),
+        _ => return MirValue::Unit,
+    };
+
+    let start_v = match start {
+        Some(e) => lower_expr(b, e),
+        None => MirValue::Int(0),
+    };
+    let end_v = match end {
+        Some(e) => lower_expr(b, e),
+        None => match base_len {
+            Some(l) => l,
+            None => return MirValue::Unit,
+        },
+    };
+
+    let mut len = binary_into(b, end_v, MirBinaryOp::Sub, start_v.clone());
+    if inclusive {
+        len = binary_into(b, len, MirBinaryOp::Add, MirValue::Int(1));
+    }
+    let byte_off = binary_into(b, start_v, MirBinaryOp::Mul, MirValue::Int(elem_size));
+    let ptr = binary_into(b, base_ptr, MirBinaryOp::Add, byte_off);
+
+    let addr = b.synthetic_storage(16);
+    let len_at = offset_addr(b, MirValue::Var(addr.clone()), 8);
+    b.current_block_mut().instrs.push(MirInstr::Store(
+        MirValue::Var(addr.clone()),
+        ptr,
+        NumTy::Uint(64),
+    ));
+    b.current_block_mut()
+        .instrs
+        .push(MirInstr::Store(len_at, len, NumTy::Uint(64)));
+    b.register_temp(MirValue::Var(addr.clone()), result_ty);
+    MirValue::Var(addr)
 }
 
 /// 类型是不是指针 / 引用（运行期都是同一个"地址"）。
@@ -2851,11 +3031,11 @@ fn collect_addr_taken_expr(e: &HirExpr, out: &mut HashSet<u32>) {
                 collect_addr_taken(e2, out);
             }
         }
-        While(c, b) => {
+        While(_, c, b) => {
             collect_addr_taken_expr(c, out);
             collect_addr_taken(b, out);
         }
-        Loop(b) => collect_addr_taken(b, out),
+        Loop(_, b) => collect_addr_taken(b, out),
         Array(elems) => {
             for e in elems {
                 collect_addr_taken_expr(e, out);

@@ -24,6 +24,7 @@ mod fmt;
 mod json;
 mod lexer;
 mod lsp;
+mod macros;
 mod mir;
 mod modules;
 mod opt;
@@ -664,6 +665,12 @@ fn compile(input: &str, cmd: &Cli) -> Result<std::path::PathBuf, String> {
     }
 
     // 4. 类型检查 + HIR
+    //
+    // 宏展开在类型检查之前：宏调用点被替换成真正的表达式，类型检查器
+    // 就看不到 `MacroCall` 了。展开必须在**模块加载之后**做——宏定义
+    // 可能来自标准库模块。
+    let ast = macros::expand(&ast).map_err(|e| e.to_string())?;
+
     let mut checker = typeck::TypeChecker::new();
     checker.set_known_modules(loaded.modules.iter().cloned().collect());
     // 32 位目标支持多字长（i64）运算：值走 8 字节栈槽，用两条 32 位指令
@@ -682,6 +689,8 @@ fn compile(input: &str, cmd: &Cli) -> Result<std::path::PathBuf, String> {
     // 4.5 提取属性（链接指令、repr 布局）到编译单元
     let mut unit = codegen::CompilationUnit::new();
     codegen::extract_attributes(&mut unit, &hir, &ast);
+
+    
 
     // 5. MIR 降级
     let mir_module = mir::lower(&hir);

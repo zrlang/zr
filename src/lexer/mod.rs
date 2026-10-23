@@ -279,6 +279,8 @@ impl<'a> Lexer<'a> {
             ';' => TokenKind::Semicolon,
             '?' => TokenKind::Question,
             '@' => TokenKind::At,
+            // `$` 只在 `macro_rules!` 的模式/替换体里出现（`$x:expr`）。
+            '$' => TokenKind::Dollar,
 
             // ===== 字符串 / 字符 =====
             '"' => return self.read_string(start + 1, line, col),
@@ -969,7 +971,9 @@ mod tests {
 
     #[test]
     fn lex_error_invalid_char() {
-        let t = Lexer::new("$").tokenize();
+        // `$` 现在是合法记号（`macro_rules!` 的元变量前缀），
+        // 所以这里用一个真正非法的字符。
+        let t = Lexer::new("\\").tokenize();
         assert!(matches!(t[0].kind, TokenKind::LexError(_)));
     }
 

@@ -180,9 +180,9 @@ impl Child {
             self.exited = true;
             self.exit_status = status;
         }
-        ExitStatus { code: self.exit_status }
+        ExitStatus { code: exit_code_of(status) }
     }
-    
+
     /// 尝试非阻塞等待
     /// 返回 0 表示未退出，>0 表示退出状态
     pub fn try_wait(self) -> i32 {
@@ -191,19 +191,31 @@ impl Child {
         if result > 0 {
             self.exited = true;
             self.exit_status = status;
-            return self.exit_status;
+            return exit_code_of(status);
         }
         return 0;
     }
-    
+
     /// 获取子进程 PID
     pub fn id(self) -> i32 {
         self.pid
     }
-    
+
     /// 杀死子进程（简化：发送 SIGKILL）
     pub fn kill(self) -> bool {
         // 简化实现：不支持信号
         false
     }
+}
+
+/// 从 wait 的原始状态里取出退出码。
+///
+/// POSIX 的 wait 状态位布局：低 8 位是终止信号（0 表示正常退出），
+/// 第 8-15 位是退出码。
+fn exit_code_of(status: i32) -> i32 {
+    if (status & 0x7f) != 0 {
+        // 被信号终止：约定用 128 + 信号号表示。
+        return 128 + (status & 0x7f);
+    }
+    return (status >> 8) & 0xff;
 }

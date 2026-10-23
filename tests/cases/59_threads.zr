@@ -1,0 +1,33 @@
+//=============================================================================
+// tests/cases/59_threads.zr — 线程
+//
+// 覆盖：
+//   - 启动线程并 join
+//   - 多个线程并发跑
+//   - 当前线程 ID
+//=============================================================================
+
+use thread::{start_thread, current_id, sleep_ms};
+
+/// 工作线程：睡一会儿再返回。
+fn worker() {
+    sleep_ms(1);
+}
+
+fn main() -> i32 {
+    // 单个线程：启动 + join。
+    let t1 = start_thread(worker);
+    if t1.join() != 0 { return 1; }
+
+    // 多个线程并发。
+    let t2 = start_thread(worker);
+    let t3 = start_thread(worker);
+    if t2.join() != 0 { return 2; }
+    if t3.join() != 0 { return 3; }
+
+    // 当前线程 ID：非零。
+    let id = current_id().value;
+    if id == 0 { return 4; }
+
+    return 0;
+}

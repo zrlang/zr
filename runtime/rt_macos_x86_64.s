@@ -251,6 +251,36 @@ _zr_realloc:
     .globl _zr_process_wait
     .globl _zr_process_getpid
 
+    .globl _zr_mkdir
+    .globl _zr_rmdir
+    .globl _zr_unlink
+    .globl _zr_rename
+    .globl _zr_path_exists
+    .globl _zr_is_dir
+    .globl _zr_file_size
+    .globl _zr_readdir_count
+    .globl _zr_readdir_name
+    .globl _zr_getcwd
+    .globl _zr_kill
+    .globl _zr_execvp
+    .globl _zr_sleep_ms
+    .globl _zr_time_ns
+    .globl _zr_time_unix_ns
+
+#==============================================================================
+# 函数指针表：用于间接调用外部函数，避免符号存根问题
+#------------------------------------------------------------------------------
+    .section __DATA,__data
+    .align 3
+_getpid_ptr:
+    .quad _getpid
+# 线程 trampoline 的地址（`lea reg, [rip+sym]` 在 Mach-O 汇编器里不可用，
+# 改成从数据段取地址再间接调用）。
+_zr_thread_trampoline_ptr:
+    .quad _zr_thread_trampoline
+
+    .section __TEXT,__text
+
 #==============================================================================
 # 线程支持（macOS 上暂存根，返回 ENOSYS）
 //------------------------------------------------------------------------------
@@ -260,17 +290,143 @@ _zr_realloc:
 //------------------------------------------------------------------------------
     .globl _zr_thread_create
 _zr_thread_create:
-    mov     rax, -1
+    push    rbp
+    mov     rbp, rsp
+    push    r12
+    push    r13
+    push    r14
+    push    r15
+    # 序言结束时 rsp ≡ 0 (mod 16)：入口 rsp ≡ 8，push rbp 变 0，再压 4 个
+    # 寄存器（32 字节）仍是 0。System V AMD64 ABI 要求"call 之前 rsp ≡ 0"。
+
+    mov     r12, rdi          // start_routine（zr 函数指针）
+    mov     r13, rsi          // arg
+
+    // 分配 pthread_t 槽（8 字节）
+    mov     edi, 8
+    mov     esi, 8
+    call    _zr_alloc
+    test    rax, rax
+    jz      .thread_create_fail
+    mov     r14, rax          // pthread_t*
+
+    // 分配 trampoline 参数 { func_ptr, arg }（16 字节）
+    mov     edi, 16
+    mov     esi, 16
+    call    _zr_alloc
+    test    rax, rax
+    jz      .thread_create_fail_trampoline
+    mov     r15, rax
+
+    mov     [r15], r12        // func_ptr
+    mov     [r15 + 8], r13    // arg
+
+    // pthread_create(pthread_t*, attr, start_routine, arg)
+    // 参数: rdi = pthread_t*, rsi = attr, rdx = start_routine, rcx = arg
+    mov     rdi, r14
+    xor     esi, esi          // attr = NULL
+    // trampoline 的地址从数据段里取：Mach-O 的汇编器不支持
+    // `lea reg, [rip+sym]` 这种 RIP 相对寻址的符号形式。
+    mov     rdx, qword ptr [_zr_thread_trampoline_ptr + rip]
+    mov     rcx, r15
+    call    _pthread_create
+    test    rax, rax
+    jz      .thread_create_success
+
+    // 失败：清理
+    mov     rdi, r15
+    mov     esi, 16
+    mov     edx, 16
+    call    _zr_dealloc
+    mov     rdi, r14
+    mov     esi, 8
+    mov     edx, 8
+    call    _zr_dealloc
+    xor     eax, eax          // 返回 NULL（失败）
+    jmp     .thread_create_done
+
+.thread_create_success:
+    mov     rax, r14          // 返回 pthread_t 槽（调用方拿它去 join）
+    jmp     .thread_create_done
+
+.thread_create_fail_trampoline:
+    mov     rdi, r14
+    mov     esi, 8
+    mov     edx, 8
+    call    _zr_dealloc
+.thread_create_fail:
+    xor     eax, eax          // 返回 NULL（失败）
+
+.thread_create_done:
+    pop     r15
+    pop     r14
+    pop     r13
+    pop     r12
+    pop     rbp
+    ret
+
+#==============================================================================
+# 线程 trampoline：把 zr 函数指针适配为 pthread_create 兼容的 C 入口
+#------------------------------------------------------------------------------
+# _zr_thread_trampoline(args)
+#   args 指向 { func_ptr: *mut void, arg: *mut void }
+#   pthread_create 要求 start_routine 是 C 约定的函数指针；zr 的函数指针
+#   直接当 C 指针用会踩到 Mach-O 的符号存根问题，所以这里**间接调用**：
+#   经由数据段里的函数指针跳转，链接器不需要为它生成存根。
+#------------------------------------------------------------------------------
+    .globl _zr_thread_trampoline
+_zr_thread_trampoline:
+    push    rbp
+    mov     rbp, rsp
+    and     rsp, -16
+    mov     rax, [rdi]        // func_ptr
+    mov     rdi, [rdi + 8]    // arg
+    call    rax               // 调用 zr 函数
+    xor     rax, rax          // 返回 NULL
+    mov     rsp, rbp
+    pop     rbp
     ret
 
 #------------------------------------------------------------------------------
 # zr_thread_join(thread, retval) -> i32
-#   rdi = thread, rsi = retval
-# 返回 -1 (ENOSYS)
-//------------------------------------------------------------------------------
+#   rdi = thread（zr_thread_create 返回的槽）, rsi = retval (*mut void)
+# 等待线程结束，将返回值存入 *retval，返回 0 成功。
+#------------------------------------------------------------------------------
     .globl _zr_thread_join
 _zr_thread_join:
+    push    rbp
+    mov     rbp, rsp
+    push    r12
+    push    r13
+    # 3 次 push 之后 rsp ≡ 0 (mod 16)（入口 8 − 3×8 = −16）；再减去 16 字节
+    # 存放 pthread_join 的返回值槽，仍保持 16 字节对齐 —— System V AMD64 ABI
+    # 要求"call 之前 rsp ≡ 0 (mod 16)"，否则 libc 里的 movaps 会段错误。
+    sub     rsp, 16
+
+    mov     r12, rdi          // thread ptr
+    mov     r13, rsi          // retval ptr
+
+    mov     rdi, [r12]        // pthread_t
+    mov     rsi, rsp          // 临时存储 retval
+    call    _pthread_join
+    test    rax, rax
+    jz      .join_success
     mov     rax, -1
+    jmp     .join_done
+
+.join_success:
+    test    r13, r13
+    jz      .join_no_retval
+    mov     rax, [rsp]
+    mov     [r13], rax
+.join_no_retval:
+    xor     eax, eax
+
+.join_done:
+    add     rsp, 16
+    pop     r13
+    pop     r12
+    pop     rbp
     ret
 
 #------------------------------------------------------------------------------
@@ -279,7 +435,12 @@ _zr_thread_join:
 //------------------------------------------------------------------------------
     .globl _zr_thread_self
 _zr_thread_self:
-    xor     rax, rax
+    push    rbp
+    mov     rbp, rsp
+    and     rsp, -16
+    call    _pthread_self
+    mov     rsp, rbp
+    pop     rbp
     ret
 
 #==============================================================================
@@ -290,7 +451,12 @@ _zr_thread_self:
 //------------------------------------------------------------------------------
     .globl _zr_process_fork
 _zr_process_fork:
+    push    rbp
+    mov     rbp, rsp
+    and     rsp, -16
     call    _fork
+    mov     rsp, rbp
+    pop     rbp
     ret
 
 #------------------------------------------------------------------------------
@@ -300,7 +466,12 @@ _zr_process_fork:
 //------------------------------------------------------------------------------
     .globl _zr_process_exec
 _zr_process_exec:
+    push    rbp
+    mov     rbp, rsp
+    and     rsp, -16
     call    _execve
+    mov     rsp, rbp
+    pop     rbp
     ret
 
 #------------------------------------------------------------------------------
@@ -310,13 +481,15 @@ _zr_process_exec:
 //------------------------------------------------------------------------------
     .globl _zr_process_wait
 _zr_process_wait:
-    // wait4(pid, status, options, rusage)
-    mov     rcx, rdx          // options
-    xor     rdx, rdx          // status
-    xor     r8, r8            // rusage = NULL
-    // macOS wait4 签名: pid_t wait4(pid_t pid, int *status, int options, struct rusage *rusage)
-    mov     rax, 7            // SYS_wait4 (macOS)
-    syscall
+    push    rbp
+    mov     rbp, rsp
+    and     rsp, -16
+    // 走 libc 的 waitpid：macOS 10.12 起 `syscall(2)` 已被标记为不支持
+    // （直接调系统调用号拿不到正确结果），waitpid 才是可用的接口。
+    // waitpid(pid, status, options) 的参数顺序与 wait4 前三个一致。
+    call    _waitpid
+    mov     rsp, rbp
+    pop     rbp
     ret
 
 #------------------------------------------------------------------------------
@@ -324,7 +497,12 @@ _zr_process_wait:
 //------------------------------------------------------------------------------
     .globl _zr_process_getpid
 _zr_process_getpid:
-    call    _getpid
+    push    rbp
+    mov     rbp, rsp
+    and     rsp, -16
+    call    qword ptr [_getpid_ptr + rip]
+    mov     rsp, rbp
+    pop     rbp
     ret
 
 #------------------------------------------------------------------------------
@@ -421,5 +599,364 @@ _zr_run_tasks:
     pop     r14
     pop     r13
     pop     r12
+    pop     rbp
+    ret
+#==============================================================================
+# 文件系统 / 路径 / 时间原语
+#
+# 全部走 libSystem。约定（与 zr 侧 std/fs.zr、std/path.zr 一致）：
+#   成功返回 >= 0，失败返回 -1。
+# 每个封装都在 `call` 前把 rsp 对齐到 16（libc 里的 movaps 需要）。
+#==============================================================================
+
+#------------------------------------------------------------------------------
+# zr_mkdir(path) -> i32
+#   rdi = path，权限固定 0777（受 umask 影响）
+#------------------------------------------------------------------------------
+    .globl _zr_mkdir
+_zr_mkdir:
+    push    rbp
+    mov     rbp, rsp
+    and     rsp, -16
+    mov     esi, 511            // mode = 0777
+    call    _mkdir
+    mov     rsp, rbp
+    pop     rbp
+    ret
+
+#------------------------------------------------------------------------------
+# zr_rmdir(path) -> i32
+#------------------------------------------------------------------------------
+    .globl _zr_rmdir
+_zr_rmdir:
+    push    rbp
+    mov     rbp, rsp
+    and     rsp, -16
+    call    _rmdir
+    mov     rsp, rbp
+    pop     rbp
+    ret
+
+#------------------------------------------------------------------------------
+# zr_unlink(path) -> i32
+#------------------------------------------------------------------------------
+    .globl _zr_unlink
+_zr_unlink:
+    push    rbp
+    mov     rbp, rsp
+    and     rsp, -16
+    call    _unlink
+    mov     rsp, rbp
+    pop     rbp
+    ret
+
+#------------------------------------------------------------------------------
+# zr_rename(old, new) -> i32
+#------------------------------------------------------------------------------
+    .globl _zr_rename
+_zr_rename:
+    push    rbp
+    mov     rbp, rsp
+    and     rsp, -16
+    call    _rename
+    mov     rsp, rbp
+    pop     rbp
+    ret
+
+#------------------------------------------------------------------------------
+# zr_path_exists(path) -> i32
+#   存在返回 1，不存在返回 0。
+#------------------------------------------------------------------------------
+    .globl _zr_path_exists
+_zr_path_exists:
+    push    rbp
+    mov     rbp, rsp
+    and     rsp, -16
+    sub     rsp, 144
+    mov     rsi, rsp
+    call    _stat$INODE64
+    test    eax, eax
+    jnz     .exists_no
+    mov     eax, 1
+    jmp     .exists_done
+.exists_no:
+    xor     eax, eax
+.exists_done:
+    add     rsp, 144
+    mov     rsp, rbp
+    pop     rbp
+    ret
+
+#------------------------------------------------------------------------------
+# zr_is_dir(path) -> i32
+#   是目录返回 1，不是返回 0，路径不存在返回 -1。
+#------------------------------------------------------------------------------
+    .globl _zr_is_dir
+_zr_is_dir:
+    push    rbp
+    mov     rbp, rsp
+    and     rsp, -16
+    sub     rsp, 144
+    mov     rsi, rsp
+    call    _stat$INODE64
+    test    eax, eax
+    jnz     .isdir_err
+    movzx   eax, word ptr [rsp+4]     // st_mode
+    and     eax, 0xF000               // S_IFMT
+    cmp     eax, 0x4000               // S_IFDIR
+    sete    al
+    movzx   eax, al
+    jmp     .isdir_done
+.isdir_err:
+    mov     eax, -1
+.isdir_done:
+    add     rsp, 144
+    mov     rsp, rbp
+    pop     rbp
+    ret
+
+#------------------------------------------------------------------------------
+# zr_file_size(path) -> i64
+#   返回文件字节数；不存在或出错返回 -1。
+#------------------------------------------------------------------------------
+    .globl _zr_file_size
+_zr_file_size:
+    push    rbp
+    mov     rbp, rsp
+    and     rsp, -16
+    sub     rsp, 144
+    mov     rsi, rsp
+    call    _stat$INODE64
+    test    eax, eax
+    jnz     .fsize_err
+    mov     rax, qword ptr [rsp+96]    // st_size
+    jmp     .fsize_done
+.fsize_err:
+    mov     rax, -1
+.fsize_done:
+    add     rsp, 144
+    mov     rsp, rbp
+    pop     rbp
+    ret
+
+#------------------------------------------------------------------------------
+# zr_readdir_count(path) -> i64
+#   目录项个数；出错返回 -1。（包含 "." 与 ".."）
+#------------------------------------------------------------------------------
+    .globl _zr_readdir_count
+_zr_readdir_count:
+    push    rbp
+    mov     rbp, rsp
+    and     rsp, -16
+    sub     rsp, 16
+    call    _opendir
+    test    rax, rax
+    jz      .rdc_fail
+    mov     qword ptr [rsp], rax       // DIR*
+    mov     qword ptr [rsp+8], 0       // count
+.rdc_loop:
+    mov     rdi, qword ptr [rsp]
+    call    _readdir$INODE64
+    test    rax, rax
+    jz      .rdc_end
+    movzx   ecx, word ptr [rax+18]     // d_namlen（INODE64 布局）
+    lea     rdx, [rax+21]              // d_name
+    cmp     ecx, 1
+    je      .rdc_dot
+    cmp     ecx, 2
+    je      .rdc_dotdot
+    jmp     .rdc_count
+.rdc_dot:
+    cmp     byte ptr [rdx], 46         // '.'
+    je      .rdc_loop
+    jmp     .rdc_count
+.rdc_dotdot:
+    cmp     word ptr [rdx], 0x2E2E     // ".."
+    je      .rdc_loop
+.rdc_count:
+    inc     qword ptr [rsp+8]
+    jmp     .rdc_loop
+.rdc_end:
+    mov     rdi, qword ptr [rsp]
+    call    _closedir
+    mov     rax, qword ptr [rsp+8]
+    jmp     .rdc_done
+.rdc_fail:
+    mov     rax, -1
+.rdc_done:
+    add     rsp, 16
+    mov     rsp, rbp
+    pop     rbp
+    ret
+
+#------------------------------------------------------------------------------
+# zr_readdir_name(path, index, buf, cap) -> i64
+#   rdi = path, rsi = index, rdx = buf, rcx = cap
+#   把第 index 个条目（跳过 "." 与 ".."）的名字写进 buf（**不含结尾 NUL**），
+#   返回名字长度。出错（越界 / 打不开 / 名字比 cap 长）返回 -1。
+#------------------------------------------------------------------------------
+    .globl _zr_readdir_name
+_zr_readdir_name:
+    push    rbp
+    mov     rbp, rsp
+    and     rsp, -16
+    sub     rsp, 64
+    mov     qword ptr [rsp+8], rdx     // buf
+    mov     qword ptr [rsp+16], rcx    // cap
+    mov     qword ptr [rsp+24], rsi    // 剩余 index
+    test    rsi, rsi
+    js      .rdn_fail
+    call    _opendir
+    test    rax, rax
+    jz      .rdn_fail
+    mov     qword ptr [rsp], rax       // DIR*
+.rdn_next:
+    mov     rdi, qword ptr [rsp]
+    call    _readdir$INODE64
+    test    rax, rax
+    jz      .rdn_close_fail
+    movzx   ecx, word ptr [rax+18]     // d_namlen
+    lea     rdx, [rax+21]              // d_name
+    cmp     ecx, 1
+    je      .rdn_dot
+    cmp     ecx, 2
+    je      .rdn_dotdot
+    jmp     .rdn_cand
+.rdn_dot:
+    cmp     byte ptr [rdx], 46
+    je      .rdn_next
+    jmp     .rdn_cand
+.rdn_dotdot:
+    cmp     word ptr [rdx], 0x2E2E
+    je      .rdn_next
+.rdn_cand:
+    cmp     qword ptr [rsp+24], 0
+    je      .rdn_found
+    dec     qword ptr [rsp+24]
+    jmp     .rdn_next
+.rdn_found:
+    movzx   ecx, word ptr [rax+18]     // 名字长度
+    mov     rdx, qword ptr [rsp+16]    // cap
+    cmp     rcx, rdx
+    ja      .rdn_close_fail            // 放不下
+    mov     qword ptr [rsp+32], rcx
+    mov     qword ptr [rsp+40], rax
+    mov     rdi, qword ptr [rsp+8]
+    mov     rsi, qword ptr [rsp+40]
+    add     rsi, 21
+    cld
+    rep movsb
+    mov     rdi, qword ptr [rsp]
+    call    _closedir
+    mov     rax, qword ptr [rsp+32]
+    jmp     .rdn_done
+.rdn_close_fail:
+    mov     rdi, qword ptr [rsp]
+    call    _closedir
+.rdn_fail:
+    mov     rax, -1
+.rdn_done:
+    add     rsp, 64
+    mov     rsp, rbp
+    pop     rbp
+    ret
+
+#------------------------------------------------------------------------------
+    .globl _zr_getcwd
+_zr_getcwd:
+    push    rbp
+    mov     rbp, rsp
+    and     rsp, -16
+    call    _getcwd
+    test    rax, rax
+    jz      .gcwd_fail
+    mov     rdi, rax
+    call    _strlen
+    jmp     .gcwd_done
+.gcwd_fail:
+    mov     rax, -1
+.gcwd_done:
+    mov     rsp, rbp
+    pop     rbp
+    ret
+
+#------------------------------------------------------------------------------
+# zr_kill(pid, sig) -> i32
+#------------------------------------------------------------------------------
+    .globl _zr_kill
+_zr_kill:
+    push    rbp
+    mov     rbp, rsp
+    and     rsp, -16
+    call    _kill
+    mov     rsp, rbp
+    pop     rbp
+    ret
+
+#------------------------------------------------------------------------------
+# zr_execvp(file, argv) -> i32
+#   成功不返回；失败返回 -1。
+#------------------------------------------------------------------------------
+    .globl _zr_execvp
+_zr_execvp:
+    push    rbp
+    mov     rbp, rsp
+    and     rsp, -16
+    call    _execvp
+    mov     rsp, rbp
+    pop     rbp
+    ret
+
+#------------------------------------------------------------------------------
+# zr_sleep_ms(ms) -> i32
+#------------------------------------------------------------------------------
+    .globl _zr_sleep_ms
+_zr_sleep_ms:
+    push    rbp
+    mov     rbp, rsp
+    and     rsp, -16
+    imul    rdi, rdi, 1000             // ms -> us
+    call    _usleep
+    mov     rsp, rbp
+    pop     rbp
+    ret
+
+#------------------------------------------------------------------------------
+# zr_time_ns() -> i64     单调时钟，纳秒
+#------------------------------------------------------------------------------
+    .globl _zr_time_ns
+_zr_time_ns:
+    push    rbp
+    mov     rbp, rsp
+    and     rsp, -16
+    sub     rsp, 16
+    mov     edi, 6                     // CLOCK_MONOTONIC
+    mov     rsi, rsp
+    call    _clock_gettime
+    mov     rax, qword ptr [rsp]       // tv_sec
+    imul    rax, rax, 1000000000
+    add     rax, qword ptr [rsp+8]     // tv_nsec
+    add     rsp, 16
+    mov     rsp, rbp
+    pop     rbp
+    ret
+
+#------------------------------------------------------------------------------
+# zr_time_unix_ns() -> i64    墙上时钟，纳秒
+#------------------------------------------------------------------------------
+    .globl _zr_time_unix_ns
+_zr_time_unix_ns:
+    push    rbp
+    mov     rbp, rsp
+    and     rsp, -16
+    sub     rsp, 16
+    xor     edi, edi                   // CLOCK_REALTIME
+    mov     rsi, rsp
+    call    _clock_gettime
+    mov     rax, qword ptr [rsp]
+    imul    rax, rax, 1000000000
+    add     rax, qword ptr [rsp+8]
+    add     rsp, 16
+    mov     rsp, rbp
     pop     rbp
     ret

@@ -27,6 +27,22 @@
     .global zr_dealloc
     .global zr_realloc
 
+    .global zr_mkdir
+    .global zr_rmdir
+    .global zr_unlink
+    .global zr_rename
+    .global zr_path_exists
+    .global zr_is_dir
+    .global zr_file_size
+    .global zr_readdir_count
+    .global zr_readdir_name
+    .global zr_getcwd
+    .global zr_kill
+    .global zr_execvp
+    .global zr_sleep_ms
+    .global zr_time_ns
+    .global zr_time_unix_ns
+
     .section .text
 
 #------------------------------------------------------------------------------
@@ -294,4 +310,84 @@ zr_realloc:
     ret
 
 .realloc_inplace:
+    ret
+#==============================================================================
+# 文件系统 / 路径 / 时间原语：本平台暂未实现，统一返回 -1。
+# 符号必须存在，否则 `use fs` 的程序链接失败。
+#==============================================================================
+    .text
+
+    .globl zr_mkdir
+zr_mkdir:
+    mov     x0, #-1
+    ret
+
+    .globl zr_rmdir
+zr_rmdir:
+    mov     x0, #-1
+    ret
+
+    .globl zr_unlink
+zr_unlink:
+    mov     x0, #-1
+    ret
+
+    .globl zr_rename
+zr_rename:
+    mov     x0, #-1
+    ret
+
+    .globl zr_path_exists
+zr_path_exists:
+    mov     x0, #-1
+    ret
+
+    .globl zr_is_dir
+zr_is_dir:
+    mov     x0, #-1
+    ret
+
+    .globl zr_file_size
+zr_file_size:
+    mov     x0, #-1
+    ret
+
+    .globl zr_readdir_count
+zr_readdir_count:
+    mov     x0, #-1
+    ret
+
+    .globl zr_readdir_name
+zr_readdir_name:
+    mov     x0, #-1
+    ret
+
+    .globl zr_getcwd
+zr_getcwd:
+    mov     x0, #-1
+    ret
+
+    .globl zr_kill
+zr_kill:
+    mov     x0, #-1
+    ret
+
+    .globl zr_execvp
+zr_execvp:
+    mov     x0, #-1
+    ret
+
+    .globl zr_sleep_ms
+zr_sleep_ms:
+    mov     x0, #-1
+    ret
+
+    .globl zr_time_ns
+zr_time_ns:
+    mov     x0, #-1
+    ret
+
+    .globl zr_time_unix_ns
+zr_time_unix_ns:
+    mov     x0, #-1
     ret
