@@ -708,7 +708,12 @@ impl TypeChecker {
         // 符号表——当时机解析会报 `cannot find value Later`。只延后别名：
         // 结构体 / 枚举 / union 的目标都是具名类型或字面量，无需等待。
         // （见 `tests/cases/70_type_alias.zr` 的头注释。）
-        let mut alias_pending: Vec<(DefId, ast::Type)> = Vec::new();
+        //
+        // `generics` 一并记下：泛型别名（`type Ref<T> = *const T`）的目标里
+        // 有 `T`，得靠它建占位符；不记的话 `T` 在第二遍解析时报
+        // `cannot find value T`，而且解析器直接丢掉 `<T>` 更糟——静默把
+        // `Ref<i32>` 当成 `*const <推断类型>`。
+        let mut alias_pending: Vec<(DefId, ast::Type, Vec<ast::GenericParam>)> = Vec::new();
         for td in &prog.type_defs {
             // cfg 过滤：结构体的属性留在 AST 上，可以在这里判断。
             //
@@ -757,14 +762,22 @@ impl TypeChecker {
                         }),
                     );
                 }
-                ast::TypeDef::Alias { target, .. } => {
-                    alias_pending.push((id, target.clone()));
+                ast::TypeDef::Alias { target, generics, .. } => {
+                    alias_pending.push((id, target.clone(), generics.clone()));
                 }
             }
         }
         // 第二个 pass：现在所有类型名都进了符号表，可以安全转换别名目标。
-        for (id, target) in alias_pending {
+        //
+        // 泛型别名要先 push 类型参数作用域再转换：目标里的 `T` 是类型变量，
+        // 靠 `lookup_type_param` 解析。转换出的目标里 `T` 是 `Infer` 占位符，
+        // 用法点（`inline_alias_ty`）按实参做替换。作用域必须 pop 掉，否则
+        // 残留会让后面无关定义里的 `T` 误解析到这个别名上。
+        for (id, target, generics) in alias_pending {
+            let scope = self.push_type_params(&generics, ast::Span::unknown());
+            self.record_type_generics(id, &generics, &scope);
             let target_ty = self.ast_to_hir_type(&target)?;
+            self.type_params.pop();
             self.type_defs.insert(
                 id,
                 hir::HirTypeDef::Alias {
@@ -5896,12 +5909,18 @@ impl TypeChecker {
         if depth >= MAX_ALIAS_DEPTH {
             return ty.clone();
         }
-        let Ty::Named(id, _args) = ty else {
+        let Ty::Named(id, args) = ty else {
             return ty.clone();
         };
         match self.type_defs.get(id) {
+            // 泛型别名：目标里是 `Infer` 占位符，必须按实参替换。
+            //
+            // 直接展开不替换会让 `type Ref<T> = *const T; let r: Ref<i32> = ..`
+            // 退化成 `*const <推断类型>`——推断到别处之后类型就飘了，而这里
+            // 完全不会报错。占位符是按声明顺序排的，和实参一一对应。
             Some(hir::HirTypeDef::Alias { target, .. }) => {
-                self.inline_alias_ty(target, depth + 1)
+                let substituted = self.subst_def_ty(*id, args, target);
+                self.inline_alias_ty(&substituted, depth + 1)
             }
             _ => ty.clone(),
         }

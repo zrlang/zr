@@ -659,15 +659,19 @@ impl Parser {
     ) -> Result<TypeDef, CompileError> {
         let _span = self.previous().span;
         let name = self.consume_ident("expected type name")?;
-        let _generics = if self.match_kind(&TokenKind::Lt) {
+        let generics = if self.match_kind(&TokenKind::Lt) {
             self.parse_generic_params()?
         } else {
             vec![]
         };
         self.consume(&TokenKind::Eq, "expected '=' in type alias")?;
         let target = self.parse_type()?;
-        self.consume(&TokenKind::Semicolon, "expected ';'")?;
-        Ok(TypeDef::Alias { name, target })
+        self.consume(&TokenKind::Semicolon, "expected ';' in type alias")?;
+        Ok(TypeDef::Alias {
+            name,
+            target,
+            generics,
+        })
     }
 
     // ==================================================================

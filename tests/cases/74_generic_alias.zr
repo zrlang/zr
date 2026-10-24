@@ -1,0 +1,60 @@
+//=============================================================================
+// tests/cases/74_generic_alias.zr — 泛型类型别名 `type X<T> = ...`
+//
+// 早先解析器把 `<T>` 整个丢掉（`let _generics = ...`），别名目标里的 `T`
+// 解析失败；而 `inline_alias_ty` 展平时又不做参数替换——`type Ref<T> =
+// *const T;` 无论传什么实参都退化成 `*const <推断类型>`，类型飘走且全程
+// 不报错（能编过、结果错）。现在 `<T>` 被保留并登记成占位符，展平按实参替换。
+//=============================================================================
+
+struct Cell<T> { v: T }
+
+type Ref<T> = *const T;
+type MutRef<T> = *mut T;
+type Pair<X, Y> = (X, Y);
+type BoxedStr = Cell<i32>;
+type AliasU8 = u8;
+type Forward = Later;
+type Later = i32;
+
+fn read(p: *const i32) -> i32 { *p }
+fn write(p: *mut i32, v: i32) { *p = v; }
+
+fn main() -> i32 {
+    let a: i32 = 1;
+    // 单实参：`Ref<i32>` 必须展开成 `*const i32`，能被取地址 / 解引用。
+    let r: Ref<i32> = &a;
+    if read(r) != 1 {
+        return 1;
+    }
+    let m: MutRef<i32> = &mut a;
+    write(m, 2);
+    if a != 2 {
+        return 2;
+    }
+
+    // 两个实参：字段下标必须各自对上，不能两个都替成同一个类型。
+    let p: Pair<i32, i64> = (1, 2i64);
+    if p.0 + p.1 as i32 != 3 {
+        return 3;
+    }
+
+    // 别名目标是指向**具体实例化类型**的结构体。
+    let c: BoxedStr = Cell { v: 41 };
+    if c.v + 1 != 42 {
+        return 4;
+    }
+
+    // 无泛型实参的别名仍然工作（回归）。
+    let u: AliasU8 = 7;
+    if u != 7 {
+        return 5;
+    }
+    // 前向引用别名（回归 `70_type_alias.zr` 的行为）。
+    let f: Forward = 3;
+    if f != 3 {
+        return 6;
+    }
+
+    return 0;
+}

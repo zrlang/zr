@@ -656,7 +656,15 @@ pub enum TypeDef {
     /// `union`（仅最后一个字段活跃，unsafe）。
     Union(UnionDef),
     /// `type` 别名。
-    Alias { name: String, target: Type },
+    Alias {
+        name: String,
+        target: Type,
+        /// 泛型参数（`type MyBox<T> = Option<T>` 里的 `<T>`）。
+        ///
+        /// 解析阶段不能丢：别名目标里要用到 `T`，没有它连"这是不是别名"
+        /// 都判断不出来（见 `typeck::collect_declarations` 的别名分支）。
+        generics: Vec<GenericParam>,
+    },
 }
 
 /// 结构体字段。
