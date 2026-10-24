@@ -898,7 +898,7 @@ mod tests {
         }
         let mut p = crate::parser::Parser::new(tokens);
         match p.parse() {
-            Ok(prog) => println!("Parsed successfully"),
+            Ok(_prog) => println!("Parsed successfully"),
             Err(e) => {
                 println!("Parse error: {}", e);
                 // Try to see current parser state

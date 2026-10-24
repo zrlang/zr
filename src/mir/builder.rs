@@ -95,7 +95,7 @@ pub fn lower_function(
 
     // 函数级作用域：参数在函数结束时按逆序 Drop。Drop 实现自己的
     // `self` 参数不能再次 Drop，否则会无限递归。
-    b.drop_scopes.push(Vec::new());
+    b.drop_scopes.push(DropScope::default());
     let dropping_self = func.name.ends_with("__drop") && func.params.len() == 1;
     for (i, p) in func.params.iter().enumerate() {
         b.def_local(p.local.0, MirValue::Var(format!("arg_{i}")), &p.ty);
@@ -177,19 +177,55 @@ fn lower_block(b: &mut Builder, block: &HirBlock) -> Option<MirValue> {
     lower_block_opts(b, block, true)
 }
 
+/// 降级一个"延迟到块尾执行"的 `defer` 块。
+///
+/// 与 `lower_block` 的唯一差别是**不**先压一个作用域：`defer` 作用域
+/// 必须与它所属的块完全重合（析构点由调用方按逆序统一发出），所以这里
+/// 只负责把语句降级出来。若块已经用 `return` / `break` 终结，就不再补
+/// 跳转，避免覆盖掉已有的终结符。
+fn lower_defer_block(b: &mut Builder, block: &HirBlock) {
+    b.drop_scopes.push(DropScope::default());
+    for stmt in &block.stmts {
+        lower_stmt(b, stmt);
+    }
+    if let Some(expr) = &block.tail {
+        let _ = lower_expr(b, expr);
+    }
+    let scope = b.drop_scopes.pop().unwrap();
+    if b.current_block_mut().term.is_none() {
+        b.emit_drop_scope(scope);
+    }
+    // 否则 defer 块内又 `return` / `break` 了：该层与外层作用域的析构都已由
+    // 终结符处理过（`Return` 走 `emit_all_drops`，`Break`/`Continue` 走
+    // `emit_drops_from`），这里不能再压回栈上——压回去会让外层块 pop 到**这**
+    // 个空层而不是它自己的那一层，真正带着 Drop 局部量的层就永远留在栈上。
+}
+
 /// `emit_scope_drops == false` 用于函数根块：返回值可能来自局部量，必须先
 /// 复制到返回槽/标记移动，再统一析构，不能提前把尾表达式的源值析构掉。
 fn lower_block_opts(b: &mut Builder, block: &HirBlock, emit_scope_drops: bool) -> Option<MirValue> {
-    b.drop_scopes.push(Vec::new());
+    b.drop_scopes.push(DropScope::default());
     let mut tail = None;
+    // `defer` 语句由 `lower_stmt` 直接排进当前作用域的 `deferred` 队列，
+    // 这里不再单独收集（见下方退出路径的注释）。
     for stmt in &block.stmts {
         lower_stmt(b, stmt);
     }
     if let Some(expr) = &block.tail {
         tail = Some(lower_expr(b, expr));
     }
+    // 正常退出路径：先跑 defer（声明顺序逆序），再析构本作用域。
+    // 作用域**总是弹出**——`emit_drop_scope` 内部会因终结符已存在而早退。
+    // 这里不能把作用域压回栈上：压回去会让外层块的 `pop` 取到这一空层而不是
+    // 它自己的那一层，真正带着 Drop 局部量的层就永远留在栈上、漏析构。
+    // defer 由 `lower_stmt` 直接排进 `scope.deferred`，这里取空即得；不要另设
+    // 局部收集器——那会在下面被 `mem::take` 整层覆盖掉，等于白收集。
     if emit_scope_drops {
-        if let Some(scope) = b.drop_scopes.pop() {
+        if let Some(mut scope) = b.drop_scopes.pop() {
+            let deferred = std::mem::take(&mut scope.deferred);
+            for d in deferred.into_iter().rev() {
+                lower_defer_block(b, &d);
+            }
             b.emit_drop_scope(scope);
         }
     }
@@ -199,6 +235,15 @@ fn lower_block_opts(b: &mut Builder, block: &HirBlock, emit_scope_drops: bool) -
 /// 降级一条语句。
 fn lower_stmt(b: &mut Builder, stmt: &HirStmt) {
     let temp_mark = b.temp_drops.len();
+    // `defer` 不立刻执行：排进当前作用域，块尾逆序取出。
+    if let HirStmt::Expr(e) = stmt {
+        if let hir::ExprKind::Defer(d) = &e.kind {
+            if let Some(scope) = b.drop_scopes.last_mut() {
+                scope.deferred.push(d.clone());
+            }
+            return;
+        }
+    }
     match stmt {
         HirStmt::Let { local, init } | HirStmt::Var { local, init } => {
             if let Some(init) = init {
@@ -809,6 +854,11 @@ fn lower_expr(b: &mut Builder, expr: &HirExpr) -> MirValue {
         }
         Return(v) => {
             let temp_mark = b.temp_drops.len();
+            // `defer` 必须先于返回值求值执行：从最内层作用域向外，各自按声明
+            // 顺序逆序。作用域本身**不能**弹出——弹掉连这层登记的 Drop 局部
+            // 量一起丢，返回路径就漏析构了（后面 `emit_all_drops` 只遍历栈上
+            // 还留着的层）。这里只取空排队项，层留在栈上。
+            b.flush_deferred();
             if let Some(e) = v {
                 if b.is_drop_ty(&e.ty) {
                     if let hir::ExprKind::Local(id) = e.kind {
@@ -1052,6 +1102,7 @@ fn lower_expr(b: &mut Builder, expr: &HirExpr) -> MirValue {
             // 是为了不覆盖已经终结的块（比如 `if c { break; }` 里 if 自己刚
             // 写完跳转）。
             if let Some(ctx) = find_loop(b, label.as_deref()).cloned() {
+                b.flush_deferred();
                 b.emit_drops_from(ctx.drop_depth);
                 b.terminate_if_open(MirTerminator::Goto(ctx.exit));
             }
@@ -1168,6 +1219,16 @@ fn lower_expr(b: &mut Builder, expr: &HirExpr) -> MirValue {
                 }
                 _ => MirValue::Unit,
             }
+        }
+        // `defer` 不立刻执行：排进当前作用域，块尾（或 `return` / `break`）
+        // 逆序取出。块的最后一条语句在 HIR 里是 `tail` 而不是 `stmts`，所以
+        // 尾表达式位置的 `defer` 只会走到这里——若没有这个分支，它会被兜底
+        // 分支当成 unit 静默丢掉，`defer` 编译通过却从不执行。
+        Defer(d) => {
+            if let Some(scope) = b.drop_scopes.last_mut() {
+                scope.deferred.push(d.clone());
+            }
+            MirValue::Unit
         }
         Yield => {
             b.current_block_mut().instrs.push(MirInstr::Suspend);
@@ -1311,6 +1372,14 @@ pub(super) fn alloc_synthetic_slot() -> u32 {
 static NEXT_SYNTHETIC: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0x4000_0000);
 
 /// MIR 构建器：管理基本块分配与临时量编号。
+/// 一个词法作用域：需要 Drop 的局部量 + 排队等待执行的 `defer`。
+#[derive(Clone, Default)]
+struct DropScope {
+    drops: Vec<DropLocal>,
+    /// 按声明顺序排队的 `defer` 块；块尾（或 `return`）时逆序取出执行。
+    deferred: Vec<hir::HirBlock>,
+}
+
 /// 一个等待作用域结束析构的局部量。
 #[derive(Clone)]
 struct DropLocal {
@@ -1369,8 +1438,8 @@ pub(super) struct Builder {
     drops: HashMap<hir::DefId, String>,
     /// 泛型类型定义的占位符参数（布局 / 字段偏移按实参替换）。
     generic_params: HashMap<hir::DefId, Vec<hir::Ty>>,
-    /// 词法作用域栈，每层记录该作用域内需要 Drop 的局部量。
-    drop_scopes: Vec<Vec<DropLocal>>,
+    /// 词法作用域栈，每层记录该作用域内需要 Drop 的局部量与 `defer`。
+    drop_scopes: Vec<DropScope>,
     /// 合成局部 id 的起点（数组字面量等没有源码局部变量的存储）。
     /// 被取过地址（`&x`）的局部变量 id。
     ///
@@ -1621,7 +1690,7 @@ impl Builder {
             None
         };
         if let Some(scope) = self.drop_scopes.last_mut() {
-            scope.push(DropLocal {
+            scope.drops.push(DropLocal {
                 local,
                 ty: ty.clone(),
                 moved: false,
@@ -1645,7 +1714,7 @@ impl Builder {
                         .drop_scopes
                         .iter()
                         .rev()
-                        .flat_map(|s| s.iter().rev())
+                        .flat_map(|s| s.drops.iter().rev())
                         .find(|e| e.local == *local)
                         .and_then(|e| e.flags.clone());
                     if let Some(flags) = flags {
@@ -1682,7 +1751,7 @@ impl Builder {
             return;
         }
         for scope in self.drop_scopes.iter_mut().rev() {
-            for entry in scope.iter_mut().rev() {
+            for entry in scope.drops.iter_mut().rev() {
                 if entry.local == local {
                     if !entry.moved_paths.contains(&path) {
                         entry.moved_paths.push(path.clone());
@@ -1703,7 +1772,7 @@ impl Builder {
         self.drop_scopes
             .iter()
             .rev()
-            .flat_map(|s| s.iter().rev())
+            .flat_map(|s| s.drops.iter().rev())
             .find(|e| e.local == local)
             .is_some_and(|e| match &e.ty {
                 hir::Ty::Named(id, _) => self.drops.contains_key(id),
@@ -1715,7 +1784,7 @@ impl Builder {
     /// 覆盖赋值时不需要（也不能）先析构。
     fn take_moved_path(&mut self, local: LocalId, path: &[usize]) -> bool {
         for scope in self.drop_scopes.iter_mut().rev() {
-            for entry in scope.iter_mut().rev() {
+            for entry in scope.drops.iter_mut().rev() {
                 if entry.local == local {
                     if let Some(pos) = entry.moved_paths.iter().position(|p| p == path) {
                         entry.moved_paths.remove(pos);
@@ -1730,7 +1799,7 @@ impl Builder {
 
     fn mark_moved(&mut self, local: LocalId) {
         for scope in self.drop_scopes.iter_mut().rev() {
-            for entry in scope.iter_mut().rev() {
+            for entry in scope.drops.iter_mut().rev() {
                 if entry.local == local {
                     entry.moved = true;
                     entry.moved_paths.clear();
@@ -1744,7 +1813,7 @@ impl Builder {
     fn replace_drop_local(&mut self, local: u32, ty: &hir::Ty) {
         let mut found: Option<(usize, usize, bool, hir::Ty)> = None;
         for (si, scope) in self.drop_scopes.iter().enumerate().rev() {
-            for (ei, entry) in scope.iter().enumerate().rev() {
+            for (ei, entry) in scope.drops.iter().enumerate().rev() {
                 if entry.local.0 == local {
                     found = Some((si, ei, entry.moved, entry.ty.clone()));
                     break;
@@ -1759,25 +1828,48 @@ impl Builder {
                 if !moved {
                     self.emit_drop(LocalId(local), &ty);
                 }
-                self.drop_scopes[si][ei].moved = false;
-                self.drop_scopes[si][ei].moved_paths.clear();
+                self.drop_scopes[si].drops[ei].moved = false;
+                self.drop_scopes[si].drops[ei].moved_paths.clear();
             }
             None => self.track_drop(LocalId(local), ty),
         }
     }
 
-    fn emit_drop_scope(&mut self, mut scope: Vec<DropLocal>) {
+    /// 执行栈上各作用域排队的 `defer`：**从最内层作用域向外**，每层内部再按
+    /// 声明顺序逆序。
+    ///
+    /// 只取空 `deferred` 队列，**不**弹出作用域——各层登记的 Drop 局部量还得
+    /// 留着，交给 `emit_drops_from` / `emit_all_drops` 统一析构。
+    ///
+    /// 方向要和 `emit_drops_from` 一致（它也是 `(depth..len).rev()` 从内向外）：
+    /// `defer` 里的析构可能依赖内层块的变量，反过来跑就会读到已析构的值。
+    fn flush_deferred(&mut self) {
+        if self.current_block_mut().term.is_some() {
+            return;
+        }
+        let pending: Vec<hir::HirBlock> = self.drop_scopes
+            .iter_mut()
+            .rev()
+            .flat_map(|s| std::mem::take(&mut s.deferred).into_iter().rev())
+            .collect();
+        for d in pending {
+            lower_defer_block(self, &d);
+        }
+    }
+
+    fn emit_drop_scope(&mut self, scope: DropScope) {
         if std::env::var_os("ZR_DEBUG_DROP").is_some() {
             eprintln!(
                 "emit scope len={} term={}",
-                scope.len(),
+                scope.drops.len(),
                 self.current_block_mut().term.is_some()
             );
         }
         if self.current_block_mut().term.is_some() {
             return;
         }
-        while let Some(entry) = scope.pop() {
+        let mut drops = scope.drops;
+        while let Some(entry) = drops.pop() {
             self.emit_drop_entry(&entry);
         }
     }
@@ -1787,7 +1879,7 @@ impl Builder {
             return;
         }
         for idx in (depth..self.drop_scopes.len()).rev() {
-            let scope = self.drop_scopes[idx].clone();
+            let scope = self.drop_scopes[idx].drops.clone();
             for entry in scope.iter().rev() {
                 self.emit_drop_entry(entry);
             }
@@ -1891,7 +1983,7 @@ impl Builder {
             .drop_scopes
             .iter()
             .rev()
-            .flat_map(|s| s.iter().rev())
+            .flat_map(|s| s.drops.iter().rev())
             .find(|e| e.local == local)
             .map(|e| (e.moved, e.moved_paths.clone(), e.flags.clone()))
             .unwrap_or((false, Vec::new(), None));
@@ -3239,6 +3331,10 @@ fn collect_addr_taken_expr(e: &HirExpr, out: &mut HashSet<u32>) {
             collect_addr_taken(b, out);
         }
         Loop(_, b) => collect_addr_taken(b, out),
+        // `defer` 块只是延后执行，里面的 `&x` 仍然会让 `x` 变成栈槽变量，
+        // 所以必须照常递归进去。漏掉这个分支时，defer 里取址的局部量会被当成
+        // 普通值处理，结构体字面量拿到的就是值而不是地址。
+        Defer(b) => collect_addr_taken(b, out),
         Array(elems) => {
             for e in elems {
                 collect_addr_taken_expr(e, out);

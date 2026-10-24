@@ -841,8 +841,16 @@ pub fn unsupported_const(kind: &str) -> ! {
 }
 
 /// 这个目标后端没有实现该运算码。报错并终止。
+///
+/// 与上面的 `unsupported_const` 一样走 `eprintln!` + `exit(1)`，不要用
+/// `panic!`：这本来就是可预期的编译失败，`panic!` 会向用户抛出一整段
+/// backtrace，把"这个目标后端不支持该运算"藏进去。
 pub fn unsupported_binary_op(op: crate::ssa::SsaBinaryOp) -> ! {
-    panic!("zr: 该目标后端尚未实现二元运算 `{op:?}`（浮点/位运算等）")
+    eprintln!(
+        "zr: error: target backend does not implement binary op `{op:?}` \
+         (floating-point / bitwise, etc.)"
+    );
+    std::process::exit(1);
 }
 
 /// 目标后端没有内联汇编支持时，明确报错并终止。

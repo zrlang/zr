@@ -267,6 +267,22 @@ pub enum ExprKind {
     Continue(Option<String>),
     /// `return`。
     Return(Option<Box<HirExpr>>),
+    /// `defer` 延迟表达式（块内每个 `defer` 都排入栈，退出时按逆序执行）。
+    Defer(HirBlock),
+    /// `try { ... } catch (pat) { ... }`。
+    ///
+    /// **预留变体**：parser 已支持 `try`/`catch` 语法，但 typeck 在没有栈展开表
+    /// 之前直接拒绝（见 `check_expr` 的 `Expression::Try` 分支），所以这个
+    /// HIR 变体当前无人构造。保留它以待将来实现异常机制时直接落地。
+    #[allow(dead_code)]
+    Try {
+        expr: Box<HirExpr>,
+        catch_pat: Option<HirPattern>,
+        catch_block: HirBlock,
+    },
+    /// `throw value`。同 `Try`，预留变体。
+    #[allow(dead_code)]
+    Throw(Box<HirExpr>),
     /// 数组字面量（元素按源码顺序保存）。
     Array(Vec<HirExpr>),
     /// 元组字面量：各元素按源码顺序保存。
@@ -292,8 +308,21 @@ pub enum ExprKind {
     },
     /// 结构体字面量：字段按源码书写顺序保存。
     Struct(Vec<(String, HirExpr)>),
-    /// Lambda / 闭包（已确定捕获列表与类型）。
-    Closure,
+    /// Lambda / 闭包。
+    ///
+    /// 第一版闭包走**单态化内联**：闭包只在它被定义的同一个函数里、被立即
+    /// 调用时生效。捕获列表记录闭包体引用的外层局部变量，调用点把闭包体展开
+    /// 进来，捕获变量直接复用外层 local 的 MIR 存储——不跨函数传递环境，因此
+    /// 不需要改后端调用约定。`params` 是已类型检查的形参（模式 + 类型），
+    /// `ret` 是返回类型，`body` 是闭包体。
+    Closure {
+        params: Vec<(HirPattern, Ty)>,
+        ret: Box<Ty>,
+        body: HirBlock,
+        /// 被闭包体引用、且定义在闭包之外的外层局部变量（去重，按发现顺序）。
+        /// `Ty` 是该 local 在闭包处的类型（用于将来 by-ref / by-value 捕获决策）。
+        captures: Vec<(LocalId, Ty)>,
+    },
     /// 类型转换 `Cast(操作数, 目标类型)`。
     ///
     /// 操作数必须留下来：丢掉它的话 MIR 侧无从生成转换指令。
@@ -669,6 +698,9 @@ pub struct HirConst {
 pub struct HirStatic {
     pub ty: Ty,
     pub init: Box<HirExpr>,
+    /// `static mut` 标记。当前后端不区分静态可变性（统一落只读段），字段
+    /// 暂未被读取；保留它供将来借用检查 / 线程安全分析落地时直接使用。
+    #[allow(dead_code)]
     pub is_mut: bool,
     /// 初值折叠后的字面量（`static X: i32 = 1 + 2;` 也能折出来）。
     pub const_value: Option<HirLiteral>,

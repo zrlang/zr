@@ -456,10 +456,6 @@ impl<'a> InferCtxt<'a> {
     // ===== 错误消息辅助 =====
 
     fn type_mismatch(&self, expected: &Ty, found: &Ty, span: Span) -> CompileError {
-        eprintln!("DEBUG-TM expected={:?} found={:?}", expected, found);
-        if let Ty::Named(id, _) = expected {
-            if id.0 == 94 { panic!("TM94 found={:?}", found); }
-        }
         CompileError::type_error(format!(
             "type mismatch: expected `{}`, found `{}`",
             self.type_name(expected),
