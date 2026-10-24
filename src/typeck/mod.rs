@@ -1238,9 +1238,15 @@ impl TypeChecker {
             let id = self.find_def(&s.name)?;
             let ty = self.ast_to_hir_type(&s.ty)?;
             let init = self.check_expr(&s.init, &ty)?;
+            // 初值折叠成字面量：`static X: i32 = 1 + 2;` 也得折出 `3`，
+            // 否则 MIR 侧没有可编码的字节，数据段就是空的、符号也不生成，
+            // 链接期才会报 "undefined symbol"。折不出来不算错——那类
+            // 静态量本来就没有可落地的存储（读取时已经报错）。
+            let const_value = self.eval_const_from_hir(&init).ok().map(|b| *b);
             if let Some(hs) = self.statics.get_mut(&id) {
                 hs.ty = ty;
                 *hs.init = init;
+                hs.const_value = const_value;
             }
         }
         Ok(())
@@ -4357,10 +4363,29 @@ impl TypeChecker {
             }
         }
 
-        // 载荷类型：以期望类型为准（`let x: i32 = f()?` / `Result<i32, _>?`），
-        // 没有具体注解时用推断变量。
+        // 载荷类型：以期望类型为准（`let x: i32 = f()?`）。没有具体注解时，从
+        // 成功变体的**真实字段类型**推出来——按当前枚举的类型实参做替换。
+        //
+        // 这里不能退回一个新的推断变量。在泛型函数里，`T` 自己的占位符是已经
+        // 存在的、会被单态化替换的类型；新造的推断变量和它无关。同一个泛型
+        // 函数里第二个 `?` 就拿到一个与 `T` 无关的类型，代码生成把值算错
+        // （见 `tests/cases/69_question.zr` 的 `chain`：`id(x)?` 之后 `id(a)?`
+        // 的结果不随 `a` 变；把 `let a` 注解成 `T` 就正常了，能证明就是这里）。
         let value_ty = match expected {
-            Ty::Infer(_) => self.infer.fresh_infer(span),
+            Ty::Infer(_) => {
+                let args = match &src_ty {
+                    Ty::Named(_, a) => a.clone(),
+                    _ => Vec::new(),
+                };
+                match self
+                    .variant_field_types(enum_id, ok_idx)
+                    .as_deref()
+                    .and_then(|ts| ts.first())
+                {
+                    Some(t) => self.subst_def_ty(enum_id, &args, t),
+                    None => Ty::Unit,
+                }
+            }
             other => other.clone(),
         };
 
@@ -6091,6 +6116,19 @@ impl TypeChecker {
     fn check_assignable(&self, expr: &HirExpr) -> Result<()> {
         match &expr.kind {
             ExprKind::Local(_) => Ok(()),
+            // 全局 `static mut` 有真实的数据符号（落 `.data`），可以当赋值目标。
+            // 只读 `static` 同样有存储，但下面的 `require_mutable_binding` 会
+            // 挡掉对它写——这里只管「是不是一个能写的位置」，不管可写性。
+            ExprKind::Def(id) => {
+                if self.statics.contains_key(id) {
+                    Ok(())
+                } else {
+                    Err(CompileError::type_error(
+                        "expression is not assignable (expected variable, field, deref, or index)",
+                    )
+                    .with_span(expr.span))
+                }
+            }
             ExprKind::Field(inner, _) => self.check_assignable(inner),
             // `*p = v` / `p[i] = v`：先验证写入目标本身可写。
             ExprKind::Deref(inner) => {
@@ -6123,6 +6161,19 @@ impl TypeChecker {
                         "cannot assign to immutable binding (declare it with `let mut`)",
                     )
                     .with_span(place.span))
+                }
+            }
+            // `static mut` 有数据符号、可以写；只读 `static` 同样有存储但不能写。
+            // 注意这条必须显式列出：下面的通配分支是 `Ok(())`，不加就会把
+            // `LIMIT = 41` 这种对只读静态量的赋值放行（见 `tests/cases/72_statics.zr`）。
+            ExprKind::Def(id) => {
+                match self.statics.get(id) {
+                    Some(s) if s.is_mut => Ok(()),
+                    _ => Err(CompileError::type_error(format!(
+                        "cannot assign to immutable static `{}`",
+                        self.def_names.get(id).cloned().unwrap_or_default()
+                    ))
+                    .with_span(place.span)),
                 }
             }
             ExprKind::Field(inner, _) => {

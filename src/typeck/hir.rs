@@ -698,9 +698,8 @@ pub struct HirConst {
 pub struct HirStatic {
     pub ty: Ty,
     pub init: Box<HirExpr>,
-    /// `static mut` 标记。当前后端不区分静态可变性（统一落只读段），字段
-    /// 暂未被读取；保留它供将来借用检查 / 线程安全分析落地时直接使用。
-    #[allow(dead_code)]
+    /// `static mut` 标记。`require_mutable_binding` 用它挡掉对只读静态量的
+    /// 赋值（`LIMIT = 41` 报错）；后端目前不区分可变性、静态量统一落 `.data`。
     pub is_mut: bool,
     /// 初值折叠后的字面量（`static X: i32 = 1 + 2;` 也能折出来）。
     pub const_value: Option<HirLiteral>,
