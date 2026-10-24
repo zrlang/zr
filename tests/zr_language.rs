@@ -25,37 +25,40 @@ const OPT_LEVELS: [&str; 5] = ["-O0", "-O1", "-O2", "-O3", "-Oz"];
 
 /// 编译并运行一个 `.zr` 用例，返回它的退出码。
 ///
-/// 编译失败会 panic（连编译都过不了的用例不能算"通过"）；运行超时或崩溃
-/// 同样视为失败。
-fn run_case(zr: &str, source: &Path, out: &Path, opt: &str) -> i32 {
+/// 失败时返回 `Err`（带编译 / 运行的诊断文本），**不 panic**：早先这里一
+/// 出错就 panic，整个 `#[test]` 当场中断，排在后面的用例连跑都跑不到——
+/// 一次回归能把十几个用例一起藏起来。改成返回值让调用方收齐所有失败再
+/// 汇总报告。`Err` 里的内容会在最终断言里原样打印出来。
+fn run_case(zr: &str, source: &Path, out: &Path, opt: &str) -> Result<i32, String> {
     let compile = Command::new(zr)
         .arg(source)
         .arg(opt)
         .arg("-o")
         .arg(out)
         .output()
-        .expect("failed to spawn the zr compiler");
-    assert!(
-        compile.status.success(),
-        "编译失败 ({opt}): {}\n{}",
-        source.display(),
-        String::from_utf8_lossy(&compile.stderr)
-    );
+        .map_err(|e| format!("spawn 编译失败: {e}"))?;
+    if !compile.status.success() {
+        return Err(format!(
+            "编译失败 ({opt}): {}\n{}",
+            source.display(),
+            String::from_utf8_lossy(&compile.stderr)
+        ));
+    }
 
     let run = Command::new(out)
         .output()
-        .expect("failed to spawn the compiled program");
+        .map_err(|e| format!("spawn 运行失败: {e}"))?;
     let code = run.status.code().unwrap_or(-1);
     if !run.status.success() {
-        panic!(
+        return Err(format!(
             "运行失败 ({opt}): {}\n退出码 {}\nstdout: {}\nstderr: {}",
             source.display(),
             code,
             String::from_utf8_lossy(&run.stdout),
             String::from_utf8_lossy(&run.stderr)
-        );
+        ));
     }
-    code
+    Ok(code)
 }
 
 /// 每个 `.zr` 用例各跑一个测试，名字取自文件名。
@@ -73,26 +76,35 @@ fn zr_language_cases() {
 
     assert!(!cases.is_empty(), "{} 下没有 .zr 用例", dir.display());
 
-    let mut failures = Vec::new();
+    // `failures` 收齐所有失败（编译失败、运行失败、断言非 0 三类），
+    // 最后一次性报告。早先 `run_case` 直接 panic，只能看到第一个失败，
+    // 其余用例被静默跳过。
+    let mut failures: Vec<String> = Vec::new();
     for case in &cases {
         let name = case.file_stem().unwrap().to_string_lossy().to_string();
         for opt in OPT_LEVELS {
             let out = std::env::temp_dir().join(format!("zr_case_{name}"));
-            let code = run_case(zr, case, &out, opt);
             let _ = std::fs::remove_file(&out);
-            if code == 0 {
-                println!("ok   {name} {opt}");
-            } else {
-                println!("FAIL {name} {opt} (断言 #{code})");
-                failures.push(format!("{name} {opt}"));
+            match run_case(zr, case, &out, opt) {
+                Ok(code) if code == 0 => println!("ok   {name} {opt}"),
+                Ok(code) => {
+                    println!("FAIL {name} {opt} (断言 #{code})");
+                    failures.push(format!("{name} {opt} 断言 #{code}"));
+                }
+                Err(msg) => {
+                    println!("FAIL {name} {opt}\n{msg}");
+                    failures.push(format!("{name} {opt}: {msg}"));
+                }
             }
+            let _ = std::fs::remove_file(&out);
         }
     }
 
     assert!(
         failures.is_empty(),
-        "以下用例未通过：{}",
-        failures.join(", ")
+        "以下 {count} 个用例未通过：\n{list}",
+        count = failures.len(),
+        list = failures.join("\n")
     );
 }
 
