@@ -663,9 +663,17 @@ impl TypeChecker {
 
         for trait_name in traits {
             match trait_name.as_str() {
-                "Debug" | "Clone" | "Copy" => {
+                "Debug" | "Clone" | "Copy"
+                | "PartialEq" | "Eq" | "Hash"
+                | "PartialOrd" | "Ord" | "Default" => {
                     // 生成 impl 块：在类型检查器中注册为已实现的 trait
                     // 实际的 trait 求解在 infer.rs 的 check_trait_impl 中处理
+                    //
+                    // 比较类（`PartialEq` 等）与 `Default` 目前**只登记
+                    // trait 标记，不生成方法体**：`fn needs_eq<T: Eq>` 这类
+                    // 边界校验能通过，但 `.eq()` / `==` 方法不存在（与
+                    // `Clone` 现状一致）。真生成方法体的工作见
+                    // `generate_derive_impls` 的 TODO 与测试 `71_derive`。
                     let impl_block = hir::HirImpl {
                         target: Ty::Named(def_id, Vec::new()),
                         trait_id: None, // derive 的具体 trait 在检查时按名字比对
