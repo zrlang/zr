@@ -353,6 +353,12 @@ impl<'a> InferCtxt<'a> {
     }
 
     /// 子类型关系检查（含自动解引用、自动借用、类型提升）。
+    ///
+    /// `sub` 是被检查的实际类型，`sup` 是期望类型。`type_mismatch` 的文案
+    /// 是 "expected `X`, found `Y`"，所以必须传 `(&sup, &sub)`——早先传成
+    /// `(&sub, &sub)`/`(&sub, &sup)`，把两个方向写反了，于是所有 `subtype`
+    /// 报出来的错都是**倒着的**（期望 `()`、实得 `u8` 会说成 "expected
+    /// `u8`, found `()`"），排查时极具误导性。
     pub fn subtype(&mut self, sub: &Ty, sup: &Ty, span: Span) -> Result<()> {
         let sub = self.resolve(sub);
         let sup = self.resolve(sup);
@@ -408,7 +414,12 @@ impl<'a> InferCtxt<'a> {
             // Pin<T>：与 Pin<U> 比较时比较内部类型
             (Ty::Pin(a), Ty::Pin(b)) => self.subtype(a, b, span),
 
-            _ => Err(self.type_mismatch(&sub, &sup, span)),
+            // `type_mismatch` 的文案是 "expected `X`, found `Y`"，而这里的
+            // `sub` 是实际类型、`sup` 是期望类型——所以顺序和 `unify`
+            // （那里 `&a` 是期望、`&b` 是实际）正好相反。早先传成
+            // `(&sub, &sup)`，于是 `subtype` 报出来的每一条错都是**倒着的**：
+            // 实际要 `()` 却拿到 `u8`，会说成 "expected `u8`, found `()`"。
+            _ => Err(self.type_mismatch(&sup, &sub, span)),
         }
     }
 

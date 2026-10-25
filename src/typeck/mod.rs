@@ -53,6 +53,13 @@ pub struct TypeChecker {
     async_outputs: HashMap<DefId, Ty>,
     /// trait 表。
     trait_defs: HashMap<DefId, hir::HirTrait>,
+    /// trait 名 → DefId，供 `#[derive(Clone)]` 按**名字**声明的实现做求解。
+    ///
+    /// derive 生成的 impl 块 `trait_id` 是 `None`（属性 args 里只有字符串），
+    /// 所以求解时得靠这张表把名字解析回 DefId。没有它，`#[derive(Clone)]`
+    /// 只能被 `check_trait_impl` 里那段 attr 扫描"认名字"，一旦求解搬到
+    /// 有真实 impl 表的地方就丢失了。
+    trait_defs_by_name: HashMap<String, DefId>,
     /// impl 块列表。
     impl_blocks: Vec<hir::HirImpl>,
     /// impl 方法（名字已被 mangle 成 `Type__method`）→ 目标类型。
@@ -157,6 +164,17 @@ pub struct TypeChecker {
     generic_asts: HashMap<DefId, ast::Function>,
     /// 泛型参数名（按声明顺序）：自由函数来自 `fn<T>`，方法来自 `impl<T>`。
     generic_names: HashMap<DefId, Vec<String>>,
+    /// 泛型函数的 trait 边界（`fn f<T: Ord>` 里的 `Ord`），按 `generic_names`
+    /// 里类型参数的顺序对齐。
+    ///
+    /// 单独存，不塞进 `generic_names`（那里只有名字）：单态化时必须拿具体实参
+    /// 去验每个边界。没存的话 `T: Ord` 解析完就被丢掉，边界等于不存在。
+    generic_bounds: HashMap<DefId, Vec<Vec<DefId>>>,
+    /// 每个类型参数对应的 trait 边界，已解析成 trait DefId（按声明顺序）。
+    ///
+    /// 存解析好的 DefId 而不是 AST 类型：单态化时已经过了 trait 检查阶段，
+    /// 名字都能解析；存 DefId 让 `check_trait_bounds` 变成纯 `&self`，
+    /// 不必再借 `ast_to_hir_type` 的可变引用。
     /// 单态实例去重：`(基础函数, 实参类型键)` → 实例 DefId。
     mono_cache: HashMap<(DefId, String), DefId>,
     /// 已登记、等待检查函数体的单态实例。
@@ -192,6 +210,7 @@ impl Default for TypeChecker {
             functions: HashMap::new(),
             async_outputs: HashMap::new(),
             trait_defs: HashMap::new(),
+            trait_defs_by_name: HashMap::new(),
             impl_blocks: Vec::new(),
             impl_targets: HashMap::new(),
             drop_impls: HashMap::new(),
@@ -225,6 +244,7 @@ impl Default for TypeChecker {
             pending_loop_label: None,
             generic_asts: HashMap::new(),
             generic_names: HashMap::new(),
+            generic_bounds: HashMap::new(),
             mono_cache: HashMap::new(),
             mono_pending: Vec::new(),
             type_generic_params: HashMap::new(),
@@ -580,9 +600,18 @@ impl TypeChecker {
             ast::TypeDef::Union(u) => &u.name,
             ast::TypeDef::Alias { name, .. } => name,
         };
+        // 结构体和枚举都保留属性。早先只有 `Struct` 取到 `attrs`，枚举落到
+        // `_ => &[]` 分支，`#[derive(..)]`、`#[deprecated]` 在 `enum` 上被
+        // **静默丢弃**——`#[derive(Clone)] enum E` 编译通过，可 `T: Clone`
+        // 却报"不实现"。属性在声明收集阶段（`collect_declarations`）就已经
+        // 写进 HIR 的 `HirEnum.attrs`，这里丢掉纯属遗漏。
+        //
+        // 联合体走 `&[]`：`ast::UnionDef` 根本没有 `attrs` 字段（联合体的
+        // derive 目前无从谈起），要支持得先在 AST 上加槽位。
         let attrs: &[ast::Attribute] = match td {
             ast::TypeDef::Struct(s) => &s.attrs,
-            _ => &[],
+            ast::TypeDef::Enum(e) => &e.attrs,
+            ast::TypeDef::Union(_) | ast::TypeDef::Alias { .. } => &[],
         };
 
         // derive 处理：生成默认 impl
@@ -639,7 +668,7 @@ impl TypeChecker {
                     // 实际的 trait 求解在 infer.rs 的 check_trait_impl 中处理
                     let impl_block = hir::HirImpl {
                         target: Ty::Named(def_id, Vec::new()),
-                        trait_id: None, // 将在后续解析
+                        trait_id: None, // derive 的具体 trait 在检查时按名字比对
                         where_clause: Vec::new(),
                         span: Span::unknown(),
                     };
@@ -794,8 +823,12 @@ impl TypeChecker {
                 hir::HirTrait {
                     assoc_types: Vec::new(),
                     is_marker,
+                    super_traits: Vec::new(),
                 },
             );
+            // 名字表：`#[derive(Clone)]` 生成的 impl 块 `trait_id` 是 `None`
+            // （属性 args 里只有字符串），求解得靠名字反查。
+            self.trait_defs_by_name.insert(t.name.clone(), id);
             // trait 里的方法也要登记成定义——后面按名字取它们的签名。
             //
             // 名字带 trait 前缀，免得两个 trait 的同名方法（`Eq::eq` 与
@@ -1099,16 +1132,25 @@ impl TypeChecker {
     fn check_traits(&mut self, prog: &Program) -> Result<()> {
         for t in &prog.traits {
             let id = self.find_def(&t.name)?;
-            // 先验证 super trait 存在（不可变借用），再取可变引用
-            for st in &t.super_traits {
-                if let AstType::Named { path, .. } = st {
-                    let _ = self.resolve_type_path(path)?;
-                }
-            }
+            // 先验证 super trait 存在（不可变借用），再取可变引用。
+            //
+            // 边界要存下来，不是"验证了就丢"：`trait Ord: Eq` 意味着实现
+            // `Ord` 蕴含实现 `Eq`，trait 求解得靠它把 `Ord` 展开成
+            // `{Ord, Eq}`。早先这里 `let _ = ...` 只做了存在性检查，
+            // `Ord` 的超类型 `Eq` 永远进不了求解图。
+            let super_ids: Vec<DefId> = t
+                .super_traits
+                .iter()
+                .filter_map(|st| match st {
+                    AstType::Named { path, .. } => self.resolve_type_path(path).ok(),
+                    _ => None,
+                })
+                .collect();
             // 先解析关联类型的默认值（避免与 get_mut 借用冲突）
             let assoc_types: Vec<_> = t.assoc_types.iter().map(|_| hir::HirAssocType).collect();
             let hir_t = self.trait_defs.get_mut(&id).unwrap();
             hir_t.assoc_types = assoc_types;
+            hir_t.super_traits = super_ids;
             for m in &t.methods {
                 // cfg 过滤：被 cfg 掉的 trait 方法没有签名条目。
                 if !self.cfg_enabled(&m.attrs) {
@@ -1286,13 +1328,38 @@ impl TypeChecker {
                 .iter()
                 .chain(f.generics.iter())
                 .filter_map(|g| match g {
-                    ast::GenericParam::Type(n) => Some(n.clone()),
+                    ast::GenericParam::Type(n, _) => Some(n.clone()),
                     _ => None,
                 })
                 .collect();
             if !generic_names.is_empty() {
+                // 边界按和 `generic_names` 完全相同的顺序收集：先 `impl<T>`、
+                // 再 `fn<T>`，且只收类型参数。顺序错位会让 `T: Ord` 的边界
+                // 落到另一个参数头上——静默放错约束比不检查更糟。
+                let generic_bounds: Vec<Vec<DefId>> = impl_gens
+                    .iter()
+                    .chain(f.generics.iter())
+                    // 必须和 `generic_names` 一样**只收类型参数**，不能给
+                    // 生命周期 / `const` 参数留占位空 vec：否则
+                    // `fn f<'a, T: Ord>` 的 `names` 是 `["T"]` 而 `bounds` 是
+                    // `[[], [Ord]]`，`T` 索引到空 vec，边界静默丢失。
+                    .filter_map(|g| match g {
+                        ast::GenericParam::Type(_, b) => Some(
+                            b.iter()
+                                .filter_map(|t| match t {
+                                    AstType::Named { path, .. } => {
+                                        self.resolve_type_path(path).ok()
+                                    }
+                                    _ => None,
+                                })
+                                .collect::<Vec<_>>(),
+                        ),
+                        _ => None,
+                    })
+                    .collect();
                 self.generic_asts.insert(id, f.clone());
                 self.generic_names.insert(id, generic_names);
+                self.generic_bounds.insert(id, generic_bounds);
             }
             if !impl_gens.is_empty() {
                 self.push_type_params(&impl_gens, ast::Span::unknown());
@@ -1926,25 +1993,42 @@ impl TypeChecker {
                 } else {
                     None
                 };
-                let ty = if let Some(ref el) = else_hir {
-                    // 合并 then/else 类型
-                    let t = then_hir
+                let then_diverges = block_diverges(then_b);
+                let else_diverges = else_b.as_ref().is_some_and(|e| expr_diverges(e));
+                let t = if then_diverges {
+                    Ty::Never
+                } else {
+                    then_hir
                         .tail
                         .as_ref()
                         .map(|t| t.ty.clone())
-                        .unwrap_or(Ty::Unit);
-                    let e = el.tail.as_ref().map(|t| t.ty.clone()).unwrap_or(Ty::Unit);
-                    self.unify_or(&t, &e)
-                } else {
-                    Ty::Unit
+                        .unwrap_or(Ty::Unit)
                 };
-                // 两个分支都是发散的（都以 `return` / `throw` 结束）时，
+                let e = match else_hir.as_ref() {
+                    None => Ty::Unit,
+                    Some(_) if else_diverges => Ty::Never,
+                    Some(el) => el
+                        .tail
+                        .as_ref()
+                        .map(|t| t.ty.clone())
+                        .unwrap_or(Ty::Unit),
+                };
+                let ty = self.unify_or(&t, &e);
+                // 两个分支都真正**发散**（都以 `return` / `throw` 结束）时，
                 // `if` 本身的值是 never：它既不产生值也不正常返回。
                 // 没有这一条，`fn f() -> i32 { if c { return 1; } else { return 2; } }`
                 // 里的 `if` 作为尾表达式会被拿去和 i32 统一，报类型不匹配。
-                let ty = if then_hir.tail.is_none()
-                    && else_hir.as_ref().is_some_and(|b| b.tail.is_none())
-                {
+                //
+                // 发散必须按 AST 形状判（`block_diverges`），**不能**看
+                // `tail.is_none()`：尾表达式为 `None` 有两种情况——块以 `return;`
+                // 结尾（发散），或块最后一句带了分号（`write_fill(...);` 之后直接
+                // `}`，不产生值但**不**发散，类型是 `()`）。早先混为一谈，后者被误判
+                // 成发散，`if` 于是拿到 `Never`，再经 `unify_or` 的"不一致返回推断
+                // 变量"兜底落到 `InferId(0)`——而 `InferId(0)` 是个**活的**推断变量，
+                // 长编译里可能早已被绑定（`std/io.zr` 里绑成了 `u8`），`subtype` 一
+                // resolve 就解析出 `u8` 去和 `()` 比，报出一条完全无中生有的
+                // "expected `()`, found `u8`"。短文件不绑定 `InferId(0)`，所以碰不到。
+                let ty = if then_diverges && else_diverges {
                     Ty::Never
                 } else {
                     ty
@@ -2601,22 +2685,35 @@ impl TypeChecker {
                 // 条件：绑定 / 通配模式不可反驳，恒匹配；字面量模式比较相等；
                 // 结构体模式是各字段条件之合。
                 let cond = pat_cond.unwrap_or_else(|| bool_lit(true, *span));
+                // 发散按 **AST 形状** 判（`then_b` 是 `Block`，`else_b` 是
+                // `Expression`，与 `expr_diverges` 里的区分一致）。不能用
+                // `then_hir.tail.is_none()`：绑定替换把 `then_hir` 包进 wrapper
+                // 再解包时，发散块的 `tail` 会丢，嵌套 `if let` 的 then 分支
+                // 于是被误判成类型 `()`，报 `expected i32, found ()`。
+                let then_diverges = block_diverges(then_b);
+                let else_diverges = else_b.as_ref().is_some_and(|e| expr_diverges(e));
                 let ty = {
-                    let t = then_hir
-                        .tail
-                        .as_ref()
-                        .map(|t| t.ty.clone())
-                        .unwrap_or(Ty::Unit);
-                    let e = else_hir
-                        .as_ref()
-                        .and_then(|b| b.tail.as_ref())
-                        .map(|t| t.ty.clone())
-                        .unwrap_or(Ty::Unit);
+                    let t = if then_diverges {
+                        Ty::Never
+                    } else {
+                        then_hir
+                            .tail
+                            .as_ref()
+                            .map(|t| t.ty.clone())
+                            .unwrap_or(Ty::Unit)
+                    };
+                    let e = match else_hir.as_ref() {
+                        None => Ty::Unit,
+                        Some(_) if else_diverges => Ty::Never,
+                        Some(el) => el
+                            .tail
+                            .as_ref()
+                            .map(|t| t.ty.clone())
+                            .unwrap_or(Ty::Unit),
+                    };
                     self.unify_or(&t, &e)
                 };
-                let ty = if then_hir.tail.is_none()
-                    && else_hir.as_ref().is_some_and(|b| b.tail.is_none())
-                {
+                let ty = if then_diverges && else_diverges {
                     Ty::Never
                 } else {
                     ty
@@ -4863,7 +4960,7 @@ impl TypeChecker {
         let params: Vec<Ty> = generics
             .iter()
             .filter_map(|g| match g {
-                ast::GenericParam::Type(n) => scope.get(n).cloned(),
+                ast::GenericParam::Type(n, _) => scope.get(n).cloned(),
                 _ => None,
             })
             .collect();
@@ -4923,6 +5020,206 @@ impl TypeChecker {
             Ty::Pin(t) => Ty::Pin(Box::new(self.subst_infer(t, map))),
             _ => ty.clone(),
         }
+    }
+
+    /// 把某个 trait 展开成它自己 + 全部超类型（含传递）。
+    ///
+    /// `trait Ord: Eq` 意味着实现 `Ord` 蕴含实现 `Eq`。查 `T: Eq` 时，
+    /// `T` 实现了 `Ord` 也算满足——所以求解必须把超类型算进来，否则
+    /// `max3<T: Ord>` 里对 `Ord` 的检查会漏掉 `Ord: Eq` 那层。
+    fn expand_trait(&self, trait_id: DefId) -> Vec<DefId> {
+        let mut out = Vec::new();
+        let mut stack = vec![trait_id];
+        while let Some(id) = stack.pop() {
+            if out.contains(&id) {
+                continue;
+            }
+            out.push(id);
+            if let Some(hir::HirTrait { super_traits, .. }) = self.trait_defs.get(&id) {
+                for st in super_traits {
+                    if !out.contains(st) {
+                        stack.push(*st);
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    /// 某个类型是否实现了某个 trait（含超类型传递、含 `#[derive]`）。
+    ///
+    /// 必须做在 `TypeChecker` 上，不能放在 `InferCtxt`：`self.infer` 是
+    /// `InferCtxt<'static>`，它的 `impl_blocks` / `type_defs` 一直是空静态表
+    /// （见字段定义处的注释），`check_trait_impl` 里那段扫 impl 的代码从来没
+    /// 拿到过真实数据——这正是 `needs_clone<Nope>` 能编过的原因。
+    ///
+    /// 方向是「每个直接实现的 trait 往上找超类型」，不能反过来。
+    /// `trait Ord: Eq` 下，实现了 `Ord` 的类型满足 `T: Eq`（`Eq` 是 `Ord` 的
+    /// 超类型）；反过来 `T: Ord` 绝不能被只有 `Eq` 的类型满足。早先这里把
+    /// **目标** trait 往上展开成 `{Ord, Eq}` 再判"实现其中任意一个"，于是
+    /// `fn id<T: Ord>` 配一个只实现了 `Eq` 的类型能静默编过——边界被削弱，
+    /// 是类型安全漏洞。
+    fn implements_trait(&self, ty: &Ty, trait_id: DefId) -> bool {
+        for id in self.direct_impls(ty) {
+            if self.expand_trait(id).contains(&trait_id) {
+                return true;
+            }
+        }
+        false
+    }
+
+    /// 某个类型**直接**实现了哪些 trait：手写 `impl` 块 + `#[derive]`。
+    ///
+    /// 不含超类型传递（那是调用方按需要展开的），否则"实现了什么"和"边界算
+    /// 不算满足"会混在一起。
+    fn direct_impls(&self, ty: &Ty) -> Vec<DefId> {
+        let mut out = Vec::new();
+        for ib in &self.impl_blocks {
+            if !self.impl_target_matches(ib, ty) {
+                continue;
+            }
+            // 手写 impl：`trait_id` 直接可用。
+            if let Some(tid) = ib.trait_id {
+                if !out.contains(&tid) {
+                    out.push(tid);
+                }
+                continue;
+            }
+            // `#[derive(Clone)]` 生成的 impl 块 `trait_id` 是 `None`（属性 args
+            // 里只有字符串），得按名字认。只认真正写出来的 trait，不能一见
+            // `derive` 属性就算满足——那样 derive 能满足**任何** trait。
+            let Ty::Named(tid, _) = self.resolve_ty(&ib.target) else {
+                continue;
+            };
+            let attrs = match self.type_defs.get(&tid) {
+                Some(hir::HirTypeDef::Struct(s)) => &s.attrs,
+                Some(hir::HirTypeDef::Enum(e)) => &e.attrs,
+                _ => continue,
+            };
+            for attr in attrs.iter().filter(|a| a.name == "derive") {
+                for name in &attr.args {
+                    if let Some(def) = self.trait_defs_by_name.get(name) {
+                        if !out.contains(def) {
+                            out.push(*def);
+                        }
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    /// 判断某个 impl 块的目标类型是否适用于给定类型。
+    ///
+    /// 不能无条件返回 `true`：那样"trait 有没有被实现过"和"这个类型实现了它"
+    /// 混为一谈——`impl Ord for i32` 存在，于是任何类型都"实现"了 `Ord`，
+    /// `max3(SomeTypeWithoutOrd)` 静默通过，是类型安全漏洞。
+    ///
+    /// 两条路径：
+    /// - **单态 impl**（`impl Ord for i32`、`impl Eq for Pair<i32>`）：目标
+    ///   解析完就是最终类型，直接比结构即可。基元类型（`i32` / `u64` / `f64`）
+    ///   是 `Ty::Int` / `Ty::Uint` / `Ty::Float`，**不是** `Ty::Named`，所以
+    ///   不能先拆 `Ty::Named` 再比——必须先解析、再比整体，否则
+    ///   `impl Ord for i32` 永远匹配不上，`max3(3, 9, 5)` 反而编不过。
+    /// - **泛型 impl**（`impl<T> Future for Ready<T>`）：目标里是未绑定的
+    ///   `Infer` 占位符（`fresh_infer` 自指，解析不出来）。按位置绑定到实参的
+    ///   一级实参，替换后比对剩余结构。
+    fn impl_target_matches(&self, ib: &hir::HirImpl, ty: &Ty) -> bool {
+        let ty = self.resolve_ty(ty);
+        let impl_ty = self.resolve_ty(&ib.target);
+        // 单态 impl（含 `impl Ord for i32` 这类基元目标）：解析后结构相等即匹配。
+        // 基元是 `Ty::Int` / `Ty::Uint` / `Ty::Float`，不是 `Ty::Named`，所以必须
+        // 先比整体结构，不能先拆 `Ty::Named` 再比——否则 `impl Ord for i32`
+        // 永远匹配不上，`max3(3, 9, 5)` 反而编不过。
+        if impl_ty == ty {
+            return true;
+        }
+        // 泛型 impl（`impl<T> Future for Ready<T>`）：目标里留着未绑定的 `Infer`
+        // 占位符，上面整体比必然不等，改按位置绑定一级实参后重比。
+        let Ty::Named(impl_id, ref impl_args) = impl_ty else {
+            return false;
+        };
+        let Ty::Named(ty_id, ref ty_args) = ty else {
+            return false;
+        };
+        if ty_id != impl_id {
+            return false;
+        }
+        let params = self
+            .type_generic_params
+            .get(&impl_id)
+            .cloned()
+            .unwrap_or_default();
+        if params.len() != ty_args.len() {
+            return false;
+        }
+        let map: HashMap<InferId, Ty> = params
+            .iter()
+            .zip(ty_args.iter())
+            .filter_map(|(p, a)| match p {
+                Ty::Infer(id) => Some((*id, a.clone())),
+                _ => None,
+            })
+            .collect();
+        impl_args.iter().zip(ty_args.iter()).all(|(exp, got)| {
+            self.subst_infer(exp, &map) == *got
+        })
+    }
+
+    /// 解析推断占位符（这里只做结构解析，不查外部表）。
+    ///
+    /// 只对已经绑定的推断变量做解引用，**解不开的原样保留**。
+    /// `fresh_infer` 建出的 `Ty::Infer(id)` 在 `vars` 里自指
+    /// （`vars[id] = Ty::Infer(id)`），无脑递归会顺着这条自环无限下去
+    /// 直到栈溢出——见 `InferCtxt::resolve` 里的同类判断。
+    fn resolve_ty(&self, ty: &Ty) -> Ty {
+        match ty {
+            Ty::Infer(id) => match self.infer.vars.get(id) {
+                Some(v) if !matches!(v, Ty::Infer(_)) => self.resolve_ty(v),
+                _ => ty.clone(),
+            },
+            Ty::Named(id, args) => Ty::Named(
+                *id,
+                args.iter().map(|t| self.resolve_ty(t)).collect(),
+            ),
+            _ => ty.clone(),
+        }
+    }
+
+    /// 校验泛型函数被单态化时的 trait 边界。
+    ///
+    /// 单态化点拿到全部具体实参，是唯一能验证"实参真的满足 `T: Ord`"的时刻。
+    /// 边界没被验证过，`fn f<T: Ord>` 里的 `Ord` 就等于没写。
+    fn check_trait_bounds(
+        &self,
+        base: DefId,
+        ordered: &[Ty],
+        span: ast::Span,
+    ) -> Result<()> {
+        let names = match self.generic_names.get(&base) {
+            Some(n) => n.clone(),
+            None => return Ok(()),
+        };
+        let bounds = match self.generic_bounds.get(&base) {
+            Some(b) => b.clone(),
+            None => return Ok(()),
+        };
+        for (i, param_name) in names.iter().enumerate() {
+            if i >= ordered.len() {
+                continue;
+            }
+            for trait_id in &bounds[i] {
+                if !self.implements_trait(&ordered[i], *trait_id) {
+                    return Err(CompileError::type_error(format!(
+                        "`{}` does not implement trait `{}` (required by `{param_name}`)",
+                        self.infer.type_name(&ordered[i]),
+                        self.def_names.get(trait_id).cloned().unwrap_or_default()
+                    ))
+                    .with_span(span));
+                }
+            }
+        }
+        Ok(())
     }
 
     /// 结构体的字段类型（按 `args` 替换泛型参数）。
@@ -5274,8 +5571,12 @@ impl TypeChecker {
     ) -> Result<DefId> {
         let key = format!("{:?}", ordered);
         if let Some(id) = self.mono_cache.get(&(base, key.clone())).copied() {
+            // 命中缓存说明同一个实参组合早就验过边界了，不必重验。
             return Ok(id);
         }
+        // 单态化是验证 trait 边界的唯一时刻：这里才拿到全部具体实参。
+        // 不查的话 `fn f<T: Ord>` 里的 `Ord` 等于没写，`f<Nope>` 静默通过。
+        self.check_trait_bounds(base, ordered, span)?;
         if self.mono_cache.len() > 512 {
             return Err(
                 CompileError::type_error("monomorphization recursion limit reached")
@@ -5421,7 +5722,7 @@ impl TypeChecker {
         let mut seen: std::collections::HashSet<&str> = std::collections::HashSet::new();
         for g in generics {
             let name = match g {
-                ast::GenericParam::Type(name) => name.as_str(),
+                ast::GenericParam::Type(name, _) => name.as_str(),
                 ast::GenericParam::Lifetime(name) => name.as_str(),
                 ast::GenericParam::Const(name) => name.as_str(),
             };
@@ -5433,7 +5734,7 @@ impl TypeChecker {
             }
             // 生命周期 / const 参数不进入类型环境：生命周期不影响代码生成，
             // const 泛型还没实现（用到时另行报错）。
-            if let ast::GenericParam::Type(name) = g {
+            if let ast::GenericParam::Type(name, _) = g {
                 let ty = self.infer.fresh_infer(span);
                 scope.insert(name.clone(), ty);
             }
@@ -6678,12 +6979,30 @@ impl TypeChecker {
         Ok(())
     }
 
+    /// 合并 `if` / `match` 各分支的结果类型。
+    ///
+    /// `Never` 是底类型：发散分支（以 `return` / `throw` 结尾）没有值可交出去，
+    /// 应当直接取另一支——`unify_or(a, Never) == a`。Rust 也是这么做的。
+    ///
+    /// 分支类型真的不一致时返回 `Unit`，而不是一个"未知"的推断变量：不一致
+    /// 本身已经是一条应当报出来的错误，不该用一个占位类型继续往下糊。
+    ///
+    /// 早先这里对任何不一致都返回 `Ty::Infer(InferId(0))`，那是一颗定时炸弹：
+    /// `InferId(0)` 不是哨兵，是个**活的**推断变量，长编译里可能早就被绑定了
+    /// （`std/io.zr` 里绑成了 `u8`）。下游 `subtype` 一 `resolve` 就解出那个旧值，
+    /// 凭空报出一条 "expected `()`, found `u8`" 这类毫无根据的错，而且报错指向
+    /// 的位置跟真正的问题毫无关系。
     fn unify_or(&self, a: &Ty, b: &Ty) -> Ty {
         if a == b {
-            a.clone()
-        } else {
-            Ty::Infer(InferId(0))
+            return a.clone();
         }
+        if matches!(a, Ty::Never) {
+            return b.clone();
+        }
+        if matches!(b, Ty::Never) {
+            return a.clone();
+        }
+        Ty::Unit
     }
 
     fn dummy_expr(&self) -> HirExpr {
@@ -7347,6 +7666,35 @@ fn block_diverges(b: &AstBlock) -> bool {
         (Some(Statement::Expr(e, _)), None) => {
             matches!(e, Expression::Return(..) | Expression::Throw(..))
         }
+        _ => false,
+    }
+}
+
+/// 一个表达式是否**发散**（控制流不会从它正常返回）。
+///
+/// 只用于判定 `if` 的分支：`else` 分支在 AST 里是一个表达式而不是块
+/// （`else { .. }` 会先脱成 `Expression::Block`，`else if` 是嵌套 `If`），
+/// 所以要顺着表达式形状递归，而不是直接套 `block_diverges`。
+///
+/// 注意 `tail == None` 和"发散"是两码事：`{ write_fill(...); }` 的 tail 是
+/// `None`（最后一句带了分号），但它正常返回一个 `()`。把这两者混同会让
+/// `if` 分支的类型推断整个走偏，详见 `check_expr_raw` 里 `Expression::If` 的注释。
+fn expr_diverges(e: &Expression) -> bool {
+    match e {
+        Expression::Return(..) | Expression::Throw(..) => true,
+        Expression::Block(b, _) => block_diverges(b),
+        Expression::If(_, then_b, else_b, _) => {
+            let then_d = block_diverges(then_b);
+            let else_d = else_b.as_ref().is_some_and(|e| expr_diverges(e));
+            then_d && else_d
+        }
+        Expression::IfLet(_, _, then_b, else_b, _) => {
+            let then_d = block_diverges(then_b);
+            let else_d = else_b.as_ref().is_some_and(|e| expr_diverges(e));
+            then_d && else_d
+        }
+        // `while` / `loop` / `break` / `continue` 都不构成发散：它们要么正常
+        // 退出，要么被 `break` 带出，控制流最终会回到外层。
         _ => false,
     }
 }

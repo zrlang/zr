@@ -616,7 +616,11 @@ pub enum GenericParam {
     /// 生命周期参数：`<'a>`。
     Lifetime(String),
     /// 类型参数：`<T>` / `<T: Trait>`。
-    Type(String),
+    ///
+    /// 第二个元素是 trait 边界（`<T: Ord>` 里的 `Ord`）。解析阶段**不能**丢掉：
+    /// 丢掉后 `T: Ord` 就成了没写，单态化时没有任何东西去验证实参真的实现了
+    /// `Ord`——`needs_clone(SomeStructWithoutClone)` 静默通过，是类型安全漏洞。
+    Type(String, Vec<Type>),
     /// 常量参数：`<const N: usize>`。
     Const(String),
 }

@@ -712,6 +712,11 @@ pub struct HirTrait {
     /// 是否为 marker trait（`#[marker]`），如 `Send`、`Sync`、`Unpin`。
     /// marker trait 没有方法，且可以有多个 impl（只要不重叠）。
     pub is_marker: bool,
+    /// 超类型 trait（`trait Ord: Eq` 里的 `Eq`）。
+    ///
+    /// 必须有：实现 `Ord` 蕴含实现 `Eq`，所以查 `T: Eq` 时，`T` 实现了
+    /// `Ord` 也算数。没有这个字段，`Ord: Eq` 那层继承关系就断了。
+    pub super_traits: Vec<DefId>,
 }
 
 /// 关联类型。

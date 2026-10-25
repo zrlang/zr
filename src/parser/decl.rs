@@ -845,16 +845,21 @@ impl Parser {
             Ok(GenericParam::Lifetime(name))
         } else {
             let name = self.consume_ident("expected generic parameter name")?;
+            // trait 边界要保留下来，不是"消费掉"。早先这里 `let _ = ...`
+            // 直接把边界丢掉，于是 `fn max3<T: Ord>` 在单态化时没有任何约束
+            // 可验，`max3(SomeNonOrdType)` 能编过——类型安全漏洞。
+            // `T: Clone + Ord` 的多边界也一并收集。
+            let mut bounds = Vec::new();
             if self.match_kind(&TokenKind::Colon) {
-                let _ = self.parse_type()?;
+                bounds.push(self.parse_type()?);
                 while self.match_kind(&TokenKind::Plus) {
-                    let _ = self.parse_type()?;
+                    bounds.push(self.parse_type()?);
                 }
             }
             if self.match_kind(&TokenKind::Eq) {
                 let _ = self.parse_type()?;
             }
-            Ok(GenericParam::Type(name))
+            Ok(GenericParam::Type(name, bounds))
         }
     }
 }

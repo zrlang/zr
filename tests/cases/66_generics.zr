@@ -14,6 +14,30 @@ fn max3<T: Ord>(a: T, b: T, c: T) -> T {
     return max(max(a, b), c);
 }
 
+// --- 超类型（supertrait）边界的方向 ---
+//
+// `trait Rankable: Equ` 意味着实现 `Rankable` 蕴含实现 `Equ`。所以只实现了
+// `Rankable` 的 `Rank`，要能同时满足 `T: Rankable` 和 `T: Equ` 两个边界。
+//
+// 早先 `implements_trait` 把**目标** trait 往上展开成超类型链，再判"实现了其中
+// 任意一个"。这等价于只看超类型：`T: Equ` 的展开是 `{Equ}`，而 `Rank` 只实现了
+// `Rankable`，于是这条被**误判成不满足**（漏掉继承关系）；反过来它又会让只实现
+// `Equ` 的类型**误过** `T: Rankable`（削弱边界，类型安全漏洞）。两个方向都错。
+// 现在改成把类型**直接**实现的每个 trait 各自往上展开，再判断目标 trait 在不在
+// 里面——两个方向都对。
+trait Rankable: Equ {
+    fn lt(self, other: Self) -> bool;
+}
+trait Equ {
+    fn eq(self, other: Self) -> bool;
+}
+struct Rank { n: i32 }
+// 只实现子 trait `Rankable`，没有单独实现 `Equ`。
+impl Rankable for Rank { fn lt(self, other: Rank) -> bool { return self.n < other.n; } }
+
+fn keep_ord<T: Rankable>(x: T) -> T { return x; }
+fn keep_eq<T: Equ>(x: T) -> T { return x; }
+
 fn unwrap_or<T>(o: Option<T>, d: T) -> T {
     match o {
         Option::Some(v) => return v,
@@ -93,6 +117,12 @@ fn main() -> i32 {
     if b.is_none() != true { return 24; }
     if b.unwrap_or(5) != 5 { return 25; }
     if by_ref(&a) != 7 { return 26; }
+
+    // `Rank` 只实现了子 trait `Rankable`。这两句都得过：`T: Rankable` 显然满足，
+    // 而 `T: Equ` 依赖「实现 `Rankable` 蕴含实现 `Equ`」这一层继承关系。
+    // 必须真调用才有效——边界在单态化时才校验，没被调用的泛型函数不检查。
+    if keep_ord(Rank { n: 3 }).n != 3 { return 27; }
+    if keep_eq(Rank { n: 4 }).n != 4 { return 28; }
 
     return 0;
 }
