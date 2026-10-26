@@ -2963,12 +2963,23 @@ fn array_info(b: &Builder, ty: &hir::Ty) -> Option<(hir::Ty, i128, i128)> {
 /// `s[i]`（str）缩放 1，`p[i]`（`*i32`）缩放 4。
 fn lower_index_addr(b: &mut Builder, recv: &HirExpr, idx: &HirExpr, elem_ty: &hir::Ty) -> MirValue {
     let mut base = lower_expr(b, recv);
-    // `str` 的运行时表示是 `{ ptr: *const u8, len: usize }`，存在一块
-    // 16 字节的存储里；`str` 的值就是**这块存储的地址**。
+    // `str` 与切片是**胖指针**：运行时表示是 `{ ptr, len }`，存在一块 16 字节
+    // 的存储里，而"值"就是**这块存储的地址**。
     //
     // 按字节索引要的是数据指针，不是这块存储的地址——直接拿存储地址
-    // 加偏移，读到的是胖指针自己的字节（指针的低位），不是字符。
-    if matches!(recv.ty, hir::Ty::Str | hir::Ty::Slice(..)) {
+    // 加偏移，读到的是胖指针自己的字节（指针的低位），不是字符。所以这里
+    // 先把 `{ptr,len}` 的 `ptr` 字段读出来。
+    //
+    // 指向切片/`str` 的裸指针与引用同样是胖指针（`p: *mut [u8; 16]` 的 `p`
+    // 还是指向那块 `{ptr,len}` 的存储）；但指向**定长数组**的指针是瘦指针，
+    // 直接就是元素存储地址，不能再解一层。
+    let fat = match &recv.ty {
+        hir::Ty::Pointer(inner, _) | hir::Ty::Reference(inner, _) => {
+            matches!(&**inner, hir::Ty::Slice(..) | hir::Ty::Str)
+        }
+        other => matches!(other, hir::Ty::Slice(..) | hir::Ty::Str),
+    };
+    if fat {
         base = load_str_ptr(b, base);
     }
     let index = lower_expr(b, idx);

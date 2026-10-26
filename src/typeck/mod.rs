@@ -3574,10 +3574,21 @@ impl TypeChecker {
         span: ast::Span,
     ) -> Result<HirExpr> {
         let idx = self.check_expr(index, &Ty::Int(64))?;
-        let elem_ty = match self.infer.resolve(&recv.ty) {
+        let recv_ty = self.infer.resolve(&recv.ty);
+        // 指针/引用指向聚合时，元素是聚合的**成员**而不是聚合本身：
+        // `p: *mut [u8; 16]` 的 `p[k]` 是 `u8`。早先这里直接把 pointee 当
+        // 元素类型，于是 `p[k]` 被推断成 `[u8; 16]`，下游按 16 字节步长缩放、
+        // 还走聚合拷贝存储路径，写出的值和内存布局全都不对。
+        let elem_ty = match recv_ty {
             Ty::Array(t, _) | Ty::Slice(t, _) => (*t).clone(),
             Ty::Str => Ty::Uint(8),
-            Ty::Pointer(t, _) | Ty::Reference(t, _) => (*t).clone(),
+            Ty::Pointer(inner, _) | Ty::Reference(inner, _) => {
+                let pointee = *inner;
+                match pointee {
+                    Ty::Array(t, _) | Ty::Slice(t, _) => (*t).clone(),
+                    other => other,
+                }
+            }
             _ => {
                 let elem = self.infer.fresh_infer(span);
                 self.infer
