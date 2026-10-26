@@ -1053,20 +1053,19 @@ impl TypeChecker {
                     fields.iter().map(|f| f.ty.clone()).collect()
                 }
             };
-            // 载荷的字段必须是标量。
+            // 载荷可以是聚合。
             //
-            // 枚举的载荷是**按值内联**在判别式后面的，字段的类型若是聚合
-            // （结构体 / 元组 / 数组 / 枚举），它的值在运行期是"指向存储的
-            // 地址"——把地址内联进枚举里，指的东西随时会失效。
-            for ty in &payload_tys {
-                if false && self.is_aggregate_ty(ty) {
-                    return Err(CompileError::type_error(
-                        "enum variant payloads must be scalars \
-                         (aggregate types are address-represented and cannot be inlined)",
-                    )
-                    .with_span(ast::Span::unknown()));
-                }
-            }
+            // 枚举的载荷是**按值内联**在判别式后面的，聚合类型在运行期是
+            // "指向存储的地址"。地址拷贝是否**安全**只取决于一件事：载荷
+            // 需不需要析构（drop glue）。需要析构时，内联地址指的东西随时会
+            // 失效，且析构要按"当前是哪个变体"决定丢哪些字段（胶还没实现）；
+            // 不需要析构时全字段可拷贝，地址拷贝无损。
+            //
+            // 早先这里还有一道"载荷必须是标量"的 ban（`is_aggregate_ty` 判定），
+            // 它把不需要析构的聚合（如 `SocketAddr::V4(Ipv4Addr, u16)` 这类
+            // std 里的全拷贝结构）也一并挡住，过度保守，被 `if false &&` 永久
+            // 关掉了。现在把死代码整个删掉：真正的防线就是下面这条 drop glue
+            // 检查——全拷贝聚合放行，带析构的聚合明确报错。
             for ty in &payload_tys {
                 if self.has_drop_glue(ty, 0) {
                     return Err(CompileError::type_error(
@@ -3707,7 +3706,21 @@ impl TypeChecker {
                     e
                 }
             };
-            let param_ty = param_tys.get(i).cloned().unwrap_or(Ty::Infer(InferId(0)));
+            // 参数表比实参少的唯一情形是"前向调用"：被调函数在源码里排在
+            // 调用点后面，`functions` 表里它的 params 还是 `collect_declarations`
+            // 留下的空占位（参数要等阶段 7 逐个函数检查时才补上），于是 `def_type`
+            // 给出的 `Ty::Function { params: [] }` 查不到形参类型。
+            //
+            // 早先这里 `unwrap_or(Ty::Infer(InferId(0)))` 拿 `InferId(0)` 当
+            // "未知类型"哨兵——但它是**活的推断变量**，大文件编译到一半它早
+            // 已被 unify 到别的类型上（曾绑成某个 `Ty::Named`），`resolve` 出旧值
+            // 后 `subtype` 报出与真实问题无关的 `type#N` 错（`std/io.zr` 的
+            // `prefix_of` 前向调用就踩过）。改回新建推断变量：未知形参就让它
+            // 独立推断、被实参绑上，不与全局共享的 `InferId(0)` 纠缠。
+            let param_ty = param_tys
+                .get(i)
+                .cloned()
+                .unwrap_or_else(|| self.infer.fresh_infer(span));
             let arg = self.check_expr(a, &param_ty)?;
             // C 风格隐式拓宽：`f32`/`i32`/`u32` 实参传给 `f64` 形参时插入显式
             // 转换。只放行"数值同族、宽度不减"这一类；`unify` 要求宽度相等，
@@ -4912,21 +4925,6 @@ impl TypeChecker {
                 257..=65536 => Ty::Int(16),
                 _ => Ty::Int(32),
             },
-        }
-    }
-
-    /// 类型是不是"聚合"（运行期用地址表示）。
-    ///
-    /// 结构体、元组、数组、枚举的值在运行期都是"指向存储的地址"，不能按值
-    /// 内联进别的聚合里。
-    fn is_aggregate_ty(&self, ty: &Ty) -> bool {
-        match ty {
-            Ty::Tuple(_) | Ty::Array(..) | Ty::Slice(..) => true,
-            Ty::Named(id, _) => matches!(
-                self.type_defs.get(id),
-                Some(hir::HirTypeDef::Struct(_) | hir::HirTypeDef::Enum(_))
-            ),
-            _ => false,
         }
     }
 
