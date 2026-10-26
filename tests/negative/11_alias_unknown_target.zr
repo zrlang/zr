@@ -1,0 +1,12 @@
+// 负向用例：重命名的目标不存在时必须明确报错，不能静默放行。
+//
+// `use io::println_fmt as pf;` 这类**多段路径**的重命名，早先的解析分支只匹配
+// `Name` 内层，于是别名被静默忽略——既不登记、也不报错，使用点只剩一句
+// "cannot find value `pf` in this scope"，完全看不出是导入写错了。
+//
+// expect: cannot resolve
+use core::Nope as X;
+
+fn main() -> i32 {
+    return 0;
+}

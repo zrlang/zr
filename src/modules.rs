@@ -293,8 +293,20 @@ fn use_tree_root(node: &crate::parser::ast::UseTree) -> Option<String> {
         crate::parser::ast::UseTree::Name(n) => Some(n.clone()),
         crate::parser::ast::UseTree::Group(items) => items.first().and_then(use_tree_root),
         crate::parser::ast::UseTree::Glob => None,
-        // `use a as b`：重命名不影响要加载哪个模块。
-        crate::parser::ast::UseTree::Rename(_, _) => None,
+        // `use a as b`：重命名不影响要加载哪个模块，内层路径里仍然藏着它。
+        // 早先这里无条件返回 `None`，于是 `use io::println_fmt as pf;` **一个
+        // 模块都不加载**——`println_fmt` 从未进入符号表，别名指向虚空，使用点
+        // 只剩一句无头无尾的 `cannot find value `pf``。多段路径的重命名尤其
+        // 隐蔽：文件里只要还有另一条不带 `as` 的 `use io::...`，模块会被那条
+        // 顺带拉进来，问题就悄悄消失（这正是它长期没被发现的原因）。
+        //
+        // 但只有**多段**路径才需要加载：单段 `use make as mkr` 的 `make` 是一个
+        // 符号名而不是模块名，按模块去查会报 `unknown module `make``——基线
+        // 里那种用法是好的，不能弄坏它。
+        crate::parser::ast::UseTree::Rename(inner, _) => match &**inner {
+            crate::parser::ast::UseTree::Group(items) => items.first().and_then(use_tree_root),
+            _ => None,
+        },
     }
 }
 

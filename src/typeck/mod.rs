@@ -904,10 +904,23 @@ impl TypeChecker {
                 }
             }
             UseTree::Rename(inner, alias) => {
-                if let UseTree::Name(name) = inner.as_ref() {
-                    if let Some(id) = self.symbols.get(name).copied() {
-                        self.use_aliases.insert(alias.clone(), id);
-                    } else {
+                // 解析出的 `Rename` 内层**不一定**是 `Name`：单段路径 `use make as mkr`
+                // 是 `Rename(Name("make"), ..)`，但多段路径 `use core::Option as Opt` 经
+                // `parse_use_tree` 包成了 `Rename(Group([Name("core"), Name("Option")]), ..)`。
+                // 早先这里只匹配 `Name` 内层，于是多段路径的重命名被**静默忽略**
+                // ——既不登记别名、也不报错，使用点只剩一句无头无尾的
+                // `cannot find value `Opt` in this scope`（P0 级静默失败）。
+                //
+                // 取的是叶子段（路径的最后一段）：模块段只起限定作用，
+                // 真正的名字在叶子。注意叶子**不是**模块名——
+                // `use core::Option as Opt` 的叶子是 `Option`，所以不能走
+                // `Name` 分支那个 `known_modules` 早退（会把别名丢掉）。
+                let leaf = Self::use_tree_leaf_name(inner);
+                match leaf {
+                    Some(name) if self.symbols.contains_key(&name) => {
+                        self.use_aliases.insert(alias.clone(), self.symbols[&name]);
+                    }
+                    Some(name) => {
                         self.errors.push(
                             CompileError::name_error(format!(
                                 "cannot resolve `{}` in import",
@@ -916,6 +929,7 @@ impl TypeChecker {
                             .with_span(*span),
                         );
                     }
+                    None => {}
                 }
             }
             UseTree::Group(trees) => {
@@ -932,6 +946,26 @@ impl TypeChecker {
             }
         }
         Ok(())
+    }
+
+    /// 取 `use` 路径的**叶子**名字。
+    ///
+    /// `parse_use_tree` 把每个路径段包成一个扁平 Group：`use core::Option`
+    /// 变成 `Group([Name("core"), Name("Option")])`，再套一层 `Rename`。
+    /// 所以叶子是沿着 `Group` 一路往下取**最后**一个元素（`parse_use_tree`
+    /// 把新段往后追加）——`Name` 就是叶子，`Group` 继续往里走，`Glob`
+    /// 取不到名字。早先 `resolve_use_tree` 只匹配 `Rename(Name(..), ..)`，
+    /// 多段路径的重命名于是被静默忽略。
+    fn use_tree_leaf_name(tree: &UseTree) -> Option<String> {
+        match tree {
+            UseTree::Name(name) => Some(name.clone()),
+            UseTree::Group(trees) => {
+                let last = trees.last()?;
+                Self::use_tree_leaf_name(last)
+            }
+            UseTree::Rename(inner, _) => Self::use_tree_leaf_name(inner),
+            UseTree::Glob => None,
+        }
     }
 
     // ==================================================================
