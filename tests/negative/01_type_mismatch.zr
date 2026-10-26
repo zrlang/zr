@@ -1,0 +1,8 @@
+// 负向用例：类型不匹配必须报错。
+// 格式约定见 tests/zr_negative.rs：`// expect:` 行的子串必须出现在 stderr 里。
+//
+// expect: type mismatch
+fn main() -> i32 {
+    let x: i32 = "hi";
+    return 0;
+}

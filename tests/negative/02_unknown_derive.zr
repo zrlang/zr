@@ -1,0 +1,12 @@
+// 负向用例：未知 derive trait 必须报错，而不是被静默忽略。
+// 早先 `#[derive]` 在解析阶段就丢掉了枚举上的属性，这里同时覆盖结构体路径。
+//
+// expect: unknown derive trait
+#[derive(Nonsense)]
+struct S {
+    x: i32,
+}
+
+fn main() -> i32 {
+    return 0;
+}

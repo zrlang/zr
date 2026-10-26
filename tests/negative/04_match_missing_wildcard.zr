@@ -1,0 +1,16 @@
+// 负向用例：match 穷尽性检查必须要求尾随 `_` 臂。
+//
+// 已知缺陷（不在本文件范围内，但值得记一笔）：这个报错文案是**误导**的——
+// 全覆盖的 match 本可以不写 `_`，和 Rust 行为一致。目前缺臂信息没区分开，
+// 统一说 "must have a trailing `_` arm"。修好之前这条用例至少保证：缺臂
+// 一定报错，不会静默通过。
+//
+// expect: match must have a trailing `_` arm
+fn main() -> i32 {
+    let x = 5;
+    let y = match x {
+        1 => 10,
+        2 => 20,
+    };
+    return y;
+}

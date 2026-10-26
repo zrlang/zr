@@ -1,0 +1,9 @@
+// 负向用例：给不可变绑定赋值必须报错。
+// `CLAUDE.md` 说 `let` 默认不可变、`let mut` 可变——这条是那条约定的回归保障。
+//
+// expect: cannot assign to immutable binding
+fn main() -> i32 {
+    let x = 5;
+    x = 6;
+    return 0;
+}

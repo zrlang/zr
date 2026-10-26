@@ -1,0 +1,14 @@
+// 负向用例：`?` 只能用在返回 `Result` / `Option` 的函数里。
+// 这是类型检查器**主动**发出的诊断（不是解析失败），值得钉住。
+//
+// expect: `?` requires the enclosing function to return `Result`
+use core::{Option, Result};
+
+fn f() -> Result<i32, i32> {
+    return Result::Ok(1);
+}
+
+fn main() -> i32 {
+    let _ = f()?;
+    return 0;
+}

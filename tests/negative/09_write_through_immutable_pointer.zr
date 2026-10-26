@@ -1,0 +1,12 @@
+// 负向用例：通过 `*const` 写入必须报错。
+//
+// 这是 zr 安全模型里少数**真的实现了**的一条（没有借用检查、没有 `unsafe`，
+// 但至少"不可变指针不可写"是有保障的）。钉住它，防止被后续改动悄悄放宽。
+//
+// expect: cannot assign through an immutable pointer
+fn main() -> i32 {
+    let x = 5;
+    let p = &x;
+    *p = 7;
+    return 0;
+}

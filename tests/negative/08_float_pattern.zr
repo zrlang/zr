@@ -1,0 +1,14 @@
+// 负向用例：浮点 / 字符串字面量模式必须明确报错。
+//
+// 浮点模式在语义上有争议（Rust 也不允许 `match 1.0`），所以这里不是
+// "将来要支持"，而是"将来仍应拒绝"。
+//
+// expect: match on a float / string pattern is not supported
+fn main() -> i32 {
+    let x = 1.5f32;
+    let y = match x {
+        1.5 => 1,
+        _ => 0,
+    };
+    return y;
+}
