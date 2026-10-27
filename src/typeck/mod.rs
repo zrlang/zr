@@ -3624,14 +3624,28 @@ impl TypeChecker {
                 }
             }
             _ => {
+                // 其它类型：只有当它确实是（或能推断成）指针时才允许下标。
+                //
+                // 早先这里把 unify 的错误 `.ok()` 掉了，于是 `(*p)[i]`
+                // （p: *const u8）这种"对 u8 下标"也照样编过：元素类型取
+                // 一个新鲜的推断变量，MIR 把 `*p` 的**值**当成地址去做
+                // 指针算术，运行时直接段错误。类型不对就明确报错。
                 let elem = self.infer.fresh_infer(span);
-                self.infer
+                if self
+                    .infer
                     .unify(
                         &recv.ty,
                         &Ty::Pointer(Box::new(elem.clone()), hir::Mutability::Immutable),
                         span,
                     )
-                    .ok();
+                    .is_err()
+                {
+                    return Err(CompileError::type_error(format!(
+                        "cannot index a value of type `{}`",
+                        ty_name(&recv_ty)
+                    ))
+                    .with_span(span));
+                }
                 elem
             }
         };

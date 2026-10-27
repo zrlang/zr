@@ -75,10 +75,12 @@ lexer → parser(ast) → typeck(hir, infer) → mir → ssa → opt → codegen
   **注意模块名不带 `std::` 前缀**：`use core::Option;`，不是 `use std::core::Option;`。
 - 运行时 `runtime/*.s`：每平台一份汇编（Linux/macOS/Windows 的 x86-64+aarch64，裸机 ARM/RISC-V）。
   提供 `zr_write` / `zr_alloc` 等符号，与编译器分离编译。
-- 已接线的优化 pass（`src/opt/mod.rs:74-99`，按 `-O` 等级分层）：
+- 已接线的优化 pass（`src/opt/mod.rs:68-102`，按 `-O` 等级分层）：
   `fold_constants` `eliminate_dead_code` `eliminate_common_subexpr` `global_value_numbering`
   `eliminate_dead_blocks` `sparse_conditional_constant_propagation` `peephole`
   `inline_functions` `optimize_loops`。
+  **`inline_functions` 只内联单块函数**（`#[inline(always)]` 的多块函数也跳过），
+  重命名必须一次性映射全部操作数——见第 5 节第 1 条。
 
 ### 确认是死代码 / 未接线的
 
@@ -113,9 +115,12 @@ lexer → parser(ast) → typeck(hir, infer) → mir → ssa → opt → codegen
 6. **`#[derive]` 生成的 impl 块 `trait_id` 是 `None`**（属性 args 只有字符串）。
    求解必须靠 `trait_defs_by_name` 反查名字；只认**真正写在 `derive` 属性里**的名字，
    不能一见 `derive` 属性就算满足——那样 derive 能满足任何 trait。
-7. **占位降级（下游会拿到错的值）**：`src/ssa/mod.rs:1267` `Deref => SsaUnaryOp::Not`；
+7. **占位降级（下游会拿到错的值）**：`src/ssa/mod.rs:1301` `Deref => SsaUnaryOp::Not`；
    `src/mir/builder.rs:1358` `AddrOf => MirUnaryOp::Deref`。
 8. **`--emit-llvm` 输出的是手写伪 IR 文本**（整数统一 i64、指针 i8*），`clang` 消费不了。
+9. **内联时的值重命名必须"同时替换"**，不能按值逐个 `replace_operand`：被内联体
+   `%10 = %1 Add %9` 里先把 `%1` 换成新号 `%9`，再处理 `%9` 就会把两个操作数一起换掉
+   （`spawn` 的帧初始化把偏移量当指针，`-O3` SIGSEGV）。用 `map_operands`。
 
 ---
 
@@ -130,94 +135,56 @@ README 里"指针与 unsafe"一节目前是**愿景**：
 - **移动语义不检查**：`let s2 = s1;` 之后再用 `s1` 不报错。
 - **`str` 是 `{ptr, len}` 结构体**，切片写成 `[]const T`（元素在后），不是 Rust 的 `&[T]`。
 - **`println` 是函数不是宏**：`println(s: str)`；格式化走 `println_fmt(fmt, &[FormatArg], n)`，
-  只支持 `{}` `{:?}` `{:x}` `{:X}`，宽度/精度/对齐/填充被**原样打印**（不报错）。
+  支持 `{}` `{:?}` `{:x}` `{:X}` `{:b}` `{:o}`、位置参数与填充/对齐/`+`/`#`/`0`/宽度/精度
+  （与 Rust 逐字符对比一致）；**没有** `{:e}` / `{:E}` 与动态宽度 `{:1$}`，这两种会被
+  原样打印（不报错）。
+- **索引不做越界检查**，但对**标量**下标会在类型检查阶段报错
+  （``cannot index a value of type `u8` ``）；指针下标写成 `p[i]`，不要写 `(*p)[i]`。
 
 ---
 
-## 5. 在途工作（继续实现的起点）
+## 5. 在途工作与当前基线
 
-`git status --short` 有 6 个已修改未提交文件，都在 `feat/lang-features` 分支：
+`feat/lang-features` 分支上有一批**已修改未提交**的改动（2026-10-27），
+修的都是"编译通过、运行不崩、结果全错"的静默 bug：
 
 | 文件 | 在做什么 |
 |---|---|
-| `src/parser/ast.rs` | `GenericParam::Type(String)` → `Type(String, Vec<Type>)`：保留 `<T: Ord>` 的 trait 边界 |
-| `src/parser/decl.rs` | 解析 `T: Clone + Ord` 多边界时收集而非丢弃 |
-| `src/typeck/hir.rs` | `HirTrait` 新增 `super_traits: Vec<DefId>` |
-| `src/typeck/infer.rs` | 修 `subtype` 的 `type_mismatch` 参数顺序（报错文案整段倒置的 bug） |
-| `src/typeck/mod.rs` | 见下 |
-| `tests/cases/66_generics.zr` | 新增超类型方向测试（`Rankable: Equ`） |
+| `src/ssa/mod.rs` | 支配边界从"直接前驱版"改成 Cooper–Harvey–Kennedy：漏 φ 会让合流块读到未初始化的栈槽 |
+| `src/opt/pass_manager.rs` | 内联重命名改成"先建完整重命名表、再逐操作数一次性映射"（见下） |
+| `src/codegen/encoder.rs` | SysV 栈上传参（第 7 个整数 / 第 9 个浮点实参）+ `call` 的 16 字节对齐 |
+| `src/typeck/mod.rs` | `check_index_scalar` 不再吞 unify 错误：`(*p)[i]` 报错，而不是运行时 SIGSEGV |
+| `std/io.zr` | `(*p)[i]` → `p[i]`（两处）；`{:#X}` 的前缀改回小写 `0x`（与 Rust 一致） |
+| `tests/cases/76_ssa_join_phi.zr`、`77_many_args.zr`、`tests/negative/12_index_scalar.zr` | 分别钉住上面三处 |
 
-`src/typeck/mod.rs` 在途改动（**已全部编译通过**）：
+### 三个"改对了才算改对"的点（代码里都有长注释）
 
-- 新增 `trait_defs_by_name`、`generic_bounds` 两张表；`generic_bounds` 的边界顺序
-  必须与 `generic_names` **严格对齐**（都只收类型参数，不能给 lifetime/const 留占位空 vec，
-  否则 `fn f<'a, T: Ord>` 里 `T` 会索引到空 vec，边界静默丢失）。
-- 新增 `expand_trait` / `implements_trait` / `direct_impls` / `impl_target_matches` /
-  `resolve_ty` / `check_trait_bounds`；在 `monomorphize` 里调用 `check_trait_bounds`
-  ——**单态化是验证 trait 边界的唯一时刻**。
-- **超类型方向**：`implements_trait` 必须"每个直接实现的 trait 各自往上展开，再判目标在不在里面"。
-  反过来（展开目标 trait）会同时**漏掉继承关系**并**削弱边界**（只实现 `Equ` 的类型
-  满足 `T: Rankable`），两个方向都错，削弱边界是类型安全漏洞。
-- `unify_or` 修好：`Never` 是底类型（`unify_or(a, Never) == a`），不一致时返回 `Unit`
-  而非 `Ty::Infer(InferId(0))`。
-- 新增 `expr_diverges`，`Expression::If` 分支改用 `block_diverges` / `expr_diverges` 判发散。
-- 枚举的 `attrs` 现在会取到（早先落到 `_ => &[]`，`#[derive]` 在 `enum` 上被静默丢弃）。
+1. **内联重命名必须同时替换**：被内联函数体 `%10 = %1 Add %9`，如果按值逐个
+   `replace_operand(instr, from, to)`——先把 `%1` 换成调用点的新号 `%9`，指令变成
+   `%10 = %9 Add %9`，接着处理 `%9` 就把两个操作数一起换掉了。症状：`spawn` /
+   future 的帧初始化把偏移量当指针，往 `0x20` 写，`-O3` 直接 SIGSEGV（`-O0/-O2`
+   不内联所以看不出来）。现在用 `map_operands` 一次性映射。
+2. **φ 位置要按迭代替换支配边界求**：`DF(x) = { y | x 支配 y 的某个前驱，x 不严格支配 y }`。
+   只算 `x ∈ preds(y)` 会漏掉"if 里套循环"的汇合块，走 else 路径时读到上一轮的垃圾。
+3. **栈上传参的偏移要跟着 `rsp` 走**：`Src::Mem(slot)` 是 `[rsp + 8*slot]` 的原始帧偏移，
+   压入实参后必须整体加 `released/8`；被调方读 `[rbp + 16 + 8k]`（`rbp` 才是稳定基准）。
 
-### ⚠️ 已知遗留回归：`52_if_let.zr` 全 5 个优化等级失败
+### `cargo test` 当前基线（2026-10-27，全绿）
 
-```
-zr: 30:8:770: type mismatch: expected `i32`, found `()`
-```
+- `cargo test --bin zr`：264 项。
+- `cargo test --test zr_language`：77 个用例 × 5 个优化等级 = 385 项（含宿主端
+  `io_print_matches_rust`，它现在逐字符对比 Rust 的格式化输出）。
+- `cargo test --test zr_negative`：12 个负向用例。
 
-**最小复现**（`/tmp/r2.zr`，已验证）：
+### 仍然缺的（按 `docs/rust-parity.md` 第五节的 P1 顺序）
 
-```zr
-fn nested(x: i32) -> i32 {
-    if let y = x {
-        if let z = y {
-            return z + 10;
-        } else {
-            return 1;
-        }
-    } else {
-        return 2;
-    }
-}
-fn main() -> i32 { return nested(5); }
-```
-
-**根因**：新增的 `expr_diverges` 假设 `Expression::If` 的 `then_b` 是表达式，套了
-`block_diverges(then_b)`。但 `src/parser/ast.rs` 里 `If` 的签名是
-`If(Box<Expression>, Block, Option<Box<Expression>>, Span)` —— **then 分支是
-`Block`，不是 `Expression`**。所以 `then_diverges` 恒为 `false`，`t` 取到
-`then_hir.tail.unwrap_or(Ty::Unit)`。而 `IfLet` 里 `then_hir` 在"有绑定需要替换"
-时被包进 `substitute_local` 的 wrapper 再解包，导致 tail 丢失 → `t == Unit`
-→ 报 `expected i32, found ()`。单层的 `if let ... { return 1; }` 不受影响
-（`/tmp/r1.zr` 通过），只有**嵌套** `if let` 触发。
-
-**修法方向**（两者任选，推荐 1）：
-1. 把 `Expression::If` 分支的类型推断改回按 `Block` 处理（`then_hir.tail` 已有正确类型，
-   发散判断直接用 `block_diverges(then_b)` 作用于 AST 的 `Block`，别经 wrapper 绕行）；
-2. 或在 `Expression::IfLet` 的分支类型计算处加一条：`then_b` 是 `Block` 且 `block_diverges`
-   为真时取 `Never`。
-
-注意 `If` 与 `IfLet` 的 AST 形状**不同**：`If.else` 是 `Option<Box<Expression>>`，
-`If.then` 是 `Block`；`IfLet.then` 是 `Block`，`IfLet.else` 也是 `Option<Box<Expression>>`。
-`expr_diverges` 里已经正确区分了这两点（`If` 用 `block_diverges`，`IfLet` 的 else 用递归），
-问题只在上面那段新增的分支类型计算代码。
-
-### `cargo test` 当前基线（2026-10-25）
-
-- 74 个用例 × 5 等级 = 370 项，**360 过 / 10 挂**。
-- 挂的 10 项 = `52_if_let` × 5 等级（上面的回归）+ `71_derive` × 5 等级。
-- `71_derive` 挂的原因：测试文件写了 `#[derive(Debug, PartialEq, Eq, Hash)]`，
-  而 `generate_derive_impls` 只接受 `Debug` / `Clone` / `Copy`，其余名字直接报
-  `cannot derive ...: unknown derive trait`。**要支持 `PartialEq` / `Eq` / `Hash` /
-  `PartialOrd` / `Ord` / `Default`，得在 `generate_derive_impls` 里加分支**
-  （目前这些名字在 `docs/rust-parity.md` 里被列为"可接受的 derive 名"，与代码不符）。
-- 宿主端 `io_print_matches_rust` 也在失败列表里，需单独查。
-
----
+- `#[derive(PartialEq/Eq/Hash/Ord/Default)]` **只登记 trait 标记、不生成方法体**：
+  约束能过，但 `.clone()` / `==` / `.hash()` 不存在。
+- 没有 `unsafe` / `dyn`（trait 对象不可用 ⇒ `std/error` 导入不了）。
+- 没有借用检查 / 移动检查。
+- 元数据（权限、时间戳）与 `tempfile` 缺失。
+- 格式串缺 `{:e}` / `{:E}`（指数）与动态宽度 `{:1$}`，会被**原样打印**。
+- 闭包未实现；`i128`/`u128` 在 64 位目标不可用；turbofish 不支持。
 
 ## 6. 工作约定
 

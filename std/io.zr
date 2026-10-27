@@ -1178,7 +1178,7 @@ fn put_bytes(buf: []mut u8, pos0: usize, p: *const u8, len: usize) -> usize {
     let mut pos = pos0;
     let mut i = 0;
     while i < len {
-        buf[pos] = (*p)[i];
+        buf[pos] = p[i];
         pos = pos + 1;
         i = i + 1;
     }
@@ -1226,7 +1226,7 @@ fn put_escaped(buf: []mut u8, pos0: usize, p: *const u8, len: usize) -> usize {
     let mut pos = pos0;
     let mut i = 0;
     while i < len {
-        let c = (*p)[i];
+        let c = p[i];
         if c == b'"' {
             pos = put_bytes(buf, pos, "\\\"".ptr, 2);
         } else if c == b'\\' {
@@ -1435,7 +1435,10 @@ fn write_arg(fd: i32, arg: &FormatArg, flags0: u64, width: usize, prec: i32) {
             }
             if alt {
                 if base == 16 {
-                    pfx = prefix_of(if upper { b'X' } else { b'x' });
+                    // Rust 的前缀恒为小写 `0x`，即使格式是 `{:#X}`
+                    // （`format!("{:#X}", 255)` == "0xFF"）。早先这里跟着
+                    // `X` 一起大写，输出 "0XFF"，与 Rust 不一致。
+                    pfx = prefix_of(b'x');
                 } else if base == 2 {
                     pfx = prefix_of(b'b');
                 } else {
@@ -1481,7 +1484,7 @@ fn write_arg(fd: i32, arg: &FormatArg, flags0: u64, width: usize, prec: i32) {
         let mut pfx: u64 = 0;
         if alt {
             if base == 16 {
-                pfx = prefix_of(if upper { b'X' } else { b'x' });
+                pfx = prefix_of(b'x');
             } else if base == 2 {
                 pfx = prefix_of(b'b');
             } else if base == 8 {

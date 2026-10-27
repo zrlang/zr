@@ -1,0 +1,18 @@
+// 负向用例：对标量做下标必须报错。
+//
+// `(*p)[i]`（p: *const u8）里的 `*p` 是 `u8`，`u8[i]` 不是合法表达式。早先
+// 这里把 unify 的失败 `.ok()` 掉了，于是照编不误：元素类型取一个新鲜的推断
+// 变量，MIR 把 `*p` 的**值**当地址做指针算术，运行时直接段错误（SIGSEGV）。
+// 指针下标要写成 `p[i]`。
+//
+// expect: cannot index a value of type `u8`
+
+fn first(p: *const u8) -> u8 {
+    return (*p)[0];
+}
+
+fn main() -> i32 {
+    let s = "42";
+    let _ = first(s.ptr);
+    return 0;
+}

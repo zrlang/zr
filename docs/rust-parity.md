@@ -54,7 +54,7 @@
 | `*const T` / `*mut T` | 可用 | ✅ | 裸指针可用；`*p = v` 走指针语义 |
 | `&T` / `&mut T` | 可用 | 🟡 | 语义上 `&T` 是只读指针（``zr: cannot assign through an immutable pointer (use `&mut` and a `*mut` type) ``），`&mut T` 可写；但**`let` 注解里的 `&T` 被解析成 `*const T`**：`let r: &i32 = &x;` → ``zr: type mismatch: expected `*const i32`, found `&i32` `` |
 | `Option<T>` / `Result<T, E>` | 可用 | ✅ | 在 `std::core` 里；`is_some()` / `is_none()` / `is_ok()` / `is_err()` / `unwrap()` / `unwrap_or()` / `map()`、模式匹配与后缀 `?` 均正常 |
-| 泛型函数 | 可用 | ✅ | 按调用点单态化（含递归泛型）；类型实参从实参 / 期望返回类型推断。泛型约束（`T: Ord`、`where`）只解析不检查，实例化后按具体类型检查方法调用 |
+| 泛型函数 | 可用 | ✅ | 按调用点单态化（含递归泛型）；类型实参从实参 / 期望返回类型推断。泛型约束（`T: Ord`、`where`）在**单态化时**校验（`check_trait_bounds`，含超类型展开）；实例化后再按具体类型检查方法调用 |
 | 泛型类型 | 可用 | ✅ | 泛型结构体 / 枚举 + `impl<T> Type<T>` 的方法均可用（`Vec<T>`、`Option<T>` 等）；字段与载荷类型按类型实参替换 |
 | `trait` | 可用 | ✅ | `trait` + `impl Trait for Type` 正常（`std::core` 的 `Eq`/`Ord`/`Copy`/`Clone`/`Display` 都在用） |
 | 关联类型 | 可用 | ✅ | `type Output;` + `type Output = i32;` 正常，`Self::Output` 能取到 |
@@ -155,8 +155,8 @@
 | Rust 的写法 | zr 的现状 | 状态 | 说明 |
 |------|------|------|------|
 | `println!("...")` 宏 | `println(s: str)` 普通函数 | 🟡 | zr 的 `println` 是**函数不是宏**：`println!("{}", 1)` 解析失败（`zr: expected '}' to close block: expected RBrace, found Bang`）。参数类型现在会检查：`println(42)` 报 `type mismatch: expected `str`, found `i32`` |
-| `print!` / `println!` 格式化 `{}` | `println_fmt(fmt, &[FormatArg], n)` | 🟡 | 支持 `{}`、`{:?}`、`{:x}`、`{:X}` 与 `{{` / `}}` 转义；**不支持宽度 / 精度 / 对齐 / 填充**：`"{:>8}"`、`"{:04}"`、`"{:.2}"` 会被**原样打印**（不报错） |
-| `Display` 浮点格式 | 大数出错 | ❌ | `1.0e300` 打印成 `.0`（`std/io.zr` 的 `write_float` 用 `val as u64` 取整数部分，溢出后全丢）。`1.0`→`1`、`3.5`→`3.5`、`1.0/3.0`→`0.3333333333333333`、`0.1+0.2`→`0.30000000000000004`、`-0.0`→`-0` 与 Rust 一致 |
+| `print!` / `println!` 格式化 `{}` | `println_fmt(fmt, &[FormatArg], n)` | 🟡 | 支持 `{}`、`{:?}`、`{:x}`、`{:X}`、`{:b}`、`{:o}`、位置参数 `{0}`、`{{`/`}}` 转义，以及填充 / 对齐（`<` `>` `^`）、`+`、`#`、`0`、宽度、精度（`{:08.2}`、`{:*^10.3}`）；与 Rust 逐字符对比一致。**没有**指数格式 `{:e}` / `{:E}`，也没有动态宽度 `{:1$}` —— 这两种会把占位符**原样打印**（不报错） |
+| `Display` 浮点格式 | 最短可回读十进制 | ✅ | `1.0`→`1`、`3.5`→`3.5`、`1.0/3.0`→`0.3333333333333333`、`0.1+0.2`→`0.30000000000000004`、`-0.0`→`-0`、`1e30`→`1000000000000000000000000000000`，与 Rust 一致（早先 ≥2⁶⁴ 会打成 `.0`，已修） |
 | `eprintln!` / `eprint!` | `eprintln(s)` / `eprint(s)` | ✅ | 写到 STDERR |
 | `println!("{:?}", x)` 结构体调试 | 需手写 `fmt_*` | 🟡 | 只有 `fmt_int` / `fmt_uint` / `fmt_float` / `fmt_bool` / `fmt_str` / `fmt_char` / `fmt_hex` 几种预制参数，没有自动 `Debug` |
 
@@ -256,14 +256,15 @@
 3. **没有借用检查 / 移动检查**（README「所有权系统」「借用检查」两节与实际不符）。
 4. **没有元数据 / 临时文件 API**：目录、路径、时间已可用（`std/fs.zr`、
     `std/path.zr`），但权限、时间戳、`tempfile` 仍缺。
-5. **浮点 `Display` 在 |v| ≥ 2⁶⁴ 时输出 `.0`**（`std/io.zr` 的 `write_float`）。
-6. **格式规格只支持 `{}` `{:?}` `{:x}` `{:X}`**，宽度 / 精度 / 对齐 / 填充会被原样打印。
-7. **闭包未实现**（README 已记录）：`closures are not implemented yet`。
-8. **`i128` / `u128` 在 64 位目标上不可用**（需要寄存器对拆分）。
-9. **泛型推断与约束的边界**：类型参数只从实参和期望返回类型推断，不看作法体
-    （`let v = Vec::new(); v.push(1)` 推不出 `T`，需要 `let v: Vec<i32>` 注解）；
-    类型路径上的 turbofish（`Option::<i32>::None`）不支持；`T: Trait` / `where`
-    约束只解析不检查，实例化后按具体类型报"方法/字段缺失"。
+5. **格式规格缺 `{:e}` / `{:E}`（指数）与动态宽度 `{:1$}`**：占位符会被原样
+   打印，不报错。其余（`{}` `{:?}` `{:x}` `{:X}` `{:b}` `{:o}`、位置参数、
+   填充 / 对齐 / `+` / `#` / `0` / 宽度 / 精度）已与 Rust 对齐。
+6. **闭包未实现**（README 已记录）：`closures are not implemented yet`。
+7. **`i128` / `u128` 在 64 位目标上不可用**（需要寄存器对拆分）。
+8. **泛型推断的边界**：类型参数只从实参和期望返回类型推断，不看作法体
+   （`let v = Vec::new(); v.push(1)` 推不出 `T`，需要 `let v: Vec<i32>` 注解）；
+   类型路径上的 turbofish（`Option::<i32>::None`）不支持。`T: Trait` / `where`
+   约束现在会在**单态化时**校验（`check_trait_bounds`，含超类型的双向展开）。
 
 ---
 
@@ -279,3 +280,24 @@
 - 审计期间 `std/io.zr` 正被并行修改（新增了 `zr_seek` / `zr_fstat_size` /
   `zr_isatty` 运行时导出），第三章的文件能力反映的是**当时的在途状态**；
   其余章节不依赖该文件的改动。
+
+### 已修复的静默 bug（回归时值得重跑的形状）
+
+这些曾经"编译通过、运行不崩、结果全错"，都已修好并有测试钉住
+（`tests/cases/76_ssa_join_phi.zr`、`77_many_args.zr`、
+`tests/negative/12_index_scalar.zr`）：
+
+1. **合流块漏 φ**（`src/ssa/mod.rs`）：支配边界只算直接前驱版，`if c { while .. { x = .. } }`
+   之后再读 `x`，走 else 那条路径时读到未初始化的栈槽（实测是一段栈地址）。
+   现用 Cooper–Harvey–Kennedy 沿支配树求迭代替换边界。
+2. **内联时逐个"按值替换"操作数**（`src/opt/pass_manager.rs`）：`%10 = %1 Add %9`
+   里先把 `%1` 换成新号 `%9`，再把 `%9` 换掉，两个操作数一起变成新号——
+   `spawn` 的帧初始化把偏移量当地址，往 `0x20` 写，`-O3` 直接 SIGSEGV。
+   现在先建完整重命名表，再逐操作数一次性映射。
+3. **第 7 个及之后的实参被静默丢弃**（`src/codegen/encoder.rs`）：SysV 的栈上传参
+   没实现，`std/io.zr` 里 7 形参的 `emit_arg` 宽度恒为 0，所有填充 / 对齐 / 零填充
+   规格失效。现在按 ABI 压栈、被调方从 `[rbp+16+8k]` 读，并补 16 字节对齐。
+4. **指针指向数组时元素类型取错**（`src/typeck/mod.rs`）：`p: *mut [u8; 16]` 的
+   `p[k]` 曾被当成 `[u8; 16]`，按 16 字节步长缩放。
+5. **对标量下标被静默接受**：`(*p)[i]`（`p: *const u8`）曾照编不误、运行时
+   SIGSEGV；现在报 ``cannot index a value of type `u8` ``。指针下标要写 `p[i]`。
