@@ -1,0 +1,106 @@
+//=============================================================================
+// tests/cases/76_ssa_join_phi.zr — 合流块的 φ 不能漏
+//
+// 场景：定义在 if **之前**的变量，被 if 里的循环改写，if 结束后再读。
+//
+//   let mut y = n;
+//   if n > 0 { while y < 10 { y = y + 1; } }
+//   return y;                       // ← 合流块
+//
+// 合流块的前驱是"if 的 else 空块"和"循环出口"，**都不是** y 的定义块
+// （定义在 if 之前与循环体里）。早先的支配边界只算了"直接前驱"版
+// （DF_local），于是合流块的 φ 整个漏掉：走 else 空块那条路径时读到的是
+// 循环头 φ 的值——一个**从未被赋值**的栈槽（实测是一段栈地址）。
+//
+// 这类 bug 是静默的：编译通过、运行不崩、结果全错，而且换个优化等级或
+// 改一行无关代码就可能"碰巧正确"。所以这里把几种合流形状都钉住。
+//=============================================================================
+
+fn after_if(n: i32) -> i32 {
+    let mut y = n;
+    if n > 0 {
+        while y < 10 {
+            y = y + 1;
+        }
+    }
+    return y;
+}
+
+// 循环出口分支会用到两个不同的值：两个都得在合流处正确。
+fn two_values(n: i32) -> i32 {
+    let mut a = n;
+    let mut b = n * 2;
+    if n > 0 {
+        while a < 6 {
+            a = a + 1;
+            b = b + 10;
+        }
+    }
+    return a * 100 + b;
+}
+
+// `if cond && f(..) { while ... }` 之后再读：std/io.zr 的 print_fmt 就是
+// 这个形状（`if j < len && is_digit(p[j]) { while ... }` 之后继续用 j）。
+fn is_digit(c: u8) -> bool {
+    return c >= b'0' && c <= b'9';
+}
+
+fn scan(fmt: str) -> usize {
+    let mut i: usize = 0;
+    while i < fmt.len {
+        let c = fmt.ptr[i];
+        if c == b'{' {
+            let mut j = i + 1;
+            if j < fmt.len && is_digit(fmt.ptr[j]) {
+                while j < fmt.len && is_digit(fmt.ptr[j]) {
+                    j = j + 1;
+                }
+            }
+            if j < fmt.len && fmt.ptr[j] == b'}' {
+                return j;
+            }
+            return 100;
+        }
+        i = i + 1;
+    }
+    return 0;
+}
+
+// 嵌套循环 + 合流：外层变量在出口处不能丢。
+fn nested(n: i32) -> i32 {
+    let mut acc = 0;
+    let mut i = 0;
+    while i < n {
+        let mut k = 0;
+        if i > 1 {
+            while k < i {
+                k = k + 1;
+                acc = acc + k;
+            }
+        } else {
+            acc = acc + 100;
+        }
+        i = i + 1;
+    }
+    return acc;
+}
+
+fn main() -> i32 {
+    // else 空块那条路径：y 必须还是 n。
+    if after_if(-3) != -3 { return 1; }
+    if after_if(0) != 0 { return 2; }
+    // 循环那条路径：y 走到 10。
+    if after_if(4) != 10 { return 3; }
+
+    if two_values(-1) != -100 - 2 { return 4; }
+    if two_values(2) != 644 { return 5; }
+
+    if scan("a{}b") != 2 { return 6; }
+    if scan("a{12}b") != 4 { return 7; }
+    if scan("ab") != 0 { return 8; }
+
+    // i=0: +100, i=1: +100, i=2: 1+2=3, i=3: 1+2+3=6
+    if nested(4) != 209 { return 9; }
+
+    return 0;
+}

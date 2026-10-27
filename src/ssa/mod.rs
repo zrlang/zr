@@ -348,15 +348,49 @@ fn convert_function(func: &mir::MirFunction) -> SsaFunction {
     }
 
     // ---- 支配树与支配边界 ----
+    //
+    // DF(x) = { y | x 支配 y 的某个前驱，但 x 不严格支配 y }
+    //
+    // 早先这里只算"直接前驱"版：`x ∈ preds(y)`（即 DF_local）。那样会**漏掉**
+    // 一类真实的合流点：定义块 x 支配某个前驱 p、但 x 不是 p 本身。最典型的
+    // 形态是"if 里套循环"——
+    //
+    //   let mut y = n;
+    //   if n > 0 { while y < 10 { y = y + 1; } }   // 循环体改写 y
+    //   return y;                                  // 汇合块（前驱：else 空块、循环出口）
+    //
+    // 汇合块的两个前驱都不是 y 的定义块（定义在 if 之前与循环体里），于是
+    // 汇合块的 φ 整个漏掉。重命名时该处引用的是**循环头**的 φ，而走
+    // "else 空块"那条路径时那个 φ 根本没被赋值——读到的是未初始化的栈槽 /
+    // 上一轮残留的寄存器值。实测 `if j < n && is_digit(..) { while .. }`
+    // 之后再用 j，拿到的是一段栈地址。
+    //
+    // 正确求法用标准的 Cooper–Harvey–Kennedy 写法：对每个合流点 y，从它的
+    // 每个前驱 p 沿支配树往上走，一路把 y 记进 DF(runner)，直到走到 idom(y)。
     let idom = mir_dominator_tree(n, &preds, &succs);
-    // DF(x) = { y | y 有 >=2 个前驱，且 x ∈ preds(y) }
     let mut df: HashMap<usize, Vec<usize>> = HashMap::new();
     for (y, ps) in preds.iter().enumerate() {
         if ps.len() < 2 {
             continue;
         }
-        for &x in ps {
-            df.entry(x).or_default().push(y);
+        // 不可达块没有 idom，不可能有 φ 读者，直接跳过。
+        let Some(&stop) = idom.get(&y) else { continue };
+        for &p in ps {
+            let mut runner = p;
+            // 支配树最多 n 层；上界只是防畸形 CFG 死循环。
+            for _ in 0..=n {
+                if runner == stop {
+                    break;
+                }
+                let entry = df.entry(runner).or_default();
+                if !entry.contains(&y) {
+                    entry.push(y);
+                }
+                match idom.get(&runner) {
+                    Some(&up) if up != runner => runner = up,
+                    _ => break,
+                }
+            }
         }
     }
 
