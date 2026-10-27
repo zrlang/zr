@@ -732,8 +732,13 @@ fn put_float_prec(buf: []mut u8, pos0: usize, m: u64, e2: i32, prec: usize) -> u
     return pos;
 }
 
-fn put_float_shortest(buf: []mut u8, pos0: usize, m: u64, e2: i32) -> usize {
-    let mut pos = pos0;
+/// 最短往返的**有效数字**：返回数字个数，`exp_out` 给小数点位置
+/// （值 = 0.<digits> * 10^exp）。
+///
+/// 位置形式（Display）与指数形式（LowerExp）共用这一套判定——两者只差
+/// "小数点放哪、要不要写 e"，选哪几位有效数字必须完全一致，否则
+/// `format!("{}", x)` 与 `format!("{:e}", x)` 会给出不同精度的结果。
+fn shortest_digits(m: u64, e2: i32, out: []mut u8, exp_out: &mut i32) -> usize {
     let mut digits: [u8; 800] = [0; 800];
     let mut dexp: i32 = 0;
     let dlen = dyadic_to_digits(m, e2, &mut digits[0..800], &mut dexp);
@@ -783,11 +788,129 @@ fn put_float_shortest(buf: []mut u8, pos0: usize, m: u64, e2: i32) -> usize {
             lo < 0 && hi < 0
         };
         if ok || n == 17 {
-            return put_positional(buf, pos0, &c[0..sl], sl, re);
+            let mut i = 0;
+            while i < sl {
+                out[i] = c[i];
+                i = i + 1;
+            }
+            *exp_out = re;
+            return sl;
         }
         n = n + 1;
     }
+    return 1;
+}
+
+fn put_float_shortest(buf: []mut u8, pos0: usize, m: u64, e2: i32) -> usize {
+    let mut c: [u8; 800] = [0; 800];
+    let mut re: i32 = 0;
+    let sl = shortest_digits(m, e2, &mut c[0..800], &mut re);
+    return put_positional(buf, pos0, &c[0..sl], sl, re);
+}
+
+/// 指数形式（Rust 的 `{:e}` / `{:E}`）：`1.234e3`。
+///
+/// 尾数只有一位整数位，指数是"第一位数字的十进制权重"。`prec < 0` 时用
+/// 最短往返数字并去掉尾随零（`1000.0` → `1e3`，`1234.0` → `1.234e3`）；
+/// `prec >= 0` 时小数点后固定 `prec` 位（不足补 0）。
+fn put_float_exp(
+    buf: []mut u8,
+    pos0: usize,
+    m: u64,
+    e2: i32,
+    prec: i32,
+    upper: bool,
+) -> usize {
+    let mut c: [u8; 800] = [0; 800];
+    let mut re: i32 = 0;
+    let mut sl: usize = 0;
+    let mut frac: usize = 0;
+    if prec < 0 {
+        sl = shortest_digits(m, e2, &mut c[0..800], &mut re);
+        frac = sl - 1;
+    } else {
+        frac = prec as usize;
+        let keep = frac + 1;
+        let mut digits: [u8; 800] = [0; 800];
+        let mut dexp: i32 = 0;
+        let dlen = dyadic_to_digits(m, e2, &mut digits[0..800], &mut dexp);
+        let mut r: [u8; 800] = [0; 800];
+        let got = round_sig(&digits[0..dlen], dlen, dexp, keep, &mut r[0..800], &mut re);
+        let mut i = 0;
+        while i < got {
+            c[i] = r[i];
+            i = i + 1;
+        }
+        sl = got;
+    }
+    return put_exp_form(buf, pos0, &c[0..sl], sl, re - 1, frac, upper);
+}
+
+/// 把"第一位数字 + 若干小数位 + 指数"写进缓冲区。
+///
+/// `digits` 是有效数字（不带符号、不带前导零），`exp10` 是第一位的权重。
+fn put_exp_form(
+    buf: []mut u8,
+    pos0: usize,
+    digits: []const u8,
+    dlen: usize,
+    exp10: i32,
+    frac: usize,
+    upper: bool,
+) -> usize {
+    let mut pos = pos0;
+    buf[pos] = digits[0];
+    pos = pos + 1;
+    if frac > 0 {
+        buf[pos] = b'.';
+        pos = pos + 1;
+        let mut i = 1;
+        while i <= frac {
+            buf[pos] = if i < dlen { digits[i] } else { b'0' };
+            pos = pos + 1;
+            i = i + 1;
+        }
+    }
+    buf[pos] = if upper { b'E' } else { b'e' };
+    pos = pos + 1;
+    if exp10 < 0 {
+        buf[pos] = b'-';
+        pos = pos + 1;
+        pos = put_uint_dec(buf, pos, (0 - exp10) as u64);
+    } else {
+        pos = put_uint_dec(buf, pos, exp10 as u64);
+    }
     return pos;
+}
+
+/// 十进制数字串的指数形式（整数用）：`1000` → `1e3`，`1234` → `1.234e3`。
+///
+/// 与浮点不同，整数的数字是**精确**的，所以 `prec < 0` 时"最短"就是
+/// "去掉尾随零"；`prec >= 0` 时要按 `prec + 1` 位有效数字四舍五入
+/// （`{:.1e}` of `999` 是 `1.0e3`，`{:.2e}` of `1299` 是 `1.30e3`），
+/// 半数按"到偶数"处理，与 Rust 一致。
+fn put_dec_exp(
+    buf: []mut u8,
+    pos0: usize,
+    digits: []const u8,
+    dlen: usize,
+    prec: i32,
+    upper: bool,
+) -> usize {
+    // 整数 digits 表示的值 = 0.<digits> * 10^dlen（"1234" → 0.1234e4）。
+    let sexp = dlen as i32;
+    if prec < 0 {
+        let mut n = dlen;
+        while n > 1 && digits[n - 1] == b'0' {
+            n = n - 1;
+        }
+        return put_exp_form(buf, pos0, digits, dlen, sexp - 1, n - 1, upper);
+    }
+    let keep = (prec as usize) + 1;
+    let mut r: [u8; 800] = [0; 800];
+    let mut re: i32 = 0;
+    let rl = round_sig(digits, dlen, sexp, keep, &mut r[0..800], &mut re);
+    return put_exp_form(buf, pos0, &r[0..rl], rl, re - 1, prec as usize, upper);
 }
 
 /// 按 Rust 的 Display 规则写出一个 f64，返回写入的字节数。
@@ -975,6 +1098,8 @@ const SPEC_HEX_LOWER: i32 = 2;
 const SPEC_HEX_UPPER: i32 = 3;
 const SPEC_BIN: i32 = 4;
 const SPEC_OCT: i32 = 5;
+const SPEC_EXP_LOWER: i32 = 6;
+const SPEC_EXP_UPPER: i32 = 7;
 
 const ALIGN_DEFAULT: i32 = 0;
 const ALIGN_LEFT: i32 = 1;
@@ -1025,6 +1150,12 @@ pub fn print_fmt(fmt: str, args: *const FormatArg, nargs: usize) {
             let mut width: usize = 0;
             let mut prec: i32 = -1;
             let mut kind: i32 = SPEC_DISPLAY;
+            // 动态宽度 / 动态精度：`{:1$}` / `{:.1$}` 的宽度/精度从参数里取，
+            // 这两个变量存参数下标（-1 = 没写）。
+            let mut width_argi: i32 = -1;
+            let mut prec_argi: i32 = -1;
+            // `{:.*}`：精度取**下一个隐式**参数，值参数再往后挪一位。
+            let mut prec_star = false;
             if j < fmt.len && fmt.ptr[j] == b':' {
                 j = j + 1;
                 // 填充 + 对齐（填充字符后面必须跟一个对齐符）
@@ -1050,16 +1181,43 @@ pub fn print_fmt(fmt: str, args: *const FormatArg, nargs: usize) {
                     zero = true;
                     j = j + 1;
                 }
-                while j < fmt.len && is_digit(fmt.ptr[j]) {
-                    width = width * 10 + ((fmt.ptr[j] - b'0') as usize);
-                    j = j + 1;
+                if j < fmt.len && is_digit(fmt.ptr[j]) {
+                    let mut w: usize = 0;
+                    while j < fmt.len && is_digit(fmt.ptr[j]) {
+                        w = w * 10 + ((fmt.ptr[j] - b'0') as usize);
+                        j = j + 1;
+                    }
+                    if j < fmt.len && fmt.ptr[j] == b'$' {
+                        // 动态宽度：`{:1$}` 用第 1 个参数当宽度
+                        width_argi = w as i32;
+                        j = j + 1;
+                    } else {
+                        width = w;
+                    }
                 }
                 if j < fmt.len && fmt.ptr[j] == b'.' {
                     j = j + 1;
-                    prec = 0;
-                    while j < fmt.len && is_digit(fmt.ptr[j]) {
-                        prec = prec * 10 + ((fmt.ptr[j] - b'0') as i32);
+                    if j < fmt.len && fmt.ptr[j] == b'*' {
+                        prec_star = true;
                         j = j + 1;
+                    } else {
+                        let mut p: i32 = 0;
+                        // `.` 后面**一个数字都没有**时 Rust 视作"没写精度"
+                        // （`format!("{:.}", 2.5)` == "2.5"），所以只在真读到
+                        // 数字时才置 `prec`。
+                        let mut has_digits = false;
+                        while j < fmt.len && is_digit(fmt.ptr[j]) {
+                            p = p * 10 + ((fmt.ptr[j] - b'0') as i32);
+                            j = j + 1;
+                            has_digits = true;
+                        }
+                        if j < fmt.len && fmt.ptr[j] == b'$' {
+                            // 动态精度：`{:.1$}` 用第 1 个参数当精度
+                            prec_argi = p;
+                            j = j + 1;
+                        } else if has_digits {
+                            prec = p;
+                        }
                     }
                 }
                 if j < fmt.len {
@@ -1079,10 +1237,36 @@ pub fn print_fmt(fmt: str, args: *const FormatArg, nargs: usize) {
                     } else if t == b'o' {
                         kind = SPEC_OCT;
                         j = j + 1;
+                    } else if t == b'e' {
+                        kind = SPEC_EXP_LOWER;
+                        j = j + 1;
+                    } else if t == b'E' {
+                        kind = SPEC_EXP_UPPER;
+                        j = j + 1;
                     }
                 }
             }
             if j < fmt.len && fmt.ptr[j] == b'}' {
+                // 动态精度/宽度要在写之前从参数里解出来。`.*` 会顺带把
+                // "值"往后推一位，所以先标记值已经定位好，避免末尾再自增。
+                let mut value_ready = false;
+                if prec_star {
+                    if ai < nargs {
+                        prec = args[ai].int_value as i32;
+                    }
+                    ai = ai + 1;
+                    if !explicit {
+                        argi = ai;
+                        ai = ai + 1;
+                        value_ready = true;
+                    }
+                }
+                if width_argi >= 0 && (width_argi as usize) < nargs {
+                    width = args[width_argi as usize].int_value as usize;
+                }
+                if prec_argi >= 0 && (prec_argi as usize) < nargs {
+                    prec = args[prec_argi as usize].int_value as i32;
+                }
                 if argi < nargs {
                     let mut flags: u64 = 0;
                     flags = ((kind as u64) << 24) | ((align as u64) << 16) | ((fill as u64) << 8);
@@ -1090,7 +1274,7 @@ pub fn print_fmt(fmt: str, args: *const FormatArg, nargs: usize) {
                     if alt { flags = flags | FLAG_ALT; }
                     if zero { flags = flags | FLAG_ZERO; }
                     write_arg(STDOUT_FD, &args[argi], flags, width, prec);
-                    if !explicit {
+                    if !explicit && !value_ready {
                         ai = ai + 1;
                     }
                 }
@@ -1247,12 +1431,15 @@ fn put_escaped(buf: []mut u8, pos0: usize, p: *const u8, len: usize) -> usize {
 }
 
 /// 把不带符号的浮点写到缓冲区（`bits` 的最高位已经是 0）。
+///
+/// `exp_kind`：-1 = 位置形式（Display/Debug），0 = `{:e}`，1 = `{:E}`。
 fn put_float_bits(
     buf: []mut u8,
     pos0: usize,
     bits: u64,
     prec: i32,
     debug: bool,
+    exp_kind: i32,
 ) -> usize {
     let ef = (bits >> 52) & 2047;
     let frac = bits & 4503599627370495;
@@ -1266,6 +1453,12 @@ fn put_float_bits(
     let m = frac | (if ef != 0 { 4503599627370496 } else { 0 as u64 });
     let e2: i32 = (ef2 as i32) - 1075;
     if m == 0 {
+        // 零：Display 是 `0`，Debug 是 `0.0`，指数形式是 `0e0` / `0.00e0`
+        // （精度决定小数点后几位，指数恒为 0）。
+        if exp_kind >= 0 {
+            let mut zeros: [u8; 1] = [b'0'];
+            return put_exp_form(buf, pos0, &zeros[0..1], 1, 0, if prec > 0 { prec as usize } else { 0 }, exp_kind == 1);
+        }
         let mut pos = pos0;
         buf[pos] = b'0';
         pos = pos + 1;
@@ -1275,6 +1468,9 @@ fn put_float_bits(
             pos = pos + 2;
         }
         return pos;
+    }
+    if exp_kind >= 0 {
+        return put_float_exp(buf, pos0, m, e2, prec, exp_kind == 1);
     }
     if prec >= 0 {
         return put_float_prec(buf, pos0, m, e2, prec as usize);
@@ -1424,7 +1620,26 @@ fn write_arg(fd: i32, arg: &FormatArg, flags0: u64, width: usize, prec: i32) {
         let mut pfx: u64 = 0;
         let mut blen: usize = 0;
         let mut numeric = true;
-        if is_radix(kind) {
+        if kind == SPEC_EXP_LOWER || kind == SPEC_EXP_UPPER {
+            // `{:e}` / `{:E}`：整数也走十进制的指数形式。负数先取绝对值
+            // 再格式化，符号由 emit_arg 补在前面（与 Rust 一致）。
+            let mag: u64 = if v < 0 { (0 - v) as u64 } else { v as u64 };
+            if v < 0 {
+                sign = b'-';
+            } else if plus {
+                sign = b'+';
+            }
+            let mut dl: [u8; 24] = [0; 24];
+            let dl_len = put_uint_dec(&mut dl[0..24], 0, mag);
+            blen = put_dec_exp(
+                &mut body[0..1024],
+                0,
+                &dl[0..dl_len],
+                dl_len,
+                prec,
+                kind == SPEC_EXP_UPPER,
+            );
+        } else if is_radix(kind) {
             let mut base: u64 = 16;
             let upper = kind == SPEC_HEX_UPPER;
             if kind == SPEC_BIN {
@@ -1466,6 +1681,23 @@ fn write_arg(fd: i32, arg: &FormatArg, flags0: u64, width: usize, prec: i32) {
     }
     if arg.kind == 1 || arg.kind == 6 {
         // 无符号整数；kind 6 是 fmt_hex 的默认十六进制。
+        let sign: u8 = if plus { b'+' } else { 0 };
+        if kind == SPEC_EXP_LOWER || kind == SPEC_EXP_UPPER {
+            // `{:e}` / `{:E}`：按十进制处理（即使参数来自 fmt_hex）。
+            let mut dl: [u8; 24] = [0; 24];
+            let dl_len = put_uint_dec(&mut dl[0..24], 0, arg.int_value as u64);
+            let blen = put_dec_exp(
+                &mut body[0..1024],
+                0,
+                &dl[0..dl_len],
+                dl_len,
+                prec,
+                kind == SPEC_EXP_UPPER,
+            );
+            flags = flags | FLAG_NUMERIC;
+            emit_arg(fd, &body[0..blen], blen, sign, 0, flags, width);
+            return;
+        }
         let mut base: u64 = 10;
         let mut upper = false;
         if arg.kind == 6 {
@@ -1491,7 +1723,6 @@ fn write_arg(fd: i32, arg: &FormatArg, flags0: u64, width: usize, prec: i32) {
                 pfx = prefix_of(b'o');
             }
         }
-        let sign: u8 = if plus { b'+' } else { 0 };
         let mut blen: usize = 0;
         if base == 10 {
             blen = put_uint_dec(&mut body[0..1024], 0, arg.int_value as u64);
@@ -1514,12 +1745,19 @@ fn write_arg(fd: i32, arg: &FormatArg, flags0: u64, width: usize, prec: i32) {
         } else if plus {
             sign = b'+';
         }
+        let mut exp_kind: i32 = -1;
+        if kind == SPEC_EXP_LOWER {
+            exp_kind = 0;
+        } else if kind == SPEC_EXP_UPPER {
+            exp_kind = 1;
+        }
         let blen = put_float_bits(
             &mut body[0..1024],
             0,
             bits & 9223372036854775807,
             prec,
             kind == SPEC_DEBUG,
+            exp_kind,
         );
         flags = flags | FLAG_NUMERIC;
         emit_arg(fd, &body[0..blen], blen, sign, 0, flags, width);

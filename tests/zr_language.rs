@@ -116,7 +116,8 @@ fn zr_language_cases() {
 /// 那里每个用例还会在 aarch64 模拟器下再跑一遍。
 /// `io` 模块的输出要和 Rust 一致：整数的十进制、浮点的"最短往返十进制"
 /// （2.675 打成 "2.675" 而不是 "2.6749999999999998"）、Debug 的引号与
-/// ".0"、十六进制规格、格式串里的转义序列。
+/// ".0"、十六进制规格、指数形式（`{:e}` / `{:E}`）、动态宽度/精度
+/// （`{:1$}` / `{:.*}`）、格式串里的转义序列。
 #[test]
 fn io_print_matches_rust() {
     let zr = env!("CARGO_BIN_EXE_zr");
@@ -127,6 +128,26 @@ fn main() -> i32 {
     println_fmt("int={} float={} str={} bool={}", &a1[0] as *const FormatArg, 4);
     let a2 = [fmt_float(1.0), fmt_int(255), fmt_int(255)];
     println_fmt("debug={:?} hex={:x} hexu={:X} esc=a\tb\\c", &a2[0] as *const FormatArg, 3);
+    let a3 = [fmt_float(1234.5), fmt_float(1000.0), fmt_float(1234.5)];
+    println_fmt("exp={:e} {:e} {:E}", &a3[0] as *const FormatArg, 3);
+    let a4 = [fmt_float(1234.5), fmt_float(0.0), fmt_float(999.0)];
+    println_fmt("expp={:.2e} {:.2e} {:.2e}", &a4[0] as *const FormatArg, 3);
+    let a5 = [fmt_int(1234), fmt_int(-1000), fmt_int(1299)];
+    println_fmt("iexp={:e} {:e} {:.2e}", &a5[0] as *const FormatArg, 3);
+    let a6 = [fmt_int(5), fmt_int(10)];
+    println_fmt("dyn=[{:1$}]", &a6[0] as *const FormatArg, 2);
+    let a7 = [fmt_int(5), fmt_int(10)];
+    println_fmt("dync=[{:*^1$}]", &a7[0] as *const FormatArg, 2);
+    let a8 = [fmt_int(2), fmt_float(1.23456)];
+    println_fmt("dynp=[{:.*}]", &a8[0] as *const FormatArg, 2);
+    let a9 = [fmt_float(1.23456), fmt_int(3)];
+    println_fmt("dynp2=[{:.1$}]", &a9[0] as *const FormatArg, 2);
+    let a10 = [fmt_int(2), fmt_int(1234)];
+    println_fmt("idynp=[{:.*}]", &a10[0] as *const FormatArg, 2);
+    let a11 = [fmt_float(3.14159)];
+    println_fmt("w=[{:08.3}]", &a11[0] as *const FormatArg, 1);
+    let a12 = [fmt_float(2.675), fmt_str("hello")];
+    println_fmt("noprec=[{:.}][{:.}]", &a12[0] as *const FormatArg, 2);
     return 0;
 }
 "#;
@@ -156,7 +177,7 @@ fn main() -> i32 {
         );
         assert_eq!(
             run.stdout,
-            b"int=42 float=2.675 str=hi bool=true\ndebug=1.0 hex=ff hexu=FF esc=a\tb\\c\n",
+            b"int=42 float=2.675 str=hi bool=true\ndebug=1.0 hex=ff hexu=FF esc=a\tb\\c\nexp=1.2345e3 1e3 1.2345E3\nexpp=1.23e3 0.00e0 9.99e2\niexp=1.234e3 -1e3 1.30e3\ndyn=[         5]\ndync=[****5*****]\ndynp=[1.23]\ndynp2=[1.235]\nidynp=[1234]\nw=[0003.142]\nnoprec=[2.675][hello]\n",
             "标准输出不符 ({opt})"
         );
         let _ = std::fs::remove_file(&out);

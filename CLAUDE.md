@@ -195,7 +195,7 @@ target/debug/zr prog.zr -O1 -o /tmp/prog && /tmp/prog
 | 模块 | 内容 | 备注 |
 |---|---|---|
 | `core` | `Option` / `Result` / `Eq` / `Ord` / `Copy` / `Clone` / `Display` | `Option` 方法齐全（`is_some`/`unwrap`/`map`）；**无 `PhantomData`** |
-| `io` | `println(s)` / `eprintln(s)` / `println_fmt(fmt, &[FormatArg], n)` / `read_bytes` / `stdin_read_line` / `File` | 格式化只支持 `{}` `{:?}` `{:x}` `{:X}`；宽度/精度/对齐被**原样打印** |
+| `io` | `println(s)` / `eprintln(s)` / `println_fmt(fmt, &[FormatArg], n)` / `read_bytes` / `stdin_read_line` / `File` | 格式串支持 `{}` `{:?}` `{:x}` `{:X}` `{:b}` `{:o}` `{:e}` `{:E}`、填充/对齐/`+`/`#`/`0`/宽度/精度、动态宽度 `{:1$}`、动态精度 `{:.*}`；缺命名参数 `{name}` 与 `{:#?}` |
 | `string` | `String` | 无 `BufRead::read_line` 形态的 API |
 | `collections` | 容器 | |
 | `async` | 运行时 | 仅部分平台完整 |
