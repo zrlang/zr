@@ -11,6 +11,7 @@
 //! 3. trait 求解：选择满足 bound 的具体实现（含 specialization）。
 //! 4. 闭包：捕获分析 + 类型推导。
 
+use std::cell::RefCell;
 use std::collections::HashMap;
 use std::fmt;
 use std::sync::OnceLock;
@@ -56,6 +57,37 @@ fn empty_functions() -> &'static HashMap<DefId, hir::HirFunction> {
 }
 fn empty_locals() -> &'static mut HashMap<LocalId, Ty> {
     Box::leak(Box::new(HashMap::new()))
+}
+
+// ---- 诊断用的 `DefId → 名字` 登记表 ----
+//
+// `InferCtxt` 拿不到 `TypeChecker` 的 `def_names`：它是 `InferCtxt<'static>`，
+// 而 `def_names` 属于 checker 自己（自引用借用过不去，见 `TypeChecker` 字段
+// 定义处的注释）。于是**所有**走 `unify` / `subtype` 的错误都把具名类型打成
+// `type#2`，用户看不到 `S`——错误信息比没有还糟。
+//
+// 这里放一张线程局部的登记表：`TypeChecker::alloc_def` 每次分配定义时写入，
+// `check_program` 开头清空。它只服务于错误信息渲染，不参与任何类型判定，因此
+// 即使某个 DefId 查不到名字，最坏也只是退回 `type#N`，不会影响正确性。
+thread_local! {
+    static DEF_NAMES: RefCell<HashMap<DefId, String>> = RefCell::new(HashMap::new());
+}
+
+/// 登记一个 `DefId` 的名字（仅供诊断）。
+pub fn register_def_name(id: DefId, name: &str) {
+    DEF_NAMES.with(|m| {
+        m.borrow_mut().insert(id, name.to_string());
+    });
+}
+
+/// 清空登记表。每次 `check_program` 开头调用：`DefId` 是按程序从 1 分配的，
+/// 不清会让上一次检查的残留名字盖到新程序里同名编号的类型上。
+pub fn clear_def_names() {
+    DEF_NAMES.with(|m| m.borrow_mut().clear());
+}
+
+fn lookup_def_name(id: DefId) -> Option<String> {
+    DEF_NAMES.with(|m| m.borrow().get(&id).cloned())
 }
 
 impl<'a> InferCtxt<'a> {
@@ -585,6 +617,9 @@ impl<'a> InferCtxt<'a> {
                 hir::HirTypeDef::Union(u) => u.name.clone(),
                 hir::HirTypeDef::Alias { def_id, .. } => format!("alias({})", def_id.0),
             }
+        } else if let Some(name) = lookup_def_name(id) {
+            // 本检查器自己的定义表（`self.type_defs` 一直是空静态表，见字段注释）。
+            name
         } else {
             format!("type#{}", id.0)
         }

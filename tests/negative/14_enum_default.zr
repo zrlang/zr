@@ -1,0 +1,13 @@
+// 负向用例：枚举不能 derive `Default`。
+//
+// Rust 靠 `#[default]` 标出"哪个变体是默认值"；zr 没有这个属性，只能猜第一个
+// 变体——那会在有载荷的变体上生成 `E::A(未初始化)`。明确报错，不猜。
+//
+// expect: cannot derive `Default` for enum
+
+#[derive(Default)]
+enum E { A, B(i32) }
+
+fn main() -> i32 {
+    return 0;
+}

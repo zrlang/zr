@@ -1,0 +1,18 @@
+// 负向用例：没 derive `PartialEq` 的聚合类型不能用 `==`。
+//
+// 早先聚合比较直接落到 MIR 的标量比较上：运行期聚合值是地址，内容相同的两个
+// 值比的是两个不同地址，`a == b` 恒假、`a != b` 恒真，编译期一声不响。
+// 现在聚合比较改写成对 `Type__eq` 的调用，方法不存在就必须报错——让人看到
+// "去 derive"，而不是拿到一个永远为假的结果。
+//
+// expect: it does not derive or implement
+
+#[derive(Clone)]
+struct S { x: i32 }
+
+fn main() -> i32 {
+    let a = S { x: 1 };
+    let b = S { x: 1 };
+    if a == b { return 1; }
+    return 0;
+}

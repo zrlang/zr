@@ -1,0 +1,74 @@
+//=============================================================================
+// tests/cases/80_match_value.zr — 穷尽 `match` 的臂值不能被 `Unit` 覆盖
+//
+// 穷尽的 `match`（所有枚举变体 / bool 两个值都覆盖）不需要 `_` 臂，它脱糖成
+// 一条 if/else 链。早先链尾那一格是 `None`——没有 else。MIR 把"if 没有 else"
+// 解释成"这个 if 的值是 `()`"，于是汇合块无条件往结果临时名里写 `Unit`，
+// 把最后一个变体臂刚算出来的值**覆盖**掉。
+//
+// 症状：臂体自带 `return` 时看不出来（从入口就离开函数了，`57_enum.zr` 一直是
+// 这个形状，所以从没暴露）；一旦 `match` 当表达式返回值，`match e { A=>10,
+// B=>20, C=>50 }` 对 C 给出 51 之类的垃圾。
+//
+// 现在 `check_match` 在"最后一条臂不是无条件臂"时补一个发散尾分支
+// （`ExprKind::Unreachable` → `MirTerminator::Unreachable`）：链尾没有通往
+// 汇合块的后继，汇合块只剩真正产值的那个前驱。
+//=============================================================================
+
+enum U { A, B, C }
+enum E { A, B(i32), C(i32, i32) }
+
+fn unit_variants(e: U) -> i32 {
+    match e { U::A => 10, U::B => 20, U::C => 50 }
+}
+
+fn payloads(e: E) -> i32 {
+    match e {
+        E::A => 10,
+        E::B(x) => 100 + x,
+        E::C(x, y) => 200 + x * 10 + y,
+    }
+}
+
+fn bools(b: bool) -> i32 {
+    match b { true => 1, false => 0 }
+}
+
+// 最后一个臂不是常量：结果来自臂体里的局部运算。
+fn tail_computed(e: U, k: i32) -> i32 {
+    match e {
+        U::A => k * 2,
+        U::B => k * 3,
+        U::C => k * 5,
+    }
+}
+
+// 嵌套：内层 match 也当表达式返回。
+fn nested(a: U, b: U) -> i32 {
+    match a {
+        U::A => match b { U::A => 1, U::B => 2, U::C => 3 },
+        U::B => 10,
+        U::C => 100,
+    }
+}
+
+fn main() -> i32 {
+    if unit_variants(U::A) != 10 { return 1; }
+    if unit_variants(U::B) != 20 { return 2; }
+    if unit_variants(U::C) != 50 { return 3; }
+
+    if payloads(E::A) != 10 { return 4; }
+    if payloads(E::B(7)) != 107 { return 5; }
+    if payloads(E::C(1, 2)) != 212 { return 6; }
+
+    if bools(true) != 1 || bools(false) != 0 { return 7; }
+
+    if tail_computed(U::A, 3) != 6 { return 8; }
+    if tail_computed(U::B, 3) != 9 { return 9; }
+    if tail_computed(U::C, 3) != 15 { return 10; }
+
+    if nested(U::A, U::C) != 3 { return 11; }
+    if nested(U::B, U::C) != 10 { return 12; }
+    if nested(U::C, U::A) != 100 { return 13; }
+    return 0;
+}

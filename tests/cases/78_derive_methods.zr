@@ -1,0 +1,124 @@
+//=============================================================================
+// tests/cases/78_derive_methods.zr — `#[derive(..)]` 要生成真正的方法体
+//
+// 早先 derive 只往 impl 表里登记一个"trait 标记"：`fn needs_clone<T: Clone>`
+// 这类边界校验能过，但 `.clone()` / `.hash()` / `.default()` 这些方法**根本
+// 不存在**（报 "no field `clone`"），`==` 更是直接走到 MIR 的标量比较上——
+// 聚合值在运行期是地址，两个内容相同的值比的是两个不同的地址，于是
+// `a == b` 恒假、`a != b` 恒真，编译期一声不响。
+//
+// 现在 derive 在 AST 层补出方法体（`Type__clone` / `__eq` / `__lt` / ...），
+// 类型检查器把聚合类型上的 `==`/`<` 改写成对方法的调用。
+//
+// 覆盖：命名字段结构体、元组结构体、嵌套结构体（递归 clone）、枚举的三种
+// 载荷形态、Hash 的一致性（相等 ⇒ 同哈希）、字典序（先比 x 再比 y）。
+//=============================================================================
+
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
+struct P { x: i32, y: i32 }
+
+// 只有 Clone：`a == b` 之类在这里应当**报错**（见 negative/13）。
+#[derive(Clone)]
+struct Nest { p: P, tag: i32 }
+
+// 元组结构体：字段名在 AST 里是空串，派生的方法必须用下标名 `"0"` / `"1"`。
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Default)]
+struct Pair(i32, i32);
+
+#[derive(Clone, PartialEq, Eq, Hash)]
+enum E { A, B(i32), C(i32, i32), S { x: i32, y: i32 } }
+
+fn check_struct() -> i32 {
+    let a = P { x: 1, y: 2 };
+    let b = a.clone();
+    if b.x != 1 || b.y != 2 { return 1; }
+    if !(a == b) { return 2; }
+    // `!=` 是 `!(__eq(..))`
+    if a != b { return 3; }
+
+    let c = P { x: 1, y: 3 };
+    if a == c { return 4; }
+    if !(a != c) { return 5; }
+
+    // Default：每个字段取零值。
+    let z = P::default();
+    if z.x != 0 || z.y != 0 { return 6; }
+
+    // Hash：相等的值哈希相同，不同值（这里）不同。
+    if a.hash() != b.hash() { return 7; }
+    if a.hash() == c.hash() { return 8; }
+
+    // 字典序：x 相同则看 y。
+    if !(a < c) { return 9; }
+    if !(a <= c) { return 10; }
+    if c <= a { return 11; }
+    if !(c > a) { return 12; }
+    if !(c >= a) { return 13; }
+    if a > c { return 14; }
+
+    // 方法形式与运算符形式必须一致。
+    if !a.eq(b) { return 15; }
+    if !a.lt(c) || !a.le(c) || !c.gt(a) { return 16; }
+    // `{:#X}` 一圈之外，`hash` 结果只用于比较，不钉具体数值。
+    return 0;
+}
+
+fn check_nested() -> i32 {
+    let n = Nest { p: P { x: 3, y: 4 }, tag: 5 };
+    // `Nest` 没有 derive Copy：`n.clone()` 走生成的 `Nest__clone`，
+    // 里面的 `p` 字段是命名类型，递归调 `P__clone`。
+    let m = n.clone();
+    if m.p.x != 3 || m.p.y != 4 || m.tag != 5 { return 20; }
+    if m.p != n.p { return 21; }
+    return 0;
+}
+
+fn check_tuple_struct() -> i32 {
+    let p = Pair(1, 2);
+    let q = p.clone();
+    if q.0 != 1 || q.1 != 2 { return 30; }
+    if !(p == q) { return 31; }
+    if p == Pair(1, 3) { return 32; }
+    let z = Pair::default();
+    if z.0 != 0 || z.1 != 0 { return 33; }
+    if p.hash() != q.hash() { return 34; }
+    return 0;
+}
+
+fn check_enum() -> i32 {
+    let c1: E = E::C(1, 2);
+    let c2 = c1.clone();
+    if !(c1 == c2) { return 40; }
+    if c1 == E::B(1) { return 41; }
+    if c1 == E::A { return 42; }
+    let cs: E = E::S { x: 1, y: 2 };
+    if c1 == cs { return 43; }
+    if c1.hash() != c2.hash() { return 44; }
+
+    let s1: E = E::S { x: 7, y: 8 };
+    let s2 = s1.clone();
+    if !(s1 == s2) { return 45; }
+    let s3: E = E::S { x: 7, y: 9 };
+    if s1 == s3 { return 46; }
+    if s1 == E::A { return 47; }
+
+    let a1: E = E::A;
+    let a2 = a1.clone();
+    if !(a1 == a2) { return 48; }
+    if a1 == E::B(0) { return 49; }
+    // 不同变体的哈希也不同（变体下标参与累积）。
+    if a1.hash() == c1.hash() { return 50; }
+    return 0;
+}
+
+fn main() -> i32 {
+    let r1 = check_struct();
+    if r1 != 0 { return r1; }
+    let r2 = check_nested();
+    if r2 != 0 { return r2; }
+    let r3 = check_tuple_struct();
+    if r3 != 0 { return r3; }
+    let r4 = check_enum();
+    if r4 != 0 { return r4; }
+    return 0;
+}

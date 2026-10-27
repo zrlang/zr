@@ -1,0 +1,14 @@
+// 负向用例：泛型类型上的 derive 必须报错。
+//
+// 派生方法体里每个字段的具体类型要等单态化才知道，而 derive 在类型检查之前
+// 就生成了 AST 方法——此时 `T` 还没有具体类型。早先只登记 trait 标记、不生成
+// 方法体，于是编译能过、调用时才报 "no field"；现在干脆在 derive 阶段说清楚。
+//
+// expect: `#[derive(..)]` on generic type
+
+#[derive(Clone)]
+struct G<T> { v: T }
+
+fn main() -> i32 {
+    return 0;
+}

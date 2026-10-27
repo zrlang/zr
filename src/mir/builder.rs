@@ -737,6 +737,15 @@ fn lower_expr(b: &mut Builder, expr: &HirExpr) -> MirValue {
             }
         }
         Block(block) => lower_block(b, block).unwrap_or(MirValue::Unit),
+        // 不可达点（类型 `!`）。目前只由穷尽 `match` 的脱糖产生：链尾那个
+        // "所有变体都没匹配上"的分支物理上走不到。把它终结成 `Unreachable`，
+        // 所在块就没有通往 join 的后继——join 只剩真正产值的那个前驱，
+        // 不会被"空分支写 Unit"覆盖（那正是 match 返回臂值 +1 的成因：见
+        // `typeck::check_match` 的注释）。
+        Unreachable => {
+            b.current_block_mut().term = Some(MirTerminator::Unreachable);
+            MirValue::Unit
+        }
         If(cond, then_block, else_block) => {
             let c = lower_expr(b, cond);
             let then_bb = b.new_block();

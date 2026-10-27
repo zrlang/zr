@@ -8,6 +8,7 @@
 //!
 //! 所有阶段共享一个 `TypeChecker`，以便跨阶段传递符号表、错误集合等状态。
 
+pub mod derive;
 pub mod hir;
 pub mod infer;
 
@@ -325,6 +326,9 @@ impl TypeChecker {
     }
 
     pub fn check_program(&mut self, prog: &Program) -> Result<hir::HirModule> {
+        // 诊断名字表按程序重建：`DefId` 从 1 重新分配，残留会让新程序里的
+        // 类型在错误信息里显示成上一次检查的某个同名编号的类型。
+        infer::clear_def_names();
         // impl 方法先展开成普通函数（名字 mangle 成 `Type__method`），这样
         // 现有签名/函数体检查、MIR 降级都能复用同一张函数表。
         let mut expanded = prog.clone();
@@ -347,6 +351,39 @@ impl TypeChecker {
                 expanded.functions.push(m);
             }
         }
+        // `#[derive(..)]` 的方法体：同样在声明收集之前补进函数表。
+        //
+        // 与上面的 impl 展开分工一致——`generate_derive_impls`（阶段 0）只
+        // 登记"实现了哪个 trait"（供 `T: Eq` 边界校验），方法体在这里生成，
+        // 这样后续的阶段（签名、函数体、MIR）完全按普通方法处理。
+        //
+        // 先收集再 push：`expanded.type_defs` 与 `expanded.functions` 同属
+        // 一个结构，边遍历边改借用检查过不去。
+        let mut derived: Vec<ast::Function> = Vec::new();
+        for td in &expanded.type_defs {
+            let (name, attrs) = match td {
+                ast::TypeDef::Struct(s) => (&s.name, &s.attrs),
+                ast::TypeDef::Enum(e) => (&e.name, &e.attrs),
+                // 联合体没有 attrs 槽位，别名不产生方法（与
+                // `process_type_attrs` 的 `_ => &[]` 一致）。
+                ast::TypeDef::Union(_) | ast::TypeDef::Alias { .. } => continue,
+            };
+            let derives = attributes::derive_traits(attrs);
+            if derives.is_empty() {
+                continue;
+            }
+            let target = ast::Type::Named {
+                path: vec![name.clone()],
+                generics: Vec::new(),
+            };
+            for m in derive::derive_methods(name, td, &derives)? {
+                // `impl_targets` 是方法表的路由键：`lookup_method` 先查它再看
+                // 符号表，缺了这一步 `a.clone()` 会报 "no field `clone`"。
+                self.impl_targets.insert(m.name.clone(), target.clone());
+                derived.push(m);
+            }
+        }
+        expanded.functions.extend(derived);
         let prog = &expanded;
 
         // ===== 阶段 1：声明收集（pass 1）=====
@@ -2928,6 +2965,67 @@ impl TypeChecker {
         };
         let r = self.check_expr(rhs, &r_ty)?;
         self.infer.unify(&l.ty, &r.ty, span).ok();
+        // 聚合类型（结构体 / 枚举）的比较走 trait 方法，不走 MIR 的标量比较。
+        //
+        // 聚合值在运行期是**地址**：早先这里直接产出 `Binary(Eq)`，后端拿两个
+        // 地址当标量比，于是内容相同的两个值也恒不相等（`a == b` 恒假，
+        // `a != b` 恒真，编译期一声不响）。`#[derive(PartialEq/Eq)]` 现在会
+        // 生成 `Type__eq`，`#[derive(PartialOrd/Ord)]` 生成 `lt/le/gt/ge`，
+        // 这里改写过去即可。
+        //
+        // 没实现对应方法就明确报错——让 `==` 退回标量比较等于把"静默算错"
+        // 留在原地。
+        if matches!(
+            op,
+            ast::BinaryOp::Eq
+                | ast::BinaryOp::Ne
+                | ast::BinaryOp::Lt
+                | ast::BinaryOp::Le
+                | ast::BinaryOp::Gt
+                | ast::BinaryOp::Ge
+        ) {
+            let cmp_ty = self.infer.resolve(&l.ty);
+            if matches!(cmp_ty, Ty::Named(..)) {
+                let (method, negate) = match op {
+                    ast::BinaryOp::Eq => ("eq", false),
+                    ast::BinaryOp::Ne => ("eq", true),
+                    ast::BinaryOp::Lt => ("lt", false),
+                    ast::BinaryOp::Le => ("le", false),
+                    ast::BinaryOp::Gt => ("gt", false),
+                    _ => ("ge", false),
+                };
+                let Some(id) = self.lookup_method(&cmp_ty, method) else {
+                    let what = if method == "eq" {
+                        "`PartialEq`"
+                    } else {
+                        "`Ord`"
+                    };
+                    return Err(CompileError::type_error(format!(
+                        "cannot compare values of type `{}`: it does not derive or implement {what}",
+                        self.infer.type_name(&cmp_ty)
+                    ))
+                    .with_span(span));
+                };
+                let call = HirExpr {
+                    kind: ExprKind::Call {
+                        callee: id,
+                        args: vec![l, r],
+                        result: self.alloc_local(),
+                    },
+                    ty: Ty::Bool,
+                    span,
+                };
+                return Ok(if negate {
+                    HirExpr {
+                        kind: ExprKind::Unary(hir::UnaryOp::Not, Box::new(call)),
+                        ty: Ty::Bool,
+                        span,
+                    }
+                } else {
+                    call
+                });
+            }
+        }
         let ty = match op {
             ast::BinaryOp::Add
             | ast::BinaryOp::Sub
@@ -3979,6 +4077,10 @@ impl TypeChecker {
         }
         // 最后一条必须是"无条件匹配臂"（`_`），或穷尽 bool 的两条字面量臂：
         // if/else 链缺 else 会把"没匹配上"变成取到 Unit 继续跑——另一种静默算错。
+        //
+        // 这个标志在下面脱糖时还要用：**最后一条不是无条件臂**意味着穷尽性
+        // 是靠"枚举变体/bool 值全覆盖"证明的，链尾的 else 永远走不到，得补
+        // 一个发散尾分支（否则 join 块会把最后一个臂的值覆盖成 `()`）。
         let last_unconditional = matches!(
             lowered.last(),
             Some(arm) if arm.cond.is_none() && arm.guard.is_none() && pat_irrefutable(&arm.pattern)
@@ -4044,7 +4146,25 @@ impl TypeChecker {
             .map(|arm| arm.body.ty.clone())
             .unwrap_or(Ty::Never);
         let n = lowered.len();
-        let mut chain: Option<hir::HirBlock> = None;
+        // 链尾的 else。最后一条臂是无条件臂时它自己就是 else（循环里会被
+        // 覆盖）；否则穷尽性来自"变体/值全覆盖"，走到这里是不可达的——
+        // 用一个发散分支而不是 `None`。
+        //
+        // 用 `None` 会开启 MIR 的"if 没有 else ⇒ 值是 Unit"路径：join 块
+        // 无条件往结果临时名写 `Unit`，把最后一个变体臂算出来的值覆盖掉。
+        // 症状是 `match e { A => 10, B => 20, C => 50 }` 对 C 返回 51。
+        let mut chain: Option<hir::HirBlock> = if last_unconditional {
+            None
+        } else {
+            Some(hir::HirBlock {
+                stmts: Vec::new(),
+                tail: Some(Box::new(hir::HirExpr {
+                    kind: ExprKind::Unreachable,
+                    ty: Ty::Never,
+                    span,
+                })),
+            })
+        };
         for k in (0..n).rev() {
             let arm = &lowered[k];
             let unconditional =
@@ -6056,7 +6176,10 @@ impl TypeChecker {
         let id = DefId(self.next_def);
         self.next_def += 1;
         self.symbols.insert(name.clone(), id);
-        self.def_names.insert(id, name);
+        self.def_names.insert(id, name.clone());
+        // 诊断用的名字表：`InferCtxt` 看不到 `self.def_names`（`'static` 借用），
+        // 没有这一步所有具名类型在 `unify` 的错误里都会打成 `type#N`。
+        infer::register_def_name(id, &name);
         id
     }
 
@@ -7642,6 +7765,7 @@ fn substitute_local(e: &mut hir::HirExpr, target: LocalId, with: &hir::HirExpr) 
         | ExprKind::Match
         | ExprKind::Break(_)
         | ExprKind::Continue(_)
+        | ExprKind::Unreachable
         | ExprKind::Defer(_)
         | ExprKind::Try { .. }
         | ExprKind::Throw(_)

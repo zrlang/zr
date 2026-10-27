@@ -267,6 +267,18 @@ pub enum ExprKind {
     Continue(Option<String>),
     /// `return`。
     Return(Option<Box<HirExpr>>),
+    /// 不可达点：类型是 `!`，运行期不该被执行到。
+    ///
+    /// 目前唯一的构造者是 `match` 的脱糖：穷尽的 `match`（所有枚举变体 /
+    /// bool 两个值都覆盖）脱糖成 if/else 链之后，链尾那个"没匹配上"的
+    /// 分支其实**永远走不到**。早先那里留的是 `None`（没有 else），
+    /// 于是 MIR 把它当成"if 没有 else 分支 ⇒ 值是 `()`"，join 块无条件往
+    /// 结果临时名里写 `Unit`——把最后一个变体臂刚算出来的值**覆盖**掉。
+    /// 症状：`match e { A => 10, B => 20, C => 50 }` 对 C 返回 51 之类的垃圾
+    /// （测试 57 的臂体全都用 `return`，从入口就离开了，所以一直没暴露）。
+    ///
+    /// 补一个显式的发散尾分支，join 块就只剩 then 一个前驱，φ 自然正确。
+    Unreachable,
     /// `defer` 延迟表达式（块内每个 `defer` 都排入栈，退出时按逆序执行）。
     Defer(HirBlock),
     /// `try { ... } catch (pat) { ... }`。
