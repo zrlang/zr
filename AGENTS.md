@@ -4,8 +4,8 @@ zr 是一门系统编程语言（Rust/Zig 混合取向），编译器用 Rust �
 本文件给在代码库里工作的 AI agent 看，是操作约定与"哪些文档可信"的清单。
 项目入口与功能全景见根目录 `CLAUDE.md`。
 
-> 最近更新：2026-10-25。工作树上有**未提交的在途改动**（见下文「在途工作」），
-> 那是继续实现的第一现场。
+> 最近更新：2026-10-27。工作树干净；`feat/lang-features` 上连续几个提交修的都是
+> "编译通过、运行不崩、结果全错"的静默 bug，清单见 §5。
 
 ---
 
@@ -121,6 +121,10 @@ lexer → parser(ast) → typeck(hir, infer) → mir → ssa → opt → codegen
 9. **内联时的值重命名必须"同时替换"**，不能按值逐个 `replace_operand`：被内联体
    `%10 = %1 Add %9` 里先把 `%1` 换成新号 `%9`，再处理 `%9` 就会把两个操作数一起换掉
    （`spawn` 的帧初始化把偏移量当指针，`-O3` SIGSEGV）。用 `map_operands`。
+10. **REX 的位是 W=0x08 / R=0x04 / X=0x02 / B=0x01，`0x09` 不是"R|B"而是"W|B"。**
+   `xor reg, reg`（`31 /r`）的 dst 同时占 reg 与 r/m 两个字段，r8–r15 要置
+   `REX.W|R|B = 0x4D`；写成 `0x48 | 0x09` 会丢 REX.R，编码成 `xor rax, r8`
+   ——零常量就变成"用 rax 异或"。新增 REX 计算时先写出位定义再拼。
 
 ---
 
@@ -143,19 +147,22 @@ README 里"指针与 unsafe"一节目前是**愿景**：
 
 ---
 
-## 5. 在途工作与当前基线
+## 5. 最近修掉的静默 bug 与当前基线
 
-`feat/lang-features` 分支上有一批**已修改未提交**的改动（2026-10-27），
-修的都是"编译通过、运行不崩、结果全错"的静默 bug：
+2026-10-27 的 `feat/lang-features` 上连续几个提交修的都是"编译通过、运行不崩、
+结果全错"的静默 bug：
 
 | 文件 | 在做什么 |
 |---|---|
 | `src/ssa/mod.rs` | 支配边界从"直接前驱版"改成 Cooper–Harvey–Kennedy：漏 φ 会让合流块读到未初始化的栈槽 |
 | `src/opt/pass_manager.rs` | 内联重命名改成"先建完整重命名表、再逐操作数一次性映射"（见下） |
-| `src/codegen/encoder.rs` | SysV 栈上传参（第 7 个整数 / 第 9 个浮点实参）+ `call` 的 16 字节对齐 |
-| `src/typeck/mod.rs` | `check_index_scalar` 不再吞 unify 错误：`(*p)[i]` 报错，而不是运行时 SIGSEGV |
+| `src/codegen/encoder.rs` | SysV 栈上传参（第 7 个整数 / 第 9 个浮点实参）+ `call` 的 16 字节对齐；零常量的 `xor reg, reg` 补回 REX.R |
+| `src/typeck/mod.rs` | `check_index_scalar` 不再吞 unify 错误；`check_match` 给穷尽 match 补发散 else；聚合类型上的 `==`/`<` 改写成 derive 方法调用 |
+| `src/typeck/derive.rs` | 新增：在 AST 层生成 `Type__clone` / `__eq` / `__lt` / `__hash` / `__default` 方法体 |
+| `src/typeck/hir.rs`、`src/mir/builder.rs` | 新增 `ExprKind::Unreachable` → `MirTerminator::Unreachable`（上面的发散 else） |
+| `src/typeck/infer.rs` | 诊断名字表：`unify`/`subtype` 的错误不再把具名类型打成 `type#N` |
 | `std/io.zr` | `(*p)[i]` → `p[i]`（两处）；`{:#X}` 的前缀改回小写 `0x`（与 Rust 一致） |
-| `tests/cases/76_ssa_join_phi.zr`、`77_many_args.zr`、`tests/negative/12_index_scalar.zr` | 分别钉住上面三处 |
+| `tests/cases/76..79`、`tests/negative/12..15` | 分别钉住上面每一处 |
 
 ### 三个"改对了才算改对"的点（代码里都有长注释）
 
@@ -171,15 +178,27 @@ README 里"指针与 unsafe"一节目前是**愿景**：
 
 ### `cargo test` 当前基线（2026-10-27，全绿）
 
-- `cargo test --bin zr`：264 项。
-- `cargo test --test zr_language`：77 个用例 × 5 个优化等级 = 385 项（含宿主端
+- `cargo test --bin zr`：265 项。
+- `cargo test --test zr_language`：79 个用例 × 5 个优化等级 = 395 项（含宿主端
   `io_print_matches_rust`，它现在逐字符对比 Rust 的格式化输出）。
-- `cargo test --test zr_negative`：12 个负向用例。
+- `cargo test --test zr_negative`：15 个负向用例。
+
+### 最近修掉的静默 bug（都在 `tests/` 里留了钉子）
+
+- **穷尽 `match` 的返回值被 `Unit` 覆盖**：靠变体/bool 全覆盖证明穷尽的 match 没有
+  `_` 臂，脱糖出的 if/else 链最后一条分支"有值"，于是整块被当成 `()`，返回值被
+  丢掉。现在 `check_match` 在这种形状下补一个发散 else（`hir::ExprKind::Unreachable`
+  → `MirTerminator::Unreachable`）。
+- **零常量没有清零自己的寄存器**：`emit_const_int(_, 0)` 走 `xor reg, reg` 捷径，
+  REX 只置了 0x09（W|B，W 本就在 0x48 里），REX.R 丢了 —— r8–r15 被编码成
+  `xor rax, r8`，零常量变成"用 rax 异或"。症状是 `match` 里返回常量 `false`
+  的路径给出 32513 之类的垃圾。钉子：`tests/cases/79_zero_const_high_reg.zr`。
 
 ### 仍然缺的（按 `docs/rust-parity.md` 第五节的 P1 顺序）
 
-- `#[derive(PartialEq/Eq/Hash/Ord/Default)]` **只登记 trait 标记、不生成方法体**：
-  约束能过，但 `.clone()` / `==` / `.hash()` 不存在。
+- `#[derive]` 的方法体已经能生成（`src/typeck/derive.rs`），**剩**：`Debug`
+  仍是标记 trait；泛型类型 / 枚举 `Default` / 枚举 `Ord` 显式报错；字段级诊断
+  不精确。
 - 没有 `unsafe` / `dyn`（trait 对象不可用 ⇒ `std/error` 导入不了）。
 - 没有借用检查 / 移动检查。
 - 元数据（权限、时间戳）与 `tempfile` 缺失。

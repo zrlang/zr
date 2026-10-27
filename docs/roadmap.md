@@ -1,6 +1,6 @@
 # zr 完善功能与修复规划（v0.9.0 → v1.0.0）
 
-> 更新时间：2026-10-25
+> 更新时间：2026-10-27
 >
 > 设计主线：
 > - **安全线**参考 Rust：编译期挡住的尽量挡，挡不住的用**显式关键字**声明"我接受后果"，**绝不静默降级**。
@@ -12,9 +12,12 @@
 
 ## 0. 现状基线
 
+> 基线数据核对于 2026-10-27（`feat/lang-features`）。
+
 - **语法面广、语义薄**：主流语法都解析过了，但安全模型（借用 / 移动 / 生命周期 / 边界 / `dyn` / `unsafe`）几乎全空；`trait` 求解的高级部分（关联类型 / 特化 / HRTB / 负边界）只有 AST 槽没语义；LTO / PGO / proc-macro / 自举全是文档空壳。
-- **测试**：`tests/cases` 74 例 × 5 等级 = 370 项，当前 360 过 / 10 挂（`52_if_let` 全 5 等级 + `71_derive` 全 5 等级）。
-- **没有负向测试机制**（见 §10）。
+- **测试**：`tests/cases` 79 例 × 5 等级 = 395 项，**全绿**；`tests/negative` 15 例（该报错的必须继续报错）；`cargo test --bin zr` 265 项。`52_if_let` 与 `71_derive` 早已修好。
+- **负向测试机制已有**（`tests/zr_negative.rs`，`// expect:` 子串约定），见 §10。
+- **`#[derive]` 生成真实方法体**（`src/typeck/derive.rs`）：结构体 `Clone/Copy/PartialEq/Eq/PartialOrd/Ord/Hash/Default` 全支持；枚举支持 `Clone/PartialEq/Eq/Hash`（`Default`/`Ord` 显式报错）。`==`/`<` 等聚合比较改写成方法调用，**没有 derive 就报错**——不再静默恒假。
 - **文档过期**：`docs/rust-parity.md` 部分过期、`future/README.md` 的 ✅ 表几乎全错、`tests/README.md` 严重过期、`Cargo.toml` description 夸大。
 
 ---
@@ -189,6 +192,71 @@ Rust 的借用检查是**线性化 + 借用区间 + 生命周期子类型**三�
 - **LSP 补齐**：`references / rename / signatureHelp / inlayHints / hover 显示类型详情 / codeAction`（快速修复：`unwrap()` → `unwrap_or(0)`）。
 - **`zr doc`**：类似 `rustdoc`，从 `///` 注释生成 HTML 文档。这条放到最后。
 
+### 4.6 交互式 shell（`zr shell`，阶段 L）**最后做**
+
+> 优先级明确排在**所有其他条目之后**（自举、跨平台、benchmark 都完成后再动）。
+
+目标：像 IPython 一样"边写边跑"——输入一段代码立刻看到结果，状态跨行保留。
+
+```
+$ zr shell
+zr 0.8.0 shell — :help 查看元命令，Ctrl-D 退出
+>>> let xs = [1, 2, 3];
+>>> fn sum(a: []const i32) -> i32 { let mut s = 0; ... }
+>>> sum(xs)
+6
+```
+
+**第一版（可用为限，不做增量编译）**
+
+- **入口**：`zr shell`。与 `zr run` / `zr build` / `zr fmt` 并列，不改动现有参数的语义；
+  `--` 之后的参数原样传给被求值的程序（`args()` 用得上）。
+- **累积式求值**：会话维护一份**内存里的源码缓冲**。每次提交（一个完整语句 / 条目）
+  先追加到缓冲，然后
+  1. 缓冲里已有的条目（`fn` / `struct` / `impl` / `use` / 常量）+ 新条目一起走完整流水线；
+  2. 若最后一条是**表达式**，把它包进一个壳函数 `fn __shell_eval_N() -> i32`（或返回该
+     表达式的类型），调用它并用 `println_fmt` 打印结果；若是 `let` / 条目，则只编译不调用。
+- **为什么先不做增量**：编译器是"整份源码 → 全部阶段"，没有任何可复用的中间产物落盘。
+  第一版按"每次重编译整个会话"实现，代码量最小、语义最容易解释正确。会话规模是几十行，
+  `zr` 自编译都在秒级，交互体验可以接受。
+- **已知限定（必须写进 `:help`）**：重编译会把会话**从头执行一遍**，前面积累的
+  `println` / 写文件等副作用会**重复发生**。所以第一版把"有副作用的语句"也当普通语句重放，
+  并在 `:help` 里明说"看到重复输出不是 bug"。真正的修法见第二版。
+- **多行输入**：括号 / 大括号 / 方括号未闭合时提示符变成 `...` 继续读；空行（或 `;;`）
+  结束一次提交。词法层面用现成的 `lexer` 数括号深度即可，不要自己再写一遍括号匹配。
+- **错误恢复**：编译失败时把错误打印出来、**把这次输入从缓冲里撤掉**（保持会话可继续），
+  并把光标停在新提示符。绝不能因为一次语法错误让整个 shell 退出。
+- **元命令**（以 `:` 开头，不进入源码缓冲）：
+  - `:help` / `:quit` / `:clear`（清空会话）
+  - `:type <expr>` —— 只做类型检查并打印推断出的类型（走 `--dump-hir` 的同一条路径）
+  - `:ast` / `:ssa` —— 打印最近一次提交的 AST / SSA（复用 `--dump-ast` / `--dump-ssa`）
+  - `:opt -O0..-O3|Oz` —— 切换后续提交的优化等级
+  - `:time` —— 打开/关闭"本次编译耗时"（复用 `ZR_TIME=1` 的输出）
+- **零第三方依赖**：不能用 `rustyline` / `reedline`。第一版用 stdin 行缓冲 + 自己维护
+  内存历史（上下键先不做）；后续若要做方向键，`termios` 的 `tcsetattr` 直接用 `libc`
+  声明，不需要新依赖（`std` 侧已经有 `extern "C"` 的用法）。
+
+**第二版（真增量，第一版跑顺之后）**
+
+- **绑定变成会话槽位**：`let x = ...` 不再塞进一次性函数，而是提升为模块级
+  `static mut __shell_x: T`，后续语句直接读写这个槽位。这样"重编译"只影响新提交，
+  旧语句**不再重放**，副作用重复的问题消失；代价是 `let` 的作用域从块级变成会话级
+  （与 IPython 的全局变量一致，属于用户预期内）。
+- **函数级增量**：已提交的条目编译结果（目标文件 / 机器码）缓存起来，新提交只编译新增部分，
+  再链接到一起。这一层需要先有 `-C incremental`（现在只有开关、无缓存实现，见 §5.1）。
+- **不落盘的执行**：把生成的机器码 `mmap(MAP_ANON|PROT_EXEC)` 后直接调用，省掉
+  "写临时文件 → exec" 的一次往返。**不能**用 LLVM/JIT——零依赖红线不允许。
+- **补全 / 高亮**：Tab 补全关键字、标准库函数名、会话里已定义的名字（符号表现成）；
+  语法高亮在行编辑层做，只处理关键字 / 字符串 / 数字三类即可。
+
+**验收标准（第一版）**
+
+- `zr shell` 里 `let` + 表达式 + 多行 `fn` 定义 + 编译错误恢复 四条路径都要有回归测试；
+  测试用管道喂 stdin（`echo '1+1\n:quit' | zr shell`），断言 stdout，不依赖 TTY。
+- 会话里 `use io::println;` 之后 `println("hi")` 能生效，说明会话源码与标准库的导入解析
+  走的是同一条路径，没有第二套符号表。
+
+
 ---
 
 ## 5. 编译器基础设施的清理
@@ -239,36 +307,53 @@ Rust 的借用检查是**线性化 + 借用区间 + 生命周期子类型**三�
 
 ## 6. `#[derive]` 补齐（独立小项目）
 
-现状：`generate_derive_impls` 只接受 `Debug / Clone / Copy`，其余名字直接报 `cannot derive ...`。**只登记 trait 标记（`trait_id: None`），不生成方法体**——`#[derive(Clone)]` 之后 `p.clone()` 报 `no field 'clone' on type`。
+现状（2026-10-27）：`src/typeck/derive.rs` 在 **AST 层** 生成真正的
+`ast::Function`（`Type__clone` / `__eq` / `__lt` / `__le` / `__gt` / `__ge` /
+`__hash` / `__default`），并登记到 `impl_targets`。生成物与手写 `impl` 的方法
+同形，签名检查 / 函数体检查 / MIR 降级 / 代码生成完全无感知——不需要第二套
+流水线。
 
-**这是 P0，因为 `71_derive.zr` 全 5 等级挂着。**
+- **已支持**
+  - 结构体：`Clone / Copy / PartialEq / Eq / PartialOrd / Ord / Hash / Default`。
+    命名字段与元组结构体都覆盖（元组结构体的字段名在 AST 里是空串，生成时补成
+    `"0"` / `"1"`），嵌套结构体递归调用字段自己的方法。
+  - 枚举：`Clone / PartialEq / Eq / Hash`。按变体嵌套 `match`，结构体载荷用
+    `前缀_字段名` 绑定（`E::S { x, y }`）。
+- **聚合比较改写**：`check_binary` 把 `Ty::Named` 上的 `==` / `!=` / `<` / `<=` /
+  `>` / `>=` 改写成对应方法调用（`!=` 包一层 `Not`）。**没 derive 就报错**
+  ``cannot compare values of type `S`: it does not derive or implement
+  `PartialEq` ``。早先直接落到 MIR 的标量比较上——聚合值在运行期是地址，
+  内容相同的两个值比较的是两个不同地址，`==` 恒假、`!=` 恒真，编译期一声不响。
+- **显式拒绝**（不再"只登记标记"糊过去）
+  - 泛型类型上的 derive（方法体里字段的具体类型要等单态化）；
+  - 枚举的 `Default`（zr 没有 `#[default]` 变体属性）；
+  - 枚举的 `PartialOrd` / `Ord`（要按判别式排序，判别式可以是显式且非单调的）。
+  三种都报错，负向用例见 `tests/negative/13`–`15`。
 
-- **`generate_derive_impls`** 从只登记 `HirImpl { trait_id: None }` 升级为生成**完整方法体**。
-- 每个 derive 展开成什么样的方法：
-  - `Clone`：结构体逐字段 `clone`，枚举按变体分派。
-  - `Copy`：marker trait，方法体空。
-  - `PartialEq`：结构体逐字段 `==`，枚举先比判别式再比载荷。
-  - `Eq`：marker trait。
-  - `PartialOrd`：同 `PartialEq` 但返回 `Ordering`。
-  - `Ord`：同 `PartialEq` 但返回 `Ordering` 且不许 `Equal`。
-  - `Hash`：调用 `std::hash::Hasher::write_*`，字段顺序敏感。
-  - `Default`：每个字段调 `Default::default()`，枚举必须有一个 `#[default]` 标记的变体。
-  - `Debug`：生成 `Debug::fmt` 返回格式化的字符串表示。
-- **诊断**：字段类型不满足对应 trait 时报错，指向具体字段。
+**剩下的**（P2，优先级低于安全线）：
+
+- **`Debug`**：仍是标记 trait，`{:?}` 不经过它。要等 `std/fmt.zr` 里的
+  `Formatter` 与字符串拼接齐备，否则生成的 `__debug` 无法拼出格式串。
+- **字段级诊断**：某字段类型本身没实现所需 trait 时，现在报的是整个类型
+  `__eq` 的类型检查失败；应指向**那个字段**并说清缺什么。
+- **`Hash` 的分布**：`str` / 切片 / 数组 / 元组 / 指针字段目前按 `0` 计入，
+  只保证"相等 ⇒ 同哈希"。等这些类型有按内容比较的语义后再替换成真实哈希。
+
+**回归**：`tests/cases/78_derive_methods.zr`（全 5 档）+ 负向 13/14/15。
 
 ---
 
 ## 7. 阶段路线图
 
-### v0.9.0 — 修复 + 文档对齐（1 周）
+### v0.9.0 — 修复 + 文档对齐（**已完成**）
 
-- 修 `52_if_let.zr` 回归：`expr_diverges` 把 `If.then` 当 `Expression` 处理，改成按 `Block` 处理。
-- 修 `subtype().ok()` 静默吞错：改成收集 + 报错。
-- `generate_derive_impls` 支持 `PartialEq / Eq`（先这两个，`71_derive` 通过）。
-- 修 `--emit-llvm` 输出（要么删掉，要么真做）。
-- `docs/rust-parity.md` 更新到与源码一致；`future/README.md` 的 ✅ 表全改成 🔧 / 📐；`tests/README.md` 里"尚未覆盖"的 enum / match / 泛型 / 智能指针条目删掉。
-- `CONTRIBUTING.md` 加"文档红线"一节。
-- **补 `tests/cases/negative/` + `tests/zr_language_negative.rs` 测试框架**（见 §10）。
+- ✅ `52_if_let` / `71_derive` 回归修好：`if let` 的分支发散按 `Block` 判。
+- ✅ `subtype().ok()` 静默吞错：`check_index_scalar` 等关键路径不再吞（`(*p)[i]` 现在编译报错）。
+- ✅ `#[derive]` 生成真实方法体（§6），`71_derive` / `78_derive_methods` 全档通过。
+- ✅ 负向测试框架 `tests/negative/` + `tests/zr_negative.rs`（`// expect:` 子串约定，见 §10）。
+- ✅ `docs/rust-parity.md` / `AGENTS.md` / `tests/README.md` 与源码对齐。
+- ⏳ `--emit-llvm` 仍是手写伪 IR（决定见 §8 第 5 条：删，但尚未动手）。
+- ⏳ `CONTRIBUTING.md` 的"文档红线"一节待补。
 
 ### v0.10.0 — 安全基础（3 周）
 
@@ -276,7 +361,7 @@ Rust 的借用检查是**线性化 + 借用区间 + 生命周期子类型**三�
 - 借用区间图 + 冲突检测（§2.1）。
 - 移动记账 + use-after-move 检测（§2.2）。
 - 切片 / 数组边界检查默认开启（`-C debug-assertions=yes`）。
-- `#[derive]` 支持 `PartialEq / Eq / Hash / Default`。
+- ✅ `#[derive]` 支持 `PartialEq / Eq / Hash / Default`（v0.9.0 已提前完成，见 §6）。
 - `HashMap` / `HashSet` 进 `std/collections.zr`。
 - **目标**：`tests/cases` 全绿，新加 `tests/cases/unsafe_*` / `borrow_*` / `move_*` 三个系列。
 
@@ -311,6 +396,15 @@ Rust 的借用检查是**线性化 + 借用区间 + 生命周期子类型**三�
 - **跨平台**：Linux x86_64 / aarch64 / macos x86_64 / arm64 / windows x86_64 全上 CI。
 - **基准**：`benchmarks/` 里跑 rustc 同源代码对比，性能差距报告写进 `docs/benchmarks.md`。
 
+### v1.1.0 — 交互式 shell（最后）
+
+- `zr shell` 第一版：累积式求值 + 多行输入 + 错误恢复 + `:help/:type/:ast/:ssa/:opt/:time`（§4.6）。
+- 第二版（增量编译 + `mmap` 执行 + Tab 补全）要等 `-C incremental` 先落地。
+
+**排期原则**：这一条**故意放在最后**。它依赖的东西比看起来多——`zr run` 的完整流水线、
+可复用的局部编译、稳定的符号解析。前面任何一项没做完，shell 都只能做成"每次重编译整个
+会话"的玩具；而那正是第一版要交付的东西，所以先让第一版跑起来，再逐项替换。
+
 ---
 
 ## 8. 关键决策记录
@@ -342,41 +436,26 @@ Rust 的借用检查是**线性化 + 借用区间 + 生命周期子类型**三�
 
 ---
 
-## 10. 最后一条建议
+## 10. 负向测试（已落地，继续按此约定加）
 
 **先修测试，再改语言。**
 
-现在 `tests/cases` 只有正例，没有负例。想验证"某个错误真被挡了"，只能手工写 `/tmp/x.zr` 编译确认（`AGENTS.md` 里也承认了）。建议 v0.9.0 阶段就先补一个 `tests/cases/negative/` 目录 + `tests/zr_language_negative.rs` 测试框架，专门跑"必须编译失败"的用例。
+`tests/cases/` 下每个 `.zr` 都必须编译通过并返回 0，放不下"应该失败"的用例。
+负向用例在 `tests/negative/`，由 `tests/zr_negative.rs` 跑：每个文件必须**编译
+失败**，且 stderr 里必须包含文件内 `// expect: <子串>` 标注的文本（可以标多行，
+没有标注时只要求"确实报错"）。
 
-这是后面所有安全改动（借用检查、移动检查、生命周期、`unsafe`、`dyn`）能不能被验证的**基础设施**——没有它，后面每加一条检查都得靠人工编译确认，回归很快就会失控。
+约定：
 
-**测试框架草图**：
+- 用**子串**而不是精确匹配。报错文案里的行号 / 列号 / 字节偏移会随无关改动漂移，
+  精确匹配会让整个套件变成"改一个字都红"；子串只钉语义。
+- 一个用例只钉**一个**错误，文件名 `<编号>_<特性>.zr`，头注释写清"早先怎么错、
+  现在为什么必须报"。
+- 新增检查（借用 / 移动 / 生命周期 / `unsafe` / `dyn`）时，**先**加这个检查该拒绝
+  的负向用例，再改代码。没有负向用例的检查等于没有检查。
 
-```rust
-// tests/zr_language_negative.rs
-// 每个 tests/cases/negative/*.zr 都必须编译失败，且错误信息包含期望的关键字。
-// 文件名约定：<编号>_<特性>.zr；期望错误关键词放在同目录的 <编号>_<特性>.err 文件里。
-
-#[test]
-fn negative_cases() {
-    for path in fs::read_dir("tests/cases/negative").unwrap() {
-        let zr_path = path.unwrap().path();
-        if zr_path.extension().unwrap() != "zr" { continue; }
-        let err_path = {
-            let mut p = zr_path.clone();
-            p.set_extension("err");
-            p
-        };
-        let expected = fs::read_to_string(err_path).unwrap();
-        let output = Command::new(./target/debug/zr)
-            .arg(&zr_path)
-            .arg("-o").arg("/tmp/_never_written")
-            .output().unwrap();
-        assert!(!output.status.success(), "{} should fail", zr_path.display());
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        assert!(stderr.contains(&expected), "missing error text in {}", zr_path.display());
-    }
-}
+```sh
+cargo test --test zr_negative     # 目前 15 个用例
 ```
 
 ---

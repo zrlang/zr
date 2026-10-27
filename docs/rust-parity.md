@@ -140,7 +140,7 @@
 | `use foo::*` | 不支持 | ❌ | ``zr: glob imports (`use foo::*`) require module system support (not yet implemented) `` |
 | `use std::core::Option` | 路径不带 `std::` | 🟡 | zr 的标准库模块直接叫 `core` / `io` / `string` / `collections`：`use core::Option;`。写 `std::core::Option` → ``zr: unknown module `std` `` |
 | `pub` / `pub(crate)` / `pub(super)` | 仅 `pub` | 🟡 | 没有 `pub(crate)` / `pub(super)` 的可见性检查 |
-| `#[derive(Debug, Clone, Copy)]` | 完全不可用 | ❌ | **结构体上直接报错**：``zr: undefined name `P` ``（derive 在阶段 0 生成 impl，此时类型名还没登记）；**枚举上被静默忽略**（`src/typeck/mod.rs` 对非 struct 的 `attrs` 硬编码成 `&[]`），`e.clone()` → ``zr: no field `clone` on type `type#70` `` |
+| `#[derive(Clone, PartialEq, Eq, Hash, Default, ...)]` | 生成真实方法体 | 🟡 | `src/typeck/derive.rs` 在 AST 层生成 `Type__clone` / `__eq` / `__lt` / `__hash` / `__default`，与手写 `impl` 方法同形。结构体支持 `Clone/Copy/PartialEq/Eq/PartialOrd/Ord/Hash/Default`（含元组结构体、嵌套结构体）；枚举支持 `Clone/PartialEq/Eq/Hash`。`==`/`<` 等聚合比较改写成方法调用，**没 derive 就报错**。仍缺：`Debug` 只是标记（`{:?}` 不走它）、泛型类型 derive 报错、枚举 `Default`/`Ord` 报错。 |
 | `#[repr(C)]` / `#[repr(u8)]` | 可用 | ✅ | |
 | `#[inline(...)]` / `#[link(...)]` / `#[test]` | 可用 | ✅ | `#[test]` 的函数会被编进产物并在 `main` 前调用 |
 | `static` / `static mut` | 标量可用 | ✅ | 初值能折成字面量的**标量**静态量会写进 `.data`：读、写、复合赋值、`&STATIC` / `&mut STATIC` 都正常。聚合静态量（结构体 / 数组 / 枚举）暂不生成数据，读取时明确报错；`static mut` 赋值不需要 `let mut`，非 `mut` 静态量赋值报错 |
@@ -246,11 +246,12 @@
 
 ### P1 — 明确报错或明显缺失的功能（能用不了，但至少看得见）
 
-1. **`#[derive(...)]` 只登记 trait 标记，不生成方法**：结构体 / 枚举都能编译，
-   `T: Clone` 之类的约束也能满足，但 `#[derive(Clone)]` 不会生成 `.clone()`，
-   `#[derive(PartialEq)]` 不会生成 `==`（比较仍报类型不匹配）。可接受的
-   derive 名：`Debug` `Clone` `Copy` `PartialEq` `Eq` `PartialOrd` `Ord`
-   `Hash` `Default`；其它名字报 `cannot derive ...`。
+1. **`#[derive(...)]` 的剩余缺口**（方法体本身已能生成，见 §2.5 那一行）：
+   `Debug` 仍只是标记 trait（`{:?}` 不经过它）；泛型类型上的 derive 明确报错；
+   枚举的 `Default` / `PartialOrd` / `Ord` 明确报错；字段类型缺少所需 trait 时
+   报的是整个类型的方法检查失败，尚未精确指向字段。可接受的 derive 名：
+   `Debug` `Clone` `Copy` `PartialEq` `Eq` `PartialOrd` `Ord` `Hash` `Default`；
+   其它名字报 `cannot derive ...`。
 2. **没有 `unsafe` 关键字**（README「指针与 unsafe」一节已过期）、
    **没有 `dyn` 关键字**（trait 对象不可用，`std::error` 因此导入不了）。
 3. **没有借用检查 / 移动检查**（README「所有权系统」「借用检查」两节与实际不符）。
