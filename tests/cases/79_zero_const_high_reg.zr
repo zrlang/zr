@@ -1,0 +1,80 @@
+//=============================================================================
+// tests/cases/79_zero_const_high_reg.zr — 零常量必须清零**自己**那个寄存器
+//
+// `emit_const_int` 对 0 走 `xor reg, reg` 捷径。`31 /r` 里 dst 同时占 modrm 的
+// reg 字段（REX.R）和 r/m 字段（REX.B），r8–r15 两个扩展位都要置。早先写的是
+// `0x48 | 0x09`，而 0x09 = W|B（W 本来就在 0x48 里），REX.R 丢了：`xor r8, r8`
+// 被编码成 `xor rax, r8`，语义从"清零"变成"r8 ^= rax"。
+//
+// 后果是"编译通过、运行不崩、结果全错"：`match` 里返回常量 `false` 的那条臂
+// 把上一次比较残留在 rax 里的结果异或进去，`f(E::A)` 返回 32513（0x7F01）
+// 这种垃圾值；同样的函数返回 `i32` 常量 0 却正常——因为只有零常量走捷径。
+//
+// 这里把最容易被分配到的形状钉住：bool 返回、常量臂在 match 里、φ 汇合在
+// 出口块；再加一个把零常量塞进一串寄存器的用例。
+//=============================================================================
+
+enum E { A, B(i32), C }
+
+// 常量 false 走第一条臂：这条边上零常量与前面的比较结果同时活跃，
+// 目标寄存器被分配到 r8–r15 的概率最高（实测就是 r8）。
+fn flag_first(o: E) -> bool {
+    match o {
+        E::A => false,
+        E::B(y) => true,
+        E::C => true,
+    }
+}
+
+// 反过来：常量 false 在最后一条臂上。
+fn flag_last(o: E) -> bool {
+    match o {
+        E::A => true,
+        E::B(y) => false,
+        E::C => false,
+    }
+}
+
+// 嵌套一层 match，两条路径都要给出正确布尔值。
+fn flag_nested(a: E, b: E) -> bool {
+    match a {
+        E::A => match b { E::A => true, _ => false },
+        E::B(x) => match b { E::A => false, _ => true },
+        E::C => false,
+    }
+}
+
+// 多个零常量各自占一个值：任何一个被异或到 rax 都会污染后面的加法。
+fn zero_sum(a: i32, b: i32) -> i32 {
+    let p = 0;
+    let q = 0;
+    let r = 0;
+    return a + b + p + q + r;
+}
+
+fn main() -> i32 {
+    let a: E = E::A;
+    let b: E = E::B(7);
+    let c: E = E::C;
+
+    if flag_first(a) { return 1; }
+    if !flag_first(b) { return 2; }
+    if !flag_first(c) { return 3; }
+
+    if !flag_last(a) { return 4; }
+    if flag_last(b) { return 5; }
+    if flag_last(c) { return 6; }
+
+    if !flag_nested(a, a) { return 7; }
+    if flag_nested(a, b) { return 8; }
+    if flag_nested(b, a) { return 9; }
+    if !flag_nested(b, c) { return 10; }
+    if flag_nested(c, a) { return 11; }
+
+    // `false as i32` 必须是 0，而不是 rax 的残留。
+    let f = flag_first(a);
+    if f as i32 != 0 { return 12; }
+
+    if zero_sum(3, 4) != 7 { return 13; }
+    return 0;
+}

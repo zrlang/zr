@@ -1497,8 +1497,16 @@ fn emit_str_addr(unit: &mut CompilationUnit, dst: Gpr, sym: &str) {
 fn emit_const_int(unit: &mut CompilationUnit, dst: Gpr, value: u64) {
     if value == 0 {
         // xor reg, reg —— 比 mov 短，且不破坏标志位。
-        // reg==r/m 都是 dst：REX 要同时带上 REX.R 和 REX.B（R8+ 时得 0x09）。
-        let rex = 0x48u8 | if dst.rex_bit() { 0x09 } else { 0x00 };
+        //
+        // `31 /r` 里 dst 同时是 reg 字段（REX.R）和 r/m 字段（REX.B），所以
+        // r8–r15 两个扩展位都得置上。这里**不能**写成 `0x48 | 0x09`：REX 的
+        // 位定义是 W=0x08、R=0x04、X=0x02、B=0x01，0x09 是 W|B，R 位反而丢了。
+        // 结果编码成 `xor rax, r8`（reg 字段=0 却带 REX.B），语义从"清零 r8"
+        // 变成 `r8 ^= rax`：返回 `false` 的路径读到的低字节取决于 rax 里残留的
+        // 比较结果。症状是 `match` 里走"常量 false"那条臂时返回 32513（0x7F01）
+        // 之类的垃圾，而同样的函数返回 `i32` 常量 0 却正常——因为只有零常量
+        // 走这条 xor 捷径，且只有被分配到 r8–r15 时才踩中。
+        let rex = 0x48u8 | if dst.rex_bit() { 0x05 } else { 0x00 };
         emit1(unit, rex);
         emit1(unit, 0x31);
         emit1(unit, 0xc0 | (dst.bits() << 3) | dst.bits());
@@ -3322,6 +3330,26 @@ mod tests {
                 "暂存器不应出现在分配池中"
             );
         }
+    }
+
+    #[test]
+    fn zero_immediate_clears_the_allocated_register_itself() {
+        // `xor reg, reg` 里 dst 同时占 modrm 的 reg 字段（REX.R）与 r/m 字段
+        // （REX.B），r8–r15 两个扩展位都得置上。早先写的是 `0x48 | 0x09`，
+        // 而 0x09 = W|B（W 已含在 0x48 里、R 丢了），编码出来是 `xor rax, r8`：
+        // 零常量的语义从"清零"变成"用 rax 异或"，返回 false 的路径会读到
+        // 上一次比较留下的 al。
+        let mut u = unit();
+        emit_const_int(&mut u, Gpr::Rdi, 0);
+        assert_eq!(u.code, vec![0x48, 0x31, 0xff], "xor rdi, rdi");
+
+        let mut u = unit();
+        emit_const_int(&mut u, Gpr::R8, 0);
+        assert_eq!(u.code, vec![0x4d, 0x31, 0xc0], "xor r8, r8 需 REX.W|R|B");
+
+        let mut u = unit();
+        emit_const_int(&mut u, Gpr::R15, 0);
+        assert_eq!(u.code, vec![0x4d, 0x31, 0xff], "xor r15, r15");
     }
 
     #[test]
