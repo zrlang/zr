@@ -1,0 +1,115 @@
+//=============================================================================
+// tests/cases/83_closure_fnptr.zr — 无捕获闭包提升成函数指针
+//
+// 早先闭包只有一条出路：在定义处立即调用（`(|x| x + 1)(5)`，单态化内联）。
+// 把闭包存进变量 / 当实参 / 返回一律报
+// `closures can only be invoked immediately where they are defined`——
+// 但 `let f = |x: i32| x + 1; f(2)` 这种写法里闭包**不引用任何外层
+// local**，本来就是普通函数，没有理由不支持。
+//
+// 现在 `check_lambda` 在捕获集为空时调用 `lift_closure`：造一个
+// `__closure_N` 顶层函数，表达式变成 `ExprKind::Def(id)`（函数指针）。
+//
+// 两处配套：
+//   - 上下文给了 `fn(..)` 类型时（`let g: fn(i32) -> i32 = |x| ..`、把闭包
+//     当实参传给 `fn(..)` 形参），没写标注的形参/返回类型直接用上下文里的；
+//   - 定义时类型仍是推断变量的（`let f = |x| x; f(1)`），提升后在
+//     `check_function_bodies` 收尾时统一解析。解不出来就报
+//     `type annotations needed for closure parameter / return type`
+//     （Rust 同样要求标注），不会让后端把 `_` 当 i64 编。
+//
+// 带捕获的闭包仍然只能立即调用，见 `tests/negative/07_closure_capture.zr`。
+//=============================================================================
+
+fn apply(f: fn(i32) -> i32, x: i32) -> i32 {
+    return f(x);
+}
+
+fn apply2(f: fn(i32, i32) -> i32, a: i32, b: i32) -> i32 {
+    return f(a, b);
+}
+
+fn pick(which: i32) -> fn(i32) -> i32 {
+    if which == 0 {
+        return |x: i32| x + 1;
+    }
+    return |x: i32| x * 2;
+}
+
+fn add_one(x: i32) -> i32 {
+    return x + 1;
+}
+
+struct Ops {
+    f: fn(i32) -> i32,
+}
+
+fn main() -> i32 {
+    // 1. 显式形参标注，返回类型从体推。
+    let f = |x: i32| x + 1;
+    if f(1) != 2 {
+        return 1;
+    }
+
+    // 2. 只靠后面的调用反推形参类型。
+    let id = |x| x;
+    if id(7) != 7 {
+        return 2;
+    }
+
+    // 3. 上下文给了函数类型，形参不用标注。
+    let g: fn(i32) -> i32 = |x| x * 2;
+    if g(5) != 10 {
+        return 3;
+    }
+
+    // 4. 当实参传给 `fn(..)` 形参。
+    if apply(|x| x + 3, 4) != 7 {
+        return 4;
+    }
+    if apply2(|a, b| a - b, 9, 4) != 5 {
+        return 5;
+    }
+
+    // 5. 当返回值。
+    let h = pick(0);
+    if h(10) != 11 {
+        return 6;
+    }
+    let k = pick(1);
+    if k(10) != 20 {
+        return 7;
+    }
+
+    // 6. 体里用 `return`（返回类型靠 `return` 反推）。
+    let r = |x: i32| {
+        return x + 1;
+    };
+    if r(41) != 42 {
+        return 8;
+    }
+
+    // 7. 与普通函数指针混用：数组、结构体字段。
+    let arr = [f, add_one];
+    if arr[0](1) != 2 || arr[1](1) != 2 {
+        return 9;
+    }
+    let ops = Ops { f: g };
+    if ops.f(3) != 6 {
+        return 10;
+    }
+
+    // 8. 浮点形参：提升出来的函数要靠 `param_types` 走 xmm 寄存器。
+    let fd = |x: f64| x * 2.0;
+    if fd(1.5) != 3.0 {
+        return 11;
+    }
+
+    // 9. 立即调用的老路子不受影响。
+    let n: i32 = 40;
+    if (|x: i32| x + n)(2) != 42 {
+        return 12;
+    }
+
+    return 0;
+}
