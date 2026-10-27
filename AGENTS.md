@@ -125,6 +125,12 @@ lexer → parser(ast) → typeck(hir, infer) → mir → ssa → opt → codegen
    `xor reg, reg`（`31 /r`）的 dst 同时占 reg 与 r/m 两个字段，r8–r15 要置
    `REX.W|R|B = 0x4D`；写成 `0x48 | 0x09` 会丢 REX.R，编码成 `xor rax, r8`
    ——零常量就变成"用 rax 异或"。新增 REX 计算时先写出位定义再拼。
+11. **后端的"这个值是不是浮点"是**反推**出来的**（`assign_float_slots` 扫
+   `SsaInstr::Binary { ty: Float }` 等指令），形参本身**没有类型标注**。所以
+   形参必须靠 `SsaFunction::param_types`（从 MIR 抄来）**显式播种**：只被转手的
+   浮点形参（`fn outer(f: f64) { inner(f) }`）反推不出来，会被当成整数走 rdi，
+   而调用方按 SysV 放在 xmm0 —— 位模式当指针用直接 SIGSEGV，或者后面所有整数
+   形参整体错位（读到的全是别人的值）。新增后端要照抄这一步。
 
 ---
 
@@ -162,8 +168,9 @@ README 里"指针与 unsafe"一节目前是**愿景**：
 | `src/typeck/hir.rs`、`src/mir/builder.rs` | 新增 `ExprKind::Unreachable` → `MirTerminator::Unreachable`（上面的发散 else） |
 | `src/typeck/infer.rs` | 诊断名字表：`unify`/`subtype` 的错误不再把具名类型打成 `type#N` |
 | `std/io.zr` | `(*p)[i]` → `p[i]`（两处）；`{:#X}` 的前缀改回小写 `0x`（与 Rust 一致） |
+| `src/ssa/mod.rs`、`src/codegen/encoder*.rs` | `SsaFunction` 新增 `param_types`（从 MIR 抄），两个后端拿它给浮点形参**播种**：只被转手的 `f64` 形参早先被判成整数，走 rdi 而调用方放 xmm0 |
 | `std/io.zr` | 格式串补 `{:e}` / `{:E}`（浮点与整数都走十进制指数形式，整数按有效数字四舍五入）、动态宽度 `{:1$}`、动态精度 `{:.*}` / `{:.1$}`；顺带修 `{:.}`（点后面没数字）不再被当成精度 0 |
-| `tests/cases/76..79`、`tests/negative/12..15` | 分别钉住上面每一处 |
+| `tests/cases/76..79`、`81`、`tests/negative/12..15` | 分别钉住上面每一处 |
 
 ### 三个"改对了才算改对"的点（代码里都有长注释）
 
@@ -180,7 +187,7 @@ README 里"指针与 unsafe"一节目前是**愿景**：
 ### `cargo test` 当前基线（2026-10-27，全绿）
 
 - `cargo test --bin zr`：265 项。
-- `cargo test --test zr_language`：80 个用例 × 5 个优化等级 = 400 项（含宿主端
+- `cargo test --test zr_language`：81 个用例 × 5 个优化等级 = 405 项（含宿主端
   `io_print_matches_rust`，它逐字符对比 Rust 的格式化输出，含 `{:e}` / `{:E}`
   与动态宽度/精度）。
 - `cargo test --test zr_negative`：15 个负向用例。

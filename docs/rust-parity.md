@@ -304,3 +304,9 @@
    `p[k]` 曾被当成 `[u8; 16]`，按 16 字节步长缩放。
 5. **对标量下标被静默接受**：`(*p)[i]`（`p: *const u8`）曾照编不误、运行时
    SIGSEGV；现在报 ``cannot index a value of type `u8` ``。指针下标要写 `p[i]`。
+6. **浮点形参的"浮点性"靠用法反推**（`src/codegen/encoder*.rs` 的
+   `assign_float_slots`）：只被转手的浮点形参（`fn outer(f: f64) { inner(f) }`）
+   从不参与浮点运算，于是被判成整数——调用方按 SysV 放进 xmm0，被调方从 rdi 读。
+   `fmt_float(f)` 的实参是 f64 形参时 `-O0/-O1/-O2` 直接 SIGSEGV（位模式当指针），
+   混排整数形参时则是"编译通过、运行不崩、结果全错"。现在 `SsaFunction::param_types`
+   从 MIR 抄过来，两个后端都拿它给形参显式播种。

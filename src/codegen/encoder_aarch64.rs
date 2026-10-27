@@ -1471,6 +1471,13 @@ pub fn emit_start_wrapper(target: &Target, unit: &mut CompilationUnit) {
 /// 浮点性可能要等 `Copy` 传播完才知道，所以每轮都重扫全部指令直到不再变化。
 fn assign_float_slots(func: &SsaFunction, base: usize) -> usize {
     let mut floats: HashMap<u32, u8> = HashMap::new();
+    // 形参按声明类型播种（见 encoder.rs 同名函数的长注释）：只被转手的
+    // 浮点形参靠用法反推不出来，会被当成整数走整数寄存器。
+    for (p, ty) in func.params.iter().zip(func.param_types.iter()) {
+        if let NumTy::Float(w) = ty {
+            floats.insert(p.id(), *w);
+        }
+    }
     let width_of =
         |v: &SsaValue, map: &HashMap<u32, u8>| -> u8 { map.get(&v.id()).copied().unwrap_or(0) };
     loop {

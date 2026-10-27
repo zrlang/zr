@@ -395,6 +395,15 @@ fn assign_float_slots(func: &SsaFunction, base: usize) -> usize {
     // 一个不动点，每轮都重新扫全部指令。
     // (值 id -> 是否是浮点, 位宽)。位宽 0 表示还没推断出来。
     let mut floats: HashMap<u32, u8> = HashMap::new();
+    // 形参按**声明类型**播种：`fn outer(f: f64) { inner(f) }` 里的 `f` 从不
+    // 参与浮点运算，靠"谁在拿它做浮点运算"反推不出来。漏了这一步，形参就
+    // 按整数走 rdi，而调用方按 SysV 把它放在 xmm0 —— 读到的位模式当指针
+    // 用，直接 SIGSEGV（`fmt_float(f)` 的实参是 f64 形参时必崩）。
+    for (p, ty) in func.params.iter().zip(func.param_types.iter()) {
+        if let crate::mir::NumTy::Float(w) = ty {
+            floats.insert(p.id(), *w);
+        }
+    }
     let width_of =
         |v: &SsaValue, map: &HashMap<u32, u8>| -> u8 { map.get(&v.id()).copied().unwrap_or(0) };
     loop {

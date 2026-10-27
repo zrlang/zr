@@ -1,0 +1,95 @@
+//=============================================================================
+// tests/cases/81_float_param_forward.zr — 只被"转手"的浮点形参必须按声明
+//                                        类型走浮点寄存器
+//
+// 后端的"这个值是浮点吗"完全靠**用法反推**（`assign_float_slots` 扫
+// `SsaInstr::Binary { ty: Float }` 之类的指令）。形参本身没有类型标注——
+// `MirParam` 是空结构，`param_types` 只停在 MIR 层，SSA 的 `SsaFunction`
+// 根本没抄过来。
+//
+// 于是 `fn outer(f: f64) { inner(f) }` 里的 `f` 从不参与浮点运算，被反推成
+// 整数：调用方按 SysV 把 f64 放进 xmm0，被调方却从 rdi 读。
+//
+// 症状分两种，都很难查：
+//   - 位模式当指针用 —— `fmt_float(f)` 的实参是 f64 形参时 -O0/-O1/-O2
+//     全部 SIGSEGV（`0x40934a0000000000` 被当成地址）；
+//   - 寄存器计数错位 —— 浮点形参被算进整数队列，后面的整数形参整体前移，
+//     编译通过、运行不崩，只是读到的值全是别人的（下面的 `mixed` 在修好
+//     之前返回 4：第 3 个形参 `b` 读到的其实是 `y` 的位模式）。
+//
+// 现在 `SsaFunction::param_types` 由 MIR 抄过来，两个后端都拿它给形参播种。
+//=============================================================================
+
+fn pass_f64(x: f64) -> f64 {
+    return x;
+}
+
+// 形参只被转手，没有浮点运算 —— 早先被判成整数。
+fn forward_f64(f: f64) -> i32 {
+    let v = pass_f64(f);
+    if v == 1234.5 {
+        return 0;
+    }
+    return 1;
+}
+
+fn pass_f32(x: f32) -> f32 {
+    return x;
+}
+
+fn forward_f32(f: f32) -> i32 {
+    let v = pass_f32(f);
+    if v == 2.5 {
+        return 0;
+    }
+    return 2;
+}
+
+// 整数与浮点形参混排：SysV 里两套寄存器各自计数，浮点被判成整数会让后面
+// 的整数形参整体错位。
+fn mixed(a: i32, x: f64, b: i32, y: f64) -> i32 {
+    let s = pass_f64(x) + pass_f64(y);
+    if a != 1 {
+        return 3;
+    }
+    if b != 2 {
+        return 4;
+    }
+    if s == 3.5 {
+        return 0;
+    }
+    return 5;
+}
+
+// 返回值也必须是浮点：`pass_f64` 的返回槽要按 xmm0 读。
+fn sum_f64(a: f64, b: f64) -> f64 {
+    return a + b;
+}
+
+fn forward_sum(a: f64, b: f64) -> i32 {
+    let v = sum_f64(a, b);
+    if v == 3.75 {
+        return 0;
+    }
+    return 6;
+}
+
+fn main() -> i32 {
+    let r1 = forward_f64(1234.5);
+    if r1 != 0 {
+        return 10 + r1;
+    }
+    let r2 = forward_f32(2.5);
+    if r2 != 0 {
+        return 20 + r2;
+    }
+    let r3 = mixed(1, 1.25, 2, 2.25);
+    if r3 != 0 {
+        return 30 + r3;
+    }
+    let r4 = forward_sum(1.5, 2.25);
+    if r4 != 0 {
+        return 40 + r4;
+    }
+    return 0;
+}

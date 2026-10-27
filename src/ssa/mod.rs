@@ -30,6 +30,13 @@ pub struct SsaFunction {
     pub name: String,
     pub params: Vec<SsaValue>,
     pub blocks: Vec<SsaBasicBlock>,
+    /// 形参的数值类型（下标与 `params` 一致），由 MIR 的 `param_types` 抄过来。
+    ///
+    /// 后端的浮点值靠"谁在拿它做浮点运算"反推，但形参常常**只被转手**
+    /// （`fn outer(f: f64) { inner(f) }`）——那时反推不出浮点性，形参就按
+    /// 整数走 rdi 而调用方按 xmm0 传，读到的位模式当指针用会直接 SIGSEGV。
+    /// 所以形参必须用声明类型显式播种。
+    pub param_types: Vec<mir::NumTy>,
     /// `#[inline(never)]`：内联 pass 必须跳过它。
     pub inline_never: bool,
     /// `#[inline(always)]`：内联 pass 必须内联它（即使多块）。
@@ -316,6 +323,7 @@ fn convert_function(func: &mir::MirFunction) -> SsaFunction {
             name: func.name.clone(),
             params,
             blocks: Vec::new(),
+            param_types: func.param_types.clone(),
             inline_never: func.inline_never,
             inline_always: func.inline_always,
         };
@@ -791,6 +799,7 @@ fn convert_function(func: &mir::MirFunction) -> SsaFunction {
         name: func.name.clone(),
         params,
         blocks: out_blocks,
+        param_types: func.param_types.clone(),
         inline_never: func.inline_never,
         inline_always: func.inline_always,
     }
@@ -913,6 +922,7 @@ pub fn split_critical_edges(func: &SsaFunction) -> SsaFunction {
         name: func.name.clone(),
         params: func.params.clone(),
         blocks,
+        param_types: func.param_types.clone(),
         inline_never: func.inline_never,
         inline_always: func.inline_always,
     }

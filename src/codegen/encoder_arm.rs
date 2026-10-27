@@ -2427,6 +2427,7 @@ mod tests {
         let func = SsaFunction {
             name: "pick".to_string(),
             params: vec![],
+            param_types: vec![],
             blocks: vec![
                 SsaBasicBlock {
                     id: 0,
