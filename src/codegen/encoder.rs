@@ -686,6 +686,58 @@ fn emit_lea_slot(unit: &mut CompilationUnit, dst: Gpr, slot: usize) {
     emit4(unit, (slot * 8) as u32);
 }
 
+/// `mov dst, [rbp + disp32]`——读栈上传参区。
+///
+/// 第 7 个及之后的整数实参按 SysV 放在调用者的栈上：`[rsp]` 是第 7 个，
+/// 往上依次递增。被调用方这边它们落在 `[rbp + 16 + 8*k]`
+/// （`[rbp]` 是保存的 rbp，`[rbp+8]` 是返回地址）。
+///
+/// 用 rbp 相对寻址而不是 rsp：本后端的栈槽一律 `[rsp + 8*slot]`，而序言里
+/// `sub rsp, frame` 之后 rsp 与 rbp 之间还夹着 callee-save 的 push，两者
+/// 的差值随函数而变，rbp 才是稳定的基准。
+fn emit_load_rbp(unit: &mut CompilationUnit, dst: Gpr, disp: u32) {
+    emit1(unit, 0x48 | if dst.rex_bit() { 0x04 } else { 0 });
+    emit1(unit, 0x8B);
+    // mod=10 (disp32), reg=dst, r/m=101 (rbp，无 SIB)
+    emit1(unit, 0b10_000_101 | dst.bits() << 3);
+    emit4(unit, disp);
+}
+
+/// `movss/movsd xmm, [rbp + disp32]`——读栈上的浮点实参。
+fn emit_load_float_rbp(unit: &mut CompilationUnit, xmm: u8, disp: u32, width: u8) {
+    emit1(unit, sse_prefix(width));
+    emit1(unit, 0x0F);
+    emit1(unit, 0x10);
+    emit1(unit, 0b10_000_101 | (xmm & 7) << 3);
+    emit4(unit, disp);
+}
+
+/// `mov [rsp], src`——往栈上传参区的当前格（也就是 `sub rsp, 8` 之后的
+/// 那个 8 字节）写一个整数实参。
+fn emit_store_rsp0(unit: &mut CompilationUnit, src: Gpr) {
+    emit1(unit, 0x48 | if src.rex_bit() { 0x04 } else { 0 });
+    emit1(unit, 0x89);
+    // mod=00 (无 disp), reg=src, r/m=100 (SIB)
+    emit1(unit, 0b00_000_100 | src.bits() << 3);
+    // SIB: scale=00, index=100 (无索引), base=100 (rsp)
+    emit1(unit, 0b00_100_100);
+}
+
+/// `sub rsp, imm32` / `add rsp, imm32`：给栈上传参区让位 / 收回来。
+fn emit_sub_rsp(unit: &mut CompilationUnit, bytes: u32) {
+    emit1(unit, 0x48);
+    emit1(unit, 0x81);
+    emit1(unit, 0xEC);
+    emit4(unit, bytes);
+}
+
+fn emit_add_rsp(unit: &mut CompilationUnit, bytes: u32) {
+    emit1(unit, 0x48);
+    emit1(unit, 0x81);
+    emit1(unit, 0xC4);
+    emit4(unit, bytes);
+}
+
 /// 内存操作的位宽与有无符号：`(字节数, 有符号)`。
 fn mem_access(ty: NumTy) -> (usize, bool) {
     match ty {
@@ -931,9 +983,17 @@ pub fn emit_function(target: &Target, unit: &mut CompilationUnit, func: &SsaFunc
     for r in &callee_saved {
         emit_push_r(unit, *r);
     }
-    // 溢出值的栈槽。SysV 要求调用时 rsp 16 字节对齐，所以向上取整。
-    let frame = FRAME_SLOTS.with(|c| c.get()) * 8;
-    let frame = (frame + 15) & !15;
+    // 溢出值的栈槽。SysV 要求**调用那一刻** rsp 16 字节对齐。
+    //
+    // 进入函数时 rsp ≡ 8 (mod 16)（`call` 压了返回地址），`push rbp` 之后
+    // rbp ≡ 0；再 push 了 k 个 callee-save 就是 -8k。所以帧长要按 k 的奇偶
+    // 补 8：k 为奇数时只把帧对齐到 16 会让每次 `call` 都落在 ≡8 上，被调用方
+    // 里用到 `movaps` 一类的对齐指令就会崩（这是个很难查的隐性问题）。
+    let mut frame = FRAME_SLOTS.with(|c| c.get()) * 8;
+    frame = (frame + 15) & !15;
+    if callee_saved.len() % 2 == 1 {
+        frame += 8;
+    }
     if frame > 0 {
         // sub rsp, imm32
         emit1(unit, 0x48);
@@ -1069,8 +1129,13 @@ fn emit_instr(unit: &mut CompilationUnit, instr: &SsaInstr) {
             args,
             ..
         } => {
-            emit_call_args(unit, args);
+            let released = emit_call_args(unit, args);
             emit_call(unit, callee);
+            // 先把栈上传参区收回来，再落返回值：结果可能就在 `[rsp+8*slot]`
+            // 这个帧内栈槽里，rsp 必须已经回到正常位置。
+            if released > 0 {
+                emit_add_rsp(unit, released as u32);
+            }
             // 浮点返回值按 ABI 在 xmm0，不是 rax
             if let Some(slot) = float_slot(*result) {
                 emit_store_float(unit, 0, slot, float_width(*result));
@@ -1192,9 +1257,13 @@ fn emit_instr(unit: &mut CompilationUnit, instr: &SsaInstr) {
             let c = use_reg(unit, *callee);
             let call_slot = CALL_SLOT.with(|c| c.get());
             emit_store_slot(unit, c, call_slot);
-            emit_call_args(unit, args);
-            emit_load_slot(unit, SCRATCH_AX, call_slot);
+            let released = emit_call_args(unit, args);
+            // 栈实参压上去之后 rsp 下移了，同一个帧内栈槽的偏移要跟着加。
+            emit_load_slot(unit, SCRATCH_AX, call_slot + released / 8);
             emit_call_reg(unit, SCRATCH_AX);
+            if released > 0 {
+                emit_add_rsp(unit, released as u32);
+            }
             if let Some(slot) = float_slot(*result) {
                 emit_store_float(unit, 0, slot, float_width(*result));
             } else {
@@ -2030,40 +2099,99 @@ fn emit_movzx(unit: &mut CompilationUnit, dst: Gpr, src: Gpr) {
     modrm(unit, 3, dst.bits(), src.bits());
 }
 
-/// 按 SysV AMD64 约定把实参搬进 rdi/rsi/rdx/rcx/r8/r9。
+/// 按 SysV AMD64 约定把实参搬进 rdi/rsi/rdx/rcx/r8/r9（浮点走 xmm0..7），
+/// 返回**调用返回之后**需要调用方释放的字节数（栈上传参区的大小）。
 ///
-/// 这是一次**并行搬运**：目标集合和源集合可能重叠，顺序执行会互相
+/// 寄存器部分是一次**并行搬运**：目标集合和源集合可能重叠，顺序执行会互相
 /// 覆盖（先 `mov rdi, rsi` 再 `mov rsi, rdi`，两步读到的都是已被改写
 /// 的值，调用方会拿到 `add(20, 20)` 而不是 `add(20, 22)`）。
 ///
-/// 做法是标准的平行搬运消环：反复挑一个"目标不再被任何人读取"的
-/// 搬运先执行；如果一个都挑不出来（说明存在环），就把某个环上的源
+/// 做法是标准的平行搬运消环：反复挑一个"目标不再被任何人读取"的搬运
+/// 先执行；如果一个都挑不出来（说明存在环），就把某个环上的源
 /// 暂存到 rax（rax 不是实参寄存器），把环打开后继续。
-fn emit_call_args(unit: &mut CompilationUnit, args: &[SsaValue]) {
+///
+/// 装不下的实参（第 7 个及之后的整数、第 9 个及之后的浮点）按 SysV 走
+/// 栈上传参区。早先这两类实参被**静默丢弃**——被调用方读到的是栈上的垃圾，
+/// 编译期一声不响，运行结果全错。`std/io.zr` 里 7 个形参的 `emit_arg`
+/// 就踩在这上面：`{:8}` 的宽度实参根本没传进去，宽度恒为 0，所有
+/// 填充 / 对齐 / 零填充规格全部失效。
+fn emit_call_args(unit: &mut CompilationUnit, args: &[SsaValue]) -> usize {
     // SysV：整数实参与浮点实参各自占一套寄存器、各自计数。
     // `f(g(1, 2.0), 3)` 里 1 在 rdi、2.0 在 xmm0、3 在 rsi。
     let mut moves: Vec<(Gpr, Src)> = Vec::new();
+    // 走栈的实参，按**声明顺序**收集（下标 0 就是第一个上栈的实参）。
+    let mut stack_args: Vec<SsaValue> = Vec::new();
     let mut gi = 0usize; // 整数形参下标
     let mut xi = 0usize; // 浮点形参下标
     for a in args {
         if let Some(slot) = float_slot(*a) {
             if xi < 8 {
                 emit_load_float(unit, xi as u8, slot, float_width(*a));
+            } else {
+                stack_args.push(*a);
             }
-            // 超过 8 个浮点实参走栈上传参区，本后端尚未实现。
             xi += 1;
-        } else {
-            if gi < ARG_REGS.len() {
-                let src = src_of(*a);
-                if !matches!(src, Src::Reg(r) if r == ARG_REGS[gi]) {
-                    moves.push((ARG_REGS[gi], src));
-                }
-                gi += 1;
+        } else if gi < ARG_REGS.len() {
+            let src = src_of(*a);
+            if !matches!(src, Src::Reg(r) if r == ARG_REGS[gi]) {
+                moves.push((ARG_REGS[gi], src));
             }
-            // 超过 6 个整数实参走栈上传参区，本后端尚未实现。
+            gi += 1;
+        } else {
+            stack_args.push(*a);
         }
     }
+
+    // 栈实参必须在寄存器搬运**之前**写好：搬运会把实参寄存器覆盖掉，而
+    // 栈实参的源完全可能就是那些寄存器。
+    let mut released = 0usize;
+    if !stack_args.is_empty() {
+        // SysV 要求 `call` 那一刻 rsp 16 字节对齐。序言已经保证"没有任何栈
+        // 实参"时是对齐的，所以这里只需补奇偶：奇数个 8 字节实参先垫一格，
+        // 垫在**最后一个实参之上**（即先 sub 再压）。
+        let pad_slots = stack_args.len() % 2;
+        if pad_slots == 1 {
+            emit_sub_rsp(unit, 8);
+        }
+        // 倒着压：最后声明的实参落在最高地址，第一个上栈的实参落在 [rsp]。
+        for (i, v) in stack_args.iter().rev().enumerate() {
+            // 栈槽是 rsp 相对的：每压下一格，同一个帧内栈槽的偏移就要 +1。
+            let shift = pad_slots + i + 1;
+            emit_sub_rsp(unit, 8);
+            if let Some(fslot) = float_slot(*v) {
+                // 浮点值一律住在 8 字节的浮点栈槽里，按位整块复制即可。
+                // **不能**用 xmm0 中转：`xmm0..7` 在 `call` 那一刻还装着
+                // 前 8 个浮点实参，拿 xmm0 搬第 9 个及之后的实参会把第 1 个
+                // 实参写坏（`eleven(1.5, 2.5, ...)` 实测 539 → 547）。
+                emit_load_slot(unit, SCRATCH_AX, fslot + shift);
+                emit_store_rsp0(unit, SCRATCH_AX);
+            } else {
+                match location_of(*v) {
+                    Location::Reg(i) => emit_store_rsp0(unit, ALLOCATABLE[i]),
+                    Location::Stack(slot) => {
+                        emit_load_slot(unit, SCRATCH_AX, slot + shift);
+                        emit_store_rsp0(unit, SCRATCH_AX);
+                    }
+                }
+            }
+        }
+        released = (pad_slots + stack_args.len()) * 8;
+    }
+
+    // 栈实参已经把 rsp 压低了 `released` 字节，而 `Src::Mem(slot)` 是
+    // `[rsp + 8*slot]` 的**原始**帧偏移——必须跟着补，否则寄存器搬运会从
+    // 错位的地址读（读到的正好是新压上去的实参或更下面的垃圾）。
+    if released > 0 {
+        let shift = released / 8;
+        for m in moves.iter_mut() {
+            if let Src::Mem(slot) = m.1 {
+                m.1 = Src::Mem(slot + shift);
+            }
+        }
+    }
+
     emit_parallel_moves(unit, &moves);
+    released
 }
 
 /// 并行搬运 `(dst, src)`：允许目标重叠，靠环检测保证正确。
@@ -2135,17 +2263,30 @@ fn emit_param_moves(unit: &mut CompilationUnit, func: &SsaFunction) {
     // 浮点形参走 xmm0..、整数形参走 rdi..，两类各自计数（SysV ABI）。
     let mut gi = 0usize;
     let mut xi = 0usize;
+    // 第几个"走栈"的形参（按声明顺序，整数与浮点共用一条队列）。
+    let mut stack_idx = 0usize;
     let mut moves: Vec<(Gpr, Src)> = Vec::new();
+    // 走栈的整数形参要等寄存器搬运做完再装载：它的落点可能就是某个还没搬
+    // 走的 ABI 实参寄存器（例如第 5 个形参还在 r8 里等着搬，而第 7 个形参
+    // 分配到的落点正好也是 r8），先装就把它踩掉了。
+    let mut stack_loads: Vec<(SsaValue, u32)> = Vec::new();
     for p in &func.params {
         if let Some(sl) = float_slot(*p) {
             if xi < 8 {
                 emit_store_float(unit, xi as u8, sl, float_width(*p));
+            } else {
+                let disp = 16 + 8 * stack_idx;
+                stack_idx += 1;
+                emit_load_float_rbp(unit, 0, disp as u32, float_width(*p));
+                emit_store_float(unit, 0, sl, float_width(*p));
             }
             xi += 1;
             continue;
         }
         if gi >= ARG_REGS.len() {
-            // 超过 6 个整数形参走栈上传参区，本后端尚未实现。
+            // 第 7 个及之后的整数形参在调用者的栈上：[rbp+16] 起。
+            stack_loads.push((*p, 16 + 8 * stack_idx as u32));
+            stack_idx += 1;
             continue;
         }
         match location_of(*p) {
@@ -2163,6 +2304,15 @@ fn emit_param_moves(unit: &mut CompilationUnit, func: &SsaFunction) {
     // 5、6 个形参在 r8/r9，而中间某步的落点正好也是 r8/r9）。顺序搬运会
     // 踩掉尚未读取的源。
     emit_parallel_moves(unit, &moves);
+    for (p, disp) in stack_loads {
+        match location_of(p) {
+            Location::Stack(slot) => {
+                emit_load_rbp(unit, SCRATCH_AX, disp);
+                emit_store_slot(unit, SCRATCH_AX, slot);
+            }
+            Location::Reg(d) => emit_load_rbp(unit, ALLOCATABLE[d], disp),
+        }
+    }
 }
 
 /// `call rel32`：0xE8 + imm32（需重定位）。
