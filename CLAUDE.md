@@ -146,12 +146,12 @@ target/debug/zr prog.zr -O1 -o /tmp/prog && /tmp/prog
 | 关联类型 `type Output;` + `type Output = i32;` | ✅（`Self::Output` 可取） |
 | 函数指针 `fn(T) -> R`（取址/传参/存储） | ✅ **x86-64 专属**，其它后端明确报错 |
 | `?` 对 `Result`/`Option` | ✅ |
-| `#[derive(Debug, Clone, Copy)]` | 🟡 只登记 trait 标记，**不生成方法**（见 §5） |
-| `#[derive(PartialEq, Eq, Hash, PartialOrd, Ord, Default)]` | ❌ 报 `cannot derive ...: unknown derive trait` |
+| `#[derive(Debug, Clone, Copy)]` | 🟡 `Clone` / `Copy` 是标记 trait；`Debug` 仍未生成方法（见 §5） |
+| `#[derive(PartialEq, Eq, Hash, PartialOrd, Ord, Default)]` | ✅ 生成真实方法体（`src/typeck/derive.rs`）；泛型类型 / 枚举 `Default` / 枚举 `Ord` 显式报错 |
 | 生命周期标注 `'a` | 🟡 **解析后丢弃**（`src/parser/ty.rs`），无任何借用/存活检查 |
 | `dyn Trait` / trait 对象 | ❌ **无 `dyn` 关键字** |
 | auto trait / blanket impl / `PhantomData<T>` | ❌ |
-| turbofish `size_of::<T>()` | ✅ **仅调用位置**；`Option::<i32>::None`（类型路径上）❌ |
+| turbofish `::<...>` | ✅ 调用位置（`size_of::<T>()`）与类型路径（`Option::<i32>::None`、`Box::<i32>::new(7)`、`Shape::<u8>::Circle { r: 7 }`）都可用 |
 | `impl Trait` 参数（APIT/RPIT） | ❌ 解析失败 |
 | `where T: !Trait` 负边界、更高阶函数、特化、孤儿规则 | ❌ |
 
@@ -330,18 +330,20 @@ target/debug/zr prog.zr -O1 -o /tmp/prog && /tmp/prog
 
 ### P1 — 明确报错或明显缺失
 
-1. **`#[derive]` 不生成方法**（`PartialEq`/`Eq`/`Hash`/`Ord`/`Default` 直接报错）
-2. **无负向测试机制** —— `tests/cases/` 全部必须编译通过，"该报错的还在报错"没有自动化保障
-3. **闭包未实现**：`closures are not implemented yet (captures are not lowered)`
-   （注：`73_closures.zr` 通过，说明支持的是受限子集，README 已记录）
-4. **`i128` / `u128` 在 64 位目标上不可用**（需寄存器对拆分）
-5. **泛型推断只从实参和期望返回类型推断**，不看用法体
+1. **`#[derive]` 剩余缺口**：方法体已经生成（`src/typeck/derive.rs`），但
+   `Debug` 仍是标记 trait（不生成方法）；泛型类型 / 枚举 `Default` / 枚举 `Ord`
+   显式报错；字段级诊断不精确；`Hash` 对 `str` / 切片 / 数组 / 元组按 `0` 计入
+2. **闭包只支持"定义处立即调用"**：`(|x| x + 1)(5)` 在调用点内联展开，捕获变量
+   复用外层 local；存进变量 / 当实参 / 返回报
+   `closures can only be invoked immediately where they are defined`
+3. **`i128` / `u128` 在 64 位目标上不可用**（需寄存器对拆分）
+4. **泛型推断只从实参和期望返回类型推断**，不看用法体
    （`let v = Vec::new(); v.push(1)` 推不出 `T`，需 `let v: Vec<i32>`）
-6. **类型路径上的 turbofish 不支持**（`Option::<i32>::None`）
-7. **穷尽性报错信息误导**：`match must have a trailing _ arm`
-8. **格式规格只支持 4 种**，宽度/精度/对齐/填充被原样打印（不报错）
-9. **`Option` / `Result` 不在 prelude**，需 `use core::Option;`
-10. **无元数据 / 临时文件 API**：权限、时间戳、`tempfile` 缺失
+5. **穷尽性报错信息误导**：`match must have a trailing `_` arm`
+6. **格式串只剩两处没做**：命名参数 `{name}` 与多行 Debug `{:#?}`
+   （`#` 对 `{:?}` 被忽略，输出的是一行）；其余规格已与 Rust 逐字符对齐
+7. **`Option` / `Result` 不在 prelude**，需 `use core::Option;`
+8. **无元数据 / 临时文件 API**：权限、时间戳、`tempfile` 缺失
 
 ### P2 — 工具链与生态
 

@@ -17,7 +17,7 @@ zr 是一门系统编程语言（Rust/Zig 混合取向），编译器用 Rust �
 | `AGENTS.md` / `CLAUDE.md` | ✅ 高 | 已逐条核对源码 |
 | `README.md` 的**语法与用例** | ✅ 高 | 跟着用例就能写出能跑的程序 |
 | `README.md` 的**安全模型**（"指针与 unsafe"） | ⚠️ 愿景 | 描述的**不是**现状，见「红线」 |
-| `docs/rust-parity.md` | ⚠️ 部分过期 | 大方向对，但个别结论已被在途改动超越（例：称泛型别名不支持、`#[derive]` 结构体报错——都已修好） |
+| `docs/rust-parity.md` | ⚠️ 部分过期 | 大方向对，但个别结论已被在途改动超越（例：称泛型别名不支持、`#[derive]` 结构体报错、类型路径上的 turbofish 不支持——都已修好） |
 | `CONTRIBUTING.md` | ⚠️ 部分过期 | 步骤对，没提负向测试缺失和架构红线 |
 | `tests/README.md` | ❌ 严重过期 | "尚未覆盖"表说 `enum`/`match`/`泛型`/`智能指针` 未实现，实际 `57_enum.zr`/`66_generics.zr` 都在跑 |
 | `future/README.md` | ❌ **不可信** | 状态列几乎全标 ✅ Done，源码里全是空壳或没接线。见下 |
@@ -187,7 +187,7 @@ README 里"指针与 unsafe"一节目前是**愿景**：
 ### `cargo test` 当前基线（2026-10-27，全绿）
 
 - `cargo test --bin zr`：265 项。
-- `cargo test --test zr_language`：81 个用例 × 5 个优化等级 = 405 项（含宿主端
+- `cargo test --test zr_language`：82 个用例 × 5 个优化等级 = 410 项（含宿主端
   `io_print_matches_rust`，它逐字符对比 Rust 的格式化输出，含 `{:e}` / `{:E}`
   与动态宽度/精度）。
 - `cargo test --test zr_negative`：15 个负向用例。
@@ -213,7 +213,8 @@ README 里"指针与 unsafe"一节目前是**愿景**：
 - 元数据（权限、时间戳）与 `tempfile` 缺失。
 - 格式串只剩命名参数 `{name}` 与多行 Debug `{:#?}` 没做（`#` 对 `{:?}` 被忽略，
   只输出一行）；`{:e}` / `{:E}` 与动态宽度/精度已与 Rust 对齐。
-- 闭包未实现；`i128`/`u128` 在 64 位目标不可用；turbofish 不支持。
+- 闭包只支持"定义处立即调用"（`(|x| x + 1)(5)`），存进变量 / 当实参 / 返回会报错；
+  `i128`/`u128` 在 64 位目标不可用。
 
 ## 6. 工作约定
 

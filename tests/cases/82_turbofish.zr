@@ -1,0 +1,127 @@
+//=============================================================================
+// tests/cases/82_turbofish.zr — turbofish（`::<...>`）的三种落点
+//
+// 早先解析器只认 `name::<T>(args)` 这一种形状，而且**一写完类型实参就
+// return**：`Option::<i32>::None` 后面的 `::None` 没人消费，报的是
+// `expected ';' after binding: expected Semicolon, found ColonColon`——
+// 错得毫无线索。`Box::<i32>::new(7)`、`Wrap::<i32>(7)`、
+// `Shape::<u8>::Circle { r: 7 }` 同样过不了。
+//
+// 现在 `::<...>` 之后继续吃路径段，把类型实参挂到整条路径上；类型检查端
+// 把显式实参当**期望类型**喂给构造器，并在模式绑定处按 scrutinee 的实际
+// 类型实参替换载荷类型。
+//
+// 后者是另一半的坑：`variant_payload_tys` 返回的是**声明**里的类型，泛型
+// 枚举的载荷是 `Ty::Infer` 占位符。不替换的话 `Opt::<u8>::Some(v)` 里的
+// `v` 是个没人绑过的 `_`，`v as i32` 报 `cannot cast '_' to 'i32'`。
+// 不加标注时之所以"碰巧能跑"，是因为 `if d != 9` 顺手把声明里的
+// `Ty::Infer` 绑到了 `i32` 上（AGENTS 红线 2 的污染）。
+//=============================================================================
+
+use core::Option;
+use core::size_of;
+
+struct Box<T> {
+    v: T,
+}
+
+impl<T> Box<T> {
+    fn new(v: T) -> Box<T> {
+        return Box { v: v };
+    }
+    fn get(self) -> T {
+        return self.v;
+    }
+}
+
+struct Wrap<T>(T);
+
+enum Opt<T> {
+    None,
+    Some(T),
+}
+
+enum Shape<T> {
+    Circle { r: T },
+    Empty,
+}
+
+fn id<T>(x: T) -> T {
+    return x;
+}
+
+// 载荷类型必须按 scrutinee 的具体化结果走：`Opt<u8>` 的 `Some` 载荷是 u8。
+fn unwrap_u8(o: Opt<u8>) -> i32 {
+    let v = match o {
+        Opt::Some(x) => x as i32,
+        Opt::None => -1,
+    };
+    return v;
+}
+
+fn area(s: Shape<u8>) -> i32 {
+    let v = match s {
+        Shape::Circle { r } => r as i32,
+        Shape::Empty => 0,
+    };
+    return v;
+}
+
+fn main() -> i32 {
+    // 1. 无载荷变体 + turbofish。
+    let n: Option<i32> = Option::<i32>::None;
+    match n {
+        Option::None => {}
+        Option::Some(v) => {
+            return 1 + v;
+        }
+    }
+
+    // 2. 关联函数 + turbofish。
+    let b = Box::<i32>::new(7);
+    if b.get() != 7 {
+        return 2;
+    }
+
+    // 3. 元组结构体构造 + turbofish。
+    let w = Wrap::<i32>(7);
+    if w.0 != 7 {
+        return 3;
+    }
+
+    // 4. 泛型函数调用 + turbofish。
+    let a = id::<i32>(9);
+    if a != 9 {
+        return 4;
+    }
+
+    // 5. 有载荷变体 + turbofish（匹配处要拿到 u8，而不是占位符）。
+    let c = Opt::<u8>::Some(9);
+    if unwrap_u8(c) != 9 {
+        return 5;
+    }
+    let d = Opt::<u8>::None;
+    if unwrap_u8(d) != -1 {
+        return 6;
+    }
+
+    // 6. 结构体载荷变体 + turbofish。
+    let s = Shape::<u8>::Circle { r: 11 };
+    if area(s) != 11 {
+        return 7;
+    }
+    let e = Shape::<u8>::Empty;
+    if area(e) != 0 {
+        return 8;
+    }
+
+    // 7. 编译期内建仍然走 turbofish。
+    if size_of::<u64>() != 8 {
+        return 9;
+    }
+    if size_of::<u8>() != 1 {
+        return 10;
+    }
+
+    return 0;
+}

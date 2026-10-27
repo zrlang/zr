@@ -613,12 +613,41 @@ impl Parser {
                 if self.check(&TokenKind::Lt) {
                     self.advance();
                     let type_args = self.parse_generic_args()?;
-                    let inner = Expression::Turbofish(
-                        Box::new(Expression::Variable(n, span)),
-                        type_args,
-                        span,
-                    );
-                    // turbofish 后面必定跟着调用
+                    // turbofish 后面**不一定**紧跟着调用：`Option::<i32>::None`
+                    // 是无载荷变体、`Box::<i32>::new(7)` 是关联函数。所以还要
+                    // 继续吃路径段，把类型实参挂到整条路径上
+                    // （`Turbofish(Path(["Option","None"]), [i32])`）。
+                    //
+                    // 早先这里写完 turbofish 就 return，后面的 `::None` 没人
+                    // 消费，报的是 `expected ';' after binding`——错得毫无线索。
+                    let mut path: Vec<String> = vec![n.clone()];
+                    while self.check(&TokenKind::ColonColon) {
+                        // 第二段又是 `::<`（`A::<T>::B::<U>`）不支持：留给
+                        // 上层报错，别在这里把 `::` 吃掉。
+                        if matches!(self.peek_n(1).map(|t| &t.kind), Some(TokenKind::Lt)) {
+                            break;
+                        }
+                        self.advance(); // ::
+                        path.push(self.consume_path_segment("expected path segment")?);
+                    }
+                    // 结构体字面量带 turbofish：`Shape::<u8>::Circle { r: 7 }`。
+                    // 路径后面跟 `{` 时按结构体字面量解析，类型实参包在外面
+                    // 一层 `Turbofish` 里交给类型检查——那里用它们当期望类型
+                    // 来定下泛型实参。
+                    if !self.no_struct_literal
+                        && self.check(&TokenKind::LBrace)
+                        && self.looks_like_struct_literal()
+                    {
+                        self.advance(); // {
+                        let init = self.parse_struct_literal(path, span)?;
+                        return Ok(Expression::Turbofish(Box::new(init), type_args, span));
+                    }
+                    let base = if path.len() == 1 {
+                        Expression::Variable(n, span)
+                    } else {
+                        Expression::Path(path, span)
+                    };
+                    let inner = Expression::Turbofish(Box::new(base), type_args, span);
                     if self.match_kind(&TokenKind::LParen) {
                         let args = self.parse_call_args()?;
                         self.consume(&TokenKind::RParen, "expected ')'")?;

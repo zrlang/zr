@@ -1836,7 +1836,41 @@ impl TypeChecker {
                     ExprKind::Def(id)
                 }
             }
-            Expression::Turbofish(inner, _, _) => {
+            Expression::Turbofish(inner, targs, _) => {
+                // 无载荷变体带显式类型实参：`Option::<i32>::None`。
+                if let Expression::Path(path, pspan) = inner.as_ref() {
+                    if let Some((def_id, index)) = self.enum_variant_target_path(path, *pspan) {
+                        let tys = self.turbofish_targs(targs)?;
+                        let want = Ty::Named(def_id, tys);
+                        return self.check_enum_variant_init(def_id, index, &[], &want, span);
+                    }
+                }
+                // 结构体字面量带显式类型实参：`Shape::<u8>::Circle { r: 7 }`。
+                // 解析器把 `{ .. }` 整个包在 `Turbofish` 里；这里把类型实参
+                // 还原成期望类型，`check_struct_init` 据此定下泛型实参。
+                if let Expression::StructInit(path, _, _, _) = inner.as_ref() {
+                    // 枚举结构体载荷（`Shape::<u8>::Circle { r: 7 }`）的路径最后
+                    // 一段是变体名，类型定义在前缀上；普通结构体就是整条路径。
+                    let def_id = match path.split_last() {
+                        Some((_, prefix)) if !prefix.is_empty() => {
+                            match self.resolve_path(prefix, span) {
+                                Ok(id)
+                                    if matches!(
+                                        self.type_defs.get(&id),
+                                        Some(hir::HirTypeDef::Enum(_))
+                                    ) =>
+                                {
+                                    id
+                                }
+                                _ => self.resolve_path(path, span)?,
+                            }
+                        }
+                        _ => self.resolve_path(path, span)?,
+                    };
+                    let tys = self.turbofish_targs(targs)?;
+                    let want = Ty::Named(def_id, tys);
+                    return self.check_expr_raw(inner, &want);
+                }
                 return self.check_expr_raw(inner, expected);
             }
             Expression::Question(inner, _) => {
@@ -3060,6 +3094,8 @@ impl TypeChecker {
         let id = match callee {
             Expression::Variable(name, _) => self.symbols.get(name).copied()?,
             Expression::Path(path, _) if path.len() == 1 => self.symbols.get(&path[0]).copied()?,
+            // `Wrap::<i32>(7)`：turbofish 外面还包了一层
+            Expression::Turbofish(inner, _, _) => return self.tuple_struct_target(inner),
             _ => return None,
         };
         let hir::HirTypeDef::Struct(s) = self.type_defs.get(&id)? else {
@@ -3099,9 +3135,34 @@ impl TypeChecker {
     /// 调用目标是枚举变体时返回 (枚举的 DefId, 变体下标)。
     fn enum_variant_target(&self, callee: &Expression) -> Option<(DefId, usize)> {
         let ast::Expression::Path(path, span) = callee else {
+            // `Option::<i32>::None` / `Option::<i32>::Some(7)`：turbofish
+            // 外面还包了一层，看到它之后继续往里看。
+            if let ast::Expression::Turbofish(inner, _, _) = callee {
+                return self.enum_variant_target(inner);
+            }
             return None;
         };
         self.enum_variant_target_path(path, *span)
+    }
+
+    /// 显式类型实参（turbofish）当成期望类型：`Option::<i32>::Some(7)` 的
+    /// `i32` 必须喂给构造器，否则 `T` 只能靠上下文推——`let a = ...` 这种
+    /// 没有上下文的地方就推不出来。
+    fn turbofish_expected(&mut self, callee: &Expression, def_id: DefId) -> Result<Option<Ty>> {
+        let ast::Expression::Turbofish(_, targs, _) = callee else {
+            return Ok(None);
+        };
+        let tys = self.turbofish_targs(targs)?;
+        Ok(Some(Ty::Named(def_id, tys)))
+    }
+
+    /// 把 turbofish 里的 AST 类型实参转成 HIR 类型。
+    fn turbofish_targs(&mut self, targs: &[AstType]) -> Result<Vec<Ty>> {
+        let mut tys = Vec::with_capacity(targs.len());
+        for t in targs {
+            tys.push(self.ast_to_hir_type(t)?);
+        }
+        Ok(tys)
     }
 
     /// 枚举变体的载荷字段类型（按声明顺序）。
@@ -3249,6 +3310,7 @@ impl TypeChecker {
         path: &[String],
         fields: &[ast::FieldPat],
         rest: bool,
+        scrut_ty: &Ty,
         span: ast::Span,
     ) -> Result<hir::HirPattern> {
         let variant_name = path.last().cloned().unwrap_or_default();
@@ -3291,7 +3353,12 @@ impl TypeChecker {
                 ))
                 .with_span(span));
             }
-            pats[idx] = Some(self.lower_pattern(&fp.pattern, &var_fields[idx].ty)?);
+            // 载荷字段类型来自**声明**，泛型参数还是占位推断变量；必须按
+            // scrutinee 的实际类型实参替换。不替换的话 `Opt::<u8>::Some { v }`
+            // 里的 `v` 拿到的是声明中的 `T`（一个没人绑过的 `_`），后面
+            // `v as i32` 报 `cannot cast '_' to 'i32'`。
+            let field_ty = self.subst_variant_field_ty(enum_id, scrut_ty, &var_fields[idx].ty);
+            pats[idx] = Some(self.lower_pattern(&fp.pattern, &field_ty)?);
         }
         let mut args = Vec::with_capacity(pats.len());
         for (i, pat) in pats.into_iter().enumerate() {
@@ -3770,12 +3837,20 @@ impl TypeChecker {
 
         // 元组结构体构造：`Point(1, 2)` 语法上是把类型名当函数调用。
         if let Some(type_id) = self.tuple_struct_target(callee) {
-            return self.check_tuple_struct_init(type_id, args, expected, span);
+            let want = match self.turbofish_expected(callee, type_id)? {
+                Some(t) => t,
+                None => expected.clone(),
+            };
+            return self.check_tuple_struct_init(type_id, args, &want, span);
         }
 
         // 枚举变体构造：`Shape::Circle(5)` 同样是"把变体名当函数调用"。
         if let Some((def_id, index)) = self.enum_variant_target(callee) {
-            return self.check_enum_variant_init(def_id, index, args, expected, span);
+            let want = match self.turbofish_expected(callee, def_id)? {
+                Some(t) => t,
+                None => expected.clone(),
+            };
+            return self.check_enum_variant_init(def_id, index, args, &want, span);
         }
 
         // 闭包立即调用：`(|x| x + 1)(5)`、`(|x| x + n)(5)`。走单态化内联：
@@ -5011,7 +5086,7 @@ impl TypeChecker {
                             Some(hir::HirTypeDef::Enum(_))
                         ) {
                             return self.lower_enum_struct_variant_pattern(
-                                enum_id, path, fields, *rest, *span,
+                                enum_id, path, fields, *rest, ty, *span,
                             );
                         }
                     }
@@ -5033,6 +5108,12 @@ impl TypeChecker {
                 let variant_name = path.last().unwrap();
                 let variant_idx = self.variant_index(def_id, variant_name);
                 let payload_tys = self.variant_payload_tys(def_id, variant_idx, *span)?;
+                // 同上：载荷类型是声明里的，泛型参数要按 scrutinee 的实际
+                // 类型实参替换，否则 `Opt::<u8>::Some(v)` 的 `v` 是 `_`。
+                let payload_tys: Vec<Ty> = payload_tys
+                    .iter()
+                    .map(|t| self.subst_variant_field_ty(def_id, ty, t))
+                    .collect();
                 let hir_args: Result<Vec<_>> = args
                     .iter()
                     .enumerate()
@@ -5171,6 +5252,23 @@ impl TypeChecker {
             })
             .collect();
         self.subst_infer(ty, &map)
+    }
+
+    /// 把枚举变体载荷字段的**声明**类型按 scrutinee 的实际类型实参替换。
+    ///
+    /// `variant_field_types` 返回的是声明里写的东西：泛型枚举的载荷是
+    /// `Ty::Infer(T 的占位符)`。模式绑定必须用具体化之后的类型——
+    /// `Opt::<u8>::Some(v)` 的 `v` 是 `u8`，不是那个占位符。
+    ///
+    /// 早先这里直接用声明类型：不加类型标注时 `if d != 9` 之类的比较会
+    /// 顺手把声明里的 `Ty::Infer` 绑到 `i32` 上（AGENTS 红线 2 的污染），
+    /// 于是"碰巧能跑"；一旦 scrutinee 是 `Opt<u8>` 或者显式 turbofish，
+    /// `v` 就留成一个没人绑过的 `_`，报 `cannot cast '_' to 'i32'`。
+    fn subst_variant_field_ty(&self, def_id: DefId, scrut_ty: &Ty, ty: &Ty) -> Ty {
+        match self.infer.resolve(scrut_ty) {
+            Ty::Named(id, targs) if id == def_id => self.subst_def_ty(def_id, &targs, ty),
+            _ => ty.clone(),
+        }
     }
 
     /// 把类型里出现的占位符 `InferId` 替换成具体类型。

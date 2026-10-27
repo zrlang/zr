@@ -354,6 +354,7 @@ zr 0.8.0 shell — :help 查看元命令，Ctrl-D 退出
 - ✅ `subtype().ok()` 静默吞错：`check_index_scalar` 等关键路径不再吞（`(*p)[i]` 现在编译报错）。
 - ✅ `#[derive]` 生成真实方法体（§6），`71_derive` / `78_derive_methods` 全档通过。
 - ✅ 负向测试框架 `tests/negative/` + `tests/zr_negative.rs`（`// expect:` 子串约定，见 §10）。
+- ✅ turbofish 三种落点补齐（无载荷变体 / 关联函数 / 结构体字面量），见 `tests/cases/82_turbofish.zr`。
 - ✅ `docs/rust-parity.md` / `AGENTS.md` / `tests/README.md` 与源码对齐。
 - ⏳ `--emit-llvm` 仍是手写伪 IR（决定见 §8 第 5 条：删，但尚未动手）。
 - ⏳ `CONTRIBUTING.md` 的"文档红线"一节待补。
@@ -375,7 +376,7 @@ zr 0.8.0 shell — :help 查看元命令，Ctrl-D 退出
 - 关联类型解析 + 求解（`HirAssocType` 从空结构体升级）。
 - `impl Trait` 在参数位置（APIT）真作为泛型参数处理。
 - `for<'a>` 高阶边界保留 + 求解。
-- **目标**：`std/error` 能导入；`Option::<i32>::None` 能解析。
+- **目标**：`std/error` 能导入。
 
 ### v0.12.0 — 易用性（2 周）
 

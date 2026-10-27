@@ -71,7 +71,7 @@
 |------|------|------|------|
 | `let x: Option<i32> = ...;` | 可用 | ✅ | 类型注解里的泛型实参保留，字段 / 载荷类型按实参替换 |
 | `fn f(x: Option<i32>)` | 可用 | ✅ | 签名与函数体一致 |
-| `Option::<i32>::None` | 不支持 | ❌ | turbofish 只在**调用位置**生效（`size_of::<T>()`、`Foo::<i32>::new()`）；类型路径上的 `::<>` 解析失败。无上下文的 `Option::None` 需要 `let` 注解 |
+| `Option::<i32>::None` | 可用 | ✅ | turbofish 后面继续吃路径段，类型实参挂在整条路径上：无载荷变体（`Option::<i32>::None`）、关联函数（`Box::<i32>::new(7)`）、元组结构体（`Wrap::<i32>(7)`）、结构体载荷变体（`Shape::<u8>::Circle { r: 7 }`）都可用。显式实参当期望类型喂给构造器；无上下文的 `Option::None` 仍需 `let` 注解 |
 
 ---
 
@@ -262,12 +262,14 @@
    `{:X}` `{:b}` `{:o}` `{:e}` `{:E}`、位置参数、填充 / 对齐 / `+` / `#` /
    `0` / 宽度 / 精度、动态宽度 `{:1$}`、动态精度 `{:.*}` / `{:.1$}`）
    已与 Rust 逐字符对齐。
-6. **闭包未实现**（README 已记录）：`closures are not implemented yet`。
+6. **闭包只支持"定义处立即调用"**：`(|x| x + 1)(5)` 会在调用点内联展开，
+   捕获变量复用外层 local。把闭包存进变量 / 当实参 / 返回会报
+   `closures can only be invoked immediately where they are defined`。
 7. **`i128` / `u128` 在 64 位目标上不可用**（需要寄存器对拆分）。
 8. **泛型推断的边界**：类型参数只从实参和期望返回类型推断，不看作法体
-   （`let v = Vec::new(); v.push(1)` 推不出 `T`，需要 `let v: Vec<i32>` 注解）；
-   类型路径上的 turbofish（`Option::<i32>::None`）不支持。`T: Trait` / `where`
-   约束现在会在**单态化时**校验（`check_trait_bounds`，含超类型的双向展开）。
+   （`let v = Vec::new(); v.push(1)` 推不出 `T`，需要 `let v: Vec<i32>` 注解）。
+   `T: Trait` / `where` 约束现在会在**单态化时**校验（`check_trait_bounds`，
+   含超类型的双向展开）。
 
 ---
 
