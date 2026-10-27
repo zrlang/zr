@@ -1223,25 +1223,36 @@ pub fn inline_functions(module: SsaModule) -> SsaModule {
                 // 形参直接换成调用点的实参，不给它们另发号
                 let subst: HashMap<SsaValue, SsaValue> =
                     params.iter().copied().zip(args.iter().copied()).collect();
+                // 重命名表必须**先完整建好**，再改写指令。
+                //
+                // 早先是边改边建：处理一条指令时按顺序对每个操作数调
+                // `replace_operand(instr, u, target)`。那是"按值相等替换"，
+                // 换进去的 `target` 可能正好等于后面还要替换的 `u`——
+                // 被内联函数体 `%10 = %1 Add %9` 就是活例子：先把 `%1`
+                // 换成调用点的新号 `%9`，指令变成 `%10 = %9 Add %9`；接着
+                // 处理 `%9`，两个操作数一起被换成同一个新号，加法变成
+                // "偏移量自己加自己"。表现是 `zr_alloc` 出来的帧指针被
+                // 32 取代，`spawn` 的帧初始化往地址 0x20 写 → SIGSEGV。
                 let mut renamed: HashMap<SsaValue, SsaValue> = HashMap::new();
+                for b in body {
+                    if let Some(r) = b.result() {
+                        renamed.insert(r, SsaValue(next as u32));
+                        next += 1;
+                    }
+                }
+                let subst_of = |v: SsaValue| -> SsaValue {
+                    subst
+                        .get(&v)
+                        .copied()
+                        .or_else(|| renamed.get(&v).copied())
+                        .unwrap_or(v)
+                };
                 let mut emit: Vec<SsaInstr> = Vec::with_capacity(body.len());
                 for b in body {
                     let mut new_instr = b.clone();
-                    let mut us = Vec::new();
-                    uses(b, &mut us);
-                    for u in us {
-                        let target = if let Some(a) = subst.get(&u) {
-                            *a
-                        } else {
-                            renamed.get(&u).copied().unwrap_or(u)
-                        };
-                        replace_operand(&mut new_instr, u, target);
-                    }
-                    if let Some(r) = new_instr.result() {
-                        let mapped = SsaValue(next as u32);
-                        next += 1;
-                        renamed.insert(r, mapped);
-                        new_instr = set_result(new_instr, mapped);
+                    map_operands(&mut new_instr, &subst_of);
+                    if let Some(r) = b.result() {
+                        new_instr = set_result(new_instr, renamed[&r]);
                     }
                     emit.push(new_instr);
                 }
@@ -1299,94 +1310,64 @@ fn max_value_id(func: &SsaFunction) -> u32 {
     max
 }
 
-/// 把指令里所有对 `from` 的引用换成 `to`。
-fn replace_operand(instr: &mut SsaInstr, from: SsaValue, to: SsaValue) {
+/// 对指令里**每个操作数**应用一次 `f`（同时替换，不是按值相等替换）。
+///
+/// 与"把值 `from` 换成 `to`"的写法相比，这里逐个操作数直接取映射结果，
+/// 不会被"刚换进去的新值恰好等于下一个待替换的旧值"误伤。内联时的批量
+/// 重命名必须用这个版本，见 `inline_functions` 里的注释。
+fn map_operands<F: Fn(SsaValue) -> SsaValue>(instr: &mut SsaInstr, f: &F) {
     match instr {
         SsaInstr::Unary { operand, .. } => {
-            if *operand == from {
-                *operand = to;
-            }
+            *operand = f(*operand);
         }
         SsaInstr::Binary { lhs, rhs, .. } => {
-            if *lhs == from {
-                *lhs = to;
-            }
-            if *rhs == from {
-                *rhs = to;
-            }
+            *lhs = f(*lhs);
+            *rhs = f(*rhs);
         }
         SsaInstr::Phi { incoming, .. } => {
             for (_, v) in incoming.iter_mut() {
-                if *v == from {
-                    *v = to;
-                }
+                *v = f(*v);
             }
         }
         SsaInstr::Call { args, .. } => {
             for a in args.iter_mut() {
-                if *a == from {
-                    *a = to;
-                }
+                *a = f(*a);
             }
         }
         SsaInstr::CallIndirect { callee, args, .. } => {
-            if *callee == from {
-                *callee = to;
-            }
+            *callee = f(*callee);
             for a in args.iter_mut() {
-                if *a == from {
-                    *a = to;
-                }
+                *a = f(*a);
             }
         }
         SsaInstr::Copy { src, .. } => {
-            if *src == from {
-                *src = to;
-            }
+            *src = f(*src);
         }
         SsaInstr::Load { ptr, .. } => {
-            if *ptr == from {
-                *ptr = to;
-            }
+            *ptr = f(*ptr);
         }
         SsaInstr::Store { ptr, value, .. } => {
-            if *ptr == from {
-                *ptr = to;
-            }
-            if *value == from {
-                *value = to;
-            }
+            *ptr = f(*ptr);
+            *value = f(*value);
         }
         // `cast` 的源操作数也要换：内联时被调函数的值号会换成调用点的，
         // 漏掉这一处，转换就会读到调用点里根本不存在的值号。
         SsaInstr::Cast { src, .. } => {
-            if *src == from {
-                *src = to;
-            }
+            *src = f(*src);
         }
         SsaInstr::SimdBinary {
             lhs, rhs, out, ..
         } => {
-            if *lhs == from {
-                *lhs = to;
-            }
-            if *rhs == from {
-                *rhs = to;
-            }
-            if *out == from {
-                *out = to;
-            }
+            *lhs = f(*lhs);
+            *rhs = f(*rhs);
+            *out = f(*out);
         }
         SsaInstr::Asm { outputs, inputs, .. } => {
             for (_, addr, _) in outputs.iter_mut() {
-                if *addr == from {
-                    *addr = to;
-                }
+                *addr = f(*addr);
             }
             for (_, v, _) in inputs.iter_mut() {
-                if *v == from {
-                    *v = to;
-                }
+                *v = f(*v);
             }
         }
         _ => {}
