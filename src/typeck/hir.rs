@@ -322,15 +322,20 @@ pub enum ExprKind {
     Struct(Vec<(String, HirExpr)>),
     /// Lambda / 闭包。
     ///
-    /// 第一版闭包走**单态化内联**：闭包只在它被定义的同一个函数里、被立即
-    /// 调用时生效。捕获列表记录闭包体引用的外层局部变量，调用点把闭包体展开
-    /// 进来，捕获变量直接复用外层 local 的 MIR 存储——不跨函数传递环境，因此
-    /// 不需要改后端调用约定。`params` 是已类型检查的形参（模式 + 类型），
-    /// `ret` 是返回类型，`body` 是闭包体。
+    /// 闭包。
+    ///
+    /// 两条出路：
+    /// - **无捕获**：`check_lambda` 直接提升成 `__closure_N` 顶层函数
+    ///   （表达式变成 `ExprKind::Def`），本变体不会出现在 HIR 里。
+    /// - **带捕获**：闭包作为**值**（存进 `let`、传参、返回）时，表达式类型
+    ///   是环境结构体 `__env_N`（字段 = 捕获局部，按发现顺序），`body` 保留
+    ///   内联体（捕获引用仍指向定义处外层 local）。调用点（`f(a)`，`f` 持有
+    ///   环境值）由 `apply_capture_body` 把内联体里捕获 local 的引用替换成
+    ///   `c.__cN` 后展开。`params` / `ret` 保持原样供签名核对。
     Closure {
         params: Vec<(HirPattern, Ty)>,
         ret: Box<Ty>,
-        body: HirBlock,
+        body: Option<HirBlock>,
         /// 被闭包体引用、且定义在闭包之外的外层局部变量（去重，按发现顺序）。
         /// `Ty` 是该 local 在闭包处的类型（用于将来 by-ref / by-value 捕获决策）。
         captures: Vec<(LocalId, Ty)>,

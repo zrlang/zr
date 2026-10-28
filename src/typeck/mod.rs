@@ -55,6 +55,24 @@ struct LiftedClosure {
     span: Span,
 }
 
+/// 带捕获闭包的值模型登记项（环境结构体 DefId → 签名与内联体）。
+///
+/// 捕获闭包作为值传递时，表达式类型是环境结构体 `__env_N`；这张表让
+/// 调用点能从环境值反查出要内联展开的闭包体。
+#[derive(Debug, Clone)]
+struct CapturedClosure {
+    /// 形参（模式 + 类型）。
+    params: Vec<(hir::HirPattern, Ty)>,
+    /// 返回类型。
+    ret: Ty,
+    /// 内联体（捕获引用仍指向定义处外层 local，调用点替换成环境字段）。
+    body: hir::HirBlock,
+    /// 捕获顺序（与环境结构体字段 `__cN` 一一对应）。
+    captures: Vec<(LocalId, Ty)>,
+    /// 闭包源码 span（报错用）。
+    span: Span,
+}
+
 /// 类型检查器。
 #[derive(Debug)]
 pub struct TypeChecker {
@@ -112,12 +130,9 @@ pub struct TypeChecker {
     generic_fn_span: Option<ast::Span>,
     /// 程序里出现过闭包（第一个的位置）。
     ///
-    /// 闭包还没有运行期表示：捕获分析与匿名结构体的生成都没做，MIR 侧只能
-    /// 闭包内联消费计数。
-    /// `closure_defined`：检查过程中产出的 `ExprKind::Closure` 个数。
-    /// `closure_consumed`：被 `check_call` 在调用点内联展开的个数。
-    /// 两者必须相等；不等说明有闭包被当值取走，超出同函数内联范围。
-    closure_defined: u32,
+    /// `closure_consumed`：被 `inline_closure_call` 内联展开的**立即调用**
+    /// 个数。带捕获闭包被当值取走（存变量 / 传参 / 返回）时靠环境结构体
+    /// `__env_N` 走 MIR，不再计数。
     closure_consumed: u32,
     /// 闭包捕获上下文栈。每层一项：进入闭包时该闭包**之外**所有可见的
     /// `LocalId`（即外层作用域里的局部变量，不含闭包自己的形参）。闭包体里
@@ -130,6 +145,16 @@ pub struct TypeChecker {
     ///
     /// 无捕获闭包本来就是一个普通函数，没有理由拒绝存进变量 / 当实参 /
     /// 返回（见 `tests/cases/83_closure_fnptr.zr` 的头注释）。`check_lambda`
+
+    /// 带捕获闭包的值模型：环境结构体 DefId → 闭包签名与内联体。
+    ///
+    /// 捕获闭包存进变量 / 传参 / 返回时，表达式类型是环境结构体
+    /// `__env_N`（字段 = 捕获局部，值拷贝）。调用点 `f(a)`（`f` 持有环境值）
+    /// 按 `Ty::Named(env_id)` 查这张表拿回闭包体与签名，`apply_capture_body`
+    /// 把内联体里捕获 local 的引用替换成 `f.__cN` 后在调用点展开。环境值按
+    /// 普通结构体传递，因此**同函数内**有效（调用方作用域里的捕获 local
+    /// 仍可达）；跨函数传值时捕获 local 生命周期不保证，暂不校验。
+    closures_by_env: HashMap<DefId, CapturedClosure>,
     /// 在捕获集为空、且闭包不是在"立即调用"位置时，登记到这里并返回
     /// `ExprKind::Def(def_id)`（函数指针）。函数体在 `finalize_lifted_closures`
     /// 里统一解析推断变量并挂进 `self.functions`。
@@ -250,11 +275,11 @@ impl Default for TypeChecker {
             type_params: Vec::new(),
             impl_generics: HashMap::new(),
             generic_fn_span: None,
-            closure_defined: 0,
             closure_consumed: 0,
             closure_ctx: Vec::new(),
             closure_captures: Vec::new(),
             lifted_closures: Vec::new(),
+            closures_by_env: HashMap::new(),
             infer: InferCtxt::empty(),
             next_def: 1,
             next_local: 1,
@@ -452,18 +477,10 @@ impl TypeChecker {
         // ===== 阶段 9：模式穷尽性检查 =====
         self.check_exhaustiveness(&functions)?;
 
-        // ===== 阶段 10：闭包一致性检查 =====
-        //
-        // 第一版闭包走单态化内联：闭包只能"在定义处立即被调用"（`(|x| x+1)(5)`）。
-        // `check_call` 会在调用点把闭包体内联展开并计数一次"消费"。这里核对
-        // 定义数与消费数：未被消费的闭包意味着它被当成值取走（存进变量 / 当
-        // 实参 / 返回），那超出了同函数内联的范围，明确报错而不是编出会崩的程序。
-        self.analyze_closures(&functions)?;
-
-        // ===== 阶段 11：未使用变量 / 未使用导入警告 =====
+        // ===== 阶段 10：未使用变量 / 未使用导入警告 =====
         self.check_unused(&functions)?;
 
-        // ===== 阶段 12：comptime 函数调用的编译期折叠 =====
+        // ===== 阶段 11：comptime 函数调用的编译期折叠 =====
         //
         // 必须排在类型检查与借用检查之后：求值器解释的是 HIR，需要名称
         // 解析与类型检查都已经完成。同时也排在最后——这样 const /
@@ -1679,10 +1696,26 @@ impl TypeChecker {
     fn check_stmt(&mut self, s: &Statement) -> Result<HirStmt> {
         match s {
             Statement::Let(_pat, ty_ann, init, span) => {
+                // 带捕获闭包作为值（`let cap = |x| x + n;`）：绑定类型是环境
+                // 结构体，不是函数类型。`infer_expr_ty` 对 Lambda 返回 `fn(..)`
+                // （那是"调用点视角"），但存下来的值实际是 `__env_N`。没有
+                // 标注时**只检查一次** Lambda、用其结果类型作绑定类型，并在
+                // 下方复用同一份 HIR——否则两次 `check_lambda` 会生成两个
+                // 不同的 `__env_N`，绑定类型与初值类型对不上。
+                let pre_checked: Option<HirExpr> = match (ty_ann, init) {
+                    (None, Some(Expression::Lambda(..))) => {
+                        let h = self.check_expr(init.as_ref().unwrap(), &Ty::Infer(InferId(0)))?;
+                        Some(h)
+                    }
+                    _ => None,
+                };
                 let ty = if let Some(t) = ty_ann {
                     self.ast_to_hir_type(t)?
                 } else if let Some(e) = init {
-                    self.infer_expr_ty(e)?
+                    pre_checked
+                        .as_ref()
+                        .map(|h| self.infer.resolve(&h.ty).clone())
+                        .unwrap_or(self.infer_expr_ty(e)?)
                 } else {
                     return Err(CompileError::type_error(
                         "type annotations needed for let-binding without initializer",
@@ -1690,7 +1723,10 @@ impl TypeChecker {
                     .with_span(*span));
                 };
                 let init_hir = if let Some(e) = init {
-                    let h = self.check_expr(e, &ty)?;
+                    let h = match (pre_checked, ty_ann) {
+                        (Some(h), _) => h,
+                        (None, _) => self.check_expr(e, &ty)?,
+                    };
                     self.check_partial_move(&h, e.span())?;
                     // `unify` 两参对称，顺序只影响文案：传反了 `let x: i32 = "hi"`
                     // 会报成 "expected `str`, found `i32`"。
@@ -3938,6 +3974,16 @@ impl TypeChecker {
             Some(c) => c,
             None => self.check_expr(callee, &callee_ty)?,
         };
+        // 带捕获闭包的值调用：被调方是一个环境结构体（`__env_N`，字段 =
+        // 捕获局部），不是普通函数指针。按环境 DefId 查 `closures_by_env`
+        // 拿回闭包签名与内联体，`apply_capture_body` 把捕获 local 替换成
+        // 环境字段后在调用点展开。`f(a)` / `f.f(a)`（`f` 是结构体字段）都
+        // 走这条路。
+        if let Ty::Named(env_id, _) = self.infer.resolve(&callee_hir.ty) {
+            if let Some(rec) = self.closures_by_env.get(&env_id).cloned() {
+                return self.apply_capture_body(callee_hir, &rec, args, expected, span);
+            }
+        }
         // 泛型函数：按实参类型生成单态实例，调用点直接指向实例。
         if let ExprKind::Def(id) = &callee_hir.kind {
             if let Some(call) = self.try_instantiate_call(*id, args, expected, span)? {
@@ -3988,6 +4034,26 @@ impl TypeChecker {
                 .cloned()
                 .unwrap_or_else(|| self.infer.fresh_infer(span));
             let arg = self.check_expr(a, &param_ty)?;
+            // 带捕获闭包（环境结构体 `__env_N`）传给 `fn(..)` 形参：环境值
+            // 不是函数指针，被调方拿不到捕获 local，跨函数环境传递机制
+            // 不存在，明确报错而不是把环境值当函数地址调用（运行必崩）。
+            if let Ty::Named(arg_id, _) = self.infer.resolve(&arg.ty) {
+                if self.closures_by_env.contains_key(&arg_id) {
+                    let param = self.infer.resolve(&param_ty);
+                    // 环境结构体传给 `fn(..)` 形参：被调方拿不到捕获 local，
+                    // 跨函数环境传递不存在，运行必崩。形参停在 Infer 也一样
+                    // 拒绝——它要么被绑成函数类型（上面），要么被绑成环境类型
+                    // 却仍被当函数指针调用，两者都错。
+                    if matches!(param, Ty::Function { .. } | Ty::Infer(_)) {
+                        return Err(CompileError::type_error(
+                        "captured closure cannot be passed as a plain `fn` value; \
+                         a closure that captures variables carries its environment and \
+                         cannot be converted to a function pointer",
+                    )
+                    .with_span(a.span()));
+                    }
+                }
+            }
             // 形参类型是推断变量（提升闭包的未标注形参，如 `let id = |x| x;`
             // 里 `x` 的类型要靠 `id(7)` 反推）：`check_literal` 对 `Infer`
             // 期望只给字面量默认类型（`Int(32)`），不会主动绑定推断变量。
@@ -6171,6 +6237,23 @@ impl TypeChecker {
         let mut captures = self.closure_captures.pop().unwrap();
         self.closure_ctx.pop();
         captures.dedup_by_key(|(l, _)| *l);
+        // 嵌套闭包捕获**向外传播**：内层闭包捕获了 `L`，而 `L` 对外层闭包
+        // 也是自由变量（在外层闭包的外层集合里），外层闭包必须一并捕获 `L`。
+        // 否则外层闭包会被提升成顶层函数（`lift_closure`），内层闭包的环境
+        // 字面量 `__env_N { __c0: L, .. }` 里引用的 `L` 就悬空了——顶层函数
+        // 没有外层局部，MIR 拿 `Local(L)` 读到未初始化的栈槽。例：
+        // `let a = 5; let outer = |b| { let inner = |c| c + a + b; inner(10) };`
+        // `inner` 捕获 `a` 与 `b`，`b` 是 `outer` 的形参（不在 `outer` 的外层
+        // 集合，不传播），`a` 是 `outer` 外层的局部（传播给 `outer`）。
+        if let Some(outer_ctx) = self.closure_ctx.last() {
+            if let Some(enclosing) = self.closure_captures.last_mut() {
+                for (l, ty) in &captures {
+                    if outer_ctx.contains(l) {
+                        enclosing.push((*l, ty.clone()));
+                    }
+                }
+            }
+        }
         let fn_ty = Ty::Function {
             params: hir_params.iter().map(|(_, t)| t.clone()).collect(),
             ret: Box::new(ret_ty.clone()),
@@ -6202,24 +6285,111 @@ impl TypeChecker {
         // 无捕获闭包提升成顶层函数：闭包不引用任何外层局部，本来就是普通
         // 函数（见 `tests/cases/83_closure_fnptr.zr` 头注释）。只有不在
         // "立即调用"位置时才提升——立即调用走单态化内联的老路子。
-        // 带捕获的闭包仍然拒绝（`analyze_closures` 兜底报错）。
         if liftable && captures.is_empty() {
             return self.lift_closure(hir_params, ret_ty, checked_body, fn_ty, span);
         }
-        // 只有**没有**提升的闭包才计入"定义数"：提升后的闭包是合法的
-        // `ExprKind::Def`，`analyze_closures` 不该因为它报错。立即调用走
-        // `inline_closure_call`，那边会 `closure_consumed += 1` 配对。
-        self.closure_defined += 1;
+        // 两条出路：
+        // 1. **立即调用**（`liftable=false`，由 `inline_closure_call` 调用）：
+        //    保留捕获列表与内联体，调用点直接把闭包体在定义处展开，捕获
+        //    local 复用外层 local（同函数内联，MIR 用得到）。
+        // 2. **非立即调用**（`liftable=true`，`let f = |..|`、传参、返回）：
+        //    无捕获时已 `lift_closure` 成顶层函数；带捕获时登记环境结构体
+        //    `__env_N`（字段 = 捕获局部，值拷贝），表达式类型是环境结构体。
+        //    调用点 `f(a)` 按环境 DefId 查 `closures_by_env` 拿回闭包体，
+        //    `apply_capture_body` 把内联体里捕获 local 替换成 `f.__cN` 后
+        //    在调用点展开。环境值按普通结构体传递，同函数内有效。
+        if !liftable {
+            // 立即调用路径：保留捕获，交给 `inline_closure_call` 展开。
+            return Ok(HirExpr {
+                kind: ExprKind::Closure {
+                    params: hir_params,
+                    ret: Box::new(ret_ty),
+                    body: Some(checked_body),
+                    captures,
+                },
+                ty: fn_ty,
+                span,
+            });
+        }
+        // 非立即调用、带捕获：登记环境结构体 + 闭包记录，返回**环境结构体
+        // 字面量**（不是 `ExprKind::Closure`——MIR 不会降级 Closure 值，它只
+        // 在立即调用里被内联展开掉）。字段 = 捕获局部，按发现顺序 `__cN`。
+        if !captures.is_empty() {
+            let env_id = self.closure_env_id(&captures)?;
+            self.closures_by_env.insert(
+                env_id,
+                CapturedClosure {
+                    params: hir_params.clone(),
+                    ret: ret_ty.clone(),
+                    body: checked_body.clone(),
+                    captures: captures.clone(),
+                    span,
+                },
+            );
+            let env_ty = Ty::Named(env_id, Vec::new());
+            // 环境结构体字面量：`__env_N { __c0: cap0, __c1: cap1, .. }`。
+            // 捕获 local 是外层局部，值拷贝进环境；MIR 按普通结构体降级。
+            let fields: Vec<(String, HirExpr)> = captures
+                .iter()
+                .enumerate()
+                .map(|(i, (cap_local, cap_ty))| {
+                    let cap_ty = self.infer.resolve(cap_ty);
+                    (
+                        format!("__c{i}"),
+                        HirExpr {
+                            kind: ExprKind::Local(*cap_local),
+                            ty: cap_ty.clone(),
+                            span,
+                        },
+                    )
+                })
+                .collect();
+            return Ok(HirExpr {
+                kind: ExprKind::Struct(fields),
+                ty: env_ty,
+                span,
+            });
+        }
+        // 非立即调用、无捕获：不应该走到这里（上面 `lift_closure` 已返回）。
         Ok(HirExpr {
             kind: ExprKind::Closure {
                 params: hir_params,
                 ret: Box::new(ret_ty),
-                body: checked_body,
-                captures,
+                body: Some(checked_body),
+                captures: Vec::new(),
             },
             ty: fn_ty,
             span,
         })
+    }
+
+    /// 带捕获闭包的环境结构体：`Ty::Named(env_id, [])`。
+    ///
+    /// 非泛型结构体：`Ty::Named` 的类型参数列表必须为空。`type_defs` 里
+    /// 登记 `HirStruct`（字段 = 捕获局部，按发现顺序），让 `lookup_field` /
+    /// `struct_layout` / `copy_struct_value` 能按名取字段。返回环境 DefId。
+    fn closure_env_id(&mut self, captures: &[(LocalId, Ty)]) -> Result<DefId> {
+        let id = self.alloc_def(format!("__env_{}", self.next_def));
+        let name = format!("__env_{}", id.0);
+        self.def_names.insert(id, name.clone());
+        self.type_defs.insert(
+            id,
+            hir::HirTypeDef::Struct(hir::HirStruct {
+                name,
+                attrs: Vec::new(),
+                repr: hir::Repr::Rust,
+                fields: captures
+                    .iter()
+                    .enumerate()
+                    .map(|(i, (_, t))| hir::HirField {
+                        name: format!("__c{i}"),
+                        ty: t.clone(),
+                        index: i,
+                    })
+                    .collect(),
+            }),
+        );
+        Ok(id)
     }
 
     /// 把无捕获闭包提升成顶层函数，表达式变成函数指针（`ExprKind::Def`）。
@@ -6269,6 +6439,121 @@ impl TypeChecker {
         Ok(HirExpr {
             kind: ExprKind::Def(def_id),
             ty: fn_ty,
+            span,
+        })
+    }
+
+    /// 把带捕获闭包的环境值在调用点内联展开：`f(a)`（`f` 是 `__env_N`）。
+    ///
+    /// 环境值是普通结构体（字段 = 捕获局部，按发现顺序 `__cN`）。展开时：
+    /// 1. 为每个形参新建局部绑定实参（避免带副作用的实参被重复求值）；
+    /// 2. 把内联体里捕获 local 的引用替换成 `f.__cN`（`f` 是环境值 local，
+    ///    MIR 走 `Field(Local(f))`）。
+    /// 形参 local 是闭包体检查时分配的，与调用方局部不冲突，直接保留。
+    fn apply_capture_body(
+        &mut self,
+        env_expr: HirExpr,
+        rec: &CapturedClosure,
+        args: &[ast::Argument],
+        expected: &Ty,
+        span: ast::Span,
+    ) -> Result<HirExpr> {
+        // 环境值必须是一个 local（`let f = |..|` 存下来的结构体值），或一个
+        // 结构体字段（`ops.f`）。取其 base local 作替换目标；非 local 直接报错。
+        let env_base: LocalId = match &env_expr.kind {
+            ExprKind::Local(l) => *l,
+            ExprKind::Field(v, _) => match &v.kind {
+                ExprKind::Local(l) => *l,
+                _ => {
+                    return Err(CompileError::type_error(
+                        "closure environment must be a local variable",
+                    )
+                    .with_span(span));
+                }
+            },
+            _ => {
+                return Err(CompileError::type_error(
+                    "closure environment must be a local variable",
+                )
+                .with_span(span));
+            }
+        };
+        let env_ty = env_expr.ty.clone();
+        // 形参绑定：复用闭包体检查时分配的形参 local（与调用方局部不冲突）。
+        let mut prelude: Vec<hir::HirStmt> = Vec::with_capacity(args.len());
+        let mut lam_body = rec.body.clone();
+        for ((pat, ty), arg) in rec.params.iter().zip(args.iter()) {
+            let local = match pat {
+                hir::HirPattern::Binding(l) => *l,
+                _ => {
+                    return Err(CompileError::type_error(
+                        "closure destructuring parameters are not yet supported",
+                    )
+                    .with_span(span));
+                }
+            };
+            let arg_ast = match arg {
+                ast::Argument::Pos(e) => e,
+                ast::Argument::Named(_, e) => e,
+            };
+            let arg_hir = self.check_expr(arg_ast, ty)?;
+            prelude.push(hir::HirStmt::Let {
+                local,
+                init: Some(Box::new(arg_hir)),
+            });
+        }
+        // 把内联体里捕获 local 的引用替换成 `env_base.__cN`。
+        for (i, (cap_local, cap_ty)) in rec.captures.iter().enumerate() {
+            let cap_ty = self.infer.resolve(cap_ty);
+            let with = HirExpr {
+                kind: ExprKind::Field(
+                    Box::new(HirExpr {
+                        kind: ExprKind::Local(env_base),
+                        ty: env_ty.clone(),
+                        span: rec.span,
+                    }),
+                    format!("__c{i}"),
+                ),
+                ty: cap_ty,
+                span: rec.span,
+            };
+            walk_block(&mut lam_body, *cap_local, &with);
+        }
+        // 闭包体里的 `return` 属于**闭包**，不是外层函数。内联到调用点后，
+        // `Return(Some(e))` 会被 MIR 当成"从外层函数返回"，把调用点之后的
+        // 代码全部跳过——`let r = |x| { return x + 1; }; r(41)` 的 `r(41)`
+        // 展开成 `return 42;`，`main` 直接返回 42，后续断言全不跑。
+        //
+        // 处理：闭包体最后一句若是 `Return(Some(e))`（`{ return e; }` 这种
+        // 常见形状），把这一句从 stmts 里摘出来，换成块尾表达式 `e`——闭包
+        // 的返回值本来就是 `e`，调用点消费这个块的值，语义一致。体内中间的
+        // `return` 需要更复杂的基本块变换，暂不支持（会报"unreachable"，
+        // 与 Rust 的 `unreachable` 语义接近，但不静默返回错值）。
+        if lam_body.tail.is_none() {
+            let tail_ret = match lam_body.stmts.last() {
+                Some(HirStmt::Expr(last)) => match &last.kind {
+                    ExprKind::Return(Some(ret_val)) => Some(ret_val.clone()),
+                    _ => None,
+                },
+                _ => None,
+            };
+            if let Some(ret_val) = tail_ret {
+                lam_body.stmts.pop();
+                lam_body.tail = Some(ret_val);
+            }
+        }
+        let result_ty = match self.infer.resolve(&rec.ret) {
+            Ty::Infer(_) => self.infer.resolve(expected).clone(),
+            other => other,
+        };
+        let mut inline_stmts = prelude;
+        inline_stmts.extend(lam_body.stmts);
+        Ok(HirExpr {
+            kind: ExprKind::Block(hir::HirBlock {
+                stmts: inline_stmts,
+                tail: lam_body.tail,
+            }),
+            ty: result_ty,
             span,
         })
     }
@@ -6351,8 +6636,14 @@ impl TypeChecker {
     ///
     /// 在调用点把闭包体展开：为每个形参新建一个局部变量绑定实参（避免带
     /// 副作用的实参被重复求值），然后把闭包体里对形参的引用替换成该新局部。
-    /// 捕获变量保持对原外层 local 的引用——它们在调用点作用域可见，MIR 直接
-    /// 用得到。这样不引入跨函数环境传递，完全复用现有后端。
+    ///
+    /// 带捕获的闭包（`(|x| x + n)(2)`，`n` 是外层 local）：闭包体里对捕获
+    /// local 的引用**直接复用调用方的 local**（同函数内联，MIR 用得到），
+    /// 不引入环境结构体。形参绑定走新 local，替换进闭包体。
+    ///
+    /// 与 `apply_capture_body`（带捕获闭包**当值**取走的调用）分工：这里只
+    /// 处理"定义处立即调用"（`liftable=false`），捕获引用在调用方作用域里
+    /// 有效；值调用走环境结构体替换成 `f.__cN`。
     fn inline_closure_call(
         &mut self,
         params: &[ast::LambdaParam],
@@ -6365,15 +6656,27 @@ impl TypeChecker {
     ) -> Result<HirExpr> {
         let lam = self.check_lambda(params, ret, body, &Ty::Unit, lam_span, false)?;
         self.closure_consumed += 1;
-        let (hir_params, ret_ty, mut lam_body, _captures) = match lam.kind {
+        let (hir_params, ret_ty, lam_body_opt, _captures, _lam_ty) = match &lam.kind {
             ExprKind::Closure {
                 params,
                 ret,
                 body,
                 captures,
-            } => (params, *ret, body, captures),
+            } => (
+                params.clone(),
+                ret.as_ref().clone(),
+                body.clone(),
+                captures.clone(),
+                lam.ty.clone(),
+            ),
             _ => unreachable!("check_lambda always yields ExprKind::Closure"),
         };
+        let lam_body = lam_body_opt.ok_or_else(|| {
+            CompileError::type_error(
+                "closure body is not available for inlining",
+            )
+            .with_span(lam_span)
+        })?;
         if hir_params.len() != args.len() {
             return Err(CompileError::type_error(format!(
                 "closure expects {} argument(s), but {} were supplied",
@@ -6396,10 +6699,13 @@ impl TypeChecker {
                 }
             }
         }
-        // 形参/实参绑定：`let new_i = arg_i;`。新 local 登记进类型表，供 MIR
-        // 识别；同时把闭包体里对原形参 local 的引用替换成 `Local(new_i)`。
         self.push_scope();
         let mut prelude: Vec<hir::HirStmt> = Vec::with_capacity(args.len());
+        // 带捕获立即调用（`(|x| x + n)(2)`，`n` 是外层 local）：闭包体里对
+        // 捕获 local 的引用直接复用调用方的 local（同函数内联，MIR 用得到），
+        // 不引入环境结构体。形参绑定走新 local（避免带副作用的实参被重复
+        // 求值），替换进闭包体。
+        let mut lam_body = lam_body;
         for ((orig, ty), arg) in param_locals.iter().zip(args.iter()) {
             let arg_ast = match arg {
                 ast::Argument::Pos(e) => e,
@@ -6439,19 +6745,6 @@ impl TypeChecker {
             ty: result_ty,
             span,
         })
-    }
-
-    fn analyze_closures(&self, _functions: &[hir::HirFunction]) -> Result<()> {
-        // 闭包一致性核对：第一版只支持"在定义处立即调用"（单态化内联）。
-        // 闭包被当成值取走（存进变量 / 当实参 / 返回）超出范围，明确报错。
-        if self.closure_defined != self.closure_consumed {
-            return Err(CompileError::type_error(format!(
-                "closures can only be invoked immediately where they are defined \
-                 ({} defined, {} consumed); storing or passing a closure is not yet supported",
-                self.closure_defined, self.closure_consumed,
-            )));
-        }
-        Ok(())
     }
 
     // ==================================================================
