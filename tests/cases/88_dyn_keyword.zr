@@ -1,0 +1,28 @@
+// 覆盖：`dyn Trait` trait 对象类型解析与类型检查（最小实现）。
+//
+// 背景：zr 早先无 `dyn` 关键字（AGENTS §4 / CLAUDE §7 P0）。
+// 现在加上词法、解析、类型检查三层的骨架，使 `dyn Error` 这类用法
+// 能被解析并通过类型检查。完整 vtable 分派与 trait-object 转换
+// 仍在未实现状态，本用例只钉住「能接受该类型而不报解析/类型错」
+// 这一半——即参数/局部注解里出现 `dyn Trait` 不再报错。
+//
+// 运行期行为（调用 trait 方法）不在此用例范围。
+fn main() -> i32 {
+    // `dyn Trait` 类型在参数注解里出现：类型检查接受它（不报"未知类型"）。
+    let _x: &dyn Error;
+    return 0;
+}
+
+trait Error {
+    fn description(self) -> str;
+}
+
+struct SimpleError {
+    pub msg: str,
+}
+
+impl Error for SimpleError {
+    fn description(self) -> str {
+        return self.msg;
+    }
+}

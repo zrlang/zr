@@ -7124,8 +7124,7 @@ impl TypeChecker {
                 let Some(id) = trait_id else {
                     return Err(CompileError::type_error(
                         "`dyn` requires at least one trait bound",
-                    )
-                    .with_span(span));
+                    ));
                 };
                 Ty::Dyn(id)
             }
@@ -8334,6 +8333,7 @@ fn ty_name(ty: &Ty) -> String {
         Ty::Infer(_) => "_".into(),
         Ty::Opaque(id) => format!("opaque({})", id.0),
         Ty::Pin(inner) => format!("Pin<{}>", ty_name(inner)),
+        Ty::Dyn(trait_id) => format!("dyn trait#{}", trait_id.0),
     }
 }
 

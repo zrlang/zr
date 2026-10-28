@@ -667,6 +667,7 @@ fn keyword_or_symbol(t: &TokenKind) -> &'static str {
         TokenKind::KwDefault => "default",
         TokenKind::KwGoto => "goto",
         TokenKind::KwUnsafe => "unsafe",
+        TokenKind::KwDyn => "dyn",
         TokenKind::KwStruct => "struct",
         TokenKind::KwEnum => "enum",
         TokenKind::KwUnion => "union",

@@ -127,6 +127,7 @@ impl<'a> InferCtxt<'a> {
             Ty::Str => 16, // ptr + len
             Ty::Unit | Ty::Never => 0,
             Ty::Pointer(..) | Ty::Reference(..) => 8,
+            Ty::Dyn(_) => 16, // 胖指针：data + vtable
             Ty::Array(inner, len) => {
                 let n = match len {
                     hir::ArrayLen::Const(_) => 1, // 简化：无法求值时按 1 计
@@ -211,6 +212,7 @@ impl<'a> InferCtxt<'a> {
             Ty::Str | Ty::Slice(..) => 8,
             Ty::Unit | Ty::Never => 1,
             Ty::Pointer(..) | Ty::Reference(..) | Ty::Function { .. } => 8,
+            Ty::Dyn(_) => 8, // 胖指针对齐
             Ty::Array(inner, _) => self.align_of(inner),
             Ty::Tuple(tys) => tys.iter().map(|t| self.align_of(t)).max().unwrap_or(1),
             Ty::Optional(inner) | Ty::ErrorUnion(inner, _) => self.align_of(inner).max(1),
@@ -600,6 +602,11 @@ impl<'a> InferCtxt<'a> {
             Ty::ErrorUnion(t, e) => {
                 format!("{}!{}", self.type_name(t), self.type_name(e))
             }
+            Ty::Dyn(trait_id) => {
+                // 暂用 DefId 编号显示 trait 名；完整实现应在类型定义表
+                // 里反查 trait 名称。
+                format!("dyn trait#{}", trait_id.0)
+            }
             Ty::Infer(_) => "_".into(),
             Ty::Opaque(id) => format!("opaque({})", self.type_id_name(*id)),
             Ty::Pin(inner) => format!("Pin<{}>", self.type_name(inner)),
@@ -668,6 +675,7 @@ impl fmt::Display for Ty {
             Ty::Infer(_) => "_".to_string(),
             Ty::Opaque(_) => "opaque".to_string(),
             Ty::Pin(inner) => format!("Pin<{}>", inner),
+            Ty::Dyn(trait_id) => format!("dyn trait#{}", trait_id.0),
         };
         f.write_str(&name)
     }
