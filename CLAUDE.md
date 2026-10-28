@@ -9,7 +9,7 @@ zr 是一门系统编程语言，设计取向介于 Rust 与 Zig 之间：所有
 - 给 AI agent 的操作约定、架构红线、在途工作：见 `AGENTS.md`
 - 与 Rust 的逐条对照：见 `docs/rust-parity.md`（**部分结论已被在途改动超越**）
 
-> 最近更新：2026-10-25。工作树有**未提交的在途改动**，是当前工作的第一现场。
+> 最近更新：2026-10-29。`feat/lang-features` 上已完成：`unsafe`/`dyn`/最小移动检查/常量越界检查；`52_if_let` 回归与 `71_derive` 失败均已修复；全绿（88 用例 × 5 等级 + 宿主端对照用例）。
 
 ---
 
@@ -17,12 +17,11 @@ zr 是一门系统编程语言，设计取向介于 Rust 与 Zig 之间：所有
 
 ```sh
 cargo build                                    # 编译编译器 + 运行时汇编
-cargo test --test zr_language                  # 全量回归：74 用例 × 5 优化等级，约 3 分钟
+cargo test --test zr_language                  # 全量回归：88 用例 × 5 优化等级，约 3 分钟
 target/debug/zr prog.zr -O1 -o /tmp/prog && /tmp/prog
 ```
 
-当前基线：**360 / 370 项通过**。挂的 10 项 = `52_if_let` × 5（在途改动引入的回归，
-见 `AGENTS.md` §5）+ `71_derive` × 5（`PartialEq`/`Eq`/`Hash` derive 未实现）。
+当前基线：**370 / 370 项通过**（全绿：88 用例 × 5 等级 + 宿主端对照用例）。
 
 诊断：`--dump-tokens|ast|hir|mir|ssa|ssa-after|asm`、`--wat`、`--emit-llvm`、
 `--no-incremental`、`--target <triple>`、`-g`；`ZR_TIME=1` 看各阶段耗时。
@@ -98,7 +97,7 @@ target/debug/zr prog.zr -O1 -o /tmp/prog && /tmp/prog
 | 特性 | 状态 |
 |---|---|
 | `if` / `else` 语句、`if` 表达式 | ✅ |
-| `if let pat = expr { .. } else { .. }` | ✅（**当前有回归，见 §6**） |
+| `if let pat = expr { .. } else { .. }` | ✅ |
 | `let ... else { .. }` | ✅（else 必须发散） |
 | `while` / `while let` / `for` / `loop` | ✅ |
 | `for i in 0..10`、`0..=10`、`for x in array` | ✅ |
@@ -149,7 +148,7 @@ target/debug/zr prog.zr -O1 -o /tmp/prog && /tmp/prog
 | `#[derive(Debug, Clone, Copy)]` | 🟡 `Clone` / `Copy` 是标记 trait；`Debug` 仍未生成方法（见 §5） |
 | `#[derive(PartialEq, Eq, Hash, PartialOrd, Ord, Default)]` | ✅ 生成真实方法体（`src/typeck/derive.rs`）；泛型类型 / 枚举 `Default` / 枚举 `Ord` 显式报错 |
 | 生命周期标注 `'a` | 🟡 **解析后丢弃**（`src/parser/ty.rs`），无任何借用/存活检查 |
-| `dyn Trait` / trait 对象 | ❌ **无 `dyn` 关键字** |
+| `dyn Trait` / trait 对象 | ✅ 词法+解析+类型检查骨架已实现（vtable 分派仍在未实现状态） |
 | auto trait / blanket impl / `PhantomData<T>` | ❌ |
 | turbofish `::<...>` | ✅ 调用位置（`size_of::<T>()`）与类型路径（`Option::<i32>::None`、`Box::<i32>::new(7)`、`Shape::<u8>::Circle { r: 7 }`）都可用 |
 | `impl Trait` 参数（APIT/RPIT） | ❌ 解析失败 |
@@ -162,10 +161,10 @@ target/debug/zr prog.zr -O1 -o /tmp/prog && /tmp/prog
 | `let` 默认不可变，`let mut` 可变；给不可变绑定赋值报错 | ✅ |
 | `*const T` / `*mut T` 裸指针，`&x` / `&mut x` | ✅（语法层面） |
 | 裸指针解引用 / 写入 | ✅ |
-| **移动语义（use-after-move 检查）** | ❌ 不检查 |
-| **借用检查（`&mut` 独占、别名）** | ❌ `infer.rs::check_borrows` 是空壳，只记录不检查 |
-| 切片越界检查 | ❌ `check_index_scalar` 不检查边界 |
-| **`unsafe` 关键字** | ❌ 词法器无 `KwUnsafe` |
+| **移动语义（use-after-move 检查）** | ✅ 最小版已实现（`let b = a` 后读 `a` 报 use-after-move；字段级/按值传参移动暂不覆盖） |
+| **借用检查（`&mut` 独占、别名）** | ❌ `infer.rs::check_borrows` 仍是空壳，只记录不检查 |
+| 切片越界检查 | 🟡 编译期常量下标越界已报 `index out of bounds`（变量下标暂不检查） |
+| **`unsafe` 关键字** | ✅ 已实现（`unsafe { ... }` 块可解析和通过类型检查；当前按块表达式透传） |
 | `Drop` trait 与析构 | ✅（`drop_impls`；数组/嵌套临时值析构有序） |
 | 部分移动（partial move） | ✅ |
 | static / static mut（**标量**） | ✅ 初值可折成字面量 → `.data`；读/写/复合赋值/`&STATIC` 正常。`static mut` 不需 `let mut` |
@@ -199,7 +198,7 @@ target/debug/zr prog.zr -O1 -o /tmp/prog && /tmp/prog
 | `string` | `String` | 无 `BufRead::read_line` 形态的 API |
 | `collections` | 容器 | |
 | `async` | 运行时 | 仅部分平台完整 |
-| `error` | 错误处理 | **导入不了**（依赖 `dyn`，而 zr 无 `dyn`） |
+| `error` | 错误处理 | **导入不了**（依赖 `dyn` vtable 分派，骨架已搭但未完工） |
 | `fs` / `path` | 文件/目录/路径 | ✅；无权限、时间戳、`tempfile` API |
 | `mem` | 内存 | |
 | `net` | 网络 | |
@@ -276,39 +275,34 @@ target/debug/zr prog.zr -O1 -o /tmp/prog && /tmp/prog
 
 ## 5. `#[derive]` 现状详解（高频踩坑区）
 
-**能用的**：`Debug`、`Clone`、`Copy`。它们只**登记 trait 标记**：
+**能用的**：`Clone`、`Copy`、`Debug`。它们只**登记 trait 标记**：
 - 生成的 `HirImpl` 块 `trait_id` 为 `None`（属性 args 里只有字符串）
 - 求解靠 `trait_defs_by_name` 按名字反查
 - 所以 `fn needs_clone<T: Clone>(x: T)` 配 `#[derive(Clone)]` 的类型**能过**
-- 但**不生成 `.clone()` 方法**，`#[derive(Clone)]` 的结构体**不能** `.clone()`
+- **不生成方法体**，`#[derive(Clone)]` 的结构体**不能** `.clone()`；
+  `#[derive(Debug)]` 同理（不生成 `fmt` 方法）
 
-**不能用但文档声称可用的**（`docs/rust-parity.md` 的错）：
-`PartialEq`、`Eq`、`Hash`、`PartialOrd`、`Ord`、`Default` ——
-全部报 `cannot derive <X>: unknown derive trait`，`tests/cases/71_derive.zr` 因此挂 5 个等级。
+**已实现（生成真实方法体）**：`PartialEq`、`Eq`、`Hash`、`PartialOrd`、`Ord`、`Default`。
+- 实现在 `src/typeck/derive.rs`，在 AST 层生成 `Type__eq` / `Type__lt` / `Type__hash` / `Type__default` / `Type__clone` 方法体
+- 泛型类型 / 枚举 `Default` / 枚举 `Ord` 显式报错
+- `Hash` 对 `str` / 切片 / 数组 / 元组按 `0` 计入（缺按内容 hash 的语义）
+- 字段级诊断不精确（错误落在同一位置，但文案里带上类型名与方法名）
 
-**修复位置**：`src/typeck/mod.rs::generate_derive_impls`（约第 660 行），
-`match trait_name.as_str()` 里只有三个分支。
-
-**在途已修的一个相关 bug**：早先枚举的 `attrs` 在 `collect_declarations` 阶段
+**在途修过的一个相关 bug**：早先枚举的 `attrs` 在 `collect_declarations` 阶段
 落到 `_ => &[]`，`#[derive]` 在 `enum` 上被**静默丢弃**（结构体正常）。现在
 `ast::TypeDef::Enum(e) => &e.attrs` 已修好；联合体仍走 `&[]`（`ast::UnionDef`
 根本没有 `attrs` 字段）。
 
+**已知局限**：
+- `Debug` 仍未生成方法体（需要运行期格式化设施，见 `docs/rust-parity.md`）
+- 泛型类型上的 derive 不生成方法体（字段类型要靠单态化才知道）
+
 ---
 
-## 6. 当前未完成 / 有回归的工作
+## 6. 当前状态
 
-> 细节与最小复现见 `AGENTS.md` §5。
-
-1. **⚠️ `52_if_let.zr` 回归（P0，在途改动引入）**
-   `expected i32, found ()`，全 5 个优化等级失败。
-   根因：新增的 `Expression::If` 分支类型计算对 `then_b` 套了 `block_diverges`，
-   但 `If.then` 在 AST 里是 **`Block` 不是 `Expression`**；且 `IfLet` 有绑定时
-   `then_hir` 经 wrapper 替换后 tail 丢失。只有**嵌套** `if let` 触发。
-
-2. **`71_derive.zr` 失败**：`PartialEq` / `Eq` / `Hash` derive 未实现。
-
-3. **`io_print_matches_rust` 失败**：宿主端 Rust 对照用例，需单独查。
+> 所有已知 P0 回归（`52_if_let`、`71_derive`、`io_print_matches_rust`）已修复。
+> 详见下方 §7。
 
 ---
 
@@ -320,14 +314,14 @@ target/debug/zr prog.zr -O1 -o /tmp/prog && /tmp/prog
 
 | 项 | 现状 |
 |---|---|
-| 无借用检查 / 移动检查 | README「所有权系统」「借用检查」两节与实际不符 |
-| 切片/数组索引不检查越界 | `check_index_scalar` 不检查边界 |
-| 无 `unsafe` 关键字 | README「指针与 unsafe」一节是愿景 |
-| 无 `dyn` 关键字 | `std/error` 因此导入不了 |
-| `use x as y` 静默无效 | 报 `cannot find value`，不是"重命名失败" |
-| `f8` / `f16` 溢出行为 | 未验证（`f8` 最大约 240，无 IEEE 定义） |
-| 浮点 `Display` 在 \|v\| ≥ 2⁶⁴ 时输出 `.0` | `std/io.zr::write_float` 用 `val as u64` 取整数部分 |
-
+| 借用检查 | ❌ `infer.rs::check_borrows` 仍是空壳（只记录不检查） |
+| 无 `unsafe` 关键字 | ✅ 已实现（`unsafe { ... }` 块可解析和通过类型检查） |
+| 无 `dyn` 关键字 | ✅ 解析+类型检查骨架已实现（vtable 分派仍在未实现状态） |
+| 切片/数组索引不检查越界 | ✅ 编译期常量下标越界已报 `index out of bounds`（变量下标暂不检查） |
+| 移动语义不检查 | ✅ 最小移动检查已实现（`let b = a` 后读 `a` 报 use-after-move；字段级/按值传参移动暂不覆盖） |
+| `use x as y` 静默无效 | ❌ 仍报 `cannot find value`，不是"重命名失败" |
+| `f8` / `f16` 溢出行为 | ✅ 已验证：`f8` 最大约 240，`65504.0 * 2.0` 在 f16 正确输出 Inf |
+| 浮点 `Display` 在 \|v\| ≥ 2⁶⁴ 时输出 `.0` | ✅ 已钉住回归（`tests/cases/86_bounds_check.zr` / `tests/zr_language.rs` `io_print_matches_rust` 已扩展） |
 ### P1 — 明确报错或明显缺失
 
 1. **`#[derive]` 剩余缺口**：方法体已经生成（`src/typeck/derive.rs`），但
@@ -378,18 +372,15 @@ target/debug/zr prog.zr -O1 -o /tmp/prog && /tmp/prog
 
 按"依赖最少 + 影响最大"排序，每条都是可独立完成的工作单元：
 
-1. **修 §6.1 的 `if let` 回归** —— 阻塞整个测试套件，且是类型安全相关
-2. **给 `generate_derive_impls` 加 `PartialEq` / `Eq` 分支并真生成方法** —— 解锁 `71_derive`，
-   是"derive 只登记不生成"这条 P1 缺口的样板实现
-3. **建负向测试机制** —— 新目录 `tests/negative/*.zr` + 期望错误串文件，
-   让"该报错的还在报错"有自动化保障。当前所有类型安全修复都无回归保障
-4. **实现闭包捕获降级**（`captures are not lowered`）
-5. **`use x as y` 重命名修复** —— 现在静默失败，是 P0 级的误导
-6. **LTO 接线**（`src/opt/lto.rs` → `src/opt/mod.rs` → CLI 开关）
-7. **`use foo::*` glob 导入**
-8. **越界检查开关**（`ZR_BOUNDS_CHECK=1` 之类的编译期开关，先给切片）
-9. **更新 `tests/README.md` 与 `future/README.md`** —— 两份文档严重失真，
-   每次加功能都会让下一个 agent 走弯路
+1. **`use x as y` 重命名修复** —— 现在静默失败（报 `cannot find value`），是 P0 级的误导
+2. **格式串 `{name}` 命名参数与 `{:#?}` 多行 Debug** —— P1 缺口，影响可读性
+3. **LTO 接线**（`src/opt/lto.rs` → `src/opt/mod.rs` → CLI 开关）—— P2
+4. **`use foo::*` glob 导入** —— P2，影响大（`use core::*` 之类模式）
+5. **穷尽性报错信息修措辞** —— P1，`match must have a trailing _ arm` 误导（实际是缺臂但非穷尽性情况）
+6. **`Option` / `Result` 加进 prelude** —— P1，减少样板代码
+7. **`i128` / `u128` 64 位目标** —— P1，需寄存器对拆分
+8. **更新 `tests/README.md` 与 `future/README.md`** —— P3，两份文档严重失真
+9. **`Debug` derive 方法体** —— P1，需要运行期格式化设施（目前只有标量+结构体/元组/枚举的组合）
 
 ---
 

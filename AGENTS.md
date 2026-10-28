@@ -4,7 +4,7 @@ zr 是一门系统编程语言（Rust/Zig 混合取向），编译器用 Rust �
 本文件给在代码库里工作的 AI agent 看，是操作约定与"哪些文档可信"的清单。
 项目入口与功能全景见根目录 `CLAUDE.md`。
 
-> 最近更新：2026-10-27。工作树干净；`feat/lang-features` 上连续几个提交修的都是
+> 最近更新：2026-10-29。工作树干净；`feat/lang-features` 上连续几个提交修的都是
 > "编译通过、运行不崩、结果全错"的静默 bug，清单见 §5。
 
 ---
@@ -187,10 +187,10 @@ README 里"指针与 unsafe"一节目前是**愿景**：
 ### `cargo test` 当前基线（2026-10-27，全绿）
 
 - `cargo test --bin zr`：265 项。
-- `cargo test --test zr_language`：82 个用例 × 5 个优化等级 = 410 项（含宿主端
+- `cargo test --test zr_language`：88 个用例 × 5 个优化等级 = 440 项（含宿主端
   `io_print_matches_rust`，它逐字符对比 Rust 的格式化输出，含 `{:e}` / `{:E}`
-  与动态宽度/精度）。
-- `cargo test --test zr_negative`：15 个负向用例。
+  与大浮点 Display（`|v| ≥ 2⁶⁴` 不带 `.0`）的回归）。
+- `cargo test --test zr_negative`：17 个负向用例（含新加的越界与 use-after-move）。
 
 ### 最近修掉的静默 bug（都在 `tests/` 里留了钉子）
 
@@ -203,19 +203,21 @@ README 里"指针与 unsafe"一节目前是**愿景**：
   `xor rax, r8`，零常量变成"用 rax 异或"。症状是 `match` 里返回常量 `false`
   的路径给出 32513 之类的垃圾。钉子：`tests/cases/79_zero_const_high_reg.zr`。
 
-### 仍然缺的（按 `docs/rust-parity.md` 第五节的 P1 顺序）
+### 在途工作（`feat/lang-features` 上）
 
-- `#[derive]` 的方法体已经能生成（`src/typeck/derive.rs`），**剩**：`Debug`
-  仍是标记 trait；泛型类型 / 枚举 `Default` / 枚举 `Ord` 显式报错；字段级诊断
-  不精确。
-- 没有 `unsafe` / `dyn`（trait 对象不可用 ⇒ `std/error` 导入不了）。
-- 没有借用检查 / 移动检查。
-- 元数据（权限、时间戳）与 `tempfile` 缺失。
-- 格式串只剩命名参数 `{name}` 与多行 Debug `{:#?}` 没做（`#` 对 `{:?}` 被忽略，
-  只输出一行）；`{:e}` / `{:E}` 与动态宽度/精度已与 Rust 对齐。
-- 闭包：**无捕获**闭包已可存进变量 / 当实参 / 返回（提升成 `__closure_N` 顶层
-  函数指针）；**带捕获**闭包只支持"定义处立即调用"（`(|x| x + 1)(5)`），存进变量 /
-  当实参 / 返回会报错；`i128`/`u128` 在 64 位目标不可用。
+以下项已在本分支上完成或部分完成，更新如下：
+
+- **`#[derive]`**：方法体已生成（`PartialEq`/`Eq`/`Hash`/`PartialOrd`/`Ord`/`Default`），
+  **剩**：`Debug` 仍是标记 trait（不生成方法体）；泛型类型 / 枚举 `Default` / 枚举 `Ord`
+  显式报错；字段级诊断不精确。
+- **`unsafe` 关键字**：✅ 已实现（`unsafe { ... }` 块可解析和通过类型检查；当前不改变语义，按块表达式透传）。
+- **`dyn` 关键字**：✅ 词法+解析+类型检查骨架已实现；vtable 分派仍在未实现状态。
+- **借用检查**：❌ `infer.rs::check_borrows` 仍是空壳（只记录不检查）。
+- **移动检查**：✅ 最小版已实现（`let b = a` 对含 drop glue 的类型是移动，读被移动的源报错）。
+- **元数据**（权限、时间戳）与 `tempfile` 缺失。
+- **格式串**：命名参数 `{name}` 与多行 Debug `{:#?}` 没做；`#` 对 `{:?}` 被忽略，只输出一行。
+- **闭包**：**无捕获**闭包已可存进变量/当实参/返回（提升成 `__closure_N` 顶层函数指针）；**带捕获**闭包已可存进变量/嵌套/多次调用（`tests/cases/84_closure_capture_value.zr`），但跨函数传 env 仍有限制。
+- **`i128`/`u128`** 在 64 位目标上不可用（需寄存器对拆分）。
 
 ## 6. 工作约定
 
