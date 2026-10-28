@@ -813,6 +813,7 @@ fn keyword(text: &str) -> Option<TokenKind> {
         "default" => TokenKind::KwDefault,
         "goto" => TokenKind::KwGoto,
         "unsafe" => TokenKind::KwUnsafe,
+        "dyn" => TokenKind::KwDyn,
 
         // 类型系统
         "struct" => TokenKind::KwStruct,

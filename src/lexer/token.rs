@@ -93,6 +93,8 @@ pub enum TokenKind {
     KwGoto,
     /// `unsafe`（原始指针解引用 / 外部函数调用等需开发者自行保证安全的操作）
     KwUnsafe,
+    /// `dyn`（trait 对象：`dyn Error` / `&dyn Error`）
+    KwDyn,
 
     // ===== 关键字（类型系统） =====
     /// `struct`
@@ -336,6 +338,7 @@ impl TokenKind {
             TokenKind::KwDefault => Some("default"),
             TokenKind::KwGoto => Some("goto"),
             TokenKind::KwUnsafe => Some("unsafe"),
+            TokenKind::KwDyn => Some("dyn"),
             TokenKind::KwStruct => Some("struct"),
             TokenKind::KwEnum => Some("enum"),
             TokenKind::KwUnion => Some("union"),

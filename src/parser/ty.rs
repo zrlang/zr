@@ -94,6 +94,15 @@ impl Parser {
             return Ok(Type::ImplTrait(bounds));
         }
 
+        // `dyn Trait` / `dyn Trait1 + Trait2`：trait 对象（动态分发）。
+        if self.match_kind(&TokenKind::KwDyn) {
+            let mut bounds = vec![self.parse_type_bp(10)?];
+            while self.match_kind(&TokenKind::Plus) {
+                bounds.push(self.parse_type_bp(10)?);
+            }
+            return Ok(Type::Dyn(bounds));
+        }
+
         // 指针：`*T` / `*const T` / `*mut T`
         if self.match_kind(&TokenKind::Star) {
             let mutability = if self.match_kind(&TokenKind::KwMut) {

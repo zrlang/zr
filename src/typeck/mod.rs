@@ -7108,6 +7108,27 @@ impl TypeChecker {
                 }
                 Ty::Opaque(opaque_id)
             }
+            AstType::Dyn(bounds) => {
+                // `dyn Trait`：trait 对象。运行时是 `{ data, vtable }` 胖指针。
+                // 取第一个 trait 边界作为主 trait（`dyn Error + Send` 的
+                // `Send` 是 auto trait，主 trait 是 `Error`）。
+                let mut trait_id = None;
+                for bound in bounds {
+                    if let AstType::Named { path, .. } = bound {
+                        if let Ok(id) = self.resolve_type_path(path) {
+                            trait_id = Some(id);
+                            break;
+                        }
+                    }
+                }
+                let Some(id) = trait_id else {
+                    return Err(CompileError::type_error(
+                        "`dyn` requires at least one trait bound",
+                    )
+                    .with_span(span));
+                };
+                Ty::Dyn(id)
+            }
         })
     }
 

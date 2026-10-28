@@ -185,6 +185,9 @@ pub enum Type {
     Anytype,
     /// `impl Trait`：存在性类型（返回位置 RPIT / 参数位置 APIT）。
     ImplTrait(Vec<Type>),
+    /// `dyn Trait`：trait 对象（动态分发）。`Vec<Type>` 是 trait 边界列表
+    /// （`dyn Error`、`dyn Error + Send`）。
+    Dyn(Vec<Type>),
 }
 
 /// 数组长度（可以是编译期常量表达式）。

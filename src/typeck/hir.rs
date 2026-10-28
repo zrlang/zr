@@ -98,6 +98,12 @@ pub enum Ty {
     Opaque(DefId),
     /// `Pin<T>`：固定指针，阻止 pointee 被移动。
     Pin(Box<Ty>),
+    /// `dyn Trait`：trait 对象（动态分发）。运行时表示是**胖指针**
+    /// `{ data: *mut void, vtable: *const VTable }`——数据指针 + 指向
+    /// 虚方法表的指针。目前类型检查接受该类型（`std/error` 的
+    /// `&'static dyn Error` 可解析），方法调用经 vtable 分派的完整实现
+    /// 尚在途，见 `docs/rust-parity.md`。
+    Dyn(DefId),
 }
 
 /// 数组长度。
