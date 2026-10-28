@@ -329,6 +329,7 @@ fn expand_in_expr(
         Expression::Spawn(e, _) => expand_in_expr(e, defs, def_lines, changed),
         Expression::Labeled(_, e, _) => expand_in_expr(e, defs, def_lines, changed),
         Expression::Goto(_, _) => Ok(()),
+        Expression::Unsafe(e, _) => expand_in_expr(e, defs, def_lines, changed),
         Expression::Intrinsic(_, _, ops, _) => {
             for o in ops.iter_mut() {
                 expand_in_expr(o, defs, def_lines, changed)?;
@@ -665,6 +666,7 @@ fn keyword_or_symbol(t: &TokenKind) -> &'static str {
         TokenKind::KwComptime => "comptime",
         TokenKind::KwDefault => "default",
         TokenKind::KwGoto => "goto",
+        TokenKind::KwUnsafe => "unsafe",
         TokenKind::KwStruct => "struct",
         TokenKind::KwEnum => "enum",
         TokenKind::KwUnion => "union",

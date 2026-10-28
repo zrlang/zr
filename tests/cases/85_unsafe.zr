@@ -1,0 +1,59 @@
+// 覆盖：`unsafe { ... }` 块——解析、作为语句、作为表达式（值透传）、
+// 原始指针解引用与写入。
+//
+// 背景：zr 目前**没有借用检查**，`unsafe` 是显式边界标记（README「指针与
+// unsafe」一节的愿景），检查阶段按块表达式透传——块的值即 unsafe 块的值。
+// 将来有了借用检查，原始指针解引用等危险操作会被要求包在 `unsafe` 里；
+// 当前 `unsafe` 只是让 `unsafe { ... }` 能解析并通过检查，不改变语义。
+//
+// 语法：`unsafe` 后必须紧跟块；`unsafe { ... }` 在语句位置不需要分号。
+fn main() -> i32 {
+    // 1. 原始指针解引用（只读）。
+    let x: i32 = 42;
+    let p: *const i32 = &x;
+    unsafe {
+        if *p != 42 {
+            return 1;
+        }
+    }
+
+    // 2. unsafe 块作为表达式（值透传：块的值即 unsafe 块的值）。
+    let z = unsafe { x + 1 };
+    if z != 43 {
+        return 2;
+    }
+
+    // 3. 原始指针写入（`*mut`）。
+    let mut m: i32 = 5;
+    let q: *mut i32 = &mut m;
+    unsafe {
+        *q = 10;
+    }
+    if m != 10 {
+        return 3;
+    }
+
+    // 4. 数组指针 + 索引。
+    let arr = [10, 20, 30];
+    let ap: *const i32 = &arr[0];
+    unsafe {
+        if *ap != 10 {
+            return 4;
+        }
+        if ap[1] != 20 {
+            return 5;
+        }
+    }
+
+    // 5. 多语句 + 尾表达式的 unsafe 块。
+    let s = unsafe {
+        let a = 1;
+        let b = 2;
+        a + b
+    };
+    if s != 3 {
+        return 6;
+    }
+
+    return 0;
+}

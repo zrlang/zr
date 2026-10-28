@@ -91,6 +91,8 @@ pub enum TokenKind {
     KwDefault,
     /// `goto`（受限跳转，仅函数内）
     KwGoto,
+    /// `unsafe`（原始指针解引用 / 外部函数调用等需开发者自行保证安全的操作）
+    KwUnsafe,
 
     // ===== 关键字（类型系统） =====
     /// `struct`
@@ -333,6 +335,7 @@ impl TokenKind {
             TokenKind::KwComptime => Some("comptime"),
             TokenKind::KwDefault => Some("default"),
             TokenKind::KwGoto => Some("goto"),
+            TokenKind::KwUnsafe => Some("unsafe"),
             TokenKind::KwStruct => Some("struct"),
             TokenKind::KwEnum => Some("enum"),
             TokenKind::KwUnion => Some("union"),

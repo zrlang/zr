@@ -812,6 +812,7 @@ fn keyword(text: &str) -> Option<TokenKind> {
         "comptime" => TokenKind::KwComptime,
         "default" => TokenKind::KwDefault,
         "goto" => TokenKind::KwGoto,
+        "unsafe" => TokenKind::KwUnsafe,
 
         // 类型系统
         "struct" => TokenKind::KwStruct,

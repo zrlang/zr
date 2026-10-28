@@ -2811,6 +2811,13 @@ impl TypeChecker {
                 ))
                 .with_span(span));
             }
+            Expression::Unsafe(inner, _) => {
+                // `unsafe { ... }`：目前 zr 没有借用检查，`unsafe` 是显式
+                // 边界标记，不改变语义——按块表达式透传（块的值即 unsafe
+                // 块的值）。将来有了借用检查，原始指针解引用等危险操作会被
+                // 要求包在 `unsafe` 里，这里只透传不降级。
+                return self.check_expr(inner, expected);
+            }
             Expression::IfLet(pat, expr, then_b, else_b, span) => {
                 // `if let pat = expr { then } else { else }` 直接降成
                 // `if <pat 匹配> { then } else { else }`。
@@ -7199,6 +7206,7 @@ impl TypeChecker {
             Expression::Await(_, _) => self.infer.fresh_infer(e.span()),
             Expression::Yield(_, _) => self.infer.fresh_infer(e.span()),
             Expression::Spawn(_, _) => self.infer.fresh_infer(e.span()),
+            Expression::Unsafe(inner, _) => self.infer_expr_ty(inner)?,
             _ => self.infer.fresh_infer(e.span()),
         })
     }

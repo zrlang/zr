@@ -443,6 +443,14 @@ impl Parser {
             return Ok(Expression::Goto(label, span));
         }
 
+        // ===== unsafe =====
+        // `unsafe { ... }`：解析成一个块表达式透传。块必须紧跟 unsafe
+        // 关键字；`unsafe fn` / `unsafe trait` 是项级，不在这里处理。
+        if self.match_kind(&TokenKind::KwUnsafe) {
+            let block = self.parse_block()?;
+            return Ok(Expression::Unsafe(Box::new(Expression::Block(block, span)), span));
+        }
+
         // ===== 一元运算符 =====
         if kind == TokenKind::Amp {
             // `&x` / `&mut x` / `&const x`
@@ -1164,6 +1172,7 @@ impl Parser {
                 | TokenKind::KwYield
                 | TokenKind::KwSpawn
                 | TokenKind::KwComptime
+                | TokenKind::KwUnsafe
                 | TokenKind::LParen
                 | TokenKind::LBracket
                 | TokenKind::LBrace

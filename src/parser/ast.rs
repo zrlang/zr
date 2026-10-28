@@ -391,6 +391,10 @@ pub enum Expression {
     Labeled(String, Box<Expression>, Span),
     /// `goto label;`
     Goto(String, Span),
+    /// `unsafe { ... }`：标记需开发者自行保证安全的操作（原始指针解引用、
+    /// 外部函数调用等）。zr 目前无借用检查，`unsafe` 是显式边界标记，检查
+    /// 阶段按块表达式透传（块的值即 unsafe 块的值）。
+    Unsafe(Box<Expression>, Span),
     /// `sizeof(T)` / `typeof(e)` / `alignof(T)`
     /// `intrinsic!(op types... args...)`
     ///
@@ -838,6 +842,7 @@ impl Spanned for Expression {
             Expression::Spawn(_, s) => *s,
             Expression::Labeled(_, _, s) => *s,
             Expression::Goto(_, s) => *s,
+            Expression::Unsafe(_, s) => *s,
             Expression::Intrinsic(_, _, _, s) => *s,
             Expression::IfLet(_, _, _, _, s) => *s,
         }

@@ -792,6 +792,9 @@ fn is_block_like(expr: &Expression) -> bool {
         // 标签只是循环/块的修饰：`outer: loop { .. }` 在语句位置
         // 同样不需要分号，按内层表达式判断。
         Expression::Labeled(_, inner, _) => is_block_like(inner),
+        // `unsafe { ... }` 也是块形状：语句位置不需要分号，且它自带块
+        // （`unsafe { let y = 1; } 下一句;` 会把 unsafe 块整个吞掉）。
+        Expression::Unsafe(_, _) => true,
         _ => false,
     }
 }
