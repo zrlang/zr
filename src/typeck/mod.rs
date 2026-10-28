@@ -3855,11 +3855,11 @@ impl TypeChecker {
         // `p: *mut [u8; 16]` 的 `p[k]` 是 `u8`。早先这里直接把 pointee 当
         // 元素类型，于是 `p[k]` 被推断成 `[u8; 16]`，下游按 16 字节步长缩放、
         // 还走聚合拷贝存储路径，写出的值和内存布局全都不对。
-        let elem_ty = match recv_ty {
-            Ty::Array(t, _) | Ty::Slice(t, _) => (*t).clone(),
+        let elem_ty = match &recv_ty {
+            Ty::Array(t, _) | Ty::Slice(t, _) => (**t).clone(),
             Ty::Str => Ty::Uint(8),
             Ty::Pointer(inner, _) | Ty::Reference(inner, _) => {
-                let pointee = *inner;
+                let pointee = (**inner).clone();
                 match pointee {
                     Ty::Array(t, _) | Ty::Slice(t, _) => (*t).clone(),
                     other => other,
@@ -3891,6 +3891,30 @@ impl TypeChecker {
                 elem
             }
         };
+        // 越界检查（编译期常量下标）：数组/切片的长度在编译期已知时，对
+        // **字面量下标**（`arr[5]`，`arr[k]` 的 `k` 是 const 局部）做边界
+        // 检查。运行期变量的下标留给 MIR 的越界检查（尚未接线），这里先
+        // 堵住"明显越界"的静默错读——`arr[5]` 在 3 元素数组上会读到相邻
+        // 内存，`arr[-1]` 更直接踩到数组前头。
+        //
+        // 只对 `Array` 与 `Slice`（长度已知或运行时长度）做；裸指针没有
+        // 长度信息，`p[k]` 是 unsafe 的原始内存访问，不检查（与 C 一致）。
+        if let Some(blen) = array_len_of(&recv_ty) {
+            if let Some(i) = const_index_of(index) {
+                if i < 0 {
+                    return Err(CompileError::type_error(format!(
+                        "index out of bounds: the len is {blen} but the index is {i}",
+                    ))
+                    .with_span(index.span()));
+                }
+                if i >= blen {
+                    return Err(CompileError::type_error(format!(
+                        "index out of bounds: the len is {blen} but the index is {i}",
+                    ))
+                    .with_span(index.span()));
+                }
+            }
+        }
         Ok(HirExpr {
             kind: ExprKind::Index(Box::new(recv), Box::new(idx)),
             ty: elem_ty,
@@ -8156,6 +8180,28 @@ fn types_may_overlap(a: &Ty, b: &Ty) -> bool {
 /// 解析器用空元组 `()` 表示切片语法里缺失的边界。
 fn is_missing_bound(e: &Expression) -> bool {
     matches!(e, Expression::Tuple(items, _) if items.is_empty())
+}
+
+/// 数组/切片类型的长度（编译期已知时返回 `Some`；裸指针 / 引用指向的
+/// 定长数组也解一层。动态切片长度运行期才有，这里返回 `None`）。
+fn array_len_of(ty: &Ty) -> Option<i128> {
+    match ty {
+        Ty::Array(_, len) => hir::array_len_value(len),
+        Ty::Pointer(inner, _) | Ty::Reference(inner, _) => match &**inner {
+            Ty::Array(_, len) => hir::array_len_value(len),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+/// 下标表达式的编译期整数值（只认字面量；`arr[k]` 的 `k` 是 const 局部
+/// 时后续版本再展开，这里先堵住最常见的 `arr[5]` 越界）。
+fn const_index_of(expr: &Expression) -> Option<i128> {
+    match expr {
+        Expression::Literal(ast::Literal::Int(n, _), _) => Some(*n),
+        _ => None,
+    }
 }
 
 /// 格式化类型名为字符串（用于错误消息）。
