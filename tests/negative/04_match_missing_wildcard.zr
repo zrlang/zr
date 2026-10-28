@@ -5,7 +5,7 @@
 // 统一说 "must have a trailing `_` arm"。修好之前这条用例至少保证：缺臂
 // 一定报错，不会静默通过。
 //
-// expect: match must have a trailing `_` arm
+// expect: match on `integer` must have a trailing `_` arm or cover all values
 fn main() -> i32 {
     let x = 5;
     let y = match x {

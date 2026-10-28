@@ -4417,8 +4417,26 @@ impl TypeChecker {
                 _ => false,
             };
             if !bool_covered && !enum_covered {
+                // 改进报错文案：区分"缺 `_` 通配臂"和"缺具体值/变体"。
+                // - 整型/标量：需要 `_` 臂捕获所有未列出的值
+                // - 枚举/bool：如果已经全覆盖则不会走到这里
+                let kind_name = match scrutinee_ty {
+                    Ty::Int(_) | Ty::Uint(_) | Ty::Float(_) => "integer",
+                    Ty::Named(id, _) => {
+                        // 尝试显示类型名
+                        match self.type_defs.get(id) {
+                            Some(hir::HirTypeDef::Enum(e)) => &e.name,
+                            Some(hir::HirTypeDef::Struct(s)) => &s.name,
+                            _ => "type",
+                        }
+                    }
+                    _ => "value",
+                };
                 return Err(
-                    CompileError::type_error("match must have a trailing `_` arm").with_span(span),
+                    CompileError::type_error(format!(
+                        "match on `{kind_name}` must have a trailing `_` arm or cover all values"
+                    ))
+                    .with_span(span),
                 );
             }
         }
