@@ -611,6 +611,44 @@ fn compile(input: &str, cmd: &Cli) -> Result<std::path::PathBuf, String> {
         println!("{:#?}", ast);
     }
 
+    // 3.5 注入 prelude：`Option` / `Result` 是每个 zr 程序最常用
+    // 的类型，要求每个程序都手写 `use core::{Option, Result}` 是
+    // 不必要的样板。这里在解析后、类型检查前把两条隐式 use 插到
+    // 用户导入之前——用户再写 `use core::Option` 也不会冲突
+    // （类型检查器会去重）。
+    //
+    // 注意：prelude 只注入 `Option` 和 `Result`，其他类型（`Some` /
+    // `None` / `Ok` / `Err`）仍需通过 `core::` 路径访问，或用户
+    // 自行 `use core::Option::Some` 等。
+    //
+    // 必须构造正确的 `UseTree::Group([Name("core"), Name("Option")])`
+    // 结构——早先写成 `Name("Option")` 会让模块加载器误把 `Option`
+    // 当成模块名，报 "unknown module `Option`"。
+    const PRELUDE_IMPORTS: &[&str] = &["core::Option", "core::Result"];
+    for path in PRELUDE_IMPORTS {
+        let segments: Vec<&str> = path.split("::").collect();
+        // 构造 `Group([Name(seg0), Name(seg1), ...])` 嵌套结构。
+        // `use core::Option` → `Group([Name("core"), Name("Option")])`
+        let mut tree = if segments.is_empty() {
+            continue;
+        } else {
+            parser::ast::UseTree::Name(segments[segments.len() - 1].to_string())
+        };
+        for &seg in segments.iter().rev().skip(1) {
+            tree = parser::ast::UseTree::Group(vec![
+                parser::ast::UseTree::Name(seg.to_string()),
+                tree,
+            ]);
+        }
+        ast.imports.insert(
+            0,
+            parser::ast::UseDecl {
+                tree,
+                span: parser::ast::Span::unknown(),
+            },
+        );
+    }
+
     // 3.4 增量编译命中检查。
     //
     // 必须在**加载模块之前**：命中时只按缓存里记的清单重新哈希文件，
