@@ -148,6 +148,13 @@ fn main() -> i32 {
     println_fmt("w=[{:08.3}]", &a11[0] as *const FormatArg, 1);
     let a12 = [fmt_float(2.675), fmt_str("hello")];
     println_fmt("noprec=[{:.}][{:.}]", &a12[0] as *const FormatArg, 2);
+    // 大浮点 Display：|v| ≥ 2⁶⁴ 时 Display 不能输出 `.0`（Rust 的 `{}` 对
+    // 整数值不带小数点）。早先用 `val as u64` 取整数部分，1e30 这种值会
+    // 截断/溢出，现在走位模式 + 最短往返。注意 Debug 的 `{:?}` 对 |v| ≥
+    // 1e16 用科学计数法（Rust 行为），zr 的 `write_float_debug` 目前仍只
+    // 输出位置计数法——那是另一处差异，不在本回归钉住的范围内。
+    let a13 = [fmt_float(1.0e30), fmt_float(1.2345e30), fmt_float(-1.5e30)];
+    println_fmt("big={} {} {}", &a13[0] as *const FormatArg, 3);
     return 0;
 }
 "#;
@@ -177,7 +184,7 @@ fn main() -> i32 {
         );
         assert_eq!(
             run.stdout,
-            b"int=42 float=2.675 str=hi bool=true\ndebug=1.0 hex=ff hexu=FF esc=a\tb\\c\nexp=1.2345e3 1e3 1.2345E3\nexpp=1.23e3 0.00e0 9.99e2\niexp=1.234e3 -1e3 1.30e3\ndyn=[         5]\ndync=[****5*****]\ndynp=[1.23]\ndynp2=[1.235]\nidynp=[1234]\nw=[0003.142]\nnoprec=[2.675][hello]\n",
+            b"int=42 float=2.675 str=hi bool=true\ndebug=1.0 hex=ff hexu=FF esc=a\tb\\c\nexp=1.2345e3 1e3 1.2345E3\nexpp=1.23e3 0.00e0 9.99e2\niexp=1.234e3 -1e3 1.30e3\ndyn=[         5]\ndync=[****5*****]\ndynp=[1.23]\ndynp2=[1.235]\nidynp=[1234]\nw=[0003.142]\nnoprec=[2.675][hello]\nbig=1000000000000000000000000000000 1234500000000000000000000000000 -1500000000000000000000000000000\n",
             "标准输出不符 ({opt})"
         );
         let _ = std::fs::remove_file(&out);
