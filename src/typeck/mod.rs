@@ -35,6 +35,26 @@ fn const_array_len(n: i128, span: Span) -> hir::ArrayLen {
     }))
 }
 
+/// 一个被提升成顶层函数的无捕获闭包。
+///
+/// `check_lambda` 在捕获集为空时登记；`finalize_lifted_closures` 在
+/// `check_function_bodies` 收尾时统一解析推断变量、构造 `HirFunction` 并
+/// 挂进 `self.functions`。这样 MIR / SSA / codegen 完全按普通函数处理它，
+/// 不需要为"函数指针"新开后端路径。
+#[derive(Debug, Clone)]
+struct LiftedClosure {
+    /// 提升后的 DefId（`ExprKind::Def(def_id)` 指向它）。
+    def_id: DefId,
+    /// 形参（模式 + 类型）。类型可能是推断变量，收尾时 resolve。
+    params: Vec<(hir::HirPattern, Ty)>,
+    /// 返回类型（推断变量，收尾时 resolve）。
+    ret: Ty,
+    /// 闭包体（局部量 id 与调用方共享编号，收尾时重编号）。
+    body: hir::HirBlock,
+    /// 闭包的源码 span（错误报告用）。
+    span: Span,
+}
+
 /// 类型检查器。
 #[derive(Debug)]
 pub struct TypeChecker {
@@ -106,6 +126,14 @@ pub struct TypeChecker {
     /// 当前最内层闭包正在收集的捕获（`LocalId` → 类型）。离开闭包时取出，
     /// 挂到对应 `ExprKind::Closure` 上。`Vec` 层与 `closure_ctx` 一一对应。
     closure_captures: Vec<Vec<(LocalId, Ty)>>,
+    /// 无捕获闭包被提升成的顶层函数（DefId → 闭包体与签名）。
+    ///
+    /// 无捕获闭包本来就是一个普通函数，没有理由拒绝存进变量 / 当实参 /
+    /// 返回（见 `tests/cases/83_closure_fnptr.zr` 的头注释）。`check_lambda`
+    /// 在捕获集为空、且闭包不是在"立即调用"位置时，登记到这里并返回
+    /// `ExprKind::Def(def_id)`（函数指针）。函数体在 `finalize_lifted_closures`
+    /// 里统一解析推断变量并挂进 `self.functions`。
+    lifted_closures: Vec<LiftedClosure>,
     /// 推断上下文。
     infer: InferCtxt<'static>,
     /// 下一个定义 ID。
@@ -226,6 +254,7 @@ impl Default for TypeChecker {
             closure_consumed: 0,
             closure_ctx: Vec::new(),
             closure_captures: Vec::new(),
+            lifted_closures: Vec::new(),
             infer: InferCtxt::empty(),
             next_def: 1,
             next_local: 1,
@@ -1604,6 +1633,10 @@ impl TypeChecker {
             self.check_instance_body(&inst)?;
             i += 1;
         }
+        // 提升闭包：无捕获闭包登记时形参/返回类型可能还是推断变量
+        // （`let id = |x| x; id(7)` 里 `x` 靠调用反推）。所有函数体检查完
+        // 再统一 resolve，把仍停着的推断变量明确报错，并回填函数体。
+        self.finalize_lifted_closures()?;
         // 函数顺序必须确定：按 DefId 排序（保证可复现产物）。
         let mut funcs: Vec<_> = self.functions.iter().collect();
         funcs.sort_by_key(|(id, _)| id.0);
@@ -2621,7 +2654,8 @@ impl TypeChecker {
                 return self.check_struct_init(path, fields, base.as_deref(), expected, span);
             }
             Expression::Lambda(params, ret, body, _) => {
-                return self.check_lambda(params, ret.as_ref(), body, expected, span);
+                // 非"立即调用"位置的闭包允许提升：无捕获时变成顶层函数指针。
+                return self.check_lambda(params, ret.as_ref(), body, expected, span, true);
             }
             Expression::Comptime(e, _) => {
                 // comptime 块：表达式必须在编译期可求值
@@ -3954,6 +3988,18 @@ impl TypeChecker {
                 .cloned()
                 .unwrap_or_else(|| self.infer.fresh_infer(span));
             let arg = self.check_expr(a, &param_ty)?;
+            // 形参类型是推断变量（提升闭包的未标注形参，如 `let id = |x| x;`
+            // 里 `x` 的类型要靠 `id(7)` 反推）：`check_literal` 对 `Infer`
+            // 期望只给字面量默认类型（`Int(32)`），不会主动绑定推断变量。
+            // 反过来，实参类型停在推断变量而形参是具体类型（把 `id` 传给
+            // `fn(..)` 形参，`id` 的形参类型还没被任何调用定下）：`check_expr`
+            // 也不主动把两者统一。两种情况都要在这里补一次 unify，否则提升
+            // 闭包的形参永远停在 Infer，收尾报 `type annotations needed`。
+            let param_is_infer = matches!(self.infer.resolve(&param_ty), Ty::Infer(_));
+            let arg_has_infer = ty_has_unresolved_infer(&arg.ty, &self.infer.vars);
+            if param_is_infer || arg_has_infer {
+                self.infer.unify(&param_ty, &arg.ty, span).ok();
+            }
             // C 风格隐式拓宽：`f32`/`i32`/`u32` 实参传给 `f64` 形参时插入显式
             // 转换。只放行"数值同族、宽度不减"这一类；`unify` 要求宽度相等，
             // 所以 `check_expr` 本身既不拒绝也不改写跨宽实参——若不补这一步，
@@ -6075,6 +6121,7 @@ impl TypeChecker {
         body: &AstBlock,
         _expected: &Ty,
         span: ast::Span,
+        liftable: bool,
     ) -> Result<HirExpr> {
         // 进入闭包**之前**抓一份当前所有可见 local：它们就是"外层局部"，
         // 闭包形参与体内新建的 local 都不在这个集合里，借此区分捕获。
@@ -6099,20 +6146,70 @@ impl TypeChecker {
             .as_ref()
             .map(|t| self.ast_to_hir_type(t))
             .unwrap_or_else(|| Ok(self.infer.fresh_infer(span)))?;
+        // 闭包体里的 `return` 返回的是**闭包**的值，不是外层函数的值。
+        // 不切换的话 `let r = |x: i32| { return x + 1; };` 里的 `return x + 1`
+        // 会被拿去和外层函数的返回类型对（碰巧都是 i32 才没炸）。切换后
+        // 立即恢复：闭包体检查完，外层函数的 `return` 语义要原样保留。
+        let saved_ret = self.infer.return_ty.take();
+        self.infer.return_ty = Some(ret_ty.clone());
         let checked_body = self.check_block(body, &ret_ty)?;
+        self.infer.return_ty = saved_ret;
+        // 返回类型是推断变量（`let f = |x| x + 1;`）：`check_block` 的 tail
+        // 走 `subtype`，而 `subtype` 对 `Infer` 期望类型直接放行**不绑定**，
+        // 于是 `ret_ty` 永远停在 Infer，收尾报 `type annotations needed`。
+        // 这里用尾表达式的实际类型把推断变量绑上——但只有真正存在尾表达式
+        // 才绑：`|x: i32| { f(x); }`（最后一句带分号）的类型是 `()`，不能
+        // 拿 `()` 去污染一个本该由 `return` 或调用点反推的返回类型。
+        if matches!(self.infer.resolve(&ret_ty), Ty::Infer(_)) {
+            if let Some(tail) = &checked_body.tail {
+                self.infer.unify(&ret_ty, &tail.ty, span).ok();
+            }
+        }
         self.pop_scope();
         // 取出本层捕获（去重，保留发现顺序；`check_expr` 在解析到外层 local
         // 时已记入）。`closure_ctx` 与 `closure_captures` 同步 pop。
         let mut captures = self.closure_captures.pop().unwrap();
         self.closure_ctx.pop();
         captures.dedup_by_key(|(l, _)| *l);
-        self.closure_defined += 1;
         let fn_ty = Ty::Function {
             params: hir_params.iter().map(|(_, t)| t.clone()).collect(),
             ret: Box::new(ret_ty.clone()),
             is_async: false,
             abi: Abi::Zr,
         };
+        // 上下文给了函数类型时（`let g: fn(i32) -> i32 = |x| ..`、把闭包
+        // 当实参传给 `fn(..)` 形参），把期望类型里的形参/返回类型统一进来。
+        // 这样没写标注的形参/返回类型能从上下文拿到，而不是停在推断变量上。
+        // 只在期望类型本身是 `Ty::Function` 时生效——`let f = |x| x` 的期望
+        // 是 Infer，统一进去会制造无意义的链。
+        if let Ty::Function {
+            params: exp_params,
+            ret: exp_ret,
+            ..
+        } = self.infer.resolve(_expected)
+        {
+            if exp_params.len() == hir_params.len() {
+                for (p, ep) in hir_params.iter().zip(exp_params.iter()) {
+                    if matches!(self.infer.resolve(&p.1), Ty::Infer(_)) {
+                        self.infer.unify(&p.1, ep, span).ok();
+                    }
+                }
+            }
+            if matches!(self.infer.resolve(&ret_ty), Ty::Infer(_)) {
+                self.infer.unify(&ret_ty, &exp_ret, span).ok();
+            }
+        }
+        // 无捕获闭包提升成顶层函数：闭包不引用任何外层局部，本来就是普通
+        // 函数（见 `tests/cases/83_closure_fnptr.zr` 头注释）。只有不在
+        // "立即调用"位置时才提升——立即调用走单态化内联的老路子。
+        // 带捕获的闭包仍然拒绝（`analyze_closures` 兜底报错）。
+        if liftable && captures.is_empty() {
+            return self.lift_closure(hir_params, ret_ty, checked_body, fn_ty, span);
+        }
+        // 只有**没有**提升的闭包才计入"定义数"：提升后的闭包是合法的
+        // `ExprKind::Def`，`analyze_closures` 不该因为它报错。立即调用走
+        // `inline_closure_call`，那边会 `closure_consumed += 1` 配对。
+        self.closure_defined += 1;
         Ok(HirExpr {
             kind: ExprKind::Closure {
                 params: hir_params,
@@ -6123,6 +6220,131 @@ impl TypeChecker {
             ty: fn_ty,
             span,
         })
+    }
+
+    /// 把无捕获闭包提升成顶层函数，表达式变成函数指针（`ExprKind::Def`）。
+    ///
+    /// 登记到 `self.lifted_closures` 与 `self.functions`（占位，body 暂空）：
+    /// 后续调用点 `def_type` 能直接拿到 `fn(..)` 类型。形参 / 返回类型可能
+    /// 还是推断变量（`let id = |x| x; id(7)` 里 `x` 要靠调用反推），所以
+    /// 函数体在 `finalize_lifted_closures` 里统一 resolve 并回填。
+    fn lift_closure(
+        &mut self,
+        params: Vec<(hir::HirPattern, Ty)>,
+        ret: Ty,
+        body: hir::HirBlock,
+        fn_ty: Ty,
+        span: ast::Span,
+    ) -> Result<HirExpr> {
+        let name = format!("__closure_{}", self.next_def);
+        let def_id = self.alloc_def(name);
+        let hir_params: Vec<hir::HirParam> = params
+            .iter()
+            .map(|(pat, ty)| hir::HirParam {
+                local: first_binding(pat).unwrap_or_else(|| self.alloc_local()),
+                ty: ty.clone(),
+            })
+            .collect();
+        self.functions.insert(
+            def_id,
+            hir::HirFunction {
+                name: format!("__closure_{}", def_id.0),
+                params: hir_params.clone(),
+                return_type: ret.clone(),
+                body: None,
+                is_async: false,
+                async_output: None,
+                is_comptime: false,
+                abi: Abi::Zr,
+                attrs: Vec::new(),
+            },
+        );
+        self.lifted_closures.push(LiftedClosure {
+            def_id,
+            params,
+            ret,
+            body,
+            span,
+        });
+        Ok(HirExpr {
+            kind: ExprKind::Def(def_id),
+            ty: fn_ty,
+            span,
+        })
+    }
+
+    /// 收尾解析所有提升闭包并回填函数体。
+    ///
+    /// `check_function_bodies` 处理完所有函数（含泛型单态实例）后调用。
+    /// 每个提升闭包：
+    /// 1. 解析形参 / 返回类型里的推断变量（`let id = |x| x; id(7)` 里 `x`
+    ///    要靠调用点反推，此时已经统一完）；
+    /// 2. 仍停在 `Infer` 的明确报 `type annotations needed`（Rust 同样要求
+    ///    这种闭包写标注，不能让后端把 `_` 当 i64 编）；
+    /// 3. 把闭包体的局部量 id 重编号成提升函数的独立编号空间（闭包体里的
+    ///    `Local(id)` 原本和调用方共享 `next_local` 计数器，两个函数若用
+    ///    同一个 `v{id}` 名字，MIR 会串味）；
+    /// 4. 把 `HirFunction`（签名 + 体）挂进 `self.functions`，MIR 按普通
+    ///    函数降级。
+    fn finalize_lifted_closures(&mut self) -> Result<()> {
+        if self.lifted_closures.is_empty() {
+            return Ok(());
+        }
+        let lifted = std::mem::take(&mut self.lifted_closures);
+        for lc in lifted {
+            // 解析形参 / 返回类型。参数类型停在推断变量时明确报错——没有
+            // 任何上下文能定下它，写出来也只会让后端把 `_` 当 i64 编。
+            let mut params = Vec::with_capacity(lc.params.len());
+            for (pat, ty) in lc.params {
+                let ty = ty_resolve_deep(&ty, &self.infer.vars);
+                if ty_has_unresolved_infer(&ty, &self.infer.vars) {
+                    return Err(CompileError::type_error(
+                        "type annotations needed for closure parameter type",
+                    )
+                    .with_span(lc.span));
+                }
+                params.push((pat, ty));
+            }
+            let ret = ty_resolve_deep(&lc.ret, &self.infer.vars);
+            if ty_has_unresolved_infer(&ret, &self.infer.vars) {
+                return Err(CompileError::type_error(
+                    "type annotations needed for closure return type",
+                )
+                .with_span(lc.span));
+            }
+            // 重编号：闭包体里的局部量 id 原本从全局计数器分配，与调用方
+            // 共享。单独成一个函数后必须有自己的编号空间，否则 MIR 里
+            // `v{id}` 会和调用方的临时名撞车。形参 local 也要重编号，因为
+            // `HirParam.local` 与函数体里 `ExprKind::Local` 必须一致。
+            let mut map: HashMap<LocalId, LocalId> = HashMap::new();
+            let hir_params: Vec<hir::HirParam> = params
+                .iter()
+                .map(|(pat, ty)| {
+                    let local = match first_binding(pat) {
+                        Some(id) => {
+                            self.next_local += 1;
+                            let nid = LocalId(self.next_local - 1);
+                            map.insert(id, nid);
+                            nid
+                        }
+                        None => {
+                            self.next_local += 1;
+                            LocalId(self.next_local - 1)
+                        }
+                    };
+                    hir::HirParam { local, ty: ty.clone() }
+                })
+                .collect();
+            let mut body = lc.body;
+            remap_lifted_body(&mut body, &mut map, &mut self.next_local);
+            // 回填签名：`functions` 里登记的占位签名用解析后的类型。
+            if let Some(hf) = self.functions.get_mut(&lc.def_id) {
+                hf.params = hir_params.clone();
+                hf.return_type = ret.clone();
+                hf.body = Some(body);
+            }
+        }
+        Ok(())
     }
 
     /// 闭包立即调用的单态化内联：`(|x| x + 1)(5)`、`(|x| x + n)(5)`。
@@ -6141,7 +6363,7 @@ impl TypeChecker {
         span: ast::Span,
         lam_span: ast::Span,
     ) -> Result<HirExpr> {
-        let lam = self.check_lambda(params, ret, body, &Ty::Unit, lam_span)?;
+        let lam = self.check_lambda(params, ret, body, &Ty::Unit, lam_span, false)?;
         self.closure_consumed += 1;
         let (hir_params, ret_ty, mut lam_body, _captures) = match lam.kind {
             ExprKind::Closure {
@@ -7754,6 +7976,82 @@ fn first_binding(p: &hir::HirPattern) -> Option<LocalId> {
     }
 }
 
+/// 类型里是否还残留**未解析**的推断变量（深层扫描）。
+///
+/// 提升闭包时形参 / 返回类型可能是推断变量（`let f = |x| x;` 里 `x` 的类型
+/// 要靠后面的调用 `f(7)` 反推）。收尾时 `resolve` 过一遍，若仍停在 `Infer`，
+/// 说明没有任何上下文能定下它——Rust 同样要求这种闭包写标注，这里明确报错
+/// 而不是让后端把 `_` 当 i64 编（见 `tests/cases/83_closure_fnptr.zr` 注释）。
+fn ty_has_unresolved_infer(ty: &Ty, vars: &HashMap<InferId, Ty>) -> bool {
+    let resolved = ty_resolve_deep(ty, vars);
+    ty_contains_infer(&resolved)
+}
+
+/// 深解析：递归地把 `Ty::Infer` 沿绑定链解到底。
+///
+/// `InferCtxt::resolve` 只跟**一层**（绑定到另一个推断变量时直接停住返回原样），
+/// 但 `unify` 的"两个推断变量"路径会让 `vars[a] = Infer(b)`，于是链可能
+/// 是 `a -> b -> i32` 两跳以上。这里跟着链走到头；链可能成环（`a -> b` 后又
+/// `b -> a`，`unify` 不查发生性），所以带 visited 集合防死循环。
+fn ty_resolve_deep(ty: &Ty, vars: &HashMap<InferId, Ty>) -> Ty {
+    fn go(ty: &Ty, vars: &HashMap<InferId, Ty>, seen: &mut HashSet<InferId>) -> Ty {
+        match ty {
+            Ty::Infer(id) => {
+                if seen.contains(id) {
+                    return ty.clone();
+                }
+                seen.insert(*id);
+                match vars.get(id) {
+                    Some(bound) => go(bound, vars, seen),
+                    None => ty.clone(),
+                }
+            }
+            Ty::Pointer(t, m) => Ty::Pointer(Box::new(go(t, vars, seen)), *m),
+            Ty::Reference(t, m) => Ty::Reference(Box::new(go(t, vars, seen)), *m),
+            Ty::Array(t, len) => Ty::Array(Box::new(go(t, vars, seen)), len.clone()),
+            Ty::Slice(t, m) => Ty::Slice(Box::new(go(t, vars, seen)), *m),
+            Ty::Tuple(ts) => Ty::Tuple(ts.iter().map(|t| go(t, vars, seen)).collect()),
+            Ty::Function {
+                params,
+                ret,
+                is_async,
+                abi,
+            } => Ty::Function {
+                params: params.iter().map(|t| go(t, vars, seen)).collect(),
+                ret: Box::new(go(ret, vars, seen)),
+                is_async: *is_async,
+                abi: abi.clone(),
+            },
+            Ty::Optional(t) => Ty::Optional(Box::new(go(t, vars, seen))),
+            Ty::ErrorUnion(t, e) => Ty::ErrorUnion(
+                Box::new(go(t, vars, seen)),
+                Box::new(go(e, vars, seen)),
+            ),
+            Ty::Named(id, args) => Ty::Named(*id, args.iter().map(|a| go(a, vars, seen)).collect()),
+            Ty::Pin(t) => Ty::Pin(Box::new(go(t, vars, seen))),
+            _ => ty.clone(),
+        }
+    }
+    go(ty, vars, &mut HashSet::new())
+}
+
+/// 类型里是否出现任何 `Ty::Infer`（深层）。
+fn ty_contains_infer(ty: &Ty) -> bool {
+    match ty {
+        Ty::Infer(_) => true,
+        Ty::Pointer(t, _) | Ty::Reference(t, _) | Ty::Slice(t, _) | Ty::Optional(t)
+        | Ty::Pin(t) => ty_contains_infer(t),
+        Ty::Array(t, _) => ty_contains_infer(t),
+        Ty::Tuple(ts) => ts.iter().any(ty_contains_infer),
+        Ty::Function { params, ret, .. } => {
+            params.iter().any(ty_contains_infer) || ty_contains_infer(ret)
+        }
+        Ty::ErrorUnion(t, e) => ty_contains_infer(t) || ty_contains_infer(e),
+        Ty::Named(_, args) => args.iter().any(ty_contains_infer),
+        _ => false,
+    }
+}
+
 /// 把（可能嵌套的）或模式展开成分支条件列表：`3 | 4 | _` → [3, 4, _]。
 fn push_or_alts<'a>(p: &'a AstPattern, out: &mut Vec<&'a AstPattern>) {
     if let AstPattern::Or(alts) = p {
@@ -7894,6 +8192,162 @@ fn walk_block(b: &mut hir::HirBlock, target: LocalId, with: &hir::HirExpr) {
     if let Some(tail) = &mut b.tail {
         substitute_local(tail, target, with);
     }
+}
+
+/// 把提升闭包体的局部量 id 重编号成独立编号空间。
+///
+/// 闭包体在 `check_lambda` 里检查时，局部量（形参 + 体内 `let`）从全局
+/// `next_local` 计数器分配，和调用方函数共享编号。单独提升成一个函数后，
+/// 若沿用原编号，MIR 里 `v{id}` 会和调用方的临时名撞车（`lower_function`
+/// 用 `v{local_id}` 作寄存器名）。这里把每个局部量重新分配到提升函数自己的
+/// 编号空间，`map` 记录旧 id → 新 id。
+fn remap_lifted_body(
+    b: &mut hir::HirBlock,
+    map: &mut HashMap<LocalId, LocalId>,
+    next_local: &mut u32,
+) {
+    // 为局部量 id 分配新编号：已有映射直接复用，否则从 `*next` 递增。
+    fn fresh(map: &mut HashMap<LocalId, LocalId>, next: &mut u32, id: LocalId) -> LocalId {
+        if let Some(&n) = map.get(&id) {
+            return n;
+        }
+        *next += 1;
+        let n = LocalId(*next - 1);
+        map.insert(id, n);
+        n
+    }
+    // `Local(id)` 的 id 换成新编号；`Call` / `CallIndirect` 的 `result`
+    // 局部量也要重编号（它是被调结果的存储位置，同样按函数独立）。
+    fn remap_expr(e: &mut HirExpr, map: &mut HashMap<LocalId, LocalId>, next: &mut u32) {
+        // 每个表达式的类型字段里若有局部量无关的东西不用动；类型本身
+        // 不含 LocalId，跳过。只需处理表达式结构与 `ExprKind::Local`。
+        match &mut e.kind {
+            ExprKind::Local(id) => {
+                *id = fresh(map, next, *id);
+            }
+            ExprKind::Binary(_, l, r) => {
+                remap_expr(l, map, next);
+                remap_expr(r, map, next);
+            }
+            ExprKind::Assign(l, r) => {
+                remap_expr(l, map, next);
+                remap_expr(r, map, next);
+            }
+            ExprKind::Unary(_, v)
+            | ExprKind::Field(v, _)
+            | ExprKind::Deref(v)
+            | ExprKind::AddrOf(v)
+            | ExprKind::Await(v)
+            | ExprKind::Cast(v)
+            | ExprKind::EnumField { value: v, .. }
+            | ExprKind::EnumTag(v)
+            | ExprKind::ArrayToSlice(v)
+            | ExprKind::Spawn(v) => remap_expr(v, map, next),
+            ExprKind::IndexRange(v, start, end, _) => {
+                remap_expr(v, map, next);
+                if let Some(s) = start {
+                    remap_expr(s, map, next);
+                }
+                if let Some(e) = end {
+                    remap_expr(e, map, next);
+                }
+            }
+            ExprKind::Return(v) => {
+                if let Some(v) = v {
+                    remap_expr(v, map, next);
+                }
+            }
+            ExprKind::Call { args, result, .. } => {
+                let n = fresh(map, next, *result);
+                *result = n;
+                for arg in args {
+                    remap_expr(arg, map, next);
+                }
+            }
+            ExprKind::EnumVariant { args, .. } => {
+                for arg in args {
+                    remap_expr(arg, map, next);
+                }
+            }
+            ExprKind::CallIndirect { callee, args, result, .. } => {
+                let n = fresh(map, next, *result);
+                *result = n;
+                remap_expr(callee, map, next);
+                for arg in args {
+                    remap_expr(arg, map, next);
+                }
+            }
+            ExprKind::If(cond, then, els) => {
+                remap_expr(cond, map, next);
+                remap_block(then, map, next);
+                if let Some(els) = els {
+                    remap_block(els, map, next);
+                }
+            }
+            ExprKind::While(_, cond, body) => {
+                remap_expr(cond, map, next);
+                remap_block(body, map, next);
+            }
+            ExprKind::Loop(_, body) => remap_block(body, map, next),
+            ExprKind::Block(blk) => remap_block(blk, map, next),
+            ExprKind::Index(recv, idx) => {
+                remap_expr(recv, map, next);
+                remap_expr(idx, map, next);
+            }
+            ExprKind::Struct(fields) => {
+                for (_, f) in fields {
+                    remap_expr(f, map, next);
+                }
+            }
+            ExprKind::Defer(d) => remap_block(d, map, next),
+            ExprKind::Array(elems) => {
+                for el in elems {
+                    remap_expr(el, map, next);
+                }
+            }
+            ExprKind::Tuple(elems) => {
+                for el in elems {
+                    remap_expr(el, map, next);
+                }
+            }
+            ExprKind::Comptime(_)
+            | ExprKind::Literal(_)
+            | ExprKind::Def(_)
+            | ExprKind::Match
+            | ExprKind::Break(_)
+            | ExprKind::Continue(_)
+            | ExprKind::Unreachable
+            | ExprKind::Try { .. }
+            | ExprKind::Throw(_)
+            | ExprKind::Closure { .. }
+            | ExprKind::Asm { .. }
+            | ExprKind::Yield
+            | ExprKind::Intrinsic => {}
+        }
+    }
+    fn remap_block(
+        blk: &mut hir::HirBlock,
+        map: &mut HashMap<LocalId, LocalId>,
+        next: &mut u32,
+    ) {
+        for stmt in &mut blk.stmts {
+            match stmt {
+                HirStmt::Expr(expr) => remap_expr(expr, map, next),
+                HirStmt::Let { local, init } | HirStmt::Var { local, init } => {
+                    let n = fresh(map, next, *local);
+                    *local = n;
+                    if let Some(init) = init {
+                        remap_expr(init, map, next);
+                    }
+                }
+                HirStmt::Item => {}
+            }
+        }
+        if let Some(tail) = &mut blk.tail {
+            remap_expr(tail, map, next);
+        }
+    }
+    remap_block(b, map, next_local);
 }
 
 /// match 臂的分支条件：`scrutinee == 字面量`，有 guard 再与它对半。

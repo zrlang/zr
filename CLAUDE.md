@@ -333,9 +333,10 @@ target/debug/zr prog.zr -O1 -o /tmp/prog && /tmp/prog
 1. **`#[derive]` 剩余缺口**：方法体已经生成（`src/typeck/derive.rs`），但
    `Debug` 仍是标记 trait（不生成方法）；泛型类型 / 枚举 `Default` / 枚举 `Ord`
    显式报错；字段级诊断不精确；`Hash` 对 `str` / 切片 / 数组 / 元组按 `0` 计入
-2. **闭包只支持"定义处立即调用"**：`(|x| x + 1)(5)` 在调用点内联展开，捕获变量
-   复用外层 local；存进变量 / 当实参 / 返回报
-   `closures can only be invoked immediately where they are defined`
+2. **闭包**：**无捕获**闭包已可存进变量 / 当实参 / 返回（提升成 `__closure_N`
+   顶层函数指针，`tests/cases/83_closure_fnptr.zr`）；`(|x| x + 1)(5)` 仍是
+   定义处立即调用（单态化内联）。**带捕获**闭包仍只支持立即调用——存进变量 /
+   当实参 / 返回报 `closures can only be invoked immediately where they are defined`
 3. **`i128` / `u128` 在 64 位目标上不可用**（需寄存器对拆分）
 4. **泛型推断只从实参和期望返回类型推断**，不看用法体
    （`let v = Vec::new(); v.push(1)` 推不出 `T`，需 `let v: Vec<i32>`）
