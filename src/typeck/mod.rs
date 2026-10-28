@@ -113,6 +113,20 @@ pub struct TypeChecker {
     locals: HashMap<LocalId, Ty>,
     /// 可被赋值的局部变量（`let mut` / `mut` 参数 / `mut` 模式绑定）。
     mutable_locals: HashSet<LocalId>,
+    /// 已被移动的局部变量（非 `Copy` / 含 drop glue 的类型，经 `let b = a`
+    /// 或按值传参后源不再有效）。在**当前块**里收集：`let b = a`（`a` 为
+    /// 移动类型的局部）后 `a` 进入这里，后续对 `a` 的**读**报 use-after-move。
+    ///
+    /// 这是移动检查的最小实现：只覆盖"整个局部被移动"（不做字段级 / 分支
+    /// 敏感）。借用检查（`&mut` 独占、别名）仍是 `infer.rs::check_borrows`
+    /// 的空壳，不在本集合里。
+    moved_locals: HashSet<LocalId>,
+    /// 当前块里"正在被移动"的局部（`let b = a` 的 `a` 在被检查的瞬间算
+    /// **移动读**而不是**普通读**，避免 `let b = a` 自己触发 use-after-move）。
+    ///
+    /// 用 `HashSet` 而非单个 `Option`：一个表达式里可能同时移动多个局部
+    /// （元组解构 `let (b, c) = (a, d)`）。
+    moving_now: HashSet<LocalId>,
     /// 泛型参数的类型（按作用域栈）。
     ///
     /// 泛型参数在声明里是一个类型变量（推断变量），用到的地方按它解析。
@@ -272,6 +286,8 @@ impl Default for TypeChecker {
             statics: HashMap::new(),
             locals: HashMap::new(),
             mutable_locals: HashSet::new(),
+            moved_locals: HashSet::new(),
+            moving_now: HashSet::new(),
             type_params: Vec::new(),
             impl_generics: HashMap::new(),
             generic_fn_span: None,
@@ -1662,6 +1678,13 @@ impl TypeChecker {
 
     fn check_block(&mut self, b: &AstBlock, expected: &Ty) -> Result<hir::HirBlock> {
         self.push_scope();
+        // 移动检查按块收集：进入块时保存外层已移动的局部，离开时恢复。
+        // 块内 `let b = a` 移动的 `a` 只在块内生效（出了块 `a` 已经不存在，
+        // 或按作用域规则被遮蔽）；跨分支的移动状态不在这里合并——那需要
+        // 数据流分析，属借用检查的完整实现，本最小版不覆盖。
+        let saved_moved = self.moved_locals.clone();
+        self.moved_locals.clear();
+        self.moving_now.clear();
         let mut stmts = Vec::new();
         for s in &b.stmts {
             stmts.push(self.check_stmt(s)?);
@@ -1689,6 +1712,7 @@ impl TypeChecker {
         } else {
             None
         };
+        self.moved_locals = saved_moved;
         self.pop_scope();
         Ok(hir::HirBlock { stmts, tail })
     }
@@ -1723,10 +1747,41 @@ impl TypeChecker {
                     .with_span(*span));
                 };
                 let init_hir = if let Some(e) = init {
+                    // 移动检查：`let b = a` 对非 `Copy`（含 drop glue）的 `a`
+                    // 是移动不是复制。把 `a` 放进 `moving_now`，使检查 `a`
+                    // 时按"移动读"对待（不报 use-after-move）；检查完再从
+                    // `moving_now` 取出并登记进 `moved_locals`——此后对 `a`
+                    // 的任何**读**都报 use-after-move。
+                    //
+                    // 只认裸 `Variable`：`let b = a` 这种整值移动是当前最
+                    // 常见的坑。`let b = a.field`（字段级部分移动）、`f(a)`
+                    // （按值传参）暂不覆盖，留待借用检查的完整实现。
+                    if let Expression::Variable(name, _) = e {
+                        if let Ok(id) = self.resolve_name(name, e.span()) {
+                            if let Some(local) = self.as_local(id) {
+                                if !self.moved_locals.contains(&local)
+                                    && self.is_move_ty(&self.locals[&local])
+                                {
+                                    self.moving_now.insert(local);
+                                }
+                            }
+                        }
+                    }
                     let h = match (pre_checked, ty_ann) {
                         (Some(h), _) => h,
                         (None, _) => self.check_expr(e, &ty)?,
                     };
+                    // 从 `moving_now` 取出并登记为已移动。
+                    if let Expression::Variable(name, _) = e {
+                        if let Ok(id) = self.resolve_name(name, e.span()) {
+                            if let Some(local) = self.as_local(id) {
+                                self.moving_now.remove(&local);
+                                if self.is_move_ty(&self.locals[&local]) {
+                                    self.moved_locals.insert(local);
+                                }
+                            }
+                        }
+                    }
                     self.check_partial_move(&h, e.span())?;
                     // `unify` 两参对称，顺序只影响文案：传反了 `let x: i32 = "hi"`
                     // 会报成 "expected `str`, found `i32`"。
@@ -1900,6 +1955,21 @@ impl TypeChecker {
             Expression::Variable(name, _) => {
                 let id = self.resolve_name(name, span)?;
                 if let Some(local) = self.as_local(id) {
+                    // 移动检查：读一个已被移动的局部（且不是"正在被移动"的
+                    // 那个，后者是 `let b = a` 的合法移动读）报 use-after-move。
+                    if self.moved_locals.contains(&local)
+                        && !self.moving_now.contains(&local)
+                        && self
+                            .locals
+                            .get(&local)
+                            .map(|t| self.is_move_ty(t))
+                            .unwrap_or(false)
+                    {
+                        return Err(CompileError::type_error(format!(
+                            "use of moved value `{name}`",
+                        ))
+                        .with_span(span));
+                    }
                     ExprKind::Local(local)
                 } else {
                     ExprKind::Def(id)
@@ -5024,6 +5094,19 @@ impl TypeChecker {
             Ty::Array(elem, _) => self.has_drop_glue(elem, depth + 1),
             _ => false,
         }
+    }
+
+    /// 类型是否"移动语义"（非 `Copy`）：含 drop glue 的类型赋值/传参是移动
+    /// 不是复制。不含 drop glue 的类型（标量、纯值结构体）按复制语义，重复
+    /// 使用合法。
+    ///
+    /// 这里以"是否含析构"为近似：zr 的 `Copy` 标记 trait 只登记不参与
+    /// 单态化决策（`src/typeck/derive.rs` 的 `generate_derive_impls` 对
+    /// `Copy` 只插标记 impl），而 MIR 的 `is_drop_ty` 正是用 drop glue 判
+    /// 移动/复制（`builder.rs` `let b = a` 对 Drop 类型 `mark_moved`）。与
+    /// MIR 保持同一判据，移动检查才不会跟后端生成对不上。
+    fn is_move_ty(&self, ty: &Ty) -> bool {
+        self.has_drop_glue(&self.infer.resolve(ty), 0)
     }
 
     fn check_field_access(&self, ty: &Ty, name: &str, span: ast::Span) -> Result<(Ty, FieldIndex)> {

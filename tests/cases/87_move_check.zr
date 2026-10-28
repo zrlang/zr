@@ -1,0 +1,56 @@
+// 覆盖：移动语义的最小实现——`let b = a` 对含 drop glue（非 `Copy`）的
+// 类型是移动，读被移动的 `a` 报 `use of moved value`（负向用例
+// `tests/negative/09_use_after_move.zr`）。本文件钉住**合法**那一半：
+// 移动后只用目标、不读源；以及不含 drop glue 的类型按复制语义可重复使用。
+//
+// 背景：zr 早先移动语义不检查（AGENTS §4）。MIR 层 `let b = a` 对 Drop 类型
+// 已经 `mark_moved`（`builder.rs`，运行时正确单次析构），但类型检查阶段不
+// 拦"移动后再读源"。现在补上检查（`moved_locals` / `is_move_ty`），这里钉住
+// 不被误伤的合法用法。
+//
+// 覆盖范围说明：这是**最小**移动检查——只覆盖"整个局部被移动"
+// （`let b = a`）。字段级部分移动（`let b = a.field`）、按值传参移动
+// （`f(a)`）不在本用例（留待借用检查完整实现）。
+fn main() -> i32 {
+    // 1. 移动后只用目标、不读源：合法（不误报）。
+    let mut hits = 0;
+    {
+        let s1 = Tracked { id: 1, hits: &mut hits };
+        let s2 = s1;
+        if s2.id != 1 {
+            return 1;
+        }
+    }
+    if hits != 1 {
+        return 2;
+    }
+
+    // 2. 不含 drop glue 的类型（标量 / 纯值结构体）按复制语义：重复使用合法。
+    let a = 5;
+    let b = a;
+    if a + b != 10 {
+        return 3;
+    }
+    let p = Point { x: 1, y: 2 };
+    let q = p;
+    if p.x + q.y != 3 {
+        return 4;
+    }
+
+    // 3. 同一块里先移动、后遮蔽：`let s = s;` 之后再用新的 `s` 合法。
+    let mut hits2 = 0;
+    let s = Tracked { id: 7, hits: &mut hits2 };
+    let s = s; // 移动进同名遮蔽变量
+    if s.id != 7 {
+        return 5;
+    }
+
+    return 0;
+}
+
+struct Tracked { id: i32, hits: &mut i32 }
+impl Drop for Tracked {
+    fn drop(&mut self) { *self.hits = *self.hits + 1; }
+}
+
+struct Point { x: i32, y: i32 }

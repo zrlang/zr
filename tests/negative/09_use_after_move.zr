@@ -1,0 +1,23 @@
+// 负向用例：移动（use-after-move）检查。
+//
+// zr 早先移动语义不检查：`let s2 = s1;` 之后再用 `s1` 不报错（AGENTS §4
+// "移动语义不检查"）。README §「所有权系统」声称赋值转移所有权（除非类型
+// 实现 Copy），但 `infer.rs::check_borrows` 是空壳，`s1` 被移动后仍可读——
+// 对含 drop glue 的类型（`String`、`Vec`、实现 `Drop` 的结构体），这意味
+// 着源与目标共享同一份存储，随后双双析构（悬垂/重复释放）或读到已移交的
+// 垃圾。
+//
+// 现在加最小移动检查：`let b = a`（`a` 为移动类型的整个局部）后，再读 `a`
+// 报 `use of moved value`。这里钉住负向用例。
+//
+// expect: use of moved value
+struct Tracked { id: i32, hits: &mut i32 }
+impl Drop for Tracked {
+    fn drop(&mut self) { *self.hits = *self.hits + 1; }
+}
+fn main() -> i32 {
+    let mut hits = 0;
+    let s1 = Tracked { id: 1, hits: &mut hits };
+    let s2 = s1;
+    return s1.id;   // 读已移动的 s1
+}
