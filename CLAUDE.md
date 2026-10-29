@@ -334,9 +334,10 @@ target/debug/zr prog.zr -O1 -o /tmp/prog && /tmp/prog
 3. **`i128` / `u128` 在 64 位目标上不可用**（需寄存器对拆分）
 4. **泛型推断只从实参和期望返回类型推断**，不看用法体
    （`let v = Vec::new(); v.push(1)` 推不出 `T`，需 `let v: Vec<i32>`）
-5. **穷尽性报错信息误导**：`match must have a trailing `_` arm`
-6. **格式串只剩两处没做**：命名参数 `{name}` 与多行 Debug `{:#?}`
-   （`#` 对 `{:?}` 被忽略，输出的是一行）；其余规格已与 Rust 逐字符对齐
+5. **穷尽性报错信息误导**——✅ 已改进（`a526953`：枚举缺臂列出缺失变体名，`17_match_missing_variant.zr`；整型/标量仍保留尾 `_` 臂措辞）
+6. **格式串剩两处**：命名参数 `{name}` 与聚合类型的多行 Debug `{:#?}`
+   （标量/字符串的 `{:#?}` 与 `{:?}` 输出一致，符合 Rust；`#` 对 `{:?}`
+   只对聚合有影响，而聚合 Debug 还未实现）；其余规格已与 Rust 逐字符对齐
 7. **`Option` / `Result`（含变体 `Some` / `None` / `Ok` / `Err`）已在 prelude**——✅ 已实现（`4ed15d7`），无需显式 `use core::Option;`
 8. **无元数据 / 临时文件 API**：权限、时间戳、`tempfile` 缺失
 
@@ -359,12 +360,12 @@ target/debug/zr prog.zr -O1 -o /tmp/prog && /tmp/prog
 
 | 文档 | 问题 |
 |---|---|
-| `tests/README.md` | "尚未覆盖"表严重过期（`enum`/`match`/`泛型`/`智能指针` 说未实现，实际都在跑） |
-| `future/README.md` | 状态列几乎全标 ✅ Done，与源码完全不符 |
-| `docs/rust-parity.md` | 称泛型别名不支持、`#[derive]` 在结构体上报错——都已修好 |
-| `README.md` 安全模型节 | 描述的是愿景（`unsafe`、借用检查、越界检查） |
-| `Cargo.toml` description | "coroutines, CTFE, and a full async runtime" 夸大 |
-| `CONTRIBUTING.md` | 未提负向测试缺失与架构红线 |
+| `tests/README.md` | ✅ 已修正（`fb4dfb2`）："尚未覆盖"表重写为按源码核对的两栏，并补 52–90 用例清单 |
+| `future/README.md` | ✅ 已修正（`fb4dfb2`）：状态列按源码实际结论重排（真正实现的留 ✅，骨架 🔧，空壳 ⬜） |
+| `docs/rust-parity.md` | ✅ 已修正（`1d38ca3`）：泛型别名改"已支持"、`dyn` 改"骨架可用" |
+| `README.md` 安全模型节 | ✅ 已修正（`1d38ca3`）：加警示说明是愿景，不是现状 |
+| `Cargo.toml` description | ✅ 已修正（`1d38ca3`）：去掉夸大的 "CTFE, and a full async runtime" |
+| `CONTRIBUTING.md` | ✅ 已修正（`1d38ca3`）：补测试约定与架构红线摘要 |
 
 ---
 
@@ -376,10 +377,10 @@ target/debug/zr prog.zr -O1 -o /tmp/prog && /tmp/prog
 2. **格式串 `{name}` 命名参数与 `{:#?}` 多行 Debug** —— P1 缺口，影响可读性
 3. **LTO 接线**（`src/opt/lto.rs` → `src/opt/mod.rs` → CLI 开关）—— P2
 4. **`use foo::*` glob 导入** —— ✅ 已完成（`40b5b45`，`90_glob_import.zr`）
-5. **穷尽性报错信息修措辞** —— P1，`match must have a trailing _ arm` 误导（实际是缺臂但非穷尽性情况）
+5. **穷尽性报错信息修措辞** —— ✅ 已完成（`a526953`：枚举缺臂列出缺失变体名，`17_match_missing_variant.zr`）
 6. **`Option` / `Result` 加进 prelude** —— ✅ 已完成（`4ed15d7`，含变体 `Some`/`None`/`Ok`/`Err`）
 7. **`i128` / `u128` 64 位目标** —— P1，需寄存器对拆分
-8. **更新 `tests/README.md` 与 `future/README.md`** —— P3，两份文档严重失真
+8. **更新 `tests/README.md` 与 `future/README.md`** —— ✅ 已完成（`fb4dfb2`；另 `1d38ca3` 修正 README / rust-parity / CONTRIBUTING / Cargo.toml）
 9. **`Debug` derive 方法体** —— P1，需要运行期格式化设施（目前只有标量+结构体/元组/枚举的组合）
 
 ---

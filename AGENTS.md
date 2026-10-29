@@ -16,12 +16,12 @@ zr 是一门系统编程语言（Rust/Zig 混合取向），编译器用 Rust �
 | **源码注释** | ✅ 最高 | 注释很密，且常记录"早先怎么错、为什么这么改"，是排查资料的第一手来源 |
 | `AGENTS.md` / `CLAUDE.md` | ✅ 高 | 已逐条核对源码 |
 | `README.md` 的**语法与用例** | ✅ 高 | 跟着用例就能写出能跑的程序 |
-| `README.md` 的**安全模型**（"指针与 unsafe"） | ⚠️ 愿景 | 描述的**不是**现状，见「红线」 |
-| `docs/rust-parity.md` | ⚠️ 部分过期 | 大方向对，但个别结论已被在途改动超越（例：称泛型别名不支持、`#[derive]` 结构体报错、类型路径上的 turbofish 不支持——都已修好） |
-| `CONTRIBUTING.md` | ⚠️ 部分过期 | 步骤对，没提负向测试缺失和架构红线 |
-| `tests/README.md` | ❌ 严重过期 | "尚未覆盖"表说 `enum`/`match`/`泛型`/`智能指针` 未实现，实际 `57_enum.zr`/`66_generics.zr` 都在跑 |
-| `future/README.md` | ❌ **不可信** | 状态列几乎全标 ✅ Done，源码里全是空壳或没接线。见下 |
-| `Cargo.toml` description | ❌ 夸大 | 称 "coroutines, CTFE, and a full async runtime"，实际 `yield` 是类型占位、async runtime 仅部分平台 |
+| `README.md` 的**安全模型**（"指针与 unsafe"） | ⚠️ 愿景 | 描述**不是**现状（借用检查/生命周期未实现）；2026-10-29 已加警示注明是设计目标 |
+| `docs/rust-parity.md` | ✅ 高 | 2026-10-29 已修正（泛型别名改"已支持"、`dyn` 改"骨架可用"）；仍以源码为准 |
+| `CONTRIBUTING.md` | ✅ 高 | 2026-10-29 已补测试约定与架构红线摘要 |
+| `tests/README.md` | ✅ 高 | 2026-10-29 已重写"尚未覆盖"表并补 52–90 用例清单 |
+| `future/README.md` | ✅ 高 | 2026-10-29 已按源码实际结论重排状态列 |
+| `Cargo.toml` description | ✅ 高 | 2026-10-29 已改为 "ownership, zero-cost abstractions, and coroutines" |
 
 **结论：以源码为准。任何"已实现"的声明都要 `grep` 验证。**
 
@@ -174,6 +174,7 @@ README 里"指针与 unsafe"一节目前是**愿景**：
 | `src/opt/pass_manager.rs` | 内联重命名改成"先建完整重命名表、再逐操作数一次性映射"（见下） |
 | `src/codegen/encoder.rs` | SysV 栈上传参（第 7 个整数 / 第 9 个浮点实参）+ `call` 的 16 字节对齐；零常量的 `xor reg, reg` 补回 REX.R |
 | `src/typeck/mod.rs` | `check_index_scalar` 不再吞 unify 错误；`check_match` 给穷尽 match 补发散 else；聚合类型上的 `==`/`<` 改写成 derive 方法调用 |
+| `src/typeck/mod.rs` | 枚举缺臂报错列出**缺失变体名**（提交 `a526953`）：早先统一说 `match must have a trailing `_` arm`，误导人以为补个 `_` 就行；现在 `match is not exhaustive: `Color` variant not covered: Blue`，整型/标量仍保留尾 `_` 臂措辞 |
 | `src/typeck/derive.rs` | 新增：在 AST 层生成 `Type__clone` / `__eq` / `__lt` / `__hash` / `__default` 方法体 |
 | `src/typeck/hir.rs`、`src/mir/builder.rs` | 新增 `ExprKind::Unreachable` → `MirTerminator::Unreachable`（上面的发散 else） |
 | `src/typeck/infer.rs` | 诊断名字表：`unify`/`subtype` 的错误不再把具名类型打成 `type#N` |
@@ -200,7 +201,7 @@ README 里"指针与 unsafe"一节目前是**愿景**：
 - `cargo test --test zr_language`：90 个用例 × 5 个优化等级 = 450 项（含宿主端
   `io_print_matches_rust`，它逐字符对比 Rust 的格式化输出，含 `{:e}` / `{:E}`
   与大浮点 Display（`|v| ≥ 2⁶⁴` 不带 `.0`）的回归）。
-- `cargo test --test zr_negative`：16 个负向用例（含新加的越界与 use-after-move）。
+- `cargo test --test zr_negative`：17 个负向用例（含新加的越界、use-after-move 与枚举缺臂 `17_match_missing_variant.zr`）。
 
 ### 最近修掉的静默 bug（都在 `tests/` 里留了钉子）
 
@@ -228,6 +229,8 @@ README 里"指针与 unsafe"一节目前是**愿景**：
 - **格式串**：命名参数 `{name}` 与多行 Debug `{:#?}` 没做；`#` 对 `{:?}` 被忽略，只输出一行。
 - **闭包**：**无捕获**闭包已可存进变量/当实参/返回（提升成 `__closure_N` 顶层函数指针）；**带捕获**闭包已可存进变量/嵌套/多次调用（`tests/cases/84_closure_capture_value.zr`），但跨函数传 env 仍有限制。
 - **`i128`/`u128`** 在 64 位目标上不可用（需寄存器对拆分）。
+- **穷尽性报错**：✅ 已改进（`a526953`：枚举缺臂列出缺失变体名，`17_match_missing_variant.zr`；整型/标量仍保留尾 `_` 臂措辞）。
+- **文档债**：✅ 已清（`fb4dfb2` 修 `tests/README.md` / `future/README.md`；`1d38ca3` 修 README 安全模型节 / `rust-parity.md` / `CONTRIBUTING.md` / `Cargo.toml` description）。
 
 ## 6. 工作约定
 
