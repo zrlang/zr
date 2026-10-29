@@ -2420,9 +2420,14 @@ fn type_size_align(b: &Builder, ty: &hir::Ty, depth: usize) -> Option<(i128, i12
         }
         Ty::Bool | Ty::Char => (1, 1),
         Ty::Unit | Ty::Never => (0, 1),
-        Ty::Pointer(..) | Ty::Reference(..) | Ty::Str | Ty::Slice(..) | Ty::Function { .. } => {
-            (8, 8)
-        }
+        Ty::Pointer(..) | Ty::Reference(..) | Ty::Function { .. } => (8, 8),
+        // `str` / 切片是 `{ptr, len}` 的 16 字节聚合，**不是**一个瘦指针。
+        // `struct_layout` 早就按 16 字节算（`size: 16, fields: [(0, ptr), (8, u64)]`），
+        // 这里却返回 8——结构体里 `str` 字段后面的字段会落在偏移 8，盖住 `len`，
+        // 于是 `s.name.len` 读到**下一个字段的值**（`str3.zr`：`S { name: str, x: i64 }`
+        // 的 `name.len` 读成 7，应 3）。修成一致，否则带 `str`/切片字段的结构体布局
+        // 整段错位（`s.name.ptr` 读对、`s.name.len` 读错，越界还可能 SIGSEGV）。
+        Ty::Str | Ty::Slice(..) => (16, 8),
         Ty::Array(elem, len) => {
             let n = hir::array_len_value(len)?;
             let (sz, al) = type_size_align(b, elem, depth + 1)?;

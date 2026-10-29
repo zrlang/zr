@@ -1,0 +1,57 @@
+//=============================================================================
+// tests/cases/95_str_slice_layout.zr — str/切片字段布局与数组字面量元素传播
+//
+// 早先两个静默 bug：
+//  1. `type_size_align` 把 `str`/切片当 **8 字节**（一个瘦指针），而
+//     `struct_layout` 按 16 字节（`{ptr, len}`）算。结构体里 `str`/切片字段
+//     后面的字段落在偏移 8，盖住 `len`——`S { name: str, x: i64 }` 的
+//     `name.len` 读到 `x` 的值（7 而不是 3）；`name.ptr` 却读对，字段访问
+//     一半对一半错，越界还 SIGSEGV。
+//  2. 数组字面量元素不按**切片**期望的元素类型收窄：`S { arr: []const i64 }`
+//     用 `[10, 20, 30]` 初始化时元素默认成 i32，`[i32; 3]` 又被字段初始化
+//     静默强转成 `[]const i64`——切片指向 i32 数据却被当 i64 读，运行期
+//     SIGSEGV（`/tmp/sl_bug.zr`）。
+//
+// 覆盖：
+//   - `str`/切片字段后面跟字段（布局：`len` 不再被盖住）
+//   - `str`/切片字段的 `ptr`/`len`/`[i]` 取值
+//   - 切片字段用 i32 字面量数组初始化（元素按期望 i64 收窄）
+//   - `let a: []const i64 = [10, 20, 30]`（切片元素类型传播，早先报 type mismatch）
+//=============================================================================
+
+use io::{fmt_int, println_fmt};
+
+struct S {
+    name: str,
+    x: i64,
+    arr: []const i64,
+}
+
+fn main() -> i32 {
+    // --- str 字段布局：`len` 不被后面的字段盖住 ---
+    let s = S { name: "abc", x: 7, arr: [10, 20, 30] };
+    if s.name.len != 3 { return 1; }
+    if s.name.ptr[0] != 97 { return 2; }  // 'a'
+    if s.name.ptr[2] != 99 { return 3; }  // 'c'
+    if s.x != 7 { return 4; }
+
+    // --- 切片字段（i32 字面量数组 → []const i64，元素按期望收窄） ---
+    if s.arr.len != 3 { return 5; }
+    if s.arr[0] != 10 { return 6; }
+    if s.arr[1] != 20 { return 7; }
+    if s.arr[2] != 30 { return 8; }
+
+    // --- let 绑定切片（早先报 type mismatch） ---
+    let a: []const i64 = [1, 5, 9];
+    if a.len != 3 { return 9; }
+    if a[2] != 9 { return 10; }
+
+    // --- 切片字段后面再跟字段（`arr` 在末尾，后面没有，但 `x` 在中间） ---
+    let s2 = S { name: "xy", x: 100, arr: [7i64, 8i64] };
+    if s2.name.len != 2 { return 11; }
+    if s2.arr[1] != 8 { return 12; }
+    if s2.x != 100 { return 13; }
+
+    println_fmt("ok name.len={} arr.len={}", &[fmt_int(s.name.len as i64), fmt_int(s.arr.len as i64)], 2);
+    return 0;
+}
