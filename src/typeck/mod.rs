@@ -220,6 +220,8 @@ pub struct TypeChecker {
     /// 限定符——标准库的定义已经被并进当前编译单元，所以这里只需要
     /// 知道"这个名字是模块"，不用再解析成 DefId。
     known_modules: HashSet<String>,
+    /// 每个模块导出的条目名（`use foo::*` 按它把模块的全部顶层名字导入）。
+    module_exports: std::collections::HashMap<String, Vec<String>>,
     /// 警告集合（deprecated 使用等）。
     warnings: Vec<CompileError>,
     /// cfg 求值用的目标平台信息。
@@ -325,6 +327,7 @@ impl Default for TypeChecker {
             use_aliases: HashMap::new(),
             variant_aliases: HashMap::new(),
             known_modules: HashSet::new(),
+            module_exports: std::collections::HashMap::new(),
             warnings: Vec::new(),
             cfg_target: attributes::CfgTarget::host(),
             ast_fns: HashMap::new(),
@@ -349,6 +352,14 @@ impl TypeChecker {
     /// 告知类型检查器哪些名字是已加载的标准库模块。
     pub fn set_known_modules(&mut self, modules: HashSet<String>) {
         self.known_modules = modules;
+    }
+
+    /// 告知类型检查器每个模块导出的条目名，供 `use foo::*` 导入。
+    pub fn set_module_exports(
+        &mut self,
+        exports: std::collections::HashMap<String, Vec<String>>,
+    ) {
+        self.module_exports = exports;
     }
 
     /// 设置目标允许的最大整数位宽。
@@ -1061,16 +1072,56 @@ impl TypeChecker {
                 }
             }
             UseTree::Group(trees) => {
+                // `use core::*` 解析成 `Group([Name("core"), Glob])`：Glob 是
+                // 兄弟节点，模块段是它前面的路径。先处理 glob（它要拿到整个
+                // 组的上下文），再处理其余兄弟。
+                if trees.iter().any(|t| matches!(t, UseTree::Glob)) {
+                    let module_name = Self::glob_module_name(trees);
+                    match module_name {
+                        Some(mod_name) => {
+                            if let Some(exports) = self.module_exports.get(&mod_name) {
+                                for item in exports {
+                                    if let Some(id) = self.symbols.get(item).copied() {
+                                        self.use_aliases.insert(item.clone(), id);
+                                    }
+                                }
+                            } else {
+                                self.errors.push(
+                                    CompileError::name_error(format!(
+                                        "cannot glob-import `{}`: unknown module",
+                                        mod_name
+                                    ))
+                                    .with_span(*span),
+                                );
+                            }
+                        }
+                        None => {
+                            self.errors.push(
+                                CompileError::name_error(
+                                    "glob import must name a module (e.g. `use core::*`)",
+                                )
+                                .with_span(*span),
+                            );
+                        }
+                    }
+                    // 其余兄弟（如果有）正常递归。
+                    for t in trees {
+                        if !matches!(t, UseTree::Glob) {
+                            self.resolve_use_tree(t, span)?;
+                        }
+                    }
+                    return Ok(());
+                }
                 for t in trees {
                     self.resolve_use_tree(t, span)?;
                 }
             }
             UseTree::Glob => {
-                // `use foo::*` —— 需要模块系统支持，此处记录为 future feature
-                self.errors.push(CompileError::internal(
-                    "glob imports (`use foo::*`) require module system support (not yet implemented)",
-                )
-                .with_span(*span));
+                // 到达这里的单独 `Glob`（不在 Group 里）：`use *`，非法。
+                self.errors.push(
+                    CompileError::name_error("glob import must name a module (e.g. `use core::*`)")
+                        .with_span(*span),
+                );
             }
         }
         Ok(())
@@ -1174,6 +1225,45 @@ impl TypeChecker {
                 Self::use_tree_leaf_name(last)
             }
             UseTree::Rename(inner, _) => Self::use_tree_leaf_name(inner),
+            UseTree::Glob => None,
+        }
+    }
+
+    /// `use foo::*` 里 `*` 所属的模块名。
+    ///
+    /// 树形是 `Group([Name("foo"), Glob])`（解析器把 `*` 包在路径外面，
+    /// 路径段 `foo` 是兄弟节点），模块名就是 Glob 前面的那段路径。纯
+    /// `use *`（无模块段）返回 `None`——那在 Rust 里也是非法写法。
+    fn glob_module_name(trees: &[UseTree]) -> Option<String> {
+        // 找 Glob 在哪个兄弟位置，取其前面的路径段作为模块名。
+        for (i, t) in trees.iter().enumerate() {
+            if matches!(t, UseTree::Glob) {
+                if i == 0 {
+                    return None;
+                }
+                // 前面是模块路径（`Group([Name("a"), Name("b"), Glob])`
+                // 代表 `use a::b::*`），取最后一段名字。zr 的标准库模块
+                // 都是单段（`core` / `io`），但多段也能取到叶子。
+                return Self::last_segment_name(&trees[..i]);
+            }
+        }
+        // 没有直接 Glob 兄弟，可能在嵌套里（`use foo::{bar::*}`）。
+        for t in trees {
+            if let UseTree::Group(inner) = t {
+                if let Some(name) = Self::glob_module_name(inner) {
+                    return Some(name);
+                }
+            }
+        }
+        None
+    }
+
+    /// 取一段 use 路径的最后一段名字（`Group([Name("a"), Name("b")])` → `b`）。
+    fn last_segment_name(trees: &[UseTree]) -> Option<String> {
+        match trees.last()? {
+            UseTree::Name(n) => Some(n.clone()),
+            UseTree::Group(items) => Self::last_segment_name(items),
+            UseTree::Rename(inner, _) => Self::last_segment_name(std::slice::from_ref(&**inner)),
             UseTree::Glob => None,
         }
     }

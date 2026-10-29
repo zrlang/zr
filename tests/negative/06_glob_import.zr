@@ -1,8 +1,0 @@
-// 负向用例：glob 导入必须明确报错，而不是静默导入或静默失败。
-//
-// expect: glob imports
-use core::*;
-
-fn main() -> i32 {
-    return 0;
-}

@@ -722,6 +722,8 @@ fn compile(input: &str, cmd: &Cli) -> Result<std::path::PathBuf, String> {
 
     let mut checker = typeck::TypeChecker::new();
     checker.set_known_modules(loaded.modules.iter().cloned().collect());
+    // 每个模块导出的条目名：`use core::*` 要按它导入全部顶层名字。
+    checker.set_module_exports(loaded.module_exports);
     // 32 位目标支持多字长（i64）运算：值走 8 字节栈槽，用两条 32 位指令
     // 计算。未实现的运算（如 i64 乘法/除法）在后端报错，不会静默截断。
     checker.set_max_int_bits(64);

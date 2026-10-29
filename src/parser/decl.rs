@@ -33,7 +33,15 @@ impl Parser {
             }
             while self.match_kind(&TokenKind::ColonColon) {
                 if self.match_kind(&TokenKind::Star) {
-                    return Ok(UseTree::Group(vec![UseTree::Glob]));
+                    // `use core::*`：`*` 是叶子，路径段（`core`）必须保留——
+                    // 早先直接返回 `Group([Glob])`，把 `core` 丢掉了，模块系统
+                    // 看不到要加载哪个模块，glob 导入无法解析。现在把已累积的
+                    // 路径包在 Glob 外面（与 `use a::{b, c}` 的 group 包装一致）。
+                    let mut tree = UseTree::Name(path[0].clone());
+                    for seg in path.into_iter().skip(1) {
+                        tree = UseTree::Group(vec![tree, UseTree::Name(seg)]);
+                    }
+                    return Ok(UseTree::Group(vec![tree, UseTree::Glob]));
                 }
                 if self.match_kind(&TokenKind::LBrace) {
                     let mut trees = Vec::new();

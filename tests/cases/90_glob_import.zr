@@ -1,0 +1,36 @@
+// 覆盖：`use foo::*` glob 导入。早先解析器把 `use core::*` 的路径段 `core`
+// 丢掉（AST 变成 `Group([Glob])`），类型检查里 Glob 分支又无条件报
+// "require module system support"——`use core::*` 之类写法直接编译失败。
+//
+// 现在两处都修了：
+// - 解析器保留路径段：`use core::*` → `Group([Name("core"), Glob])`；
+// - 模块加载器记录每个模块的导出条目名（`module_exports`），类型检查的
+//   Glob 分支把该模块的全部顶层名字登记成别名。
+//
+// 这里刻意只用 glob 导入、不写显式 `use`，任何一环坏了用例都会红。
+use core::*;
+use io::*;
+
+fn main() -> i32 {
+    // 1. `use core::*`：类型（Option / Result）与它们的变体都可用。
+    let o: Option<i32> = Some(7);
+    let v = o.unwrap();
+    if v != 7 {
+        return 1;
+    }
+    let r: Result<i32, i32> = Ok(9);
+    if !r.is_ok() {
+        return 2;
+    }
+
+    // 2. `use core::*` 的泛型函数（`min`）也能调。
+    let m = min(3, 5);
+    if m != 3 {
+        return 3;
+    }
+
+    // 3. `use io::*`：`println` 等 io 函数可用。
+    println("glob import ok");
+
+    return 0;
+}

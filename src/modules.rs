@@ -28,6 +28,45 @@ pub struct LoadReport {
     pub modules: Vec<String>,
 }
 
+/// 收集一个模块（`Program`）里定义的所有顶层条目名，供 `use foo::*` 导入。
+///
+/// 只取**定义**类条目（函数 / 类型 / trait / 常量 / 静态 / extern 声明 / 宏），
+/// 不取 `use` 与 `mod`（它们是限定符不是可导入名）。标准库模块里的条目基本
+/// 都带 `pub`；AST 层没有逐条记录可见性（只有 `pub`，无可见性检查），这里
+/// 一律按"可导出"处理——`use core::*` 把 `core` 的全部顶层名字拉进来。
+fn module_item_names(module: &Program) -> Vec<String> {
+    let mut out = Vec::new();
+    for f in &module.functions {
+        out.push(f.name.clone());
+    }
+    for td in &module.type_defs {
+        match td {
+            crate::parser::ast::TypeDef::Struct(s) => out.push(s.name.clone()),
+            crate::parser::ast::TypeDef::Enum(e) => out.push(e.name.clone()),
+            crate::parser::ast::TypeDef::Union(u) => out.push(u.name.clone()),
+            crate::parser::ast::TypeDef::Alias { name, .. } => out.push(name.clone()),
+        }
+    }
+    for t in &module.traits {
+        out.push(t.name.clone());
+    }
+    for c in &module.consts {
+        out.push(c.name.clone());
+    }
+    for s in &module.statics {
+        out.push(s.name.clone());
+    }
+    for m in &module.macros {
+        out.push(m.name.clone());
+    }
+    for e in &module.externs {
+        for f in &e.functions {
+            out.push(f.name.clone());
+        }
+    }
+    out
+}
+
 /// 标准库根目录（`<crate>/std`）。
 pub fn std_root() -> PathBuf {
     let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
@@ -40,6 +79,12 @@ pub struct Loaded {
     pub error: Option<String>,
     /// 并入主程序的模块名（类型检查用得上：`io` 这类段要当模块看待）。
     pub modules: Vec<String>,
+    /// 每个模块导出的条目名（`use core::*` 要按它导入全部名字）。
+    ///
+    /// 键是模块名（`core` / `io`），值是模块里定义的顶层条目名（函数、
+    /// 类型、常量、静态、trait、宏、extern 声明）。`use foo::*` 在类型检查
+    /// 时把这里列出的名字全部登记成 `foo` 的别名。
+    pub module_exports: std::collections::HashMap<String, Vec<String>>,
     /// 读过的文件与指纹。
     pub report: LoadReport,
 }
@@ -51,12 +96,14 @@ pub fn load(prog: &mut Program, base_dir: &Path) -> Loaded {
     let mut out = Loaded {
         error: None,
         modules: Vec::new(),
+        module_exports: std::collections::HashMap::new(),
         report: LoadReport::default(),
     };
     let mut loader = Loader {
         seen: std::collections::HashSet::new(),
         modules: std::collections::HashSet::new(),
         report: &mut out.report,
+        module_exports: &mut out.module_exports,
     };
 
     // 1) 先展开内联模块（它们已经在内存里了）
@@ -91,6 +138,8 @@ struct Loader<'a> {
     /// 已加载的模块名。
     modules: std::collections::HashSet<String>,
     report: &'a mut LoadReport,
+    /// 模块名 → 导出的条目名（`use foo::*` 用）。
+    module_exports: &'a mut std::collections::HashMap<String, Vec<String>>,
 }
 
 /// `mod` 嵌套深度上限。超过就当作循环引用报错——递归 `mod` 会无限展开。
@@ -116,6 +165,10 @@ impl Loader<'_> {
             })?;
             let (module, path) = self.parse_file(&path)?;
             self.modules.insert(name.clone());
+
+            // 记录本模块导出的条目名，供 `use core::*` 导入。
+            self.module_exports
+                .insert(name.clone(), module_item_names(&module));
 
             for dep in collect_use_roots(&module.imports) {
                 if !self.modules.contains(&dep) {
@@ -145,6 +198,9 @@ impl Loader<'_> {
         let (module, path) = self.parse_file(&path)?;
         // `mod foo;` 里 foo 是**模块名**，登记它让 `foo::bar` 能解析
         self.modules.insert(name.to_string());
+        // 记录导出条目名，供 `use foo::*` 导入。
+        self.module_exports
+            .insert(name.to_string(), module_item_names(&module));
         let dir = path.parent().unwrap_or(base).to_path_buf();
         self.absorb(prog, module, &dir, depth);
         Ok(())
@@ -169,8 +225,7 @@ impl Loader<'_> {
     /// 把一个模块的条目并进主程序，并递归处理它自己的依赖。
     fn absorb(&mut self, prog: &mut Program, module: Program, dir: &Path, depth: usize) {
         // 先取出来，避免借用冲突
-        let mut items: Vec<ModuleItem> = Vec::new();
-        let Program {
+        let mut items: Vec<ModuleItem> = Vec::new();        let Program {
             attrs,
             modules,
             imports,
