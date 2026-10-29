@@ -9,7 +9,7 @@ zr 是一门系统编程语言，设计取向介于 Rust 与 Zig 之间：所有
 - 给 AI agent 的操作约定、架构红线、在途工作：见 `AGENTS.md`
 - 与 Rust 的逐条对照：见 `docs/rust-parity.md`（**部分结论已被在途改动超越**）
 
-> 最近更新：2026-10-29。`feat/lang-features` 上已完成：`unsafe`/`dyn`/最小移动检查/常量越界检查；`52_if_let` 回归与 `71_derive` 失败均已修复；**又修掉了 `55_tuple_pattern` / `74_generic_alias` / `60_process` / `64_fs_path` / `io_print_matches_rust`（用户定义遮蔽标准库同名函数，见提交 `1ef4a02`）**；全绿（89 用例 × 5 等级 + 宿主端对照用例）。
+> 最近更新：2026-10-29。`feat/lang-features` 上已完成：`unsafe`/`dyn`/最小移动检查/常量越界检查；`52_if_let` 回归与 `71_derive` 失败均已修复；**又修掉了 `55_tuple_pattern` / `74_generic_alias` / `60_process` / `64_fs_path` / `io_print_matches_rust`（用户定义遮蔽标准库同名函数，见提交 `1ef4a02`）**；**支持 `use foo::*` glob 导入（见提交 `40b5b45`）**；全绿（90 用例 × 5 等级 + 宿主端对照用例）。
 
 ---
 
@@ -17,11 +17,11 @@ zr 是一门系统编程语言，设计取向介于 Rust 与 Zig 之间：所有
 
 ```sh
 cargo build                                    # 编译编译器 + 运行时汇编
-cargo test --test zr_language                  # 全量回归：89 用例 × 5 优化等级，约 3 分钟
+cargo test --test zr_language                  # 全量回归：90 用例 × 5 优化等级，约 3 分钟
 target/debug/zr prog.zr -O1 -o /tmp/prog && /tmp/prog
 ```
 
-当前基线：**89 用例 × 5 等级 + 宿主端对照用例 全绿**。
+当前基线：**90 用例 × 5 等级 + 宿主端对照用例 全绿**。
 
 诊断：`--dump-tokens|ast|hir|mir|ssa|ssa-after|asm`、`--wat`、`--emit-llvm`、
 `--no-incremental`、`--target <triple>`、`-g`；`ZR_TIME=1` 看各阶段耗时。
@@ -233,8 +233,8 @@ target/debug/zr prog.zr -O1 -o /tmp/prog && /tmp/prog
 | 特性 | 状态 |
 |---|---|
 | `mod`、`use`、`use a::{b, c}` 分组导入 | ✅ |
-| `use x as y` 重命名 | ❌ **无效**（静默失败：报 `cannot find value`） |
-| `use foo::*` glob 导入 | ❌ 明确报错 |
+| `use x as y` 重命名 | ✅（`75_use_alias.zr`；含多段路径 `use core::Option as Opt`） |
+| `use foo::*` glob 导入 | ✅（`40b5b45`，`90_glob_import.zr`） |
 | `pub` / `pub(crate)` / `pub(super)` | 🟡 仅 `pub`，无可见性检查 |
 | `extern "C" { ... }` 声明块 | ✅ |
 | `extern "C" fn ...`（带体定义） | ❌ 明确报错 |
@@ -258,7 +258,7 @@ target/debug/zr prog.zr -O1 -o /tmp/prog && /tmp/prog
 
 ## 4. 已实现但未测试覆盖
 
-`tests/cases/` 共 89 个用例，全部通过时 `cargo test` 绿。以下**已实现但无用例**，
+`tests/cases/` 共 90 个用例，全部通过时 `cargo test` 绿。以下**已实现但无用例**，
 属于回归盲区，加功能时容易破坏而无人发现：
 
 - 多边界泛型 `T: Clone + Ord`（在途改动新支持，仅解析，无校验用例）
@@ -319,7 +319,7 @@ target/debug/zr prog.zr -O1 -o /tmp/prog && /tmp/prog
 | 无 `dyn` 关键字 | ✅ 解析+类型检查骨架已实现（vtable 分派仍在未实现状态） |
 | 切片/数组索引不检查越界 | ✅ 编译期常量下标越界已报 `index out of bounds`（变量下标暂不检查） |
 | 移动语义不检查 | ✅ 最小移动检查已实现（`let b = a` 后读 `a` 报 use-after-move；字段级/按值传参移动暂不覆盖） |
-| `use x as y` 静默无效 | ❌ 仍报 `cannot find value`，不是"重命名失败" |
+| `use x as y` 静默无效 | ✅ 已修复（`75_use_alias.zr`；含多段路径 `use core::Option as Opt`） |
 | `f8` / `f16` 溢出行为 | ✅ 已验证：`f8` 最大约 240，`65504.0 * 2.0` 在 f16 正确输出 Inf |
 | 浮点 `Display` 在 \|v\| ≥ 2⁶⁴ 时输出 `.0` | ✅ 已钉住回归（`tests/cases/86_bounds_check.zr` / `tests/zr_language.rs` `io_print_matches_rust` 已扩展） |
 ### P1 — 明确报错或明显缺失
@@ -349,7 +349,7 @@ target/debug/zr prog.zr -O1 -o /tmp/prog && /tmp/prog
 5. **自举（bootstrap）未开始**：`src/zr0/` 未接线，`future/bootstrap/` 只有设计文档
 6. **宏系统未接线**：`src/macro_system/` 未 `mod` 声明；`proc-macro` 不存在
 7. **可见性检查缺失**：只有 `pub`，无 `pub(crate)` / `pub(super)`
-8. **glob 导入 `use foo::*` 不支持**
+8. **glob 导入 `use foo::*` 不支持** —— ✅ 已实现（`40b5b45`，`90_glob_import.zr`）
 9. **协程 `yield` 只是类型占位**，不是可执行协程
 10. **`const` 泛型参数解析接受但检查报错**
 11. **trait 求解的高级特性全缺**：关联类型投影、更高阶函数（`for<'a>`）、特化、
@@ -372,10 +372,10 @@ target/debug/zr prog.zr -O1 -o /tmp/prog && /tmp/prog
 
 按"依赖最少 + 影响最大"排序，每条都是可独立完成的工作单元：
 
-1. **`use x as y` 重命名修复** —— 现在静默失败（报 `cannot find value`），是 P0 级的误导
+1. **`use x as y` 重命名修复** —— ✅ 已完成（`75_use_alias.zr`，含多段路径 `use core::Option as Opt`）
 2. **格式串 `{name}` 命名参数与 `{:#?}` 多行 Debug** —— P1 缺口，影响可读性
 3. **LTO 接线**（`src/opt/lto.rs` → `src/opt/mod.rs` → CLI 开关）—— P2
-4. **`use foo::*` glob 导入** —— P2，影响大（`use core::*` 之类模式）
+4. **`use foo::*` glob 导入** —— ✅ 已完成（`40b5b45`，`90_glob_import.zr`）
 5. **穷尽性报错信息修措辞** —— P1，`match must have a trailing _ arm` 误导（实际是缺臂但非穷尽性情况）
 6. **`Option` / `Result` 加进 prelude** —— ✅ 已完成（`4ed15d7`，含变体 `Some`/`None`/`Ok`/`Err`）
 7. **`i128` / `u128` 64 位目标** —— P1，需寄存器对拆分
