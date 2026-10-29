@@ -9,7 +9,7 @@ zr 是一门系统编程语言，设计取向介于 Rust 与 Zig 之间：所有
 - 给 AI agent 的操作约定、架构红线、在途工作：见 `AGENTS.md`
 - 与 Rust 的逐条对照：见 `docs/rust-parity.md`（**部分结论已被在途改动超越**）
 
-> 最近更新：2026-10-29。`feat/lang-features` 上已完成：`unsafe`/`dyn`/最小移动检查/常量越界检查；`52_if_let` 回归与 `71_derive` 失败均已修复；**又修掉了 `55_tuple_pattern` / `74_generic_alias` / `60_process` / `64_fs_path` / `io_print_matches_rust`（用户定义遮蔽标准库同名函数，见提交 `1ef4a02`）**；**支持 `use foo::*` glob 导入（见提交 `40b5b45`）**；全绿（93 用例 × 5 等级 + 宿主端对照用例）。
+> 最近更新：2026-10-29。`feat/lang-features` 上已完成：`unsafe`/`dyn`/最小移动检查/常量越界检查；`52_if_let` 回归与 `71_derive` 失败均已修复；**又修掉了 `55_tuple_pattern` / `74_generic_alias` / `60_process` / `64_fs_path` / `io_print_matches_rust`（用户定义遮蔽标准库同名函数，见提交 `1ef4a02`）**；**支持 `use foo::*` glob 导入（见提交 `40b5b45`）**；全绿（94 用例 × 5 等级 + 宿主端对照用例）。
 
 ---
 
@@ -17,11 +17,11 @@ zr 是一门系统编程语言，设计取向介于 Rust 与 Zig 之间：所有
 
 ```sh
 cargo build                                    # 编译编译器 + 运行时汇编
-cargo test --test zr_language                  # 全量回归：93 用例 × 5 优化等级，约 3 分钟
+cargo test --test zr_language                  # 全量回归：94 用例 × 5 优化等级，约 3 分钟
 target/debug/zr prog.zr -O1 -o /tmp/prog && /tmp/prog
 ```
 
-当前基线：**93 用例 × 5 等级 + 宿主端对照用例 全绿**。
+当前基线：**94 用例 × 5 等级 + 宿主端对照用例 全绿**。
 
 诊断：`--dump-tokens|ast|hir|mir|ssa|ssa-after|asm`、`--wat`、`--emit-llvm`、
 `--no-incremental`、`--target <triple>`、`-g`；`ZR_TIME=1` 看各阶段耗时。
@@ -258,7 +258,7 @@ target/debug/zr prog.zr -O1 -o /tmp/prog && /tmp/prog
 
 ## 4. 已实现但未测试覆盖
 
-`tests/cases/` 共 93 个用例，全部通过时 `cargo test` 绿。以下**已实现但无用例**，
+`tests/cases/` 共 94 个用例，全部通过时 `cargo test` 绿。以下**已实现但无用例**，
 属于回归盲区，加功能时容易破坏而无人发现：
 
 - 多边界泛型 `T: Clone + Ord`（✅ 已补 `91_multi_bound_generics.zr`：`P` 同时 impl 两个边界，`pick<P>` 两处边界都求解，形参按值移动两次）
@@ -285,7 +285,7 @@ target/debug/zr prog.zr -O1 -o /tmp/prog && /tmp/prog
 **已实现（生成真实方法体）**：`PartialEq`、`Eq`、`Hash`、`PartialOrd`、`Ord`、`Default`。
 - 实现在 `src/typeck/derive.rs`，在 AST 层生成 `Type__eq` / `Type__lt` / `Type__hash` / `Type__default` / `Type__clone` 方法体
 - 泛型类型 / 枚举 `Default` / 枚举 `Ord` 显式报错
-- `Hash` 对 `str` / 切片 / 数组按 `0` 计入（缺按内容 hash 的语义）；**指针 / 引用已改为按地址计入**（`b5f5a56`）；**元组已改为按内容计**（`38f1ddd`，`29fc950` 修好混合宽度元组字段访问后）
+- `Hash` 对 `str` / 切片按 `0` 计入（缺按内容 hash 的语义，且运行期长度需循环）；**指针 / 引用已改为按地址计入**（`b5f5a56`）；**元组已改为按内容计**（`38f1ddd`，`29fc950` 修好混合宽度元组字段访问后）；**数组已改为按内容计**（`caab7a0`，定长展开 ≤ 32）
 - 字段级诊断已修到**真实源码位置**：`StructDef` / `EnumDef` / `Field` 带 span，结构体字段精准到列、枚举结构体载荷也精准到字段、derive 拒绝诊断与默认值字段诊断都用类型/字段的位置（`bcf29f6` / `9238875` / `60174ca`）
 
 **在途修过的一个相关 bug**：早先枚举的 `attrs` 在 `collect_declarations` 阶段
@@ -323,13 +323,14 @@ target/debug/zr prog.zr -O1 -o /tmp/prog && /tmp/prog
 | `f8` / `f16` 溢出行为 | ✅ 已验证：`f8` 最大约 240，`65504.0 * 2.0` 在 f16 正确输出 Inf |
 | 浮点 `Display` 在 \|v\| ≥ 2⁶⁴ 时输出 `.0` | ✅ 已钉住回归（`tests/cases/86_bounds_check.zr` / `tests/zr_language.rs` `io_print_matches_rust` 已扩展） |
 | 混合宽度元组字段访问读垃圾 | ✅ 已修复（`29fc950`）：元组字面量元素按期望元素类型检查，`(i32, i64)` 的 `t.1` 不再读到"值\|高位垃圾"；新增 `tests/cases/93_mixed_width_tuple.zr` |
+| 数组字段访问读垃圾 | ✅ 已修复（`caab7a0`）：`is_aggregate` 补数组（`s.a` 被当成标量加载，`s.a[0]` 读垃圾）；新增 `tests/cases/94_array_field_hash.zr` |
 ### P1 — 明确报错或明显缺失
 
 1. **`#[derive]` 剩余缺口**：方法体已经生成（`src/typeck/derive.rs`），
    `Debug` 仍是标记 trait（不生成方法）；泛型类型 / 枚举 `Default` / 枚举 `Ord`
    显式报错（位置已修到类型定义，`60174ca`）；字段级诊断已修到真实源码位置
-   （`bcf29f6` / `9238875`）；`Hash` 对 `str` / 切片 / 数组按 `0` 计入
-   （指针/引用按地址计 `b5f5a56`，元组按内容计 `38f1ddd`）
+   （`bcf29f6` / `9238875`）；`Hash` 对 `str` / 切片按 `0` 计入
+   （指针/引用按地址计 `b5f5a56`，元组按内容计 `38f1ddd`，数组按内容计 `caab7a0`）
 2. **闭包**：**无捕获**闭包已可存进变量 / 当实参 / 返回（提升成 `__closure_N`
    顶层函数指针，`tests/cases/83_closure_fnptr.zr`）；`(|x| x + 1)(5)` 仍是
    定义处立即调用（单态化内联）。**带捕获**闭包仍只支持立即调用——存进变量 /
