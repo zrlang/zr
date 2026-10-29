@@ -159,6 +159,7 @@
 | P1 #7 Option/Result prelude | `4ed15d7` | ✅ |
 | P1-1a derive 字段级诊断 | `bcf29f6` `9238875` | ✅ |
 | P1-1d derive 拒绝文案 + 位置 | `60174ca` | ✅ |
+| P1-1b Hash 指针/引用按地址 | `b5f5a56` | ✅ |
 | P2 #8 glob 导入 `use foo::*` | `40b5b45` | ✅ |
 | P3 文档债（全部 6 项） | `fb4dfb2` `1d38ca3` | ✅ |
 | §4 多边界泛型 | `8d68ae3` | ✅ |
