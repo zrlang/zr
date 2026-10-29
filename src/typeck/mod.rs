@@ -2902,9 +2902,16 @@ impl TypeChecker {
             Expression::Array(elems, repeat, _) => {
                 let elem = self.infer.fresh_infer(span);
                 // 声明类型（`let b: [u8; 4] = [1, 2, ..]`）先定下元素类型，
-                // 否则字面量的默认类型（i32）会顶掉它。
-                if let Ty::Array(decl_elem, _) = expected {
-                    let _ = self.infer.unify(&elem, decl_elem, span);
+                // 否则字面量的默认类型（i32）会顶掉它。**切片**也要定下元素
+                // 类型：`S { arr: [10, 20, 30] }`（`arr: []const i64`）早先
+                // 元素默认成 i32，`[i32; 3]` 又被字段初始化静默强转成
+                // `[]const i64`——切片指向 i32 数据却被当 i64 读，运行期
+                // 读越界（`/tmp/sl_bug.zr` 直接 SIGSEGV）。
+                match self.infer.resolve(expected) {
+                    Ty::Array(decl_elem, _) | Ty::Slice(decl_elem, _) => {
+                        let _ = self.infer.unify(&elem, &decl_elem, span);
+                    }
+                    _ => {}
                 }
                 let mut hir_elems = Vec::new();
                 if let Some(rep) = repeat {
