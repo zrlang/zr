@@ -264,7 +264,7 @@ target/debug/zr prog.zr -O1 -o /tmp/prog && /tmp/prog
 - 多边界泛型 `T: Clone + Ord`（✅ 已补 `91_multi_bound_generics.zr`：`P` 同时 impl 两个边界，`pick<P>` 两处边界都求解，形参按值移动两次）
 - 关联类型投影（`Self::Output` / `P::Output`）——❌ 实测**不可用**（方法签名/体里报 `cannot find value`；`assoc_types` 只过 HIR、无投影解析，见 §3.4 修正）
 - `f8` / `f16` 窄浮点（`53_narrow_float.zr` 覆盖基础算术，但溢出/NaN/舍入未测）
-- `static mut` 的复合赋值与 `&mut STATIC`
+- `static mut` 的复合赋值与 `&mut STATIC`——✅ 已覆盖（`72_statics.zr`：`COUNTER += 2` 且断言值、`&mut COUNTER` 解引用写且断言值）
 - `#[cfg(...)]` 的过滤路径（✅ 已补 `92_cfg_filter.zr`：互斥 host 键保证正好一个保留 + 恒假键被滤掉 + 引用滤掉的项报 undefined）
 - 所有非 x86-64 后端（测试只跑宿主架构）
 - `--emit-llvm` / `--wat` 输出
