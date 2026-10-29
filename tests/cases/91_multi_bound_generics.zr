@@ -1,0 +1,32 @@
+// 覆盖：多边界泛型 `T: Clone + Ord`（§4 回归盲区——在途改动新支持，
+// 早先只验证解析，无校验用例）。
+//
+// 背景：`fn f<T: Clone + Ord>(x: T)` 里两个边界都要被求解。早先单态化时
+// `check_trait_bounds` 逐个验证 `T: Clone` 与 `T: Ord`；本用例保证两处都
+// 真正走通（`P` 同时 impl 了 `Clone` 与 `Ord`），且函数体里能按 T 使用。
+//
+// 也覆盖：泛型函数形参按值传入（`let y = x; let z = x;` 两个移动）。
+use core::*;
+use io::*;
+
+// 实现 Clone + Ord 的具名结构体。
+struct P { a: i32, b: i32 }
+
+impl Clone for P {}
+impl Ord for P {}
+
+// 多边界泛型函数：T 同时满足 Clone + Ord。
+fn pick<T: Clone + Ord>(x: T) -> i32 {
+    // T: Clone 与 T: Ord 边界都要求被求解；形参按值移动两次也走通。
+    let _y = x;
+    let _z = x;
+    return 1;
+}
+
+fn main() -> i32 {
+    let p = P { a: 1, b: 2 };
+    if pick(p) == 1 {
+        return 0;
+    }
+    return 1;
+}

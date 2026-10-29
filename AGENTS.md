@@ -49,8 +49,8 @@ target/debug/zr prog.zr -O1 -o /tmp/prog   # 编译单个程序
   `ld` 直接断言崩溃（`atomShouldReplaceExisting`）。先 `nm` 看目标文件有没有
   重复符号，再下结论。已修复（提交 `1ef4a02`：MIR 按最终符号名去重，保留首个
   用户定义）。
-- 测试：`tests/zr_language.rs` 把 90 个 `tests/cases/*.zr` 各在
-  `-O0/-O1/-O2/-O3/-Oz` 跑一遍（450 次编译+运行）。退出码 0 = 过，非 0 = 失败（编号指向失败的断言）。
+- 测试：`tests/zr_language.rs` 把 91 个 `tests/cases/*.zr` 各在
+  `-O0/-O1/-O2/-O3/-Oz` 跑一遍（455 次编译+运行）。退出码 0 = 过，非 0 = 失败（编号指向失败的断言）。
   宿主端另有 `io_print_matches_rust` 等 Rust 对照用例。
 - **没有负向测试机制。** `tests/cases/` 下每个 `.zr` 都必须编译通过并返回 0。
   想验证"某错误真被拦住了"，单独写 `/tmp/x.zr` 手工编译确认。
@@ -198,7 +198,7 @@ README 里"指针与 unsafe"一节目前是**愿景**：
 ### `cargo test` 当前基线（2026-10-29，全绿）
 
 - `cargo test --bin zr`：265 项。
-- `cargo test --test zr_language`：90 个用例 × 5 个优化等级 = 450 项（含宿主端
+- `cargo test --test zr_language`：91 个用例 × 5 个优化等级 = 455 项（含宿主端
   `io_print_matches_rust`，它逐字符对比 Rust 的格式化输出，含 `{:e}` / `{:E}`
   与大浮点 Display（`|v| ≥ 2⁶⁴` 不带 `.0`）的回归）。
 - `cargo test --test zr_negative`：17 个负向用例（含新加的越界、use-after-move 与枚举缺臂 `17_match_missing_variant.zr`）。

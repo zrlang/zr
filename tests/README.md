@@ -110,6 +110,7 @@ cargo test --test zr_language
 | `88_dyn_keyword.zr` | `dyn Trait`：词法+解析+类型检查骨架 |
 | `89_prelude_variant.zr` | prelude 变体：`Option`/`Result`/`Some`/`None`/`Ok`/`Err` 无需显式 `use` |
 | `90_glob_import.zr` | `use foo::*` glob：`use core::*` / `use io::*` / 用户模块 |
+| `91_multi_bound_generics.zr` | 多边界泛型 `T: Clone + Ord`：`P` 同时 impl 两个边界、两处都求解、形参按值移动 |
 
 ## 尚未覆盖（编译器还不支持）
 
