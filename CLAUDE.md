@@ -337,7 +337,7 @@ target/debug/zr prog.zr -O1 -o /tmp/prog && /tmp/prog
 5. **穷尽性报错信息误导**：`match must have a trailing `_` arm`
 6. **格式串只剩两处没做**：命名参数 `{name}` 与多行 Debug `{:#?}`
    （`#` 对 `{:?}` 被忽略，输出的是一行）；其余规格已与 Rust 逐字符对齐
-7. **`Option` / `Result` 不在 prelude**，需 `use core::Option;`
+7. **`Option` / `Result`（含变体 `Some` / `None` / `Ok` / `Err`）已在 prelude**——✅ 已实现（`4ed15d7`），无需显式 `use core::Option;`
 8. **无元数据 / 临时文件 API**：权限、时间戳、`tempfile` 缺失
 
 ### P2 — 工具链与生态
@@ -377,7 +377,7 @@ target/debug/zr prog.zr -O1 -o /tmp/prog && /tmp/prog
 3. **LTO 接线**（`src/opt/lto.rs` → `src/opt/mod.rs` → CLI 开关）—— P2
 4. **`use foo::*` glob 导入** —— P2，影响大（`use core::*` 之类模式）
 5. **穷尽性报错信息修措辞** —— P1，`match must have a trailing _ arm` 误导（实际是缺臂但非穷尽性情况）
-6. **`Option` / `Result` 加进 prelude** —— P1，减少样板代码
+6. **`Option` / `Result` 加进 prelude** —— ✅ 已完成（`4ed15d7`，含变体 `Some`/`None`/`Ok`/`Err`）
 7. **`i128` / `u128` 64 位目标** —— P1，需寄存器对拆分
 8. **更新 `tests/README.md` 与 `future/README.md`** —— P3，两份文档严重失真
 9. **`Debug` derive 方法体** —— P1，需要运行期格式化设施（目前只有标量+结构体/元组/枚举的组合）

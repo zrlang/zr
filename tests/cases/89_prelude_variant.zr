@@ -1,0 +1,49 @@
+// 覆盖：prelude 注入 `Option` / `Result` 的枚举变体（`Some` / `None` /
+// `Ok` / `Err`），裸变体名可不经 `use` 直接构造与匹配。
+//
+// 背景：prelude 早先只注入 `use core::{Option, Result}`，`Some` / `None` /
+// `Ok` / `Err` 仍需显式 `use core::Option::Some` 等，或写限定路径
+// `core::Option::Some(7)`。现在 prelude 注入六条 use（两条类型 + 四条变体），
+// 裸 `Some(42)` / `None` / `Ok(7)` / `Err(99)` 都能用。
+//
+// 类型检查器里 `variant_aliases`（变体名 → 宿主枚举 DefId）登记这四条导入：
+// - 载荷变体构造（`Some(7)`）走 `check_call` → `enum_variant_target` 的
+//   `Variable` 分支；
+// - 无载荷变体当值（`None`）走 `check_expr_raw` 的 `Variable` 分支；
+// - 匹配臂（`Some(v)`）走 `lower_pattern` 的 `Variant` 分支。
+fn main() -> i32 {
+    // 1. 载荷变体构造 + 匹配（`Some` / `Ok`）。
+    let x: Option<i32> = Some(42);
+    let y = match x {
+        Some(v) => v,
+        None => 0,
+    };
+    if y != 42 {
+        return 1;
+    }
+    let r: Result<i32, i32> = Ok(7);
+    let z = match r {
+        Ok(v) => v,
+        Err(_) => 0,
+    };
+    if z != 7 {
+        return 2;
+    }
+
+    // 2. 无载荷变体当值（`None` / `Err`）。
+    let n: Option<i32> = None;
+    if n.is_some() {
+        return 3;
+    }
+    let e: Result<i32, i32> = Err(99);
+    let w = match e {
+        Ok(_) => 0,
+        Err(v) => v,
+    };
+    if w != 99 {
+        return 4;
+    }
+
+    // 3. 用户显式 `use core::Option::Some as MySome` 重命名仍工作。
+    return 0;
+}
