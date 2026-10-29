@@ -198,9 +198,11 @@ README 里"指针与 unsafe"一节目前是**愿景**：
 ### `cargo test` 当前基线（2026-10-29，全绿）
 
 - `cargo test --bin zr`：265 项。
-- `cargo test --test zr_language`：92 个用例 × 5 个优化等级 = 460 项（含宿主端
-  `io_print_matches_rust`，它逐字符对比 Rust 的格式化输出，含 `{:e}` / `{:E}`
-  与大浮点 Display（`|v| ≥ 2⁶⁴` 不带 `.0`）的回归）。
+- `cargo test --test zr_language`：92 个用例 × 5 个优化等级 = 460 项，另有 3 个宿主端
+  对照用例（`io_print_matches_rust`——逐字符对比 Rust 的格式化输出，含 `{:e}` / `{:E}`
+  与大浮点 Display（`|v| ≥ 2⁶⁴` 不带 `.0`）的回归；`extern_c_write_prints_string_literal`；
+  `toolchain_subcommands_emit`——`zr fmt` / `zr fmt --check` / `zr pkg init` / `zr lsp`
+  与 `--emit-llvm` / `--wat` 的发射验证）。
 - `cargo test --test zr_negative`：17 个负向用例（含新加的越界、use-after-move 与枚举缺臂 `17_match_missing_variant.zr`）。
 
 ### 最近修掉的静默 bug（都在 `tests/` 里留了钉子）
