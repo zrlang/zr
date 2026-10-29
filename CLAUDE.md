@@ -269,7 +269,7 @@ target/debug/zr prog.zr -O1 -o /tmp/prog && /tmp/prog
 - 所有非 x86-64 后端（测试只跑宿主架构）
 - `--emit-llvm` / `--wat` 输出——✅ 已补宿主端测试（`tests/zr_language.rs::toolchain_subcommands_emit`：`--emit-llvm` 写出含 `define i64 @main()` 的 IR 文本、`--wat`（wasm32）写出以 `(module` 开头的 WAT 文本）
 - 全部优化 pass 各自的隔离行为
-- `zr fmt --check`、`zr pkg`、`zr lsp` 三个子命令——✅ 部分已补（`toolchain_subcommands_emit`：`zr fmt` 重排源码、`zr fmt --check` 对未格式化返回非 0 且报 `needs formatting`、对已格式化返回 0）
+- `zr fmt --check`、`zr pkg`、`zr lsp` 三个子命令——✅ 已补宿主端测试（`toolchain_subcommands_emit`：`zr fmt` 重排源码、`zr fmt --check` 对未格式化返回非 0 且报 `needs formatting`、对已格式化返回 0；`zr pkg init` 创建 `zr.toml`；`zr lsp` 在 stdin 关闭时打印 `listening on stdio` 并干净退出）
 
 ---
 

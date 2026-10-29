@@ -349,4 +349,41 @@ fn toolchain_subcommands_emit() {
     );
     let _ = std::fs::remove_file(&wat_out);
     let _ = std::fs::remove_file(&src);
+
+    // --- zr pkg init：在空目录里创建 zr.toml ---
+    let pkg_dir = dir.join("zr_pkg_init_dir");
+    let _ = std::fs::remove_dir_all(&pkg_dir);
+    std::fs::create_dir_all(&pkg_dir).unwrap();
+    let pkg = Command::new(zr)
+        .arg("pkg")
+        .arg("init")
+        .current_dir(&pkg_dir)
+        .output()
+        .expect("failed to spawn zr pkg init");
+    assert!(
+        pkg.status.success(),
+        "`zr pkg init` 失败: {}",
+        String::from_utf8_lossy(&pkg.stderr)
+    );
+    assert!(
+        pkg_dir.join("zr.toml").exists(),
+        "`zr pkg init` 应创建 zr.toml"
+    );
+    let _ = std::fs::remove_dir_all(&pkg_dir);
+
+    // --- zr lsp：stdio 服务在 stdin 关闭时打印 banner 并干净退出 ---
+    let lsp = Command::new(zr)
+        .arg("lsp")
+        .stdin(std::process::Stdio::null())
+        .output()
+        .expect("failed to spawn zr lsp");
+    assert!(
+        lsp.status.success(),
+        "`zr lsp` 在 stdin 关闭时应干净退出"
+    );
+    let banner = String::from_utf8_lossy(&lsp.stderr);
+    assert!(
+        banner.contains("listening on stdio"),
+        "`zr lsp` 应打印 `listening on stdio` banner，得到: {banner}"
+    );
 }
