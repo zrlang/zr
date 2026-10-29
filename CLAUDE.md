@@ -326,7 +326,7 @@ target/debug/zr prog.zr -O1 -o /tmp/prog && /tmp/prog
 | 数组字段访问读垃圾 | ✅ 已修复（`caab7a0`）：`is_aggregate` 补数组（`s.a` 被当成标量加载，`s.a[0]` 读垃圾）；新增 `tests/cases/94_array_field_hash.zr` |
 | `str`/切片字段布局错位 | ✅ 已修复（`1161b65`）：`type_size_align` 把 `str`/切片当 8 字节（应为 16 `{ptr,len}`），`S { name: str, x: i64 }` 的 `name.len` 读到 `x` 的值；新增 `tests/cases/95_str_slice_layout.zr` |
 | 切片字段初始化静默存坏数据 | ✅ 已修复（`273d6f4`）：数组字面量不按切片期望元素类型收窄，`S { arr: []const i64 }` 用 `[10,20,30]` 静默强转成 `[]const i64`，运行期 SIGSEGV |
-| `loop` 表达式不产生 `break` 值 | ✅ 已修复（`87ef09a`）：`ExprKind::Break` 只记标签丢弃值、`Loop` 恒 `Never`，`let x = loop { break 7; }` 静默得 0；新增 `tests/cases/97_loop_value.zr`（标量）。**聚合 break 值在 `-O3`/`-Oz` 有已知 codegen 缺陷**（见 P0-7） |
+| `loop` 表达式不产生 `break` 值 | ✅ 已修复（`87ef09a` + `daf9763`）：`ExprKind::Break` 只记标签丢弃值、`Loop` 恒 `Never`，`let x = loop { break 7; }` 静默得 0；`break` 现在携带值、`Loop` 按其类型化；新增 `tests/cases/97_loop_value.zr`（含**聚合** break 值，`daf9763` 修掉 `-O3`/`-Oz` 的寄存器分配缺陷） |
 ### P1 — 明确报错或明显缺失
 
 1. **`#[derive]` 剩余缺口**：方法体已经生成（`src/typeck/derive.rs`），
@@ -337,10 +337,12 @@ target/debug/zr prog.zr -O1 -o /tmp/prog && /tmp/prog
    （`41ec8f4`，新增 `tests/cases/96_str_slice_hash.zr`）；只剩 `Debug` 方法体
    （需运行期格式化设施）
 
-   **P0-7（已知 codegen 缺陷，尚未修）**：聚合（结构体/元组/数组）作为 `loop`
-   的 break 值在 `-O3`/`-Oz` 触发既有寄存器分配 bug——值横跨循环出口被与常量
-   `8` 合并（`bb2` 里 `movabsq $0x8, %r10` 覆盖保存聚合地址的 `%r10`，
-   `load [%r10]` 读到地址 8 段错误）。标量不受影响（`87ef09a`）。
+   **P0-7（已修 `daf9763`）**：聚合（结构体/元组/数组）作为 `loop` 的 break
+   值在 `-O3`/`-Oz` 触发寄存器分配 bug——值横跨循环出口被与常量 `8` 合并
+   （`bb2` 里 `movabsq $0x8, %r10` 覆盖保存聚合地址的 `%r10`，`load [%r10]`
+   读到地址 8 段错误）。根因：`live_intervals` 的线性位置按数组顺序排块（非
+   RPO），定义在 break 块、用在出口块的值区间倒挂、不分配寄存器。修复：线性
+   位置改按 RPO 编号（`src/codegen/regalloc.rs`，`mir_rpo` 改 `pub(crate)`）。
 2. **闭包**：**无捕获**闭包已可存进变量 / 当实参 / 返回（提升成 `__closure_N`
    顶层函数指针，`tests/cases/83_closure_fnptr.zr`）；`(|x| x + 1)(5)` 仍是
    定义处立即调用（单态化内联）。**带捕获**闭包仍只支持立即调用——存进变量 /

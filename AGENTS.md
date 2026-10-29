@@ -225,10 +225,10 @@ README 里"指针与 unsafe"一节目前是**愿景**：
   **数组按内容**（`caab7a0`）、**`str`/切片按内容**（`41ec8f4`，`96_str_slice_hash.zr`）；
   **剩**：`Debug` 仍是标记 trait（不生成方法体）；泛型类型 / 枚举 `Default` /
   枚举 `Ord` 显式报错；字段级诊断不精确。
-- **`loop` 带值 break**：✅ 已实现（`87ef09a`）——`let x = loop { break 7; }`
+- **`loop` 带值 break**：✅ 已实现（`87ef09a` + `daf9763`）——`let x = loop { break 7; }`
   不再静默得 0（`ExprKind::Break` 现在携带值，`Loop` 按其类型化）；
-  `tests/cases/97_loop_value.zr`。**聚合 break 值在 `-O3`/`-Oz` 有已知
-  codegen 缺陷**（值横跨循环出口被寄存器分配器与常量 `8` 合并，段错误）。
+  `tests/cases/97_loop_value.zr`（含聚合 break 值）。`daf9763` 修掉聚合 break
+  值在 `-O3`/`-Oz` 的寄存器分配缺陷（`live_intervals` 线性位置改按 RPO）。
 - **`unsafe` 关键字**：✅ 已实现（`unsafe { ... }` 块可解析和通过类型检查；当前不改变语义，按块表达式透传）。
 - **`dyn` 关键字**：✅ 词法+解析+类型检查骨架已实现；vtable 分派仍在未实现状态。
 - **借用检查**：❌ `infer.rs::check_borrows` 仍是空壳（只记录不检查）。

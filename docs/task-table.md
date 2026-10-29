@@ -76,7 +76,7 @@ i64 读，运行期越界 SIGSEGV（`/tmp/sl_bug.zr`）。`let a: []const i64 = 
 | P0-6a | 复现：`let x = loop { break 7; }` 静默得 0（`ExprKind::Break` 只记标签丢弃值、`Loop` 恒 `Never`） | ✅ `87ef09a` |
 | P0-6b | 修复：typeck 压入 `LoopBreakCtx` 栈（`loop`/`while`/`for` 各一项，`while`/`for` 非值），`Break(v)` 携带值、与目标循环 break 类型统一；MIR `LoopCtx.result` + `assign_if_open` 写结果临时名 | ✅ `87ef09a` |
 | P0-6c | 回归：`tests/cases/97_loop_value.zr`（标量 break 值 + 累加 + 嵌套 + 语句 break + 发散循环） | ✅ `87ef09a` |
-| P0-7 | **已知 codegen 缺陷（未修）**：聚合（结构体/元组/数组）作为 `loop` break 值在 `-O3`/`-Oz` 触发寄存器分配 bug——值横跨循环出口被与常量 `8` 合并（`bb2` 里 `movabsq $0x8, %r10` 覆盖保存聚合地址的 `%r10`，`load [%r10]` 读到地址 8 段错误）。标量不受影响。修复需查 `src/codegen/regalloc.rs` 的"值横跨回边"分配 | ⬜ |
+| P0-7 | **已修** `daf9763`：聚合（结构体/元组/数组）作为 `loop` break 值在 `-O3`/`-Oz` 触发寄存器分配 bug——`live_intervals` 线性位置按数组顺序排块（非 RPO），定义在 break 块、用在出口块的值区间倒挂、不分配寄存器，codegen 拿被常量 `8` 覆盖的寄存器当基址，`load [r8]` 读到地址 8 段错误。修复：线性位置改按 RPO 编号（`src/codegen/regalloc.rs`，`mir_rpo` 改 `pub(crate)`） | ✅ `daf9763` |
 
 ### P0-1 借用检查（NLL）——拆 4 个子任务
 
