@@ -39,7 +39,7 @@
 
 | 子任务 | 内容 | 状态 |
 |---|---|---|
-| P1-1a | **字段级诊断**：derive 生成的 `Type__eq`/`__lt` 等失败时，报错应指向**出问题的那个字段**并说清缺什么 trait，而不是 `0:0:0`（实测：`Outer { b: Inner }` 上 `derive(PartialEq)` 报 `cannot compare values of type Inner` 但位置是 `0:0:0`）。已修：`StructDef`/`EnumDef`/`Field` 带真实 span，生成的字段访问用字段 span，报错指向 `b: Inner`；结构体字段精准到列，枚举载荷指到枚举定义。新增宿主端测试 `derive_field_error_has_span` | ✅ |
+| P1-1a | **字段级诊断**：derive 生成的 `Type__eq`/`__lt` 等失败时，报错应指向**出问题的那个字段**并说清缺什么 trait，而不是 `0:0:0`（实测：`Outer { b: Inner }` 上 `derive(PartialEq)` 报 `cannot compare values of type Inner` 但位置是 `0:0:0`）。已修：`StructDef`/`EnumDef`/`Field` 带真实 span，生成的字段访问用字段 span；结构体字段精准到列（`b: Inner` → `3:24`），枚举结构体载荷也精准到字段（`B { x: Inner }` → `2:22`），元组载荷回退到枚举定义。新增宿主端测试 `derive_field_error_has_span` | ✅ |
 | P1-1b | **`Hash` 分布**：`str`/切片/数组/元组/指针字段当前按 `0` 计入（只保证"相等⇒同哈希"，碰撞严重）；等这些类型有按内容比较语义后换真实哈希 | ⬜ |
 | P1-1c | **`Debug` 方法体**：目前是标记 trait，`{:?}` 不经过它；需要 `std/fmt` 的 `Formatter` 与字符串拼接齐备（受阻于格式化设施） | ⬜ |
 | P1-1d | 泛型类型上的 derive / 枚举 `Default` / 枚举 `Ord` 显式报错——已实现（负向 13–15），仅需核对文案 | ⬜ |
@@ -157,7 +157,7 @@
 |---|---|---|
 | P1 #5 穷尽性措辞 | `a526953` | ✅ |
 | P1 #7 Option/Result prelude | `4ed15d7` | ✅ |
-| P1-1a derive 字段级诊断 | `bcf29f6` | ✅ |
+| P1-1a derive 字段级诊断 | `bcf29f6` `9238875` | ✅ |
 | P2 #8 glob 导入 `use foo::*` | `40b5b45` | ✅ |
 | P3 文档债（全部 6 项） | `fb4dfb2` `1d38ca3` | ✅ |
 | §4 多边界泛型 | `8d68ae3` | ✅ |
