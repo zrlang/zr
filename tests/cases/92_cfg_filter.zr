@@ -1,0 +1,29 @@
+// 覆盖：`#[cfg(...)]` 过滤路径（§4 回归盲区——无"被过滤项引用应报错"
+// 的用例，也没有正向验证 cfg 条件求值的用例）。
+//
+// 背景：`#[cfg]` 过滤在解析阶段与类型检查阶段各做一遍，按**编译目标**
+// 求值（`src/attributes.rs::CfgTarget`，`target_os` / `target_arch`）。
+// 本用例用三个互斥的 host 键（linux / macos / windows）保证**正好一个**
+// 函数被保留，再放一个恒假键（`nonexistent_os`）的函数——它必须被滤掉。
+// 这样既验证"成立则保留"，也验证"不成立则不存在"。
+//
+// 运行期只调 `which()`：返回值必在 1..=3，证明 cfg 求值没错、没把
+// 多个函数同时留下（重复定义会编译失败），也没全滤掉（undefined）。
+#[cfg(target_os = "linux")]
+fn which() -> i32 { return 1; }
+
+#[cfg(target_os = "macos")]
+fn which() -> i32 { return 2; }
+
+#[cfg(target_os = "windows")]
+fn which() -> i32 { return 3; }
+
+// 恒假条件：必须被过滤掉。
+#[cfg(target_os = "nonexistent_os")]
+fn never() -> i32 { return 99; }
+
+fn main() -> i32 {
+    let w = which();
+    if w < 1 || w > 3 { return 1; }
+    return 0;
+}

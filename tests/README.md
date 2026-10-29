@@ -111,6 +111,7 @@ cargo test --test zr_language
 | `89_prelude_variant.zr` | prelude 变体：`Option`/`Result`/`Some`/`None`/`Ok`/`Err` 无需显式 `use` |
 | `90_glob_import.zr` | `use foo::*` glob：`use core::*` / `use io::*` / 用户模块 |
 | `91_multi_bound_generics.zr` | 多边界泛型 `T: Clone + Ord`：`P` 同时 impl 两个边界、两处都求解、形参按值移动 |
+| `92_cfg_filter.zr` | `#[cfg(...)]` 过滤：互斥 host 键（linux/macos/windows）保证正好一个保留、恒假键被滤掉、运行期只调保留的那个 |
 
 ## 尚未覆盖（编译器还不支持）
 

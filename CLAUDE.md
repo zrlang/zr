@@ -9,7 +9,7 @@ zr 是一门系统编程语言，设计取向介于 Rust 与 Zig 之间：所有
 - 给 AI agent 的操作约定、架构红线、在途工作：见 `AGENTS.md`
 - 与 Rust 的逐条对照：见 `docs/rust-parity.md`（**部分结论已被在途改动超越**）
 
-> 最近更新：2026-10-29。`feat/lang-features` 上已完成：`unsafe`/`dyn`/最小移动检查/常量越界检查；`52_if_let` 回归与 `71_derive` 失败均已修复；**又修掉了 `55_tuple_pattern` / `74_generic_alias` / `60_process` / `64_fs_path` / `io_print_matches_rust`（用户定义遮蔽标准库同名函数，见提交 `1ef4a02`）**；**支持 `use foo::*` glob 导入（见提交 `40b5b45`）**；全绿（91 用例 × 5 等级 + 宿主端对照用例）。
+> 最近更新：2026-10-29。`feat/lang-features` 上已完成：`unsafe`/`dyn`/最小移动检查/常量越界检查；`52_if_let` 回归与 `71_derive` 失败均已修复；**又修掉了 `55_tuple_pattern` / `74_generic_alias` / `60_process` / `64_fs_path` / `io_print_matches_rust`（用户定义遮蔽标准库同名函数，见提交 `1ef4a02`）**；**支持 `use foo::*` glob 导入（见提交 `40b5b45`）**；全绿（92 用例 × 5 等级 + 宿主端对照用例）。
 
 ---
 
@@ -17,11 +17,11 @@ zr 是一门系统编程语言，设计取向介于 Rust 与 Zig 之间：所有
 
 ```sh
 cargo build                                    # 编译编译器 + 运行时汇编
-cargo test --test zr_language                  # 全量回归：91 用例 × 5 优化等级，约 3 分钟
+cargo test --test zr_language                  # 全量回归：92 用例 × 5 优化等级，约 3 分钟
 target/debug/zr prog.zr -O1 -o /tmp/prog && /tmp/prog
 ```
 
-当前基线：**91 用例 × 5 等级 + 宿主端对照用例 全绿**。
+当前基线：**92 用例 × 5 等级 + 宿主端对照用例 全绿**。
 
 诊断：`--dump-tokens|ast|hir|mir|ssa|ssa-after|asm`、`--wat`、`--emit-llvm`、
 `--no-incremental`、`--target <triple>`、`-g`；`ZR_TIME=1` 看各阶段耗时。
@@ -258,14 +258,14 @@ target/debug/zr prog.zr -O1 -o /tmp/prog && /tmp/prog
 
 ## 4. 已实现但未测试覆盖
 
-`tests/cases/` 共 91 个用例，全部通过时 `cargo test` 绿。以下**已实现但无用例**，
+`tests/cases/` 共 92 个用例，全部通过时 `cargo test` 绿。以下**已实现但无用例**，
 属于回归盲区，加功能时容易破坏而无人发现：
 
 - 多边界泛型 `T: Clone + Ord`（✅ 已补 `91_multi_bound_generics.zr`：`P` 同时 impl 两个边界，`pick<P>` 两处边界都求解，形参按值移动两次）
 - 关联类型在泛型枚举上的投影
 - `f8` / `f16` 窄浮点（`53_narrow_float.zr` 覆盖基础算术，但溢出/NaN/舍入未测）
 - `static mut` 的复合赋值与 `&mut STATIC`
-- `#[cfg(...)]` 的过滤路径（无"被过滤项引用应报错"的用例）
+- `#[cfg(...)]` 的过滤路径（✅ 已补 `92_cfg_filter.zr`：互斥 host 键保证正好一个保留 + 恒假键被滤掉 + 引用滤掉的项报 undefined）
 - 所有非 x86-64 后端（测试只跑宿主架构）
 - `--emit-llvm` / `--wat` 输出
 - 全部优化 pass 各自的隔离行为
