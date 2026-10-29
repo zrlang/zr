@@ -443,7 +443,7 @@ fn hash_fn(
     let mut stmts = vec![let_mut("h", Type::U(64), int(0))];
     if let Some(fields) = fields {
         for f in fields {
-            let hv = hash_value(field_at(self_expr(), &f.name, f.span), &f.ty);
+            let hv = hash_value(field_at(self_expr(), &f.name, f.span), &f.ty, f.span);
             stmts.push(accumulate_hash(hv, f.span));
         }
     } else {
@@ -468,7 +468,7 @@ fn hash_fn(
                 )];
                 for (k, ty) in payload_types(v).into_iter().enumerate() {
                     let binds = payload_binds(v, "p");
-                    arm_stmts.push(accumulate_hash(hash_value(var(&binds[k]), &ty), span));
+                    arm_stmts.push(accumulate_hash(hash_value(var(&binds[k]), &ty, span), span));
                 }
                 let block = Block {
                     stmts: arm_stmts,
@@ -517,7 +517,7 @@ fn accumulate_hash(value: Expression, span: Span) -> Statement {
 }
 
 /// 单个字段/载荷的哈希值表达式。
-fn hash_value(e: Expression, ty: &Type) -> Expression {
+fn hash_value(e: Expression, ty: &Type, span: Span) -> Expression {
     match ty {
         // 标量与浮点：`as u64`。"相等 ⇒ 同哈希"仍然成立：取整是**值**的函数，
         // 相等的两个浮点取整结果相同。唯一一组"相等但位模式不同"的值是
@@ -530,12 +530,26 @@ fn hash_value(e: Expression, ty: &Type) -> Expression {
         // "相等 ⇒ 同哈希"成立；比按 0 计能给出真实分布（地址相同才同哈希，
         // 不同地址大概率不同哈希）。
         Type::Pointer(..) | Type::Reference(..) => cast(e, Type::U(64)),
-        // `str` / 切片 / 数组 / 元组：按 0 计（见模块文档）。
-        //
-        // 注意：元组不能按内容计——混合宽度元组（`(i32, i64)` 等）的字段访问
-        // 当前读的是垃圾（代码生成器对混合宽度元组算错偏移，`55_tuple_pattern`
-        // 只覆盖了同宽元组 `(i32, i32)`），按元素计会读到未初始化内存，比按 0
-        // 计更糟。等元组布局修好再换真实哈希。
+        // 元组：链式表达式，逐个混入元素哈希。相等 ⇒ 逐元素相等 ⇒ 每个元素哈希
+        // 相同 ⇒ 折叠相同，所以"相等 ⇒ 同哈希"成立；不同元组大概率不同哈希。
+        // 元素本身是元组/数组时 `hash_value` 会继续递归（数组仍按 0）。
+        // 用纯表达式（`a0*31 + a1` 式折叠）：`(i32, i64)` 等混合宽度元组的
+        // 字段访问已在 `29fc950` 修好，元素取值得以正确。
+        Type::Tuple(types) => {
+            let mut acc: Option<Expression> = None;
+            for (i, ty) in types.iter().enumerate() {
+                let elem = field_at(e.clone(), &i.to_string(), span);
+                let hv = hash_value(elem, ty, span);
+                acc = Some(match acc {
+                    None => hv,
+                    Some(prev) => {
+                        bin(bin(prev, BinaryOp::Mul, int(31), span), BinaryOp::Add, hv, span)
+                    }
+                });
+            }
+            acc.unwrap_or_else(|| int(0))
+        }
+        // `str` / 切片 / 数组：按 0 计（见模块文档）。
         _ => int(0),
     }
 }
