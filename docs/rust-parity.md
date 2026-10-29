@@ -59,9 +59,9 @@
 | `trait` | 可用 | ✅ | `trait` + `impl Trait for Type` 正常（`std::core` 的 `Eq`/`Ord`/`Copy`/`Clone`/`Display` 都在用） |
 | 关联类型 | 可用 | ✅ | `type Output;` + `type Output = i32;` 正常，`Self::Output` 能取到 |
 | `impl` 块 | 可用 | ✅ | 关联函数、`self` / `&self` / `&mut self` 三种接收者、`Self` 类型均可 |
-| `type` 别名 | 可用（非泛型） | ✅ | 在**使用点展开**：`let x: MyInt`、结构体字段、数组 / 指针、`Vec<MyInt>`、别名套别名、前向引用都正常；**泛型别名 `type V<T> = Vec<T>` 仍不支持**（目标里的 `T` 找不到） |
+| `type` 别名 | 可用（含泛型） | ✅ | 在**使用点展开**：`let x: MyInt`、结构体字段、数组 / 指针、`Vec<MyInt>`、别名套别名、前向引用都正常；**泛型别名 `type V<T> = Vec<T>` 已支持**（`74_generic_alias.zr`，提交 `8d6c475`：保留参数并登记占位符，展平按实参替换） |
 | 生命周期标注 `'a` | 解析后丢弃 | 🟡 | `&'a T`、`struct S<'a>` 能写，但类型检查阶段直接丢掉标注（`src/parser/ty.rs`），**没有任何借用/存活检查** |
-| `dyn Trait` / trait 对象 | 不支持 | ❌ | 词法器里**没有 `dyn` 关键字**：`&dyn Speak` → `zr: expected ')': expected RParen, found Ident("Speak")` |
+| `dyn Trait` / trait 对象 | 骨架可用 | 🔧 | 词法+解析+类型检查三层已实现（`88_dyn_keyword.zr`：参数/局部注解里出现 `&dyn Error` 不再报错）；**完整 vtable 分派与 trait-object 转换仍在未实现状态**，调用 trait 方法不在此用例范围 |
 | auto trait | 不支持 | ❌ | 无 auto trait 机制、无 blanket impl 语法 |
 | `PhantomData<T>` | 不存在 | ❌ | `std::core` 里没有 `PhantomData`，也没有等价物 |
 
@@ -252,8 +252,10 @@
    报的是整个类型的方法检查失败，尚未精确指向字段。可接受的 derive 名：
    `Debug` `Clone` `Copy` `PartialEq` `Eq` `PartialOrd` `Ord` `Hash` `Default`；
    其它名字报 `cannot derive ...`。
-2. **没有 `unsafe` 关键字**（README「指针与 unsafe」一节已过期）、
-   **没有 `dyn` 关键字**（trait 对象不可用，`std::error` 因此导入不了）。
+2. **`unsafe` 只是骨架**（`unsafe { ... }` 块可解析和通过类型检查，`85_unsafe.zr`；
+   当前不改变语义，按块表达式透传）；**`dyn` 只是骨架**（词法+解析+类型检查
+   已实现，`88_dyn_keyword.zr`；vtable 分派未完工，trait-object 转换受限，
+   `std::error` 因此仍难导入）。
 3. **没有借用检查 / 移动检查**（README「所有权系统」「借用检查」两节与实际不符）。
 4. **没有元数据 / 临时文件 API**：目录、路径、时间已可用（`std/fs.zr`、
     `std/path.zr`），但权限、时间戳、`tempfile` 仍缺。
