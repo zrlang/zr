@@ -238,3 +238,115 @@ fn main() -> i32 {
     }
     let _ = std::fs::remove_file(&src);
 }
+
+/// 工具链子命令 / 发射开关（§4 回归盲区）。
+///
+/// 逐项验证：
+/// - `zr fmt` 能重排源码、`zr fmt --check` 能报告"需要格式化 / 已格式化"
+///   （`--check` 对未格式化返回非 0，对已格式化返回 0——与 `git diff --exit-code`
+///   的惯例一致）；
+/// - `--emit-llvm` 真能写出 LLVM IR 文本（虽然目前是伪 IR，整数统一 i64）；
+/// - `--wat`（wasm32）能写出 WAT 文本。
+#[test]
+fn toolchain_subcommands_emit() {
+    let zr = env!("CARGO_BIN_EXE_zr");
+    let dir = std::env::temp_dir();
+
+    // --- zr fmt / zr fmt --check ---
+    let unformatted = dir.join("zr_fmt_unformatted.zr");
+    std::fs::write(&unformatted, "fn main()->i32{return 0;}\n").unwrap();
+    // 未格式化时 --check 报"需要格式化"并返回非 0。
+    let check = Command::new(zr)
+        .arg("fmt")
+        .arg("--check")
+        .arg(&unformatted)
+        .output()
+        .expect("failed to spawn zr fmt --check");
+    assert!(
+        !check.status.success(),
+        "未格式化源码 `zr fmt --check` 应当返回非 0"
+    );
+    let msg = String::from_utf8_lossy(&check.stdout);
+    assert!(
+        msg.contains("needs formatting"),
+        "`zr fmt --check` 应当报 `needs formatting`，得到: {msg}"
+    );
+    // 实际格式化。
+    let fmt = Command::new(zr)
+        .arg("fmt")
+        .arg(&unformatted)
+        .output()
+        .expect("failed to spawn zr fmt");
+    assert!(
+        fmt.status.success(),
+        "`zr fmt` 失败: {}",
+        String::from_utf8_lossy(&fmt.stderr)
+    );
+    let formatted = std::fs::read_to_string(&unformatted).unwrap();
+    assert!(
+        formatted.contains("fn main() -> i32 {"),
+        "`zr fmt` 应把 `fn main()->i32{{` 重排成 `fn main() -> i32 {{`，得到:\n{formatted}"
+    );
+    // 已格式化后 --check 返回 0。
+    let check2 = Command::new(zr)
+        .arg("fmt")
+        .arg("--check")
+        .arg(&unformatted)
+        .output()
+        .expect("failed to spawn zr fmt --check");
+    assert!(
+        check2.status.success(),
+        "已格式化源码 `zr fmt --check` 应当返回 0"
+    );
+    let _ = std::fs::remove_file(&unformatted);
+
+    // --- --emit-llvm 写出 IR 文本 ---
+    let src = dir.join("zr_emit_llvm.zr");
+    std::fs::write(&src, "fn main() -> i32 {\n    let a = 1 + 2;\n    return a;\n}\n").unwrap();
+    let ir_out = dir.join("zr_emit_llvm.ll");
+    let emit = Command::new(zr)
+        .arg(&src)
+        .arg("--emit-llvm")
+        .arg("-O0")
+        .arg("-o")
+        .arg(&ir_out)
+        .output()
+        .expect("failed to spawn zr --emit-llvm");
+    assert!(
+        emit.status.success(),
+        "`--emit-llvm` 失败: {}",
+        String::from_utf8_lossy(&emit.stderr)
+    );
+    let ir = std::fs::read_to_string(&ir_out).unwrap();
+    assert!(
+        ir.contains("define i64 @main()"),
+        "LLVM IR 应当含 `define i64 @main()`，得到:\n{ir}"
+    );
+    let _ = std::fs::remove_file(&ir_out);
+
+    // --- --wat（wasm32）写出 WAT 文本 ---
+    let wat_out = dir.join("zr_emit.wat");
+    let wat = Command::new(zr)
+        .arg(&src)
+        .arg("--wat")
+        .arg("--target")
+        .arg("wasm32-unknown-unknown")
+        .arg("-O0")
+        .arg("-o")
+        .arg(&wat_out)
+        .output()
+        .expect("failed to spawn zr --wat");
+    assert!(
+        wat.status.success(),
+        "`--wat` 失败: {}",
+        String::from_utf8_lossy(&wat.stderr)
+    );
+    let wat_txt = std::fs::read_to_string(&wat_out).unwrap();
+    assert!(
+        wat_txt.trim_start().starts_with("(module"),
+        "WAT 应当以 `(module` 开头，得到:\n{}",
+        &wat_txt[..wat_txt.len().min(120)]
+    );
+    let _ = std::fs::remove_file(&wat_out);
+    let _ = std::fs::remove_file(&src);
+}
