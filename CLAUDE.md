@@ -9,7 +9,7 @@ zr 是一门系统编程语言，设计取向介于 Rust 与 Zig 之间：所有
 - 给 AI agent 的操作约定、架构红线、在途工作：见 `AGENTS.md`
 - 与 Rust 的逐条对照：见 `docs/rust-parity.md`（**部分结论已被在途改动超越**）
 
-> 最近更新：2026-10-29。`feat/lang-features` 上已完成：`unsafe`/`dyn`/最小移动检查/常量越界检查；`52_if_let` 回归与 `71_derive` 失败均已修复；**又修掉了 `55_tuple_pattern` / `74_generic_alias` / `60_process` / `64_fs_path` / `io_print_matches_rust`（用户定义遮蔽标准库同名函数，见提交 `1ef4a02`）**；**支持 `use foo::*` glob 导入（见提交 `40b5b45`）**；全绿（95 用例 × 5 等级 + 宿主端对照用例）。
+> 最近更新：2026-10-29。`feat/lang-features` 上已完成：`unsafe`/`dyn`/最小移动检查/常量越界检查；`52_if_let` 回归与 `71_derive` 失败均已修复；**又修掉了 `55_tuple_pattern` / `74_generic_alias` / `60_process` / `64_fs_path` / `io_print_matches_rust`（用户定义遮蔽标准库同名函数，见提交 `1ef4a02`）**；**支持 `use foo::*` glob 导入（见提交 `40b5b45`）**；全绿（97 用例 × 5 等级 + 宿主端对照用例）。
 
 ---
 
@@ -17,11 +17,11 @@ zr 是一门系统编程语言，设计取向介于 Rust 与 Zig 之间：所有
 
 ```sh
 cargo build                                    # 编译编译器 + 运行时汇编
-cargo test --test zr_language                  # 全量回归：95 用例 × 5 优化等级，约 3 分钟
+cargo test --test zr_language                  # 全量回归：97 用例 × 5 优化等级，约 3 分钟
 target/debug/zr prog.zr -O1 -o /tmp/prog && /tmp/prog
 ```
 
-当前基线：**95 用例 × 5 等级 + 宿主端对照用例 全绿**。
+当前基线：**97 用例 × 5 等级 + 宿主端对照用例 全绿**。
 
 诊断：`--dump-tokens|ast|hir|mir|ssa|ssa-after|asm`、`--wat`、`--emit-llvm`、
 `--no-incremental`、`--target <triple>`、`-g`；`ZR_TIME=1` 看各阶段耗时。
@@ -258,7 +258,7 @@ target/debug/zr prog.zr -O1 -o /tmp/prog && /tmp/prog
 
 ## 4. 已实现但未测试覆盖
 
-`tests/cases/` 共 95 个用例，全部通过时 `cargo test` 绿。以下**已实现但无用例**，
+`tests/cases/` 共 97 个用例，全部通过时 `cargo test` 绿。以下**已实现但无用例**，
 属于回归盲区，加功能时容易破坏而无人发现：
 
 - 多边界泛型 `T: Clone + Ord`（✅ 已补 `91_multi_bound_generics.zr`：`P` 同时 impl 两个边界，`pick<P>` 两处边界都求解，形参按值移动两次）
@@ -326,13 +326,21 @@ target/debug/zr prog.zr -O1 -o /tmp/prog && /tmp/prog
 | 数组字段访问读垃圾 | ✅ 已修复（`caab7a0`）：`is_aggregate` 补数组（`s.a` 被当成标量加载，`s.a[0]` 读垃圾）；新增 `tests/cases/94_array_field_hash.zr` |
 | `str`/切片字段布局错位 | ✅ 已修复（`1161b65`）：`type_size_align` 把 `str`/切片当 8 字节（应为 16 `{ptr,len}`），`S { name: str, x: i64 }` 的 `name.len` 读到 `x` 的值；新增 `tests/cases/95_str_slice_layout.zr` |
 | 切片字段初始化静默存坏数据 | ✅ 已修复（`273d6f4`）：数组字面量不按切片期望元素类型收窄，`S { arr: []const i64 }` 用 `[10,20,30]` 静默强转成 `[]const i64`，运行期 SIGSEGV |
+| `loop` 表达式不产生 `break` 值 | ✅ 已修复（`87ef09a`）：`ExprKind::Break` 只记标签丢弃值、`Loop` 恒 `Never`，`let x = loop { break 7; }` 静默得 0；新增 `tests/cases/97_loop_value.zr`（标量）。**聚合 break 值在 `-O3`/`-Oz` 有已知 codegen 缺陷**（见 P0-7） |
 ### P1 — 明确报错或明显缺失
 
 1. **`#[derive]` 剩余缺口**：方法体已经生成（`src/typeck/derive.rs`），
    `Debug` 仍是标记 trait（不生成方法）；泛型类型 / 枚举 `Default` / 枚举 `Ord`
    显式报错（位置已修到类型定义，`60174ca`）；字段级诊断已修到真实源码位置
-   （`bcf29f6` / `9238875`）；`Hash` 对 `str` / 切片按 `0` 计入
-   （指针/引用按地址计 `b5f5a56`，元组按内容计 `38f1ddd`，数组按内容计 `caab7a0`）
+   （`bcf29f6` / `9238875`）；`Hash` 已覆盖**指针/引用按地址**（`b5f5a56`）、
+   **元组按内容**（`38f1ddd`）、**数组按内容**（`caab7a0`）、**`str`/切片按内容**
+   （`41ec8f4`，新增 `tests/cases/96_str_slice_hash.zr`）；只剩 `Debug` 方法体
+   （需运行期格式化设施）
+
+   **P0-7（已知 codegen 缺陷，尚未修）**：聚合（结构体/元组/数组）作为 `loop`
+   的 break 值在 `-O3`/`-Oz` 触发既有寄存器分配 bug——值横跨循环出口被与常量
+   `8` 合并（`bb2` 里 `movabsq $0x8, %r10` 覆盖保存聚合地址的 `%r10`，
+   `load [%r10]` 读到地址 8 段错误）。标量不受影响（`87ef09a`）。
 2. **闭包**：**无捕获**闭包已可存进变量 / 当实参 / 返回（提升成 `__closure_N`
    顶层函数指针，`tests/cases/83_closure_fnptr.zr`）；`(|x| x + 1)(5)` 仍是
    定义处立即调用（单态化内联）。**带捕获**闭包仍只支持立即调用——存进变量 /

@@ -49,7 +49,7 @@ target/debug/zr prog.zr -O1 -o /tmp/prog   # 编译单个程序
   `ld` 直接断言崩溃（`atomShouldReplaceExisting`）。先 `nm` 看目标文件有没有
   重复符号，再下结论。已修复（提交 `1ef4a02`：MIR 按最终符号名去重，保留首个
   用户定义）。
-- 测试：`tests/zr_language.rs` 把 95 个 `tests/cases/*.zr` 各在
+- 测试：`tests/zr_language.rs` 把 97 个 `tests/cases/*.zr` 各在
   `-O0/-O1/-O2/-O3/-Oz` 跑一遍（460 次编译+运行）。退出码 0 = 过，非 0 = 失败（编号指向失败的断言）。
   宿主端另有 `io_print_matches_rust` 等 Rust 对照用例。
 - **没有负向测试机制。** `tests/cases/` 下每个 `.zr` 都必须编译通过并返回 0。
@@ -198,7 +198,7 @@ README 里"指针与 unsafe"一节目前是**愿景**：
 ### `cargo test` 当前基线（2026-10-29，全绿）
 
 - `cargo test --bin zr`：265 项。
-- `cargo test --test zr_language`：95 个用例 × 5 个优化等级 = 475 项，另有 3 个宿主端
+- `cargo test --test zr_language`：97 个用例 × 5 个优化等级 = 485 项，另有 3 个宿主端
   对照用例（`io_print_matches_rust`——逐字符对比 Rust 的格式化输出，含 `{:e}` / `{:E}`
   与大浮点 Display（`|v| ≥ 2⁶⁴` 不带 `.0`）的回归；`extern_c_write_prints_string_literal`；
   `toolchain_subcommands_emit`——`zr fmt` / `zr fmt --check` / `zr pkg init` / `zr lsp`
@@ -221,8 +221,14 @@ README 里"指针与 unsafe"一节目前是**愿景**：
 以下项已在本分支上完成或部分完成，更新如下：
 
 - **`#[derive]`**：方法体已生成（`PartialEq`/`Eq`/`Hash`/`PartialOrd`/`Ord`/`Default`），
-  **剩**：`Debug` 仍是标记 trait（不生成方法体）；泛型类型 / 枚举 `Default` / 枚举 `Ord`
-  显式报错；字段级诊断不精确。
+  `Hash` 已覆盖**指针/引用按地址**（`b5f5a56`）、**元组按内容**（`38f1ddd`）、
+  **数组按内容**（`caab7a0`）、**`str`/切片按内容**（`41ec8f4`，`96_str_slice_hash.zr`）；
+  **剩**：`Debug` 仍是标记 trait（不生成方法体）；泛型类型 / 枚举 `Default` /
+  枚举 `Ord` 显式报错；字段级诊断不精确。
+- **`loop` 带值 break**：✅ 已实现（`87ef09a`）——`let x = loop { break 7; }`
+  不再静默得 0（`ExprKind::Break` 现在携带值，`Loop` 按其类型化）；
+  `tests/cases/97_loop_value.zr`。**聚合 break 值在 `-O3`/`-Oz` 有已知
+  codegen 缺陷**（值横跨循环出口被寄存器分配器与常量 `8` 合并，段错误）。
 - **`unsafe` 关键字**：✅ 已实现（`unsafe { ... }` 块可解析和通过类型检查；当前不改变语义，按块表达式透传）。
 - **`dyn` 关键字**：✅ 词法+解析+类型检查骨架已实现；vtable 分派仍在未实现状态。
 - **借用检查**：❌ `infer.rs::check_borrows` 仍是空壳（只记录不检查）。

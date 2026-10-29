@@ -73,6 +73,10 @@ i64 读，运行期越界 SIGSEGV（`/tmp/sl_bug.zr`）。`let a: []const i64 = 
 | P0-5a | 复现：切片字段 i32 字面量数组 → SIGSEGV | ✅ `273d6f4` |
 | P0-5b | 修复：`resolve(expected)` 为数组/切片时把元素类型 unify 给字面量 | ✅ `273d6f4` |
 | P0-5c | 回归：`tests/cases/95_str_slice_layout.zr`（切片字段按期望收窄） | ✅ `273d6f4` |
+| P0-6a | 复现：`let x = loop { break 7; }` 静默得 0（`ExprKind::Break` 只记标签丢弃值、`Loop` 恒 `Never`） | ✅ `87ef09a` |
+| P0-6b | 修复：typeck 压入 `LoopBreakCtx` 栈（`loop`/`while`/`for` 各一项，`while`/`for` 非值），`Break(v)` 携带值、与目标循环 break 类型统一；MIR `LoopCtx.result` + `assign_if_open` 写结果临时名 | ✅ `87ef09a` |
+| P0-6c | 回归：`tests/cases/97_loop_value.zr`（标量 break 值 + 累加 + 嵌套 + 语句 break + 发散循环） | ✅ `87ef09a` |
+| P0-7 | **已知 codegen 缺陷（未修）**：聚合（结构体/元组/数组）作为 `loop` break 值在 `-O3`/`-Oz` 触发寄存器分配 bug——值横跨循环出口被与常量 `8` 合并（`bb2` 里 `movabsq $0x8, %r10` 覆盖保存聚合地址的 `%r10`，`load [%r10]` 读到地址 8 段错误）。标量不受影响。修复需查 `src/codegen/regalloc.rs` 的"值横跨回边"分配 | ⬜ |
 
 ### P0-1 借用检查（NLL）——拆 4 个子任务
 
@@ -98,7 +102,7 @@ i64 读，运行期越界 SIGSEGV（`/tmp/sl_bug.zr`）。`let a: []const i64 = 
 | 子任务 | 内容 | 状态 |
 |---|---|---|
 | P1-1a | **字段级诊断**：derive 生成的 `Type__eq`/`__lt` 等失败时，报错应指向**出问题的那个字段**并说清缺什么 trait，而不是 `0:0:0`（实测：`Outer { b: Inner }` 上 `derive(PartialEq)` 报 `cannot compare values of type Inner` 但位置是 `0:0:0`）。已修：`StructDef`/`EnumDef`/`Field` 带真实 span，生成的字段访问用字段 span；结构体字段精准到列（`b: Inner` → `3:24`），枚举结构体载荷也精准到字段（`B { x: Inner }` → `2:22`），元组载荷回退到枚举定义。新增宿主端测试 `derive_field_error_has_span` | ✅ |
-| P1-1b | **`Hash` 分布**：`str`/切片/指针/元组/数组字段当前按 `0` 计入（只保证"相等⇒同哈希"，碰撞严重）；**指针/引用字段已改为按地址计入**（`b5f5a56`：相等⇒地址相同⇒同哈希，且给出真实分布）；**元组字段已改为按内容计**（`29fc950` 修好混合宽度元组字段访问后：逐元素折叠 `a0*31 + a1`，相等⇒同哈希、不同元组大概率不同）；**数组字段已改为按内容计**（`caab7a0`：定长展开 `a[0]*31 + a[1]`，长度 ≤ 32；更大/动态长度仍按 `0`）；`str`/切片仍按 `0`（运行期长度，需循环） | 🔧 |
+| P1-1b | **`Hash` 分布**：`str`/切片/指针/元组/数组字段当前按 `0` 计入（只保证"相等⇒同哈希"，碰撞严重）；**指针/引用字段已改为按地址计入**（`b5f5a56`：相等⇒地址相同⇒同哈希，且给出真实分布）；**元组字段已改为按内容计**（`29fc950` 修好混合宽度元组字段访问后：逐元素折叠 `a0*31 + a1`，相等⇒同哈希、不同元组大概率不同）；**数组字段已改为按内容计**（`caab7a0`：定长展开 `a[0]*31 + a[1]`，长度 ≤ 32；更大/动态长度仍按 `0`）；**`str`/切片已改为按内容计**（`41ec8f4`：`content_hash_loop` 用 `while` + 累加器折叠 `h*31 + byte`，`"abc"`=96354、`""`=0；新增 `tests/cases/96_str_slice_hash.zr`） | ✅ `41ec8f4` |
 | P1-1c | **`Debug` 方法体**：目前是标记 trait，`{:?}` 不经过它；需要 `std/fmt` 的 `Formatter` 与字符串拼接齐备（受阻于格式化设施） | ⬜ |
 | P1-1d | 泛型类型上的 derive / 枚举 `Default` / 枚举 `Ord` 显式报错——已实现（负向 13–15），报错位置也已从 `0:0:0` 修到类型定义（`derive_methods` 用 `span` 传参） | ✅ |
 
@@ -219,6 +223,11 @@ i64 读，运行期越界 SIGSEGV（`/tmp/sl_bug.zr`）。`let a: []const i64 = 
 | P1-1d derive 拒绝文案 + 位置 | `60174ca` | ✅ |
 | P1-1b Hash 指针/引用按地址 | `b5f5a56` | ✅ |
 | P1-1b Hash 元组按内容 | `29fc950` 后 | ✅ |
+| P1-1b Hash 数组按内容 | `caab7a0` | ✅ |
+| P1-1b Hash `str`/切片按内容 | `41ec8f4` | ✅ |
+| P0-4 str/切片字段布局 | `1161b65` | ✅ |
+| P0-5 切片字段按期望收窄 | `273d6f4` | ✅ |
+| P0-6 `loop` 带值 break | `87ef09a` | ✅ |
 | P2 #8 glob 导入 `use foo::*` | `40b5b45` | ✅ |
 | P3 文档债（全部 6 项） | `fb4dfb2` `1d38ca3` | ✅ |
 | §4 多边界泛型 | `8d68ae3` | ✅ |
