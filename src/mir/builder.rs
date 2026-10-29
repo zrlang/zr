@@ -833,6 +833,8 @@ fn lower_expr(b: &mut Builder, expr: &HirExpr) -> MirValue {
                 exit,
                 drop_depth: b.drop_scopes.len(),
                 label: label.clone(),
+                // `while` / `for` 是语句（类型 `()`），没有 break 值槽。
+                result: None,
             });
             let _ = lower_block(b, body);
             b.loops.pop();
@@ -846,11 +848,23 @@ fn lower_expr(b: &mut Builder, expr: &HirExpr) -> MirValue {
             let exit = b.new_block();
             b.current_block_mut().term = Some(MirTerminator::Goto(head));
             b.current = head;
+            // `loop` 作为表达式时准备一个结果临时名，带值 `break` 写进来
+            // （同 `if` 表达式：各分支把结果写进同一个临时名，SSA 在汇合处
+            // 插 φ）；作为语句（`()` / `Never`）不需要。
+            let result = match &expr.ty {
+                hir::Ty::Unit | hir::Ty::Never => None,
+                ty => {
+                    let name = b.temp();
+                    b.register_temp(MirValue::Var(name.clone()), ty);
+                    Some(name)
+                }
+            };
             b.loops.push(LoopCtx {
                 header: head,
                 exit,
                 drop_depth: b.drop_scopes.len(),
                 label: label.clone(),
+                result: result.clone(),
             });
             let _ = lower_block(b, body);
             b.loops.pop();
@@ -859,7 +873,10 @@ fn lower_expr(b: &mut Builder, expr: &HirExpr) -> MirValue {
             // 的出口跳转冲掉，整个循环退化成死循环。
             b.terminate_if_open(MirTerminator::Goto(head));
             b.current = exit;
-            MirValue::Unit
+            match result {
+                Some(name) => MirValue::Var(name),
+                None => MirValue::Unit,
+            }
         }
         Return(v) => {
             let temp_mark = b.temp_drops.len();
@@ -1105,12 +1122,20 @@ fn lower_expr(b: &mut Builder, expr: &HirExpr) -> MirValue {
             // 这一步已经是一个 `Int(42)`。
             mir_literal(folded, &expr.ty)
         }
-        Break(label) => {
+        Break(label, value) => {
             // `break` 终结当前块并跳到对应循环的出口。带标签时从内向外
             // 找第一个匹配标签的循环，否则取最内层。用 `terminate_if_open`
             // 是为了不覆盖已经终结的块（比如 `if c { break; }` 里 if 自己刚
             // 写完跳转）。
+            //
+            // 带值 break：把值写进该循环的结果槽（`loop` 表达式的值），
+            // 然后才跳出口。
             if let Some(ctx) = find_loop(b, label.as_deref()).cloned() {
+                if let (Some(v), Some(result)) = (value, &ctx.result) {
+                    let val = lower_expr(b, v);
+                    // 写进循环的结果临时名（同 `if` 表达式，SSA 汇合处插 φ）。
+                    b.assign_if_open(result, val);
+                }
                 b.flush_deferred();
                 b.emit_drops_from(ctx.drop_depth);
                 b.terminate_if_open(MirTerminator::Goto(ctx.exit));
@@ -1497,6 +1522,9 @@ struct LoopCtx {
     drop_depth: usize,
     /// 循环标签（`outer: loop`）。无标签的 `break` / `continue` 取最内层。
     label: Option<String>,
+    /// `loop` 作为表达式时的结果临时名：带值 `break` 把值写进来，循环结束时
+    /// 作为表达式的值。`loop` 恒作语句（`()`/`Never` 类型）时为 `None`。
+    result: Option<String>,
 }
 
 /// 按标签找循环上下文：`Some(label)` 从内向外找名字匹配的，

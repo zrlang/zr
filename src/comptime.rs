@@ -294,7 +294,7 @@ impl<'a> ComptimeEvaluator<'a> {
                 }
             },
 
-            ExprKind::Break(_) => Ok(Flow::Break),
+            ExprKind::Break(_, _) => Ok(Flow::Break),
             ExprKind::Continue(_) => Ok(Flow::Continue),
 
             ExprKind::Return(value) => {
@@ -713,7 +713,7 @@ fn describe(kind: &ExprKind) -> &'static str {
         ExprKind::Deref(_) => "dereference",
         ExprKind::AddrOf(_) => "address-of",
         ExprKind::Index(..) => "indexing",
-        ExprKind::Break(_) => "`break`",
+        ExprKind::Break(_, _) => "`break`",
         ExprKind::Continue(_) => "`continue`",
         ExprKind::Array(..) => "an array literal",
         ExprKind::Tuple(..) => "a tuple literal",

@@ -265,7 +265,12 @@ pub enum ExprKind {
     /// `break`：跳到对应循环的出口。
     ///
     /// 携带可选标签：`break 'outer` 跳指定循环，无标签跳最内层。
-    Break(Option<String>),
+    /// 第二个字段是 `break` 的值（`loop { break 7; }` 作为表达式产生 7）；
+    /// `loop` 的类型是所有 `break` 值的统一类型（见 `Expression::Loop`）。
+    /// 带值 break 的类型检查：值与该循环的 break 类型统一，并**保留**在 HIR
+    /// 里供 MIR 写入循环的结果槽——早先只记标签，值被丢弃，`let x = loop {
+    /// break 7; }` 静默得 0。
+    Break(Option<String>, Option<Box<HirExpr>>),
     /// `continue`：跳回对应循环的回边。
     ///
     /// 必须和 `Break` 分开。之前两者共用 `Break`，于是 `continue` 会跳出

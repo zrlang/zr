@@ -73,6 +73,33 @@ struct CapturedClosure {
     span: Span,
 }
 
+/// `loop` / `while` / `for` 的 break 上下文（`TypeChecker::loop_ctxs` 栈项）。
+#[derive(Debug)]
+struct LoopBreakCtx {
+    /// 循环标签（`outer: loop`）。`break 'outer` 按它匹配；无标签取最内层。
+    label: Option<String>,
+    /// break 值类型。`loop` 用新鲜推断变量（`break v` 与它统一）；`while` /
+    /// `for` 是 `Unit`（break 作语句）。
+    ty: Ty,
+    /// 该循环是否是 `loop`（可带值 break）。`while` / `for` 为 `false`。
+    is_value: bool,
+    /// 见过带值 `break` 吗？`loop` 检查完据此定类型。
+    value_seen: bool,
+    /// 见过不带值 `break` 吗？
+    plain_seen: bool,
+}
+
+/// 在 break 上下文栈里找 `break` 的目标：`None`（无标签）取最内层，
+/// `Some(name)` 从内向外找第一个标签匹配的项。
+fn find_loop_ctx(ctxs: &[LoopBreakCtx], label: Option<&str>) -> Option<usize> {
+    match label {
+        None => ctxs.len().checked_sub(1),
+        Some(name) => ctxs
+            .iter()
+            .rposition(|c| c.label.as_deref() == Some(name)),
+    }
+}
+
 /// 类型检查器。
 #[derive(Debug)]
 pub struct TypeChecker {
@@ -241,6 +268,15 @@ pub struct TypeChecker {
     /// `Expression::Labeled` 先把标签放在这里，紧接着检查的
     /// `while` / `loop` / `for` 会取走它并写进 HIR。
     pending_loop_label: Option<String>,
+    /// 活动循环的 break 上下文栈（`loop` / `while` / `for` 各占一项）。
+    ///
+    /// `Expression::Loop` 压入 `is_value: true` 的项（`break v` 把 `v` 的类型
+    /// 与该循环的 break 类型统一），`while` / `for` 压入 `is_value: false` 的项
+    /// （`break` 作语句，值只检查后丢弃——Rust 里 `while`/`for` 的 `break` 不能
+    /// 带值，zr 沿用"检查但不产生表达式值"）。`break` 取最内层（无标签）或按
+    /// 标签匹配的项。早先只记 `loop` 的 break 类型，`let x = loop { break 7; }`
+    /// 静默得 0。
+    loop_ctxs: Vec<LoopBreakCtx>,
     /// 可单态化的泛型函数 / 泛型 `impl` 方法的 AST。
     ///
     /// 声明阶段只把类型参数当作推断变量，函数体按具体类型重新检查才能真正
@@ -332,6 +368,7 @@ impl Default for TypeChecker {
             cfg_target: attributes::CfgTarget::host(),
             ast_fns: HashMap::new(),
             pending_loop_label: None,
+            loop_ctxs: Vec::new(),
             generic_asts: HashMap::new(),
             generic_names: HashMap::new(),
             generic_bounds: HashMap::new(),
@@ -2552,7 +2589,18 @@ impl TypeChecker {
             Expression::While(cond, body, else_b, _) => {
                 let label = self.pending_loop_label.take();
                 let c = self.check_expr(cond, &Ty::Bool)?;
+                // `while` 的 break 是语句（不产生表达式值），压一个非值上下文，
+                // 让 `break v` 在这里被当作语句 break（值只检查后丢弃），不会
+                // 误写入外层 `loop` 的结果槽。
+                self.loop_ctxs.push(LoopBreakCtx {
+                    label: label.clone(),
+                    ty: Ty::Unit,
+                    is_value: false,
+                    value_seen: false,
+                    plain_seen: false,
+                });
                 let b = self.check_block(body, &Ty::Unit)?;
+                self.loop_ctxs.pop();
                 let _else_hir = if let Some(eb) = else_b {
                     Some(self.check_block(eb, &Ty::Unit)?)
                 } else {
@@ -2592,7 +2640,19 @@ impl TypeChecker {
                         self.infer.locals.insert(id, elem_ty.clone());
                         id
                     });
-                    let body_hir = self.check_block(body, &Ty::Unit)?;
+                    let body_hir = {
+                        // `for` 的 break 是语句（不产生表达式值），同上。
+                        self.loop_ctxs.push(LoopBreakCtx {
+                            label: label.clone(),
+                            ty: Ty::Unit,
+                            is_value: false,
+                            value_seen: false,
+                            plain_seen: false,
+                        });
+                        let b = self.check_block(body, &Ty::Unit)?;
+                        self.loop_ctxs.pop();
+                        b
+                    };
                     self.pop_scope();
 
                     let src_local = self.alloc_local();
@@ -2823,19 +2883,61 @@ impl TypeChecker {
             }
             Expression::Loop(body, _) => {
                 let label = self.pending_loop_label.take();
+                // `loop` 表达式的类型 = 所有带值 `break` 的统一类型（没有带值
+                // break 就按"有没有 break"定 `()`/`Never`）。压入一个新鲜推断
+                // 变量，`break v` 把 `v` 与它统一；检查完弹出来解析。
+                let break_ty = self.infer.fresh_infer(span);
+                self.loop_ctxs.push(LoopBreakCtx {
+                    label: label.clone(),
+                    ty: break_ty.clone(),
+                    is_value: true,
+                    value_seen: false,
+                    plain_seen: false,
+                });
                 let b = self.check_block(body, &Ty::Unit)?;
+                let ctx = self.loop_ctxs.pop().unwrap();
+                let ty = if ctx.value_seen {
+                    self.infer.resolve(&ctx.ty)
+                } else if ctx.plain_seen {
+                    Ty::Unit
+                } else {
+                    // 循环体没有 `break`：死循环，发散。
+                    Ty::Never
+                };
                 return Ok(HirExpr {
                     kind: ExprKind::Loop(label, b),
-                    ty: Ty::Never,
+                    ty,
                     span,
                 });
             }
             Expression::Break(label, value, _) => {
-                if let Some(val) = value {
-                    let _ = self.check_expr(val, &Ty::Infer(InferId(0)))?;
-                }
+                // 带值 break：把值与目标循环（最内层，或按标签匹配）的 break
+                // 类型统一。目标必须是 `loop`（`is_value`）；`while`/`for` 的
+                // break 是语句，值只检查后丢弃（Rust 里 `while`/`for` 不能带值
+                // break）。值**保留**在 HIR 里供 MIR 写入结果槽——早先只检查
+                // 后丢弃，`let x = loop { break 7; }` 静默得 0。
+                let hir_val = if let Some(val) = value {
+                    let ctx_idx = find_loop_ctx(&self.loop_ctxs, label.as_deref());
+                    match ctx_idx {
+                        Some(idx) if self.loop_ctxs[idx].is_value => {
+                            let ty = self.loop_ctxs[idx].ty.clone();
+                            let hv = self.check_expr(val, &ty)?;
+                            self.loop_ctxs[idx].value_seen = true;
+                            Some(Box::new(hv))
+                        }
+                        _ => {
+                            let _ = self.check_expr(val, &Ty::Infer(InferId(0)))?;
+                            None
+                        }
+                    }
+                } else {
+                    if let Some(idx) = find_loop_ctx(&self.loop_ctxs, label.as_deref()) {
+                        self.loop_ctxs[idx].plain_seen = true;
+                    }
+                    None
+                };
                 return Ok(HirExpr {
-                    kind: ExprKind::Break(label.clone()),
+                    kind: ExprKind::Break(label.clone(), hir_val),
                     ty: Ty::Never,
                     span,
                 });
@@ -8986,7 +9088,7 @@ fn substitute_local(e: &mut hir::HirExpr, target: LocalId, with: &hir::HirExpr) 
         | ExprKind::Local(_)
         | ExprKind::Def(_)
         | ExprKind::Match
-        | ExprKind::Break(_)
+        | ExprKind::Break(_, _)
         | ExprKind::Continue(_)
         | ExprKind::Unreachable
         | ExprKind::Defer(_)
@@ -9141,7 +9243,7 @@ fn remap_lifted_body(
             | ExprKind::Literal(_)
             | ExprKind::Def(_)
             | ExprKind::Match
-            | ExprKind::Break(_)
+            | ExprKind::Break(_, _)
             | ExprKind::Continue(_)
             | ExprKind::Unreachable
             | ExprKind::Try { .. }

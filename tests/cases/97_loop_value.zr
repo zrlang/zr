@@ -1,0 +1,63 @@
+//=============================================================================
+// tests/cases/97_loop_value.zr — `loop` 表达式带值 `break` 的返回值
+//
+// 早先 `ExprKind::Break` 只记标签、丢弃值，`Expression::Loop` 恒为
+// `Ty::Never`：`let x = loop { break 7; };` 静默得 0，`fn f() -> u64 {
+// loop { break 5; } }` 也返回 0。本用例钉住（标量）：
+//   - `loop` 作为表达式产生带值 `break` 的值
+//   - 计算出的累加值（循环体写累加器再 break）
+//   - 嵌套循环：内层 break 值被外层丢弃，外层 break 值生效
+//   - 绑到变量的 `loop` 表达式
+//   - 循环体不 break ⇒ 发散（`fn infinite() -> i64 { loop {} }` 编译通过）
+//   - `while` / `for` 是语句：break 值不产生表达式值
+//
+// 注意：**聚合**（结构体/元组/数组）作为 break 值在 `-O3`/`-Oz` 有已知
+// codegen 缺陷——值横跨循环出口被寄存器分配器与常量 `8` 合并（`bb2` 里
+// `movabsq $0x8, %r10` 覆盖了保存聚合地址的 `%r10`，`load [%r10]` 读到
+// 地址 8 直接段错误）。标量不受影响。见 `docs/task-table.md` P0-7。
+//=============================================================================
+
+fn const_break() -> i64 { loop { break 5; } }
+
+fn accumulator() -> i64 {
+    let mut i: i64 = 0;
+    let mut s: i64 = 0;
+    loop {
+        if i >= 4 { break s; }
+        s = s + i;
+        i = i + 1;
+    }
+}
+
+fn nested() -> i64 {
+    let mut i: i64 = 0;
+    loop {
+        let mut j: i64 = 0;
+        loop {
+            if j >= 3 { break 100; }   // 内层 break 值（被外层丢弃）
+            j = j + 1;
+        }
+        i = i + 1;
+        if i >= 2 { break 55; }        // 外层 break 值
+    }
+}
+
+fn infinite() -> i64 { loop { } }      // 永不 break：发散，不调用
+
+fn main() -> i32 {
+    if const_break() != 5 { return 1; }
+    if accumulator() != 6 { return 2; }   // 0+1+2+3
+    if nested() != 55 { return 3; }
+    // 绑到变量的 `loop` 表达式
+    let x = loop { break 7; };
+    if x != 7 { return 4; }
+    // `while` / `for` 是语句：break 值不产生表达式值
+    let mut w: i64 = 0;
+    let mut i: i64 = 0;
+    while i < 3 { break 99; }          // 作语句，值丢弃
+    i = 0;
+    for j in 0..3 { break 88; }
+    if w != 0 { return 5; }
+
+    return 0;
+}
