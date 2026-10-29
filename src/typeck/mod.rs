@@ -3001,8 +3001,20 @@ impl TypeChecker {
             Expression::Tuple(elems, _) => {
                 let mut tys = Vec::new();
                 let mut hir_elems = Vec::with_capacity(elems.len());
-                for e in elems {
-                    let h = self.check_expr(e, &Ty::Infer(InferId(0)))?;
+                // 期望类型是元组时，按对应元素类型检查每个元素——否则元组里的
+                // 整数字面量（`(1, 5)` 在 `(i32, i64)` 位置）会各自落成默认的
+                // `i32`，存进 i64 槽只写低 4 字节，`t.1` 读到"值 | 高位垃圾"。
+                // 期望类型还是推断变量（未知）时退回各自独立推断（原行为）。
+                let exp_tys: Option<Vec<Ty>> = match self.infer.resolve(expected) {
+                    Ty::Tuple(ts) => Some(ts),
+                    _ => None,
+                };
+                for (i, e) in elems.iter().enumerate() {
+                    let elem_exp = exp_tys
+                        .as_ref()
+                        .and_then(|ts| ts.get(i).cloned())
+                        .unwrap_or_else(|| Ty::Infer(InferId(0)));
+                    let h = self.check_expr(e, &elem_exp)?;
                     tys.push(h.ty.clone());
                     hir_elems.push(h);
                 }
