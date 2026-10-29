@@ -387,3 +387,44 @@ fn toolchain_subcommands_emit() {
         "`zr lsp` 应打印 `listening on stdio` banner，得到: {banner}"
     );
 }
+
+/// `#[derive(..)]` 的字段级诊断要指到真实源码位置，而不是 `0:0:0`。
+///
+/// 早先 derive 在 AST 层生成 `Type__eq` 等方法时全部用 `Span::unknown()`
+/// （`derive.rs` 的 `SPAN`），某字段类型没实现所需 trait 时，报错位置落在
+/// `0:0:0`——用户只知道"有个类型缺 trait"，不知道**哪个字段**。
+/// 现在 `StructDef` / `Field` 都带真实 span，生成的字段访问用字段的 span，
+/// 报错指向 `b: Inner` 那个字段。这里钉住"位置不是 0:0:0"。
+#[test]
+fn derive_field_error_has_span() {
+    let zr = env!("CARGO_BIN_EXE_zr");
+    let dir = std::env::temp_dir();
+    let src = dir.join("zr_derive_field_span.zr");
+    let out = dir.join("zr_derive_field_span.bin");
+    std::fs::write(
+        &src,
+        "struct Inner { v: i32 }\n\
+         #[derive(PartialEq)]\n\
+         struct Outer { a: i32, b: Inner }\n\
+         fn main() -> i32 { return 0; }\n",
+    )
+    .expect("写临时源码失败");
+    let compile = Command::new(zr)
+        .arg(&src)
+        .arg("-O0")
+        .arg("-o")
+        .arg(&out)
+        .output()
+        .expect("spawn 编译失败");
+    assert!(!compile.status.success(), "该用例应编译失败");
+    let stderr = String::from_utf8_lossy(&compile.stderr);
+    assert!(
+        stderr.contains("cannot compare values of type `Inner`"),
+        "应报缺 trait 的类型名，得到: {stderr}"
+    );
+    // 报错位置 `zr: <line>:<col>:<off>:` 的三个数字不能全为 0。
+    assert!(
+        !stderr.starts_with("zr: 0:0:0:"),
+        "字段级诊断应指向真实源码位置，而不是 0:0:0，得到: {stderr}"
+    );
+}

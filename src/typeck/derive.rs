@@ -50,6 +50,9 @@ const SPAN: Span = Span::unknown();
 struct FieldInfo {
     name: String,
     ty: Type,
+    /// 字段名所在源码区间。生成 `self.field` 访问时用它做诊断位置，让
+    /// "某字段缺 trait"的报错指向**那个字段**而不是整个类型定义。
+    span: Span,
 }
 
 /// 为某个带 `#[derive(..)]` 的类型生成方法体。
@@ -58,6 +61,13 @@ struct FieldInfo {
 /// 组合直接报错（见模块文档的"已知限定"）。不认识的 trait 名不在这里报错，
 /// 交给 `generate_derive_impls` 统一报 "unknown derive trait"。
 pub fn derive_methods(type_name: &str, type_def: &ast::TypeDef, traits: &[String]) -> Result<Vec<Function>> {
+    // derive 生成的比较/哈希方法在诊断里用类型定义的位置指出"哪个类型缺
+    // trait"，避免报 `0:0:0`（`SPAN`）。
+    let span = match type_def {
+        ast::TypeDef::Struct(s) => s.span,
+        ast::TypeDef::Enum(e) => e.span,
+        _ => SPAN,
+    };
     let mut out = Vec::new();
     // 先按 trait 名推出这次要生成哪几个方法，避免重复生成（`PartialEq` 与
     // `Eq` 都要求 `eq`，`PartialOrd` 与 `Ord` 都要求 `lt/le/gt/ge`）。
@@ -104,6 +114,7 @@ pub fn derive_methods(type_name: &str, type_def: &ast::TypeDef, traits: &[String
                             f.name.clone()
                         },
                         ty: f.ty.clone(),
+                        span: f.span,
                     })
                     .collect::<Vec<_>>(),
             ),
@@ -132,20 +143,20 @@ pub fn derive_methods(type_name: &str, type_def: &ast::TypeDef, traits: &[String
         }
     }
     if want_clone {
-        out.push(clone_fn(type_name, &self_ty, fields.as_deref(), variants.as_deref())?);
+        out.push(clone_fn(type_name, &self_ty, fields.as_deref(), variants.as_deref(), span)?);
     }
     if want_eq {
-        out.push(eq_fn(type_name, &self_ty, fields.as_deref(), variants.as_deref())?);
+        out.push(eq_fn(type_name, &self_ty, fields.as_deref(), variants.as_deref(), span)?);
     }
     if want_ord {
         let fields = fields.as_deref().unwrap_or(&[]);
-        out.push(lt_fn(type_name, &self_ty, fields));
-        out.push(le_fn(type_name, &self_ty));
-        out.push(gt_fn(type_name, &self_ty));
-        out.push(ge_fn(type_name, &self_ty));
+        out.push(lt_fn(type_name, &self_ty, fields, span));
+        out.push(le_fn(type_name, &self_ty, span));
+        out.push(gt_fn(type_name, &self_ty, span));
+        out.push(ge_fn(type_name, &self_ty, span));
     }
     if want_hash {
-        out.push(hash_fn(type_name, &self_ty, fields.as_deref(), variants.as_deref())?);
+        out.push(hash_fn(type_name, &self_ty, fields.as_deref(), variants.as_deref(), span)?);
     }
     Ok(out)
 }
@@ -213,11 +224,12 @@ fn clone_fn(
     self_ty: &Type,
     fields: Option<&[FieldInfo]>,
     variants: Option<&[ast::Variant]>,
+    _span: Span,
 ) -> Result<Function> {
     if let Some(fields) = fields {
         let args = fields
             .iter()
-            .map(|f| clone_value(field(self_expr(), &f.name), &f.ty))
+            .map(|f| clone_value(field_at(self_expr(), &f.name, f.span), &f.ty))
             .collect();
         return Ok(make_fn(
             type_name,
@@ -265,22 +277,24 @@ fn eq_fn(
     self_ty: &Type,
     fields: Option<&[FieldInfo]>,
     variants: Option<&[ast::Variant]>,
+    span: Span,
 ) -> Result<Function> {
     let body = if let Some(fields) = fields {
         // `f1 == g1 && f2 == g2 && ...`（零字段恒等）。
         let mut acc: Option<Expression> = None;
         for f in fields {
             let cmp = bin(
-                field(self_expr(), &f.name),
+                field_at(self_expr(), &f.name, f.span),
                 BinaryOp::Eq,
-                field(var("other"), &f.name),
+                field_at(var("other"), &f.name, f.span),
+                f.span,
             );
             acc = Some(match acc {
-                Some(prev) => bin(prev, BinaryOp::And, cmp),
+                Some(prev) => bin(prev, BinaryOp::And, cmp, span),
                 None => cmp,
             });
         }
-        acc.unwrap_or_else(|| Expression::Literal(Literal::Bool(true), SPAN))
+        acc.unwrap_or_else(|| Expression::Literal(Literal::Bool(true), span))
     } else {
         let variants = variants.unwrap_or(&[]);
         // 第一层按 `self` 的变体分派，第二层在同一个变体内比较载荷：
@@ -295,15 +309,15 @@ fn eq_fn(
                         let obinds = payload_binds(w, "o");
                         let mut acc: Option<Expression> = None;
                         for (a, b) in sbinds.iter().zip(obinds.iter()) {
-                            let cmp = bin(var(a), BinaryOp::Eq, var(b));
+                            let cmp = bin(var(a), BinaryOp::Eq, var(b), span);
                             acc = Some(match acc {
-                                Some(prev) => bin(prev, BinaryOp::And, cmp),
+                                Some(prev) => bin(prev, BinaryOp::And, cmp, span),
                                 None => cmp,
                             });
                         }
-                        acc.unwrap_or_else(|| Expression::Literal(Literal::Bool(true), SPAN))
+                        acc.unwrap_or_else(|| Expression::Literal(Literal::Bool(true), span))
                     } else {
-                        Expression::Literal(Literal::Bool(false), SPAN)
+                        Expression::Literal(Literal::Bool(false), span)
                     };
                     ast::Arm {
                         pattern,
@@ -329,28 +343,30 @@ fn eq_fn(
 /// `fn Type__lt(self, other: Type) -> bool`：字段按字典序比较。
 ///
 /// `f1 < g1 || (f1 == g1 && (f2 < g2 || (f2 == g2 && ...)))`
-fn lt_fn(type_name: &str, self_ty: &Type, fields: &[FieldInfo]) -> Function {
+fn lt_fn(type_name: &str, self_ty: &Type, fields: &[FieldInfo], span: Span) -> Function {
     let mut acc: Option<Expression> = None;
     for (i, f) in fields.iter().enumerate().rev() {
         let lt = bin(
-            field(self_expr(), &f.name),
+            field_at(self_expr(), &f.name, f.span),
             BinaryOp::Lt,
-            field(var("other"), &f.name),
+            field_at(var("other"), &f.name, f.span),
+            f.span,
         );
         acc = Some(if i == fields.len() - 1 {
             // 最后一个字段：没有"后面"要比较了，不必再拼 `==`。
             lt
         } else {
             let eq = bin(
-                field(self_expr(), &f.name),
+                field_at(self_expr(), &f.name, f.span),
                 BinaryOp::Eq,
-                field(var("other"), &f.name),
+                field_at(var("other"), &f.name, f.span),
+                f.span,
             );
             let tail = acc.expect("非末字段一定有后续比较");
-            bin(lt, BinaryOp::Or, bin(eq, BinaryOp::And, tail))
+            bin(lt, BinaryOp::Or, bin(eq, BinaryOp::And, tail, span), span)
         });
     }
-    let body = acc.unwrap_or_else(|| Expression::Literal(Literal::Bool(false), SPAN));
+    let body = acc.unwrap_or_else(|| Expression::Literal(Literal::Bool(false), span));
     make_fn(
         type_name,
         "lt",
@@ -365,7 +381,7 @@ fn lt_fn(type_name: &str, self_ty: &Type, fields: &[FieldInfo]) -> Function {
 ///
 /// 用组合而不是自己重写一遍字段比较：`lt` / `eq` 已经在别处生成，两者
 /// 都必须与它们**完全**一致，否则 `a <= b` 与 `a < b || a == b` 会分家。
-fn le_fn(type_name: &str, self_ty: &Type) -> Function {
+fn le_fn(type_name: &str, self_ty: &Type, span: Span) -> Function {
     let lt = method_call(self_expr(), "lt", vec![var("other")]);
     let eq = method_call(self_expr(), "eq", vec![var("other")]);
     make_fn(
@@ -374,12 +390,12 @@ fn le_fn(type_name: &str, self_ty: &Type) -> Function {
         Some(receiver(self_ty)),
         vec![param("other", self_ty)],
         Type::Bool,
-        bin(lt, BinaryOp::Or, eq),
+        bin(lt, BinaryOp::Or, eq, span),
     )
 }
 
 /// `fn Type__gt(self, other) -> bool { !self.le(other) }`
-fn gt_fn(type_name: &str, self_ty: &Type) -> Function {
+fn gt_fn(type_name: &str, self_ty: &Type, span: Span) -> Function {
     let le = method_call(self_expr(), "le", vec![var("other")]);
     make_fn(
         type_name,
@@ -387,12 +403,12 @@ fn gt_fn(type_name: &str, self_ty: &Type) -> Function {
         Some(receiver(self_ty)),
         vec![param("other", self_ty)],
         Type::Bool,
-        Expression::Unary(ast::UnaryOp::Not, Box::new(le), SPAN),
+        Expression::Unary(ast::UnaryOp::Not, Box::new(le), span),
     )
 }
 
 /// `fn Type__ge(self, other) -> bool { !self.lt(other) }`
-fn ge_fn(type_name: &str, self_ty: &Type) -> Function {
+fn ge_fn(type_name: &str, self_ty: &Type, span: Span) -> Function {
     let lt = method_call(self_expr(), "lt", vec![var("other")]);
     make_fn(
         type_name,
@@ -400,7 +416,7 @@ fn ge_fn(type_name: &str, self_ty: &Type) -> Function {
         Some(receiver(self_ty)),
         vec![param("other", self_ty)],
         Type::Bool,
-        Expression::Unary(ast::UnaryOp::Not, Box::new(lt), SPAN),
+        Expression::Unary(ast::UnaryOp::Not, Box::new(lt), span),
     )
 }
 
@@ -413,13 +429,14 @@ fn hash_fn(
     self_ty: &Type,
     fields: Option<&[FieldInfo]>,
     variants: Option<&[ast::Variant]>,
+    span: Span,
 ) -> Result<Function> {
     // 枚举：把变体号也混进去，不同变体即使载荷都是零值也不同哈希。
     let mut stmts = vec![let_mut("h", Type::U(64), int(0))];
     if let Some(fields) = fields {
         for f in fields {
-            let hv = hash_value(field(self_expr(), &f.name), &f.ty);
-            stmts.push(accumulate_hash(hv));
+            let hv = hash_value(field_at(self_expr(), &f.name, f.span), &f.ty);
+            stmts.push(accumulate_hash(hv, f.span));
         }
     } else {
         let variants = variants.unwrap_or(&[]);
@@ -437,35 +454,35 @@ fn hash_fn(
                         Box::new(var("h")),
                         AssignOp::Assign,
                         Box::new(int(i as i128)),
-                        SPAN,
+                        span,
                     ),
-                    SPAN,
+                    span,
                 )];
                 for (k, ty) in payload_types(v).into_iter().enumerate() {
                     let binds = payload_binds(v, "p");
-                    arm_stmts.push(accumulate_hash(hash_value(var(&binds[k]), &ty)));
+                    arm_stmts.push(accumulate_hash(hash_value(var(&binds[k]), &ty), span));
                 }
                 let block = Block {
                     stmts: arm_stmts,
                     tail: None,
-                    span: SPAN,
+                    span,
                 };
                 ast::Arm {
                     pattern: variant_pattern(type_name, v, "p"),
                     guard: None,
-                    body: Box::new(Expression::Block(block, SPAN)),
+                    body: Box::new(Expression::Block(block, span)),
                 }
             })
             .collect();
         stmts.push(Statement::Expr(
-            Expression::Match(Box::new(self_expr()), arms, SPAN),
-            SPAN,
+            Expression::Match(Box::new(self_expr()), arms, span),
+            span,
         ));
     }
     let block = Block {
         stmts,
         tail: Some(Box::new(var("h"))),
-        span: SPAN,
+        span,
     };
     Ok(make_fn(
         type_name,
@@ -473,16 +490,21 @@ fn hash_fn(
         Some(receiver(self_ty)),
         Vec::new(),
         Type::U(64),
-        Expression::Block(block, SPAN),
+        Expression::Block(block, span),
     ))
 }
 
 /// `h = h * 31 + (值)`。
-fn accumulate_hash(value: Expression) -> Statement {
-    let mixed = bin(bin(var("h"), BinaryOp::Mul, int(31)), BinaryOp::Add, value);
+fn accumulate_hash(value: Expression, span: Span) -> Statement {
+    let mixed = bin(
+        bin(var("h"), BinaryOp::Mul, int(31), span),
+        BinaryOp::Add,
+        value,
+        span,
+    );
     Statement::Expr(
-        Expression::Assign(Box::new(var("h")), AssignOp::Assign, Box::new(mixed), SPAN),
-        SPAN,
+        Expression::Assign(Box::new(var("h")), AssignOp::Assign, Box::new(mixed), span),
+        span,
     )
 }
 
@@ -695,6 +717,12 @@ fn field(e: Expression, name: &str) -> Expression {
     Expression::Field(Box::new(e), name.to_string(), SPAN)
 }
 
+/// 带位置版本的 `field`：用于 derive 生成的字段访问，让"某字段缺 trait"的
+/// 报错指向**那个字段**（`span`）而不是 `0:0:0`。
+fn field_at(e: Expression, name: &str, span: Span) -> Expression {
+    Expression::Field(Box::new(e), name.to_string(), span)
+}
+
 fn method_call(recv: Expression, name: &str, args: Vec<Expression>) -> Expression {
     Expression::Call(
         Box::new(field(recv, name)),
@@ -715,8 +743,8 @@ fn call_path(path: &[String], args: Vec<Expression>) -> Expression {
     )
 }
 
-fn bin(l: Expression, op: BinaryOp, r: Expression) -> Expression {
-    Expression::Binary(Box::new(l), op, Box::new(r), SPAN)
+fn bin(l: Expression, op: BinaryOp, r: Expression, span: Span) -> Expression {
+    Expression::Binary(Box::new(l), op, Box::new(r), span)
 }
 
 fn cast(e: Expression, ty: Type) -> Expression {

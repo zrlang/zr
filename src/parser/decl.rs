@@ -450,7 +450,7 @@ impl Parser {
         _visibility: Visibility,
         attrs: Vec<Attribute>,
     ) -> Result<TypeDef, CompileError> {
-        let _span = self.previous().span;
+        let span = self.previous().span;
         let name = self.consume_ident("expected struct name")?;
         let generics = if self.match_kind(&TokenKind::Lt) {
             self.parse_generic_params()?
@@ -462,17 +462,23 @@ impl Parser {
             // 元组结构体 `struct Point(u32, u32)`
             let mut fields = Vec::new();
             if !self.check(&TokenKind::RParen) {
+                let fty = self.parse_type()?;
+                let fspan = self.previous().span;
                 fields.push(Field {
                     name: String::new(),
-                    ty: self.parse_type()?,
+                    ty: fty,
+                    span: fspan,
                 });
                 while self.match_kind(&TokenKind::Comma) {
                     if self.check(&TokenKind::RParen) {
                         break;
                     }
+                    let fty = self.parse_type()?;
+                    let fspan = self.previous().span;
                     fields.push(Field {
                         name: String::new(),
-                        ty: self.parse_type()?,
+                        ty: fty,
+                        span: fspan,
                     });
                 }
             }
@@ -483,6 +489,7 @@ impl Parser {
                 generics,
                 attrs,
                 fields,
+                span,
             }));
         }
 
@@ -493,6 +500,7 @@ impl Parser {
                 generics,
                 attrs,
                 fields: Vec::new(),
+                span,
             }));
         }
 
@@ -501,6 +509,7 @@ impl Parser {
         while !self.check(&TokenKind::RBrace) && !self.is_at_end() {
             let _fvis = self.parse_visibility();
             let fname = self.consume_ident("expected field name")?;
+            let fspan = self.previous().span;
             self.consume(&TokenKind::Colon, "expected ':' after field name")?;
             let fty = self.parse_type()?;
             if self.match_kind(&TokenKind::Eq) {
@@ -510,6 +519,7 @@ impl Parser {
             fields.push(Field {
                 name: fname,
                 ty: fty,
+                span: fspan,
             });
             // 最后一个字段后面允许省略逗号
             if !self.match_kind(&TokenKind::Comma) {
@@ -522,6 +532,7 @@ impl Parser {
             generics,
             attrs,
             fields,
+            span,
         }))
     }
 
@@ -534,7 +545,7 @@ impl Parser {
         _visibility: Visibility,
         attrs: Vec<Attribute>,
     ) -> Result<TypeDef, CompileError> {
-        let _span = self.previous().span;
+        let span = self.previous().span;
         let name = self.consume_ident("expected enum name")?;
         let generics = if self.match_kind(&TokenKind::Lt) {
             self.parse_generic_params()?
@@ -565,6 +576,7 @@ impl Parser {
             generics,
             repr,
             variants,
+            span,
         }))
     }
 
@@ -592,11 +604,13 @@ impl Parser {
             let mut fields = Vec::new();
             while !self.check(&TokenKind::RBrace) && !self.is_at_end() {
                 let fname = self.consume_ident("expected field name")?;
+                let fspan = self.previous().span;
                 self.consume(&TokenKind::Colon, "expected ':'")?;
                 let fty = self.parse_type()?;
                 fields.push(Field {
                     name: fname,
                     ty: fty,
+                    span: fspan,
                 });
                 // 最后一个字段后面允许省略逗号。
                 if !self.match_kind(&TokenKind::Comma) {
@@ -641,11 +655,13 @@ impl Parser {
         while !self.check(&TokenKind::RBrace) && !self.is_at_end() {
             let _fvis = self.parse_visibility();
             let fname = self.consume_ident("expected field name")?;
+            let fspan = self.previous().span;
             self.consume(&TokenKind::Colon, "expected ':'")?;
             let fty = self.parse_type()?;
             fields.push(Field {
                 name: fname,
                 ty: fty,
+                span: fspan,
             });
             // 最后一个字段后面允许省略逗号
             if !self.match_kind(&TokenKind::Comma) {

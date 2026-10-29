@@ -683,6 +683,9 @@ pub enum TypeDef {
 pub struct Field {
     pub name: String,
     pub ty: Type,
+    /// 字段名所在源码区间。derive 生成的 `self.field` 访问用它做诊断位置，
+    /// 让"某字段缺 trait"的报错指向**那个字段**而不是整个类型定义。
+    pub span: Span,
 }
 
 /// 结构体定义。
@@ -693,6 +696,9 @@ pub struct StructDef {
     pub generics: Vec<GenericParam>,
     pub attrs: Vec<Attribute>,
     pub fields: Vec<Field>,
+    /// 定义所在源码区间。derive 生成的比较/哈希方法用它在诊断里指出
+    /// "哪个类型缺 trait"，避免报 `0:0:0`。
+    pub span: Span,
 }
 
 /// 闭包的一个参数：模式 + 可选的类型标注。
@@ -735,6 +741,9 @@ pub struct EnumDef {
     /// 底层整数类型（默认 `i32`）。
     pub repr: Option<Type>,
     pub variants: Vec<Variant>,
+    /// 定义所在源码区间。derive 生成的比较/哈希方法用它在诊断里指出
+    /// "哪个类型缺 trait"，避免报 `0:0:0`。
+    pub span: Span,
 }
 
 /// 联合体定义。
