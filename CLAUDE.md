@@ -142,7 +142,7 @@ target/debug/zr prog.zr -O1 -o /tmp/prog && /tmp/prog
 | 超类型继承方向（`trait Ord: Eq` 蕴含 `T: Equ`） | ✅ **在途已修**：`implements_trait` 把每个直接实现的 trait 往上展开 |
 | trait 方法：关联函数、`self` / `&self` / `&mut self` | ✅ |
 | `Self` 类型 | ✅ |
-| 关联类型 `type Output;` + `type Output = i32;` | ✅（`Self::Output` 可取） |
+| 关联类型 `type Output;` + `type Output = i32;` | 🟡 **声明可用**，但 `Self::Output` / `P::Output` **投影不可用**（方法签名/体里写 `-> Self::Output` 报 `cannot find value`，`assoc_types` 只过 HIR、无投影解析） |
 | 函数指针 `fn(T) -> R`（取址/传参/存储） | ✅ **x86-64 专属**，其它后端明确报错 |
 | `?` 对 `Result`/`Option` | ✅ |
 | `#[derive(Debug, Clone, Copy)]` | 🟡 `Clone` / `Copy` 是标记 trait；`Debug` 仍未生成方法（见 §5） |
@@ -262,7 +262,7 @@ target/debug/zr prog.zr -O1 -o /tmp/prog && /tmp/prog
 属于回归盲区，加功能时容易破坏而无人发现：
 
 - 多边界泛型 `T: Clone + Ord`（✅ 已补 `91_multi_bound_generics.zr`：`P` 同时 impl 两个边界，`pick<P>` 两处边界都求解，形参按值移动两次）
-- 关联类型在泛型枚举上的投影
+- 关联类型投影（`Self::Output` / `P::Output`）——❌ 实测**不可用**（方法签名/体里报 `cannot find value`；`assoc_types` 只过 HIR、无投影解析，见 §3.4 修正）
 - `f8` / `f16` 窄浮点（`53_narrow_float.zr` 覆盖基础算术，但溢出/NaN/舍入未测）
 - `static mut` 的复合赋值与 `&mut STATIC`
 - `#[cfg(...)]` 的过滤路径（✅ 已补 `92_cfg_filter.zr`：互斥 host 键保证正好一个保留 + 恒假键被滤掉 + 引用滤掉的项报 undefined）
