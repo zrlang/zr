@@ -200,6 +200,12 @@ pub struct TypeChecker {
     errors: Vec<CompileError>,
     /// 导入解析缓存。
     use_aliases: HashMap<String, DefId>,
+    /// 裸枚举变体导入（`use core::Option::Some`）：叶子变体名 → 宿主枚举的
+    /// DefId。`use_tree_root` 只加载模块，类型检查器另行把叶子段登记到这里；
+    /// 调用点 `Some(7)` 走 `enum_variant_target` 的 `Variable` 分支查表。
+    /// 同名变体（两个枚举都有 `Some`）后注册的覆盖先注册的——与
+    /// `use_aliases` 的"后导入遮蔽先导入"语义一致。
+    variant_aliases: HashMap<String, DefId>,
     /// 已加载的标准库模块名。
     ///
     /// `use io::{println}` 里的 `io` 不是一个可调用的符号，而是模块
@@ -308,6 +314,7 @@ impl Default for TypeChecker {
             current_is_async: false,
             errors: Vec::new(),
             use_aliases: HashMap::new(),
+            variant_aliases: HashMap::new(),
             known_modules: HashSet::new(),
             warnings: Vec::new(),
             cfg_target: attributes::CfgTarget::host(),
@@ -981,6 +988,10 @@ impl TypeChecker {
 
     fn resolve_imports(&mut self, prog: &Program) -> Result<()> {
         for imp in &prog.imports {
+            // 先登记变体别名（`use core::Option::Some` 的 `Some` → 宿主
+            // `Option` 的 DefId），再跑普通符号解析——这样 `Name` 分支遇到
+            // 变体叶子时能从 `variant_aliases` 查到，不报"无法解析"。
+            self.register_variant_aliases(&imp.tree, &imp.span);
             self.resolve_use_tree(&imp.tree, &imp.span)?;
         }
         Ok(())
@@ -995,6 +1006,11 @@ impl TypeChecker {
                 }
                 if let Some(id) = self.symbols.get(name).copied() {
                     self.use_aliases.insert(name.clone(), id);
+                } else if self.variant_aliases.contains_key(name) {
+                    // 枚举变体导入（`use core::Option::Some`）：变体名本身不
+                    // 进符号表，宿主枚举在 `variant_aliases` 里（注册在
+                    // `resolve_imports` 的预处理）。这里静默放行，裸 `Some(7)`
+                    // 的解析由 `enum_variant_target` 的 `Variable` 分支完成。
                 } else {
                     self.errors.push(
                         CompileError::name_error(format!("cannot resolve `{}` in import", name))
@@ -1047,6 +1063,88 @@ impl TypeChecker {
         Ok(())
     }
 
+    /// 拍平 use 树路径，把形如 `use core::Option::Some` 的**枚举变体导入**
+    /// 登记进 `variant_aliases`（叶子名 → 宿主枚举 DefId）。
+    ///
+    /// 两条结构都要处理（`parse_use_tree` 与 prelude 注入各造一种）：
+    /// - 解析器形式 `Group([Group([core, Option]), Some])`（链式段包在左侧）
+    /// - 注入形式 `Group([core, Group([Option, Some])])`（模块段在左侧）
+    ///
+    /// 统一规则：`Group([i0, i1, ..., ik])` 里**第一个**项是其余项的公共
+    /// 前缀上下文，前缀段数 = `segments(i0)`（Name 1 段、Group 递归拼段）；
+    /// 第 j 项（j≥1）的路径 = 前缀上下文 ++ 它自身展开的段。`i0` 自身也
+    /// 贡献路径（如 `use core::{Option, Result}` 的 `Option`）。
+    ///
+    /// 对每个**深度 ≥ 2** 的段序列，倒数第二段是枚举的符号名时，把最后
+    /// 一段登记为该枚举的变体别名。同名变体（两个枚举都有 `Some`）后登记
+    /// 的覆盖先登记的，与 `use_aliases` 的"后导入遮蔽先导入"语义一致。
+    fn register_variant_aliases(&mut self, tree: &UseTree, _span: &ast::Span) {
+        // 子树贡献的路径段（顺序拼接）。
+        fn segments_of(tree: &UseTree, out: &mut Vec<String>) {
+            match tree {
+                UseTree::Name(n) => out.push(n.clone()),
+                UseTree::Group(items) => {
+                    for it in items {
+                        segments_of(it, out);
+                    }
+                }
+                UseTree::Rename(inner, _) => segments_of(inner, out),
+                UseTree::Glob => {}
+            }
+        }
+
+        // 收集所有叶子路径（前缀 ++ 自身段）。
+        fn paths_of(tree: &UseTree, prefix: &[String], out: &mut Vec<Vec<String>>) {
+            match tree {
+                UseTree::Name(n) => {
+                    let mut p = prefix.to_vec();
+                    p.push(n.clone());
+                    out.push(p);
+                }
+                UseTree::Group(items) => {
+                    if items.is_empty() {
+                        return;
+                    }
+                    // 第一项：自身贡献路径 + 作为其余项的公共前缀。
+                    paths_of(&items[0], prefix, out);
+                    let mut ctx = prefix.to_vec();
+                    segments_of(&items[0], &mut ctx);
+                    // 注意：`i0` 自己的路径已经用原 `prefix` 收过了；
+                    // 从 `i1` 起用扩展上下文。
+                    for it in items.iter().skip(1) {
+                        paths_of(it, &ctx, out);
+                    }
+                }
+                UseTree::Rename(inner, _) => paths_of(inner, prefix, out),
+                UseTree::Glob => {}
+            }
+        }
+
+        let mut paths = Vec::new();
+        paths_of(tree, &[], &mut paths);
+        for p in paths {
+            if p.len() < 2 {
+                continue;
+            }
+            let parent = &p[p.len() - 2];
+            let leaf = &p[p.len() - 1];
+            let Some(enum_id) = self.symbols.get(parent).copied() else {
+                continue;
+            };
+            if !matches!(self.type_defs.get(&enum_id), Some(hir::HirTypeDef::Enum(_))) {
+                continue;
+            }
+            // 叶子自身已是符号（如同名函数/类型）时不覆盖：普通符号优先。
+            if self.symbols.contains_key(leaf) {
+                continue;
+            }
+            self.variant_aliases.insert(leaf.clone(), enum_id);
+        }
+    }
+
+    /// 带路径上下文的 use 树解析。`path` 记录从根到当前节点的中间段
+    /// （不含当前节点自身）：`use core::Option::Some` 解析到叶子 `Some` 时
+    /// `path == ["core", "Option"]`。
     /// 取 `use` 路径的**叶子**名字。
     ///
     /// `parse_use_tree` 把每个路径段包成一个扁平 Group：`use core::Option`
@@ -1953,7 +2051,51 @@ impl TypeChecker {
                 return Ok(HirExpr { kind, ty, span });
             }
             Expression::Variable(name, _) => {
-                let id = self.resolve_name(name, span)?;
+                let id = match self.resolve_name(name, span) {
+                    Ok(id) => id,
+                    // 裸无载荷枚举变体（`use core::Option::None` 导入的 `None`
+                    // 当值用）：不是名字，是"0 实参的变体构造"。
+                    Err(_) => {
+                        if let Some(enum_id) = self.variant_aliases.get(name).copied() {
+                            let Some(hir::HirTypeDef::Enum(he)) =
+                                self.type_defs.get(&enum_id)
+                            else {
+                                return Err(CompileError::name_error(
+                                    format!("cannot find value `{name}` in this scope"),
+                                )
+                                .with_span(span));
+                            };
+                            let idx = he
+                                .variants
+                                .iter()
+                                .position(|v| v.name == *name)
+                                .unwrap_or(0);
+                            if !he
+                                .variants
+                                .get(idx)
+                                .map_or(false, |v| matches!(v.payload, hir::HirVariantPayload::Unit))
+                            {
+                                return Err(CompileError::name_error(
+                                    format!(
+                                        "`{name}` is a payload variant, use `{name}(...)` to construct it"
+                                    ),
+                                )
+                                .with_span(span));
+                            }
+                            return self.check_enum_variant_init(
+                                enum_id,
+                                idx,
+                                &[],
+                                expected,
+                                span,
+                            );
+                        }
+                        return Err(CompileError::name_error(
+                            format!("cannot find value `{name}` in this scope"),
+                        )
+                        .with_span(span));
+                    }
+                };
                 if let Some(local) = self.as_local(id) {
                     // 移动检查：读一个已被移动的局部（且不是"正在被移动"的
                     // 那个，后者是 `let b = a` 的合法移动读）报 use-after-move。
@@ -3281,15 +3423,28 @@ impl TypeChecker {
 
     /// 调用目标是枚举变体时返回 (枚举的 DefId, 变体下标)。
     fn enum_variant_target(&self, callee: &Expression) -> Option<(DefId, usize)> {
-        let ast::Expression::Path(path, span) = callee else {
-            // `Option::<i32>::None` / `Option::<i32>::Some(7)`：turbofish
-            // 外面还包了一层，看到它之后继续往里看。
-            if let ast::Expression::Turbofish(inner, _, _) = callee {
-                return self.enum_variant_target(inner);
+        // `Option::<i32>::None` / `Option::<i32>::Some(7)`：turbofish
+        // 外面还包了一层，看到它之后继续往里看。
+        if let ast::Expression::Turbofish(inner, _, _) = callee {
+            return self.enum_variant_target(inner);
+        }
+        match callee {
+            ast::Expression::Path(path, span) => {
+                self.enum_variant_target_path(path, *span)
             }
-            return None;
-        };
-        self.enum_variant_target_path(path, *span)
+            // 通过 `use core::Option::Some` 导入的裸变体名（`Some(7)`）：
+            // 变量名经 `variant_aliases` 指向宿主枚举定义（登记见
+            // `resolve_use_tree`）。按 (枚举 DefId, 变体名) 查变体下标。
+            ast::Expression::Variable(name, _span) => {
+                let alias_id = self.variant_aliases.get(name).copied()?;
+                let hir::HirTypeDef::Enum(he) = self.type_defs.get(&alias_id)? else {
+                    return None;
+                };
+                let index = he.variants.iter().position(|v| &v.name == name)?;
+                Some((alias_id, index))
+            }
+            _ => None,
+        }
     }
 
     /// 显式类型实参（turbofish）当成期望类型：`Option::<i32>::Some(7)` 的
@@ -5348,7 +5503,24 @@ impl TypeChecker {
                 Ok(hir::HirPattern::Struct(hir_fields?))
             }
             AstPattern::Variant { path, args, span } => {
-                let def_id = self.resolve_path(&path[..path.len() - 1], *span)?;
+                // 裸变体模式（`Some(v)`）：路径只有变体名本身，宿主枚举靠
+                // `variant_aliases`（`use core::Option::Some` 时登记）找。
+                // 限定路径（`Option::Some(v)` / `Opt::<i32>::Some(v)`）照旧
+                // 走 `resolve_path`。
+                let def_id = if path.len() == 1 {
+                    match self.variant_aliases.get(&path[0]) {
+                        Some(id) => *id,
+                        None => {
+                            return Err(CompileError::name_error(format!(
+                                "cannot find enum variant `{}` in this scope (import it via its enum type, e.g. `use core::Option::Some`)",
+                                path[0]
+                            ))
+                            .with_span(*span));
+                        }
+                    }
+                } else {
+                    self.resolve_path(&path[..path.len() - 1], *span)?
+                };
                 let variant_name = path.last().unwrap();
                 let variant_idx = self.variant_index(def_id, variant_name);
                 let payload_tys = self.variant_payload_tys(def_id, variant_idx, *span)?;

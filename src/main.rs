@@ -611,24 +611,35 @@ fn compile(input: &str, cmd: &Cli) -> Result<std::path::PathBuf, String> {
         println!("{:#?}", ast);
     }
 
-    // 3.5 注入 prelude：`Option` / `Result` 是每个 zr 程序最常用
-    // 的类型，要求每个程序都手写 `use core::{Option, Result}` 是
-    // 不必要的样板。这里在解析后、类型检查前把两条隐式 use 插到
-    // 用户导入之前——用户再写 `use core::Option` 也不会冲突
-    // （类型检查器会去重）。
+    // 3.5 注入 prelude：`Option` / `Result`（连同它们的枚举变体 `Some` /
+    // `None` / `Ok` / `Err`）是每个 zr 程序最常用的类型，要求每个程序都手写
+    // `use core::{Option, Result, Some, None, Ok, Err}` 是不必要的样板。这里
+    // 在解析后、类型检查前把这些隐式 use 插到用户导入之前——用户再写同名
+    // use 也不会冲突（类型检查器会去重）。
     //
-    // 注意：prelude 只注入 `Option` 和 `Result`，其他类型（`Some` /
-    // `None` / `Ok` / `Err`）仍需通过 `core::` 路径访问，或用户
-    // 自行 `use core::Option::Some` 等。
+    // 必须构造正确的 `UseTree::Group([Name("core"), Name(...)])` 结构
+    // ——早先写成 `Name("Option")` 会让模块加载器误把 `Option` 当成模块名，
+    // 报 "unknown module `Option`"。
     //
-    // 必须构造正确的 `UseTree::Group([Name("core"), Name("Option")])`
-    // 结构——早先写成 `Name("Option")` 会让模块加载器误把 `Option`
-    // 当成模块名，报 "unknown module `Option`"。
-    const PRELUDE_IMPORTS: &[&str] = &["core::Option", "core::Result"];
+    // 变体用 `Group([Name("core"), Group([Name("Option"), Name("Some")])])`
+    // 嵌套导入（与 `parse_use_tree` 的段追加顺序一致——每往右推一层就包一个
+    // 新 Group，旧树是 Group 的第一个元素）；枚举变体在 zr 里是模块内符号，
+    // 不会与用户本地的同名绑定冲突（同名时用户的绑定遮蔽 prelude）。
+    const PRELUDE_IMPORTS: &[&str] = &[
+        "core::Option",
+        "core::Result",
+        "core::Option::Some",
+        "core::Option::None",
+        "core::Result::Ok",
+        "core::Result::Err",
+    ];
     for path in PRELUDE_IMPORTS {
         let segments: Vec<&str> = path.split("::").collect();
-        // 构造 `Group([Name(seg0), Name(seg1), ...])` 嵌套结构。
+        // 构造嵌套 `Group([Name(seg0), Group([Name(seg1), ...])])`——与
+        // `parse_use_tree` 的段追加顺序一致（新段往后追加，旧树是 Group 的
+        // 第一个元素）。
         // `use core::Option` → `Group([Name("core"), Name("Option")])`
+        // `use core::Option::Some` → `Group([Name("core"), Group([Name("Option"), Name("Some")])])`
         let mut tree = if segments.is_empty() {
             continue;
         } else {
