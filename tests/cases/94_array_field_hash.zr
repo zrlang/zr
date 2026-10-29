@@ -1,0 +1,48 @@
+//=============================================================================
+// tests/cases/94_array_field_hash.zr — 数组字段访问与按内容 Hash
+//
+// 早先 `is_aggregate` 漏了数组：`s.a`（`a: [T; N]`）被当成标量加载，`s.a[0]`
+// 读到垃圾（`arr_idx` 复现 `x=0 y=0`）。修好 `is_aggregate` 后数组字段按
+// 地址表示返回，`s.a[i]` 取值得以正确。由此 derive 的数组 Hash 从恒 `0`
+// 换成定长展开逐元素折叠。
+//
+// 覆盖：
+//   - 数组字段访问 `s.a[i]`（之前读垃圾）
+//   - 数组字段的 derive Hash：相等⇒同哈希、不同⇒不同
+//   - 元组数组、结构体数组（嵌套聚合）
+//=============================================================================
+
+#[derive(Hash, PartialEq)]
+struct S {
+    a: [u8; 3],
+}
+
+#[derive(Hash, PartialEq)]
+struct T {
+    b: [(i32, i64); 2],
+}
+
+fn main() -> i32 {
+    // --- 数组字段访问（之前 `s.a[i]` 读垃圾） ---
+    let s = S { a: [1, 2, 3] };
+    if s.a[0] != 1 { return 1; }
+    if s.a[1] != 2 { return 2; }
+    if s.a[2] != 3 { return 3; }
+
+    // --- 数组字段 derive Hash：相等⇒同哈希、不同⇒不同 ---
+    let s2 = S { a: [1, 2, 3] };
+    let s3 = S { a: [1, 2, 4] };
+    if s.hash() != s2.hash() { return 4; }
+    if s.hash() == s3.hash() { return 5; }
+
+    // --- 元组数组（嵌套聚合，元素是 `(i32, i64)` 混合宽度） ---
+    let t = T { b: [(1, 2), (3, 5)] };
+    if t.b[0].1 != 2 { return 6; }
+    if t.b[1].1 != 5 { return 7; }
+    let t2 = T { b: [(1, 2), (3, 5)] };
+    let t3 = T { b: [(1, 2), (3, 6)] };
+    if t.hash() != t2.hash() { return 8; }
+    if t.hash() == t3.hash() { return 9; }
+
+    return 0;
+}

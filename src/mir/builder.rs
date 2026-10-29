@@ -2646,6 +2646,12 @@ fn is_aggregate(b: &Builder, ty: &hir::Ty) -> bool {
     }
     match ty {
         hir::Ty::Named(def_id, args) => enum_layout(b, *def_id, args).is_some(),
+        // 数组是**地址表示**的值聚合（运行期值是指向元素存储的地址，与元组
+        // 同一套布局）。早先这里漏了数组，字段访问 `s.a`（`a: [T; N]`）被当成
+        // 标量加载——`s.a[0]` 读到的是垃圾（`arr_idx.zr`：`x=0 y=0`）。
+        // `Index`/`copy_struct_into` 早已用 `array_info` 特判数组，这里补齐，
+        // 让字段访问与它们一致。
+        hir::Ty::Array(..) => true,
         _ => false,
     }
 }
