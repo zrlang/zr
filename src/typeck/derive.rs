@@ -38,8 +38,8 @@
 
 use crate::error::{CompileError, Result};
 use crate::parser::ast::{
-    self, Argument, AssignOp, BinaryOp, Block, Expression, FieldPat, Function, Literal, Mutability,
-    Param, Pattern, Receiver, Span, Statement, Type, VariantPayload,
+    self, Argument, ArrayLen, AssignOp, BinaryOp, Block, Expression, FieldPat, Function, Literal,
+    Mutability, Param, Pattern, Receiver, Span, Statement, Type, VariantPayload,
 };
 
 /// 生成代码没有源码位置。所有派生方法的诊断都落在同一点上，但错误文案里
@@ -549,7 +549,36 @@ fn hash_value(e: Expression, ty: &Type, span: Span) -> Expression {
             }
             acc.unwrap_or_else(|| int(0))
         }
-        // `str` / 切片 / 数组：按 0 计（见模块文档）。
+        // 数组：定长展开逐元素哈希（`a[0]*31 + a[1]` 式折叠）。数组长度由类型
+        // 固定，逐元素折叠足以区分内容——相等 ⇒ 逐元素相等 ⇒ 折叠相同。
+        // 只在长度已知且不大时展开（Rust 的 `[T; N]: Hash` 也只支持 N ≤ 32 的
+        // const 泛型，更大走切片）；超大/动态长度回退按 0，避免生成巨型方法体。
+        Type::Array(elem, len) => {
+            let n = match len {
+                ArrayLen::Const(expr) => match &**expr {
+                    Expression::Literal(Literal::Int(n, _), _) => *n,
+                    _ => -1,
+                },
+                ArrayLen::Dynamic => -1,
+            };
+            if n < 0 || n > 32 {
+                return int(0);
+            }
+            let mut acc: Option<Expression> = None;
+            for i in 0..n {
+                let elem_expr = Expression::Index(Box::new(e.clone()), Box::new(int(i)), span);
+                let hv = hash_value(elem_expr, elem, span);
+                acc = Some(match acc {
+                    None => hv,
+                    Some(prev) => {
+                        bin(bin(prev, BinaryOp::Mul, int(31), span), BinaryOp::Add, hv, span)
+                    }
+                });
+            }
+            acc.unwrap_or_else(|| int(0))
+        }
+        // `str` / 切片：按 0 计（见模块文档）。切片长度是运行期值，定长展开
+        // 不适用；按内容计需要一个运行时循环（见 `docs/rust-parity.md`）。
         _ => int(0),
     }
 }
