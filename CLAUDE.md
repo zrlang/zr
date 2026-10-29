@@ -285,7 +285,7 @@ target/debug/zr prog.zr -O1 -o /tmp/prog && /tmp/prog
 **已实现（生成真实方法体）**：`PartialEq`、`Eq`、`Hash`、`PartialOrd`、`Ord`、`Default`。
 - 实现在 `src/typeck/derive.rs`，在 AST 层生成 `Type__eq` / `Type__lt` / `Type__hash` / `Type__default` / `Type__clone` 方法体
 - 泛型类型 / 枚举 `Default` / 枚举 `Ord` 显式报错
-- `Hash` 对 `str` / 切片 / 数组 / 元组按 `0` 计入（缺按内容 hash 的语义）；**指针 / 引用已改为按地址计入**（`b5f5a56`）
+- `Hash` 对 `str` / 切片 / 数组按 `0` 计入（缺按内容 hash 的语义）；**指针 / 引用已改为按地址计入**（`b5f5a56`）；**元组已改为按内容计**（`38f1ddd`，`29fc950` 修好混合宽度元组字段访问后）
 - 字段级诊断已修到**真实源码位置**：`StructDef` / `EnumDef` / `Field` 带 span，结构体字段精准到列、枚举结构体载荷也精准到字段、derive 拒绝诊断与默认值字段诊断都用类型/字段的位置（`bcf29f6` / `9238875` / `60174ca`）
 
 **在途修过的一个相关 bug**：早先枚举的 `attrs` 在 `collect_declarations` 阶段
@@ -322,13 +322,14 @@ target/debug/zr prog.zr -O1 -o /tmp/prog && /tmp/prog
 | `use x as y` 静默无效 | ✅ 已修复（`75_use_alias.zr`；含多段路径 `use core::Option as Opt`） |
 | `f8` / `f16` 溢出行为 | ✅ 已验证：`f8` 最大约 240，`65504.0 * 2.0` 在 f16 正确输出 Inf |
 | 浮点 `Display` 在 \|v\| ≥ 2⁶⁴ 时输出 `.0` | ✅ 已钉住回归（`tests/cases/86_bounds_check.zr` / `tests/zr_language.rs` `io_print_matches_rust` 已扩展） |
+| 混合宽度元组字段访问读垃圾 | ✅ 已修复（`29fc950`）：元组字面量元素按期望元素类型检查，`(i32, i64)` 的 `t.1` 不再读到"值\|高位垃圾"；新增 `tests/cases/93_mixed_width_tuple.zr` |
 ### P1 — 明确报错或明显缺失
 
 1. **`#[derive]` 剩余缺口**：方法体已经生成（`src/typeck/derive.rs`），
    `Debug` 仍是标记 trait（不生成方法）；泛型类型 / 枚举 `Default` / 枚举 `Ord`
    显式报错（位置已修到类型定义，`60174ca`）；字段级诊断已修到真实源码位置
-   （`bcf29f6` / `9238875`）；`Hash` 对 `str` / 切片 / 数组 / 元组按 `0` 计入
-   （指针/引用已按地址计，`b5f5a56`）
+   （`bcf29f6` / `9238875`）；`Hash` 对 `str` / 切片 / 数组按 `0` 计入
+   （指针/引用按地址计 `b5f5a56`，元组按内容计 `38f1ddd`）
 2. **闭包**：**无捕获**闭包已可存进变量 / 当实参 / 返回（提升成 `__closure_N`
    顶层函数指针，`tests/cases/83_closure_fnptr.zr`）；`(|x| x + 1)(5)` 仍是
    定义处立即调用（单态化内联）。**带捕获**闭包仍只支持立即调用——存进变量 /
