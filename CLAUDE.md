@@ -285,8 +285,8 @@ target/debug/zr prog.zr -O1 -o /tmp/prog && /tmp/prog
 **已实现（生成真实方法体）**：`PartialEq`、`Eq`、`Hash`、`PartialOrd`、`Ord`、`Default`。
 - 实现在 `src/typeck/derive.rs`，在 AST 层生成 `Type__eq` / `Type__lt` / `Type__hash` / `Type__default` / `Type__clone` 方法体
 - 泛型类型 / 枚举 `Default` / 枚举 `Ord` 显式报错
-- `Hash` 对 `str` / 切片 / 数组 / 元组按 `0` 计入（缺按内容 hash 的语义）
-- 字段级诊断不精确（错误落在同一位置，但文案里带上类型名与方法名）
+- `Hash` 对 `str` / 切片 / 数组 / 元组按 `0` 计入（缺按内容 hash 的语义）；**指针 / 引用已改为按地址计入**（`b5f5a56`）
+- 字段级诊断已修到**真实源码位置**：`StructDef` / `EnumDef` / `Field` 带 span，结构体字段精准到列、枚举结构体载荷也精准到字段、derive 拒绝诊断与默认值字段诊断都用类型/字段的位置（`bcf29f6` / `9238875` / `60174ca`）
 
 **在途修过的一个相关 bug**：早先枚举的 `attrs` 在 `collect_declarations` 阶段
 落到 `_ => &[]`，`#[derive]` 在 `enum` 上被**静默丢弃**（结构体正常）。现在
@@ -324,9 +324,11 @@ target/debug/zr prog.zr -O1 -o /tmp/prog && /tmp/prog
 | 浮点 `Display` 在 \|v\| ≥ 2⁶⁴ 时输出 `.0` | ✅ 已钉住回归（`tests/cases/86_bounds_check.zr` / `tests/zr_language.rs` `io_print_matches_rust` 已扩展） |
 ### P1 — 明确报错或明显缺失
 
-1. **`#[derive]` 剩余缺口**：方法体已经生成（`src/typeck/derive.rs`），但
+1. **`#[derive]` 剩余缺口**：方法体已经生成（`src/typeck/derive.rs`），
    `Debug` 仍是标记 trait（不生成方法）；泛型类型 / 枚举 `Default` / 枚举 `Ord`
-   显式报错；字段级诊断不精确；`Hash` 对 `str` / 切片 / 数组 / 元组按 `0` 计入
+   显式报错（位置已修到类型定义，`60174ca`）；字段级诊断已修到真实源码位置
+   （`bcf29f6` / `9238875`）；`Hash` 对 `str` / 切片 / 数组 / 元组按 `0` 计入
+   （指针/引用已按地址计，`b5f5a56`）
 2. **闭包**：**无捕获**闭包已可存进变量 / 当实参 / 返回（提升成 `__closure_N`
    顶层函数指针，`tests/cases/83_closure_fnptr.zr`）；`(|x| x + 1)(5)` 仍是
    定义处立即调用（单态化内联）。**带捕获**闭包仍只支持立即调用——存进变量 /
