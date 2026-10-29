@@ -1010,7 +1010,7 @@ fn mir_intersect(
 }
 
 /// 逆后序（块号序列）。
-fn mir_rpo(n: usize, succs: &[Vec<usize>]) -> Vec<usize> {
+pub(crate) fn mir_rpo(n: usize, succs: &[Vec<usize>]) -> Vec<usize> {
     let mut visited = vec![false; n];
     let mut post = Vec::with_capacity(n);
     if n == 0 {

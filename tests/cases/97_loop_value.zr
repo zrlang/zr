@@ -10,11 +10,9 @@
 //   - 绑到变量的 `loop` 表达式
 //   - 循环体不 break ⇒ 发散（`fn infinite() -> i64 { loop {} }` 编译通过）
 //   - `while` / `for` 是语句：break 值不产生表达式值
-//
-// 注意：**聚合**（结构体/元组/数组）作为 break 值在 `-O3`/`-Oz` 有已知
-// codegen 缺陷——值横跨循环出口被寄存器分配器与常量 `8` 合并（`bb2` 里
-// `movabsq $0x8, %r10` 覆盖了保存聚合地址的 `%r10`，`load [%r10]` 读到
-// 地址 8 直接段错误）。标量不受影响。见 `docs/task-table.md` P0-7。
+//   - 聚合（结构体）作为 break 值——早先 `-O3`/`-Oz` 触发寄存器分配缺陷
+//     （值横跨循环出口被与常量 `8` 合并，段错误），见 `docs/task-table.md`
+//     P0-7；已修（regalloc 线性位置改按 RPO 编号）。
 //=============================================================================
 
 fn const_break() -> i64 { loop { break 5; } }
@@ -42,6 +40,16 @@ fn nested() -> i64 {
     }
 }
 
+struct P { x: i64, y: i64 }
+
+fn agg() -> P {
+    let mut i: i64 = 0;
+    loop {
+        if i >= 2 { break P { x: 7, y: 9 }; }
+        i = i + 1;
+    }
+}
+
 fn infinite() -> i64 { loop { } }      // 永不 break：发散，不调用
 
 fn main() -> i32 {
@@ -51,13 +59,16 @@ fn main() -> i32 {
     // 绑到变量的 `loop` 表达式
     let x = loop { break 7; };
     if x != 7 { return 4; }
+    // 聚合 break 值（`-O3`/`-Oz` 早先段错误，见上）
+    let p = agg();
+    if p.x != 7 || p.y != 9 { return 5; }
     // `while` / `for` 是语句：break 值不产生表达式值
     let mut w: i64 = 0;
     let mut i: i64 = 0;
     while i < 3 { break 99; }          // 作语句，值丢弃
     i = 0;
     for j in 0..3 { break 88; }
-    if w != 0 { return 5; }
+    if w != 0 { return 6; }
 
     return 0;
 }

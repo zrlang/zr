@@ -367,26 +367,13 @@ fn live_intervals(func: &SsaFunction) -> (HashMap<u32, (usize, usize)>, Vec<usiz
         return (HashMap::new(), Vec::new());
     }
 
-    // ---- 线性位置：块下标 -> [起, 终) ----
-    //
-    // 位置只是**活跃区间端点的度量**，正确性完全由下面的 CFG 活跃性保证；
-    // 块之间的先后顺序不影响结果。
-    let mut block_range: Vec<(usize, usize)> = Vec::with_capacity(n);
-    let mut pos = 0usize;
-    for block in &func.blocks {
-        let len = block.instrs.len() + 1; // +1 给终结符
-        block_range.push((pos, pos + len));
-        pos += len;
-    }
-    // 块号 -> 下标（MIR 降级保证块号连续，但别依赖这一点）。
+    // ---- 块号 -> 下标、前驱表 ----
     let index_of: HashMap<usize, usize> = func
         .blocks
         .iter()
         .enumerate()
         .map(|(i, b)| (b.id, i))
         .collect();
-
-    // ---- 前驱表 ----
     let succs: Vec<Vec<usize>> = func
         .blocks
         .iter()
@@ -399,6 +386,26 @@ fn live_intervals(func: &SsaFunction) -> (HashMap<u32, (usize, usize)>, Vec<usiz
                 preds[si].push(i);
             }
         }
+    }
+
+    // ---- 线性位置：块下标 -> [起, 终) ----
+    //
+    // 位置只是**活跃区间端点的度量**，正确性完全由下面的 CFG 活跃性保证；
+    // 块之间的先后顺序不影响结果。
+    //
+    // 但**线性顺序必须按 RPO**（反向后序）排：`bb3 -> bb2` 是一条前进边
+    // （bb3 先执行），数组顺序却可能是 `bb2` 在下标 2、`bb3` 在下标 3，
+    // 于是 `%11`（定义在 bb3、用在 bb2）的 def 位置反而 > use 位置——
+    // 区间**倒挂**，寄存器分配器把 `%11` 与一个常量 `8` 分到同一寄存器，
+    // 常量装载覆盖了保存聚合地址的寄存器，`load [r10]` 读到地址 8 段错误
+    // （P0-7）。按 RPO 编号后 def 必在 use 前，区间不再倒挂。
+    let rpo = crate::ssa::mir_rpo(n, &succs);
+    let mut block_range: Vec<(usize, usize)> = vec![(0, 0); n];
+    let mut pos = 0usize;
+    for &bi in &rpo {
+        let len = func.blocks[bi].instrs.len() + 1; // +1 给终结符
+        block_range[bi] = (pos, pos + len);
+        pos += len;
     }
 
     // ---- 每块的 use / def ----
@@ -545,7 +552,14 @@ fn live_intervals(func: &SsaFunction) -> (HashMap<u32, (usize, usize)>, Vec<usiz
 
     let mut pos = 0usize;
     let mut calls: Vec<usize> = Vec::new();
-    for (bi, block) in func.blocks.iter().enumerate() {
+    // 必须按 **RPO 顺序**遍历：`pos` 是线性端点，要与上面的 `block_range`
+    // 一致（否则 def/use 端点落在数组顺序、活跃拉伸落在 RPO 顺序，两套刻度
+    // 打架）。早先这里按数组顺序遍历，而 `block_range` 后来改成 RPO——于是
+    // 定义在 bb3、用在 bb2 的值（`bb3 -> bb2` 是前进边）端点倒挂，区间空、
+    // 值根本不分配寄存器，codegen 拿一个被常量覆盖的寄存器当基址，
+    // `load [r8]` 读到地址 8 段错误（P0-7）。
+    for &bi in &rpo {
+        let block = &func.blocks[bi];
         let n_phi = block
             .instrs
             .iter()
