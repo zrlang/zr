@@ -526,7 +526,11 @@ fn hash_value(e: Expression, ty: &Type) -> Expression {
         // 这是允许的——只要求相等必同哈希。
         Type::I(_) | Type::U(_) | Type::F(_) | Type::Bool | Type::Char => cast(e, Type::U(64)),
         Type::Named { .. } => method_call(e, "hash", Vec::new()),
-        // `str` / 切片 / 数组 / 元组 / 指针 / 引用：按 0 计（见模块文档）。
+        // 指针 / 引用：按地址计。相等的两个指针地址相同，取整后仍相同，所以
+        // "相等 ⇒ 同哈希"成立；比按 0 计能给出真实分布（地址相同才同哈希，
+        // 不同地址大概率不同哈希）。
+        Type::Pointer(..) | Type::Reference(..) => cast(e, Type::U(64)),
+        // `str` / 切片 / 数组 / 元组：按 0 计（见模块文档）。
         _ => int(0),
     }
 }
