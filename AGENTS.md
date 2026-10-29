@@ -42,9 +42,15 @@ target/debug/zr prog.zr -O1 -o /tmp/prog   # 编译单个程序
 ```
 
 - **运行时链接失败**（`requires the platform linker` + `runtime source ... was not built`）
-  **是环境问题**，重跑 `cargo build`。别把它当语言 bug 去改编译器。
-- 测试：`tests/zr_language.rs` 把 74 个 `tests/cases/*.zr` 各在
-  `-O0/-O1/-O2/-O3/-Oz` 跑一遍（370 次编译+运行）。退出码 0 = 过，非 0 = 失败（编号指向失败的断言）。
+  有时是环境问题（重跑 `cargo build`），**但别急着归因**——2026-10-29 在
+  `60_process` / `64_fs_path` / `74_generic_alias` 上发现同样的报错其实是
+  **真实 bug**：用户 `fn read` 与 prelude 拉进来的 `core` 模块 `pub fn read`
+  同名，MIR 降级时都加 `z_` 前缀发射，目标文件里 `_z_read` 定义两次，macOS
+  `ld` 直接断言崩溃（`atomShouldReplaceExisting`）。先 `nm` 看目标文件有没有
+  重复符号，再下结论。已修复（提交 `1ef4a02`：MIR 按最终符号名去重，保留首个
+  用户定义）。
+- 测试：`tests/zr_language.rs` 把 89 个 `tests/cases/*.zr` 各在
+  `-O0/-O1/-O2/-O3/-Oz` 跑一遍（445 次编译+运行）。退出码 0 = 过，非 0 = 失败（编号指向失败的断言）。
   宿主端另有 `io_print_matches_rust` 等 Rust 对照用例。
 - **没有负向测试机制。** `tests/cases/` 下每个 `.zr` 都必须编译通过并返回 0。
   想验证"某错误真被拦住了"，单独写 `/tmp/x.zr` 手工编译确认。
@@ -156,10 +162,13 @@ README 里"指针与 unsafe"一节目前是**愿景**：
 ## 5. 最近修掉的静默 bug 与当前基线
 
 2026-10-27 的 `feat/lang-features` 上连续几个提交修的都是"编译通过、运行不崩、
-结果全错"的静默 bug：
+结果全错"的静默 bug；2026-10-29 又修掉了"用户定义被标准库同名函数遮蔽"的两个
+关联 bug（提交 `1ef4a02`，详见 §1 的链接失败说明）：
 
 | 文件 | 在做什么 |
 |---|---|
+| `src/typeck/mod.rs` | `alloc_def_top`（同名保留用户）+ `function_def_ids`（阶段 6/7 逐条取本函数 DefId）：用户 `fn swap` 不再被 prelude 拉进来的 `core` 的 `swap<T>` 覆盖，元组返回类型不再被静默改成 `()` |
+| `src/mir/mod.rs` | 按最终符号名去重（保留首个用户定义）：用户 `fn read` 与 `core` 的 `pub fn read` 同名同体不再都发射成 `z_read`，`_z_read` 不再定义两次，macOS `ld` 不再断言崩溃 |
 | `src/ssa/mod.rs` | 支配边界从"直接前驱版"改成 Cooper–Harvey–Kennedy：漏 φ 会让合流块读到未初始化的栈槽 |
 | `src/opt/pass_manager.rs` | 内联重命名改成"先建完整重命名表、再逐操作数一次性映射"（见下） |
 | `src/codegen/encoder.rs` | SysV 栈上传参（第 7 个整数 / 第 9 个浮点实参）+ `call` 的 16 字节对齐；零常量的 `xor reg, reg` 补回 REX.R |
@@ -184,10 +193,10 @@ README 里"指针与 unsafe"一节目前是**愿景**：
 3. **栈上传参的偏移要跟着 `rsp` 走**：`Src::Mem(slot)` 是 `[rsp + 8*slot]` 的原始帧偏移，
    压入实参后必须整体加 `released/8`；被调方读 `[rbp + 16 + 8k]`（`rbp` 才是稳定基准）。
 
-### `cargo test` 当前基线（2026-10-27，全绿）
+### `cargo test` 当前基线（2026-10-29，全绿）
 
 - `cargo test --bin zr`：265 项。
-- `cargo test --test zr_language`：88 个用例 × 5 个优化等级 = 440 项（含宿主端
+- `cargo test --test zr_language`：89 个用例 × 5 个优化等级 = 445 项（含宿主端
   `io_print_matches_rust`，它逐字符对比 Rust 的格式化输出，含 `{:e}` / `{:E}`
   与大浮点 Display（`|v| ≥ 2⁶⁴` 不带 `.0`）的回归）。
 - `cargo test --test zr_negative`：17 个负向用例（含新加的越界与 use-after-move）。
