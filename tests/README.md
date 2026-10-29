@@ -13,7 +13,8 @@ cargo test --test zr_language
 ```
 
 之所以用宿主运行器而不是语言内的 `#[test]` + 断言宏，是因为 `#[test]`
-属性、断言内建、闭包这些设施编译器目前还不支持（见下方"尚未覆盖"）。
+属性、断言内建这些设施编译器目前还不支持（闭包已可用，见 `83_closure_fnptr.zr`
+与 `84_closure_capture_value.zr`；见下方"尚未覆盖"）。
 
 ## 已覆盖
 
@@ -75,31 +76,71 @@ cargo test --test zr_language
 | `49_dynamic_future_source.zr` | `-> impl Future` 动态来源：不同分支返回不同异步 future，动态 poll/drop |
 | `50_dynamic_future_aggregate.zr` | 动态 future 返回聚合值：数组结果跨 poll 搬运 |
 | `51_spawn.zr` | `spawn` 任务队列：await 前轮询、退出前清空、Ready 后 drop 帧 |
+| `52_if_let.zr` | `if let` 解构：绑定 / 嵌套 / else 分支 |
+| `58_macros.zr` | `macro_rules!`：宏展开与调用 |
+| `59_threads.zr` | 线程：`spawn`/`join`、共享数据 |
+| `60_process.zr` | 进程：`std::process` 创建与等待（宿主端对照） |
+| `61_labeled_loops.zr` | 带标签循环：`outer: loop { break outer; }` 与 Rust `'outer` 风格 |
+| `62_while_let.zr` | `while let`：解构 + 条件循环 |
+| `63_let_else.zr` | `let ... else { .. }`：绑定 + 发散 else |
+| `64_fs_path.zr` | 文件系统与路径：`std::fs` / `std::path`（宿主端对照） |
+| `65_slices.zr` | 切片：`[]const T`、数组→切片强转、切片参数 |
+| `66_generics.zr` | 泛型：泛型函数 / impl、`T: Trait` 边界、单态化 |
+| `67_unsigned_ops.zr` | 无符号整数：运算、环绕、比较、`as` |
+| `68_float_widening.zr` | 浮点拓宽：`f32`→`f64`、实参位置隐式拓宽 |
+| `69_question.zr` | `?` 后缀：`Result` / `Option` 传播、错误类型一致 |
+| `70_type_alias.zr` | `type` 别名：使用点展开、别名套别名、前向引用 |
+| `71_derive.zr` | `#[derive]`：`PartialEq`/`Eq`/`Hash`/`PartialOrd`/`Ord`/`Default`/`Debug`/`Clone`/`Copy` |
+| `72_statics.zr` | `static` / `static mut`：标量初值、读/写/复合赋值/`&STATIC` |
+| `73_closures.zr` | 闭包：无捕获立即调用、无捕获存进变量 |
+| `74_generic_alias.zr` | `type X<T>` 泛型别名：保留参数、按实参替换 |
+| `75_use_alias.zr` | `use x as y` 重命名：单段与多段路径 |
+| `76_ssa_join_phi.zr` | SSA 合流 φ：Cooper–Harvey–Kennedy 支配边界 |
+| `77_many_args.zr` | 多实参调用：SysV 栈上传参（第 7 个整数 / 第 9 个浮点） |
+| `78_derive_methods.zr` | derive 方法体：`==`/`<`/`hash`/`default`/`clone` 真实生成 |
+| `79_zero_const_high_reg.zr` | 零常量清 REX.R：r8–r15 不编码成 `xor rax, r8` |
+| `80_match_value.zr` | `match` 返回值：穷尽 match 不被 `()` 覆盖 |
+| `81_float_param_forward.zr` | 浮点形参转发：`SsaFunction::param_types` 播种 |
+| `82_turbofish.zr` | turbofish `::<...>`：调用位置与类型路径 |
+| `83_closure_fnptr.zr` | 无捕获闭包提升：存进变量 / 当实参 / 返回（`__closure_N`） |
+| `84_closure_capture_value.zr` | 带捕获闭包：存进变量 / 嵌套 / 多次调用 |
+| `85_unsafe.zr` | `unsafe` 块：可解析和通过类型检查 |
+| `86_bounds_check.zr` | 常量越界：编译期下标越界报 `index out of bounds`；浮点 Display 回归 |
+| `87_move_check.zr` | 最小移动检查：`let b = a` 后读 `a` 报 use-after-move |
+| `88_dyn_keyword.zr` | `dyn Trait`：词法+解析+类型检查骨架 |
+| `89_prelude_variant.zr` | prelude 变体：`Option`/`Result`/`Some`/`None`/`Ok`/`Err` 无需显式 `use` |
+| `90_glob_import.zr` | `use foo::*` glob：`use core::*` / `use io::*` / 用户模块 |
 
 ## 尚未覆盖（编译器还不支持）
 
 Rust Book 的其余章节目前一个都测不了，因为对应特性尚未实现。列在这里
 是为了让"测试通过"这个说法有明确边界，而不是暗示语言已经可用。
 
-| Rust Book 章节 | 阻塞原因 |
-|----------------|----------|
-| 所有权 / 借用 / 引用 / 切片 | 借用检查与引用语义未实现 |
-| 枚举 | `enum` 未实现（具名结构体与字段访问已覆盖） |
+> 注：这张表在 2026-10-29 之前严重过期——它声称 `enum` / `match` / `泛型` /
+> `闭包` / `智能指针` 都未实现，实际上 `57_enum.zr` / `25_match.zr` /
+> `66_generics.zr` / `83_closure_fnptr.zr` / `75_use_alias.zr` /
+> `90_glob_import.zr` 都在跑。以下按当前源码与用例重新核对。
+
+| Rust Book 章节 | 现状 |
+|----------------|------|
+| 所有权 / 借用 / 引用 / 切片 | 🟡 部分：最小移动检查已实现（`87_move_check.zr`：`let b = a` 后读 `a` 报 use-after-move；字段级/按值传参移动暂不覆盖）；**借用检查仍是空壳**（`infer.rs::check_borrows` 只记录不检查）；切片已覆盖（`65_slices.zr`） |
+| 枚举 | ✅ `57_enum.zr`：变体构造 / 判别式 / 变体模式 / 穷尽性 / 拷贝语义；`80_match_value.zr` 钉 match 返回值 |
 | 浮点（仅 ARM32 / Thumb / RISC-V / wasm） | x86-64 与 aarch64 已支持；其余后端遇到浮点字面量会**明确报错**（不再静默发射 0） |
 | 字符串字面量（仅 ARM32 / Thumb / RISC-V / wasm） | x86-64 与 aarch64 已落 `.rodata`（可取址、按地址比较），并可通过 `extern "C"` 调用运行时的 `zr_write` 输出；其余后端遇到字符串字面量会**明确报错**。尚无解引用 / 索引（需要 SSA 内存模型） |
-| 模式匹配（`match` / `if let` / 解构） | `match` 未降低到 MIR |
-| 包管理与 Cargo | 标准库按需加载刚落地，模块系统还不完整 |
-| 集合（Vector / String / HashMap） | `std` 里对应的模块仍编译不过 |
-| 错误处理（`panic!` / `Result` / `?`） | 断言内建与 `Result` 未实现 |
-| 泛型 / Trait / 生命周期 | 类型检查器没把类型参数绑定成类型 |
-| 函数式（闭包 / 迭代器） | 闭包未实现 |
-| 智能指针（`Box` / `Rc` / `RefCell`） | 未实现 |
-| 并发（线程 / 通道 / `Mutex` / `Send`） | 未实现 |
-| 面向对象 / 状态模式 | 依赖 `trait` 与 `enum` |
+| 模式匹配（`match` / `if let` / 解构） | ✅ `25_match.zr`（字面量/绑定/或/guard）、`52_if_let.zr`、`54_struct_pattern.zr`、`55_tuple_pattern.zr`、`56_range_pattern.zr`、`62_while_let.zr`；`match` 脱糖成 if/else 链。**缺臂报错已改进**（枚举列出缺失变体名） |
+| 包管理与 Cargo | 🟡 模块系统已支持 `mod` / `use` / `use a::{b,c}` / `use x as y`（`75_use_alias.zr`）/ `use foo::*`（`90_glob_import.zr`）；但无 Cargo 等价物 |
+| 集合（Vector / String / HashMap） | 🟡 `std/collections` 与 `std/string` 已加载，但 `String` 无 `BufRead::read_line` 形态的 API；无 `HashMap` |
+| 错误处理（`panic!` / `Result` / `?`） | ✅ `69_question.zr`：`?` 对 `Result`/`Option` 生效；`Option`/`Result`（含变体）已在 prelude（`89_prelude_variant.zr`）。`panic!` 未实现 |
+| 泛型 / Trait / 生命周期 | ✅ 泛型函数/impl 与 `T: Trait` 边界校验已实现（`66_generics.zr`、`74_generic_alias.zr`）；trait 方法/关联类型/`Self` 可用。**生命周期标注 `'a` 解析后丢弃**，无借用/存活检查 |
+| 函数式（闭包 / 迭代器） | 🟡 **无捕获**闭包已可存进变量/当实参/返回（`83_closure_fnptr.zr`）；**带捕获**闭包已可存进变量/嵌套/多次调用（`84_closure_capture_value.zr`），但跨函数传 env 仍有限制 |
+| 智能指针（`Box` / `Rc` / `RefCell`） | ❌ 未实现 |
+| 并发（线程 / 通道 / `Mutex` / `Send`） | 🟡 线程已覆盖（`59_threads.zr`）；无通道 / `Mutex` / `Send` |
+| 面向对象 / 状态模式 | ✅ `trait` 与 `enum` 都已实现；trait 对象 `dyn` 骨架已搭（`88_dyn_keyword.zr`），vtable 分派未完工 |
+| `async` / 协程 | ✅ `29_async.zr` / `47..51` 覆盖 `.await` / future / `spawn`；`yield` 只是类型占位 |
 
 | 32 位目标上的宽整数（`i64` / `u64` / `i128`） | 32 位寄存器放不下，多字长（寄存器对）尚未实现；**写出来会在类型检查阶段报错** |
 | Thumb-2 的 spilling | 超过 8 个活跃寄存器会（正确地）报 `unsupported_pressure`；栈上传参（≥5 个）同理 |
-| 高级特性（`unsafe` / 关联类型 / 宏） | 仅 `asm!` / `intrinsic!` 能解析，代码生成未实现 |
+| 高级特性（`unsafe` / 关联类型 / 宏） | 🟡 `unsafe` 已实现（`85_unsafe.zr`：`unsafe { ... }` 块可解析和通过类型检查）；关联类型 `type Output;` + `type Output = i32;` 已实现；宏走 `macro_rules!`（`58_macros.zr`）；proc-macro 未接线 |
 
 ## 循环控制流
 
@@ -316,13 +357,16 @@ if *p != 7 { return 1; }
 报错。现在 `match` 脱糖成 if/else 链，语义由 `25_match.zr` 锁住：
 
 * 支持的模式：字面量（整数 / bool / char，**含负数** `-5`）、`_`、绑定臂
-  `v`（一般与 guard 连用）、或模式 `3 | 4`、guard `3 if n > 2`。
-* **穷尽性在编译期强制**：最后一条必须是 `_`（或一条不带 guard 的绑定臂）
-  否则报错；唯一例外是 bool——`true`/`false` 两条字面量臂视作穷尽。
-  不强制的话"没匹配上"的路径会落到 Unit 继续跑。
+  `v`（一般与 guard 连用）、或模式 `3 | 4`、guard `3 if n > 2`、结构体模式
+  `P { x: 1, y: v }`（含 `..` 尾与嵌套，`54_struct_pattern.zr`）、元组模式
+  `(1, v)`（`55_tuple_pattern.zr`）、范围模式 `1..=10` / `1..10`（
+  `56_range_pattern.zr`）、枚举变体模式 `Shape::Circle(r)`（`57_enum.zr`）。
+* **穷尽性在编译期强制**：全覆盖的 match（枚举所有变体 / bool 双字面量）
+  可省 `_`（与 Rust 一致）；否则需要一条不带 guard 的 `_` / 绑定臂兜底。
+  缺臂报错现在区分场景：枚举列出**缺失变体名**（`match is not exhaustive:
+  `Color` variant not covered: Blue`），整型/标量说需要尾 `_` 臂。不强制的话
+  "没匹配上"的路径会落到 Unit 继续跑。
 * **首匹配胜出**：脱糖是顺序 if/else 链，前面臂命中失败。
-* **宽模式（tuple / 结构体 / 枚举 payload / 范围）报"未实现"**——代码生成还没有
-  聚合值的表达方式，宁可显式报错也不静默乱匹配。
 * 绑定臂的实现：guard / 臂体里对 `v` 的引用**内联成 scrutinee 表达式**
   （`substitute_local`），因为臂绑定没有独立存储。
 * 限定（已知）：scrutinee 每臂重新求值——含副作用的 scrutinee 会重复执行；
@@ -346,9 +390,11 @@ match n {
 ### 类型检查穷尽性不是摆设
 
 "尾 `_` 臂"这个检查本来就有，但它存在与否曾经无关紧要——因为运行期是空的。
-两个改动发生在同一会话：先强制这个规则（"match must have a trailing `_` arm"，
-bool 双字面量特例除外），再接通运行期。规则先行的原因：缺 else 的链会把
-"没匹配上"变成"取到错误值跑下去"，比报错糟糕得多。
+两个改动发生在同一会话：先强制这个规则（枚举变体全覆盖 / bool 双字面量可
+省 `_`，其余需尾 `_` 臂），再接通运行期。规则先行的原因：缺 else 的链会把
+"没匹配上"变成"取到错误值跑下去"，比报错糟糕得多。缺臂报错在 2026-10-29
+又改进过：枚举现在列出缺失的变体名（`17_match_missing_variant.zr`），不再
+笼统说"补一个 `_` 臂"。
 
 ### 顺带修掉的常量编码 bug
 
