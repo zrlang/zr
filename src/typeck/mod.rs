@@ -4701,12 +4701,41 @@ impl TypeChecker {
                     }
                     _ => "value",
                 };
-                return Err(
-                    CompileError::type_error(format!(
+                // 对枚举，报出**缺失的变体名**而不是笼统的"需要 `_` 臂"。
+                // Rust 在枚举缺臂时提示的是具体变体（`non-exhaustive patterns:
+                // `C` not covered`），早先这里说 "must have a trailing `_` arm
+                // or cover all values" 会误导人以为补一个 `_` 就行。
+                let mut missing: Vec<&str> = Vec::new();
+                if let Ty::Named(id, _) = scrutinee_ty {
+                    if let Some(hir::HirTypeDef::Enum(he)) = self.type_defs.get(id) {
+                        let mut seen = vec![false; he.variants.len()];
+                        for arm in &lowered {
+                            if let hir::HirPattern::Variant { index, .. } = &arm.pattern {
+                                if let Some(flag) = seen.get_mut(*index) {
+                                    *flag = true;
+                                }
+                            }
+                        }
+                        for (idx, v) in he.variants.iter().enumerate() {
+                            if !seen[idx] {
+                                missing.push(v.name.as_str());
+                            }
+                        }
+                    }
+                }
+                let msg = if !missing.is_empty() {
+                    format!(
+                        "match is not exhaustive: `{}` variant{} not covered: {}",
+                        kind_name,
+                        if missing.len() > 1 { "s" } else { "" },
+                        missing.join(", ")
+                    )
+                } else {
+                    format!(
                         "match on `{kind_name}` must have a trailing `_` arm or cover all values"
-                    ))
-                    .with_span(span),
-                );
+                    )
+                };
+                return Err(CompileError::type_error(msg).with_span(span));
             }
         }
         // 把

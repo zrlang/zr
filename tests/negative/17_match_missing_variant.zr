@@ -1,0 +1,15 @@
+// 负向用例：枚举缺臂时，报错要列出**缺失的变体**，而不是笼统说
+// "需要尾随 `_` 臂"（那会误导人以为补一个 `_` 就行，而 Rust 提示的是
+// `non-exhaustive patterns: `C` not covered`）。
+//
+// expect: match is not exhaustive: `Color` variant not covered: Blue
+enum Color { Red, Green, Blue }
+
+fn main() -> i32 {
+    let c = Color::Red;
+    let v = match c {
+        Color::Red => 1,
+        Color::Green => 2,
+    };
+    return v;
+}
