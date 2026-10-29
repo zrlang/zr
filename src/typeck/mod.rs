@@ -196,6 +196,14 @@ pub struct TypeChecker {
     current_function: Option<DefId>,
     /// 当前函数是否是 `async fn`（`.await` 只能在异步上下文中使用）。
     current_is_async: bool,
+    /// 函数 DefId 的登记顺序（与 `prog.functions` 的 cfg 过滤后顺序一致）。
+    ///
+    /// 同一名字可能同时有用户定义与标准库定义（如用户 `fn swap` 与
+    /// `core` 的 `swap<T>`）。`find_def(name)` 只按名字查、且只认首个
+    /// （用户）定义，但阶段 6/7 逐个处理 `prog.functions` 时**每个函数**
+    /// 都要拿到它自己的 DefId——否则标准库 `swap<T>` 的签名会覆盖用户
+    /// `swap` 的条目，用户元组返回类型被静默丢掉（`55_tuple_pattern`）。
+    function_def_ids: Vec<DefId>,
     /// 错误集合（延迟报告，允许错误恢复）。
     errors: Vec<CompileError>,
     /// 导入解析缓存。
@@ -312,6 +320,7 @@ impl Default for TypeChecker {
             locals_by_def: HashMap::new(),
             current_function: None,
             current_is_async: false,
+            function_def_ids: Vec::new(),
             errors: Vec::new(),
             use_aliases: HashMap::new(),
             variant_aliases: HashMap::new(),
@@ -821,7 +830,11 @@ impl TypeChecker {
             if !self.cfg_enabled(&item.attrs) {
                 continue;
             }
-            let id = self.alloc_def(item.name.clone());
+            let id = self.alloc_def_top(item.name.clone());
+            // 记录本函数自己的 DefId：同名函数（用户定义 + 标准库定义）在
+            // `prog.functions` 里按顺序各占一条，`find_def(name)` 只认首个，
+            // 阶段 6/7 必须用这里的逐条 DefId 而不是按名查找。
+            self.function_def_ids.push(id);
             self.ast_fns.insert(item.name.clone(), item.clone());
             // 参数类型这里不解析，`check_function_signatures`（阶段 6）只解析
             // 返回类型；参数要等阶段 7 `check_function_bodies` 逐个函数补上。
@@ -867,7 +880,7 @@ impl TypeChecker {
                     continue;
                 }
             }
-            let id = self.alloc_def(match td {
+            let id = self.alloc_def_top(match td {
                 ast::TypeDef::Struct(s) => s.name.clone(),
                 ast::TypeDef::Enum(e) => e.name.clone(),
                 ast::TypeDef::Union(u) => u.name.clone(),
@@ -930,7 +943,7 @@ impl TypeChecker {
             );
         }
         for t in &prog.traits {
-            let id = self.alloc_def(t.name.clone());
+            let id = self.alloc_def_top(t.name.clone());
             let (is_marker, _) = classify_trait(t);
             self.trait_defs.insert(
                 id,
@@ -958,7 +971,7 @@ impl TypeChecker {
             }
         }
         for c in &prog.consts {
-            let id = self.alloc_def(c.name.clone());
+            let id = self.alloc_def_top(c.name.clone());
             self.consts.insert(
                 id,
                 hir::HirConst {
@@ -968,7 +981,7 @@ impl TypeChecker {
             );
         }
         for s in &prog.statics {
-            let id = self.alloc_def(s.name.clone());
+            let id = self.alloc_def_top(s.name.clone());
             self.statics.insert(
                 id,
                 hir::HirStatic {
@@ -1546,12 +1559,19 @@ impl TypeChecker {
     }
 
     fn check_function_signatures(&mut self, prog: &Program) -> Result<()> {
+        // `function_def_ids` 只登记 cfg 通过的函数，与 `prog.functions` 的
+        // 下标不一致（cfg 掉的函数占位但未登记），所以要独立计数。
+        let mut di = 0usize;
         for f in &prog.functions {
             // cfg 过滤：被 cfg 掉的函数没有符号表条目。
             if !self.cfg_enabled(&f.attrs) {
                 continue;
             }
-            let id = self.find_def(&f.name)?;
+            // 用本函数自己的 DefId（按登记顺序），不是 `find_def(&f.name)`——
+            // 同名时 `find_def` 只认首个（用户）定义，标准库的重复定义拿不到
+            // 自己的条目，签名会覆盖用户的。
+            let id = self.function_def_ids.get(di).copied().unwrap_or(self.find_def(&f.name)?);
+            di += 1;
             // 签名里的泛型参数 / `Self` 要先绑上——它们是类型变量。
             //
             // `impl<T>` 的类型参数不在方法自己身上（方法被展开成普通函数后
@@ -1671,12 +1691,16 @@ impl TypeChecker {
 
     fn check_function_bodies(&mut self, prog: &Program) -> Result<Vec<hir::HirFunction>> {
         let _result: Vec<hir::HirFunction> = Vec::new();
+        // 与 `check_function_signatures` 相同：cfg 过滤后独立计数，逐条取
+        // 本函数自己的 DefId（同名用户/标准库定义不能按名查）。
+        let mut di = 0usize;
         for f in &prog.functions {
             // cfg 过滤：被 cfg 掉的函数没有符号表条目。
             if !self.cfg_enabled(&f.attrs) {
                 continue;
             }
-            let id = self.find_def(&f.name)?;
+            let id = self.function_def_ids.get(di).copied().unwrap_or(self.find_def(&f.name)?);
+            di += 1;
             // 泛型函数的体跳过：类型参数是推断变量，按它检查只会报一堆
             // 假错。函数体留空，用到它时再按具体类型单态化检查。
             // `impl<T>` 里的方法同理（`impl_generics` 由展开阶段记录）。
@@ -7096,6 +7120,30 @@ impl TypeChecker {
         self.def_names.insert(id, name.clone());
         // 诊断用的名字表：`InferCtxt` 看不到 `self.def_names`（`'static` 借用），
         // 没有这一步所有具名类型在 `unify` 的错误里都会打成 `type#N`。
+        infer::register_def_name(id, &name);
+        id
+    }
+
+    /// 顶层声明专用的 DefId 登记：**用户定义优先**，同名时保留先注册的。
+    ///
+    /// `collect_declarations` 先处理用户源码里的函数/类型/常量/静态，后处理
+    /// 被 `use` 拉进来的标准库模块条目。同名时（用户自己写 `fn swap`，标准库
+    /// `core` 也有 `swap<T>`）**先注册的（用户）要赢**——不能后注册的（std）
+    /// 覆盖，否则 `main` 里调 `swap((12,13))` 会解析到泛型 std `swap<T>`
+    /// （返回 `()`），用户的元组返回类型被静默丢掉，报
+    /// "cannot access field `0` on type `()`"（`55_tuple_pattern`）。
+    ///
+    /// 这里保留首次注册：std 的重复条目仍拿到独立 DefId（进 `functions` /
+    /// `generic_asts`，限定路径 `core::swap` 仍可解析），只是不再改写
+    /// `symbols` 里用户的名字绑定。真正的重复定义（用户写两个同名函数）
+    /// 是另一个错误，不由这里管。
+    fn alloc_def_top(&mut self, name: String) -> DefId {
+        let id = DefId(self.next_def);
+        self.next_def += 1;
+        if !self.symbols.contains_key(&name) {
+            self.symbols.insert(name.clone(), id);
+        }
+        self.def_names.insert(id, name.clone());
         infer::register_def_name(id, &name);
         id
     }

@@ -334,11 +334,19 @@ pub fn lower(hir: &HirModule) -> MirModule {
         })
         .collect();
 
+    // 已发射的最终符号名：同名（用户定义 + 标准库定义）会撞成一个 `z_` 符号，
+    // 重复发射会让链接器报 duplicate symbol。用户函数在 `hir.functions` 里排
+    // 在前，标准库模块函数排在后——保留首个（用户）定义，跳过被遮蔽的 std
+    // 函数（`core::read` 之类，用户自己写 `fn read` 时它不可达）。
+    let mut emitted: HashSet<String> = HashSet::new();
     for func in &hir.functions {
         if let Some(body) = &func.body {
             let mut func = func.clone();
             if user_fns.contains(&func.name) {
                 func.name = mangled_symbol(&func.name);
+            }
+            if !emitted.insert(func.name.clone()) {
+                continue;
             }
             functions.push(builder::lower_function(
                 &func,
