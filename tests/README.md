@@ -114,6 +114,7 @@ cargo test --test zr_language
 | `92_cfg_filter.zr` | `#[cfg(...)]` 过滤：互斥 host 键（linux/macos/windows）保证正好一个保留、恒假键被滤掉、运行期只调保留的那个 |
 | `93_mixed_width_tuple.zr` | 混合宽度元组字段访问：`(i32, i64)` / `(i64, i32)` / `(i32, i32)` 三种、结构体字段与按值传参位置——早先元组字面量元素不按期望类型检查，`t.1` 读到"值\|高位垃圾" |
 | `94_array_field_hash.zr` | 数组字段访问与按内容 Hash：`s.a[i]` 读对（早先 `is_aggregate` 漏数组，读垃圾）、数组字段 derive Hash 相等⇒同哈希/不同⇒不同、元组数组嵌套聚合 |
+| `95_str_slice_layout.zr` | `str`/切片字段布局与数组字面量元素传播：`S { name: str, x: i64 }` 的 `name.len` 读对（早先 `type_size_align` 把 str/切片当 8 字节，`len` 被下个字段盖住）、切片字段用 i32 字面量数组初始化按期望 i64 收窄 |
 
 ## 尚未覆盖（编译器还不支持）
 

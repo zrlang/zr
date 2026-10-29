@@ -47,6 +47,33 @@
 | P0-3b | 修复：`is_aggregate` 对 `Ty::Array(..)` 返回 true（数组是地址表示的值聚合） | ✅ `caab7a0` |
 | P0-3c | 回归：`tests/cases/94_array_field_hash.zr`（数组字段访问 + 元组数组嵌套） | ✅ `caab7a0` |
 
+### P0-4 str/切片字段布局错位（`1161b65` 已修）
+
+现状：早先 `type_size_align` 把 `str`/切片当 **8 字节**（瘦指针），`struct_layout`
+却按 16 字节（`{ptr, len}`）算。结构体里 `str`/切片字段后面的字段落在偏移 8，
+盖住 `len`——`S { name: str, x: i64 }` 的 `name.len` 读到 `x` 的值（`str3.zr`：
+len=7 应 3）。元组/数组/枚举载荷含 `str`/切片时同样错位。
+
+| 子任务 | 内容 | 状态 |
+|---|---|---|
+| P0-4a | 复现：`S { name: str, x: i64 }` 的 `name.len` 读到 `x` | ✅ `1161b65` |
+| P0-4b | 修复：`type_size_align` 对 `str`/切片返回 `(16, 8)` | ✅ `1161b65` |
+| P0-4c | 回归：`tests/cases/95_str_slice_layout.zr`（str/切片字段布局） | ✅ `1161b65` |
+
+### P0-5 切片字段初始化静默存坏数据（`273d6f4` 已修）
+
+现状：早先 `Expression::Array` 只按**数组**期望类型传播元素类型，**切片**期望
+没处理。`S { arr: []const i64 }` 用 `[10, 20, 30]` 初始化时元素默认成 i32，
+`[i32; 3]` 又被字段初始化静默强转成 `[]const i64`——切片指向 i32 数据却被当
+i64 读，运行期越界 SIGSEGV（`/tmp/sl_bug.zr`）。`let a: []const i64 = [10,20,30]`
+更在类型检查报 `type mismatch`（let 与字段初始化不一致）。
+
+| 子任务 | 内容 | 状态 |
+|---|---|---|
+| P0-5a | 复现：切片字段 i32 字面量数组 → SIGSEGV | ✅ `273d6f4` |
+| P0-5b | 修复：`resolve(expected)` 为数组/切片时把元素类型 unify 给字面量 | ✅ `273d6f4` |
+| P0-5c | 回归：`tests/cases/95_str_slice_layout.zr`（切片字段按期望收窄） | ✅ `273d6f4` |
+
 ### P0-1 借用检查（NLL）——拆 4 个子任务
 
 现状：`src/typeck/infer.rs::check_borrows` 返回空 `errors`（`borrow_intervals`

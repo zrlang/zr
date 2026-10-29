@@ -9,7 +9,7 @@ zr 是一门系统编程语言，设计取向介于 Rust 与 Zig 之间：所有
 - 给 AI agent 的操作约定、架构红线、在途工作：见 `AGENTS.md`
 - 与 Rust 的逐条对照：见 `docs/rust-parity.md`（**部分结论已被在途改动超越**）
 
-> 最近更新：2026-10-29。`feat/lang-features` 上已完成：`unsafe`/`dyn`/最小移动检查/常量越界检查；`52_if_let` 回归与 `71_derive` 失败均已修复；**又修掉了 `55_tuple_pattern` / `74_generic_alias` / `60_process` / `64_fs_path` / `io_print_matches_rust`（用户定义遮蔽标准库同名函数，见提交 `1ef4a02`）**；**支持 `use foo::*` glob 导入（见提交 `40b5b45`）**；全绿（94 用例 × 5 等级 + 宿主端对照用例）。
+> 最近更新：2026-10-29。`feat/lang-features` 上已完成：`unsafe`/`dyn`/最小移动检查/常量越界检查；`52_if_let` 回归与 `71_derive` 失败均已修复；**又修掉了 `55_tuple_pattern` / `74_generic_alias` / `60_process` / `64_fs_path` / `io_print_matches_rust`（用户定义遮蔽标准库同名函数，见提交 `1ef4a02`）**；**支持 `use foo::*` glob 导入（见提交 `40b5b45`）**；全绿（95 用例 × 5 等级 + 宿主端对照用例）。
 
 ---
 
@@ -17,11 +17,11 @@ zr 是一门系统编程语言，设计取向介于 Rust 与 Zig 之间：所有
 
 ```sh
 cargo build                                    # 编译编译器 + 运行时汇编
-cargo test --test zr_language                  # 全量回归：94 用例 × 5 优化等级，约 3 分钟
+cargo test --test zr_language                  # 全量回归：95 用例 × 5 优化等级，约 3 分钟
 target/debug/zr prog.zr -O1 -o /tmp/prog && /tmp/prog
 ```
 
-当前基线：**94 用例 × 5 等级 + 宿主端对照用例 全绿**。
+当前基线：**95 用例 × 5 等级 + 宿主端对照用例 全绿**。
 
 诊断：`--dump-tokens|ast|hir|mir|ssa|ssa-after|asm`、`--wat`、`--emit-llvm`、
 `--no-incremental`、`--target <triple>`、`-g`；`ZR_TIME=1` 看各阶段耗时。
@@ -258,7 +258,7 @@ target/debug/zr prog.zr -O1 -o /tmp/prog && /tmp/prog
 
 ## 4. 已实现但未测试覆盖
 
-`tests/cases/` 共 94 个用例，全部通过时 `cargo test` 绿。以下**已实现但无用例**，
+`tests/cases/` 共 95 个用例，全部通过时 `cargo test` 绿。以下**已实现但无用例**，
 属于回归盲区，加功能时容易破坏而无人发现：
 
 - 多边界泛型 `T: Clone + Ord`（✅ 已补 `91_multi_bound_generics.zr`：`P` 同时 impl 两个边界，`pick<P>` 两处边界都求解，形参按值移动两次）
@@ -324,6 +324,8 @@ target/debug/zr prog.zr -O1 -o /tmp/prog && /tmp/prog
 | 浮点 `Display` 在 \|v\| ≥ 2⁶⁴ 时输出 `.0` | ✅ 已钉住回归（`tests/cases/86_bounds_check.zr` / `tests/zr_language.rs` `io_print_matches_rust` 已扩展） |
 | 混合宽度元组字段访问读垃圾 | ✅ 已修复（`29fc950`）：元组字面量元素按期望元素类型检查，`(i32, i64)` 的 `t.1` 不再读到"值\|高位垃圾"；新增 `tests/cases/93_mixed_width_tuple.zr` |
 | 数组字段访问读垃圾 | ✅ 已修复（`caab7a0`）：`is_aggregate` 补数组（`s.a` 被当成标量加载，`s.a[0]` 读垃圾）；新增 `tests/cases/94_array_field_hash.zr` |
+| `str`/切片字段布局错位 | ✅ 已修复（`1161b65`）：`type_size_align` 把 `str`/切片当 8 字节（应为 16 `{ptr,len}`），`S { name: str, x: i64 }` 的 `name.len` 读到 `x` 的值；新增 `tests/cases/95_str_slice_layout.zr` |
+| 切片字段初始化静默存坏数据 | ✅ 已修复（`273d6f4`）：数组字面量不按切片期望元素类型收窄，`S { arr: []const i64 }` 用 `[10,20,30]` 静默强转成 `[]const i64`，运行期 SIGSEGV |
 ### P1 — 明确报错或明显缺失
 
 1. **`#[derive]` 剩余缺口**：方法体已经生成（`src/typeck/derive.rs`），
