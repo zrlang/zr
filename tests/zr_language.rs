@@ -388,43 +388,75 @@ fn toolchain_subcommands_emit() {
     );
 }
 
-/// `#[derive(..)]` 的字段级诊断要指到真实源码位置，而不是 `0:0:0`。
+/// `#[derive(..)]` 的诊断要指到真实源码位置，而不是 `0:0:0`。
 ///
-/// 早先 derive 在 AST 层生成 `Type__eq` 等方法时全部用 `Span::unknown()`
-/// （`derive.rs` 的 `SPAN`），某字段类型没实现所需 trait 时，报错位置落在
-/// `0:0:0`——用户只知道"有个类型缺 trait"，不知道**哪个字段**。
-/// 现在 `StructDef` / `Field` 都带真实 span，生成的字段访问用字段的 span，
-/// 报错指向 `b: Inner` 那个字段。这里钉住"位置不是 0:0:0"。
+/// 早先 derive 在 AST 层生成 `Type__eq` / `__hash` / `__default` 等方法时全部
+/// 用 `Span::unknown()`（`derive.rs` 的 `SPAN`），某字段类型没实现所需 trait、
+/// 或 derive 明确拒绝的用例（泛型 / 枚举 `Default` / 枚举 `Ord`）报错位置都落
+/// 在 `0:0:0`——用户只知道"有个类型缺 trait"，不知道**哪个字段**。
+/// 现在 `StructDef` / `EnumDef` / `Field` 都带真实 span，生成的字段访问与
+/// 拒绝诊断用字段 / 类型定义的 span。这里钉住三类：比较缺 trait、枚举
+/// `Default` 拒绝、字段无默认值——报错位置都不是 `0:0:0`。
 #[test]
 fn derive_field_error_has_span() {
     let zr = env!("CARGO_BIN_EXE_zr");
     let dir = std::env::temp_dir();
-    let src = dir.join("zr_derive_field_span.zr");
-    let out = dir.join("zr_derive_field_span.bin");
-    std::fs::write(
-        &src,
-        "struct Inner { v: i32 }\n\
-         #[derive(PartialEq)]\n\
-         struct Outer { a: i32, b: Inner }\n\
-         fn main() -> i32 { return 0; }\n",
-    )
-    .expect("写临时源码失败");
-    let compile = Command::new(zr)
-        .arg(&src)
-        .arg("-O0")
-        .arg("-o")
-        .arg(&out)
-        .output()
-        .expect("spawn 编译失败");
-    assert!(!compile.status.success(), "该用例应编译失败");
-    let stderr = String::from_utf8_lossy(&compile.stderr);
-    assert!(
-        stderr.contains("cannot compare values of type `Inner`"),
-        "应报缺 trait 的类型名，得到: {stderr}"
-    );
-    // 报错位置 `zr: <line>:<col>:<off>:` 的三个数字不能全为 0。
-    assert!(
-        !stderr.starts_with("zr: 0:0:0:"),
-        "字段级诊断应指向真实源码位置，而不是 0:0:0，得到: {stderr}"
-    );
+
+    // 用例：源码 + 期望的报错子串。
+    let cases: Vec<(&str, &str)> = vec![
+        // 结构体字段缺 PartialEq。
+        (
+            "struct Inner { v: i32 }\n\
+             #[derive(PartialEq)]\n\
+             struct Outer { a: i32, b: Inner }\n\
+             fn main() -> i32 { return 0; }\n",
+            "cannot compare values of type `Inner`",
+        ),
+        // 枚举不能 derive Default。
+        (
+            "#[derive(Default)]\n\
+             enum E { A, B(i32) }\n\
+             fn main() -> i32 { return 0; }\n",
+            "cannot derive `Default` for enum `E`",
+        ),
+        // 泛型类型上的 derive 明确拒绝。
+        (
+            "#[derive(Clone)]\n\
+             struct G<T> { v: T }\n\
+             fn main() -> i32 { return 0; }\n",
+            "`#[derive(..)]` on generic type `G`",
+        ),
+        // 某字段类型没 derive Default（递归找 `S__default` 失败）。
+        (
+            "struct S { x: f64 }\n\
+             #[derive(Default)]\n\
+             struct T { a: i32, b: S }\n\
+             fn main() -> i32 { return 0; }\n",
+            "cannot find value `S__default`",
+        ),
+    ];
+
+    for (i, (src_text, expect)) in cases.iter().enumerate() {
+        let src = dir.join(format!("zr_derive_field_span_{i}.zr"));
+        let out = dir.join(format!("zr_derive_field_span_{i}.bin"));
+        std::fs::write(&src, src_text).expect("写临时源码失败");
+        let compile = Command::new(zr)
+            .arg(&src)
+            .arg("-O0")
+            .arg("-o")
+            .arg(&out)
+            .output()
+            .expect("spawn 编译失败");
+        assert!(!compile.status.success(), "用例 {i} 应编译失败");
+        let stderr = String::from_utf8_lossy(&compile.stderr);
+        assert!(
+            stderr.contains(expect),
+            "用例 {i} 应报 `{expect}`，得到: {stderr}"
+        );
+        // 报错位置 `zr: <line>:<col>:<off>:` 的三个数字不能全为 0。
+        assert!(
+            !stderr.starts_with("zr: 0:0:0:"),
+            "用例 {i} 应指向真实源码位置，而不是 0:0:0，得到: {stderr}"
+        );
+    }
 }

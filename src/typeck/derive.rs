@@ -91,7 +91,7 @@ pub fn derive_methods(type_name: &str, type_def: &ast::TypeDef, traits: &[String
         return Err(CompileError::type_error(format!(
             "`#[derive(..)]` on generic type `{type_name}` is not supported yet"
         ))
-        .with_span(SPAN));
+        .with_span(span));
     }
 
     let self_ty = named(type_name);
@@ -129,7 +129,7 @@ pub fn derive_methods(type_name: &str, type_def: &ast::TypeDef, traits: &[String
             return Err(CompileError::type_error(format!(
                 "cannot derive `Default` for enum `{type_name}`: zr has no `#[default]` variant attribute"
             ))
-            .with_span(SPAN));
+            .with_span(span));
         };
         out.push(default_fn(type_name, &self_ty, fields)?);
     }
@@ -139,7 +139,7 @@ pub fn derive_methods(type_name: &str, type_def: &ast::TypeDef, traits: &[String
                 "cannot derive `Ord`/`PartialOrd` for enum `{type_name}` yet: \
                  ordering needs discriminant comparison, which derive does not implement"
             ))
-            .with_span(SPAN));
+            .with_span(span));
         }
     }
     if want_clone {
@@ -195,7 +195,7 @@ fn default_value(type_name: &str, f: &FieldInfo) -> Result<Expression> {
         // "the trait bound `Inner: Default` is not satisfied" 位置一致。
         Type::Named { path, .. } => {
             let last = path.last().cloned().unwrap_or_default();
-            call(&format!("{last}__default"), Vec::new())
+            call_path_at(&[format!("{last}__default")], Vec::new(), f.span)
         }
         Type::Optional(inner) => {
             // `T?` 就是 `Option<T>`；Option 的 Default 是 `None`，而 zr 的
@@ -215,7 +215,7 @@ fn unsupported_default(type_name: &str, f: &FieldInfo) -> CompileError {
         "cannot derive `Default` for `{type_name}`: field `{}` has no default value",
         f.name
     ))
-    .with_span(SPAN)
+    .with_span(f.span)
 }
 
 /// `fn Type__clone(self) -> Type`：字段逐个 `.clone()`（标量按位复制）。
@@ -764,6 +764,16 @@ fn call_path(path: &[String], args: Vec<Expression>) -> Expression {
         Box::new(Expression::Path(path.to_vec(), SPAN)),
         args.into_iter().map(Argument::Pos).collect(),
         SPAN,
+    )
+}
+
+/// 带位置版本的 `call_path`：递归取 `Type__default` 等时用字段的 span，让
+/// "目标类型没 derive Default"的报错指向**那个字段**而不是 `0:0:0`。
+fn call_path_at(path: &[String], args: Vec<Expression>, span: Span) -> Expression {
+    Expression::Call(
+        Box::new(Expression::Path(path.to_vec(), span)),
+        args.into_iter().map(Argument::Pos).collect(),
+        span,
     )
 }
 
