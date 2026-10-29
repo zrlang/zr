@@ -1,0 +1,51 @@
+//=============================================================================
+// tests/cases/96_str_slice_hash.zr — derive Hash 对 str/切片字段按内容计
+//
+// 早先 `str`/切片字段在 derive Hash 里恒按 `0` 计入（只保证"相等⇒同哈希"，
+// 碰撞严重）。本用例钉住按内容哈希：
+//   - `str` 按字节折叠（`ptr[i] as u64`），空串哈希 0
+//   - 切片逐元素折叠（`hash_value(e[i], T)` 递归）
+//   - 相等⇒同哈希、不同⇒不同
+//
+// 注意：块尾如果是 `loop` 表达式，其 `break` 值不会传播（`fn f() -> u64 {
+// ... loop { break acc } }` 返回 0），所以这里生成 `while` + 尾表达式
+// `__hash_acc`（见 `src/typeck/derive.rs::content_hash_loop`）。
+//=============================================================================
+
+#[derive(Hash, PartialEq)]
+struct S {
+    name: str,
+    arr: []const i64,
+}
+
+// 单字段结构体：钉住 "abc" 的字节折叠精确值
+// ((97*31)+98)*31 + 99 = 96354
+#[derive(Hash)]
+struct OnlyStr {
+    name: str,
+}
+
+fn main() -> i32 {
+    let a = S { name: "abc", arr: [1, 2, 3] };
+    let b = S { name: "abc", arr: [1, 2, 3] };
+    let c = S { name: "abd", arr: [1, 2, 3] };
+    let d = S { name: "abc", arr: [1, 2, 4] };
+    let e = S { name: "", arr: [] };
+
+    // 相等 ⇒ 同哈希
+    if a.hash() != b.hash() { return 1; }
+    // 不同 str ⇒ 不同哈希（"abc" vs "abd"）
+    if a.hash() == c.hash() { return 2; }
+    // 不同切片元素 ⇒ 不同哈希
+    if a.hash() == d.hash() { return 3; }
+    // 空串 / 空切片哈希 0（内容为空）
+    if e.hash() != 0 { return 4; }
+    // 非空哈希非 0
+    if a.hash() == 0 { return 5; }
+
+    // 手工验证 "abc" 的字节折叠精确值
+    let only = OnlyStr { name: "abc" };
+    if only.hash() != 96354 { return 6; }
+
+    return 0;
+}

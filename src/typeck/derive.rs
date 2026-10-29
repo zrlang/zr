@@ -516,6 +516,82 @@ fn accumulate_hash(value: Expression, span: Span) -> Statement {
     )
 }
 
+/// 生成按内容哈希的循环块：
+///
+/// ```text
+/// { let mut __hash_acc: u64 = 0;
+///   let mut __hash_i: u64 = 0;
+///   while __hash_i < len {
+///       __hash_acc = __hash_acc * 31 + elem(__hash_i);
+///       __hash_i = __hash_i + 1;
+///   }
+///   __hash_acc }
+/// ```
+///
+/// 用 `while` + 尾表达式 `__hash_acc`，**不用** `loop`（`break` 带值）作块尾：
+/// zr 的块尾如果是 `loop` 表达式，其值**不会**传播出去（`/tmp/blk_loop.zr`：
+/// `fn f() -> u64 { ... loop { break acc } }` 返回 0 应 3），而 `while` 作语句 +
+/// 变量作尾正常。`__hash_acc`/`__hash_i` 的 `let` 在块作用域里，两个 `str`/切片
+/// 字段各自生成独立的块，名字不冲突。`elem(i)` 由调用方闭包给出：`str` 是
+/// `ptr[i] as u64`，切片是 `hash_value(e[i], T)`。长度是运行期值，无法像数组
+/// 那样定长展开。
+fn content_hash_loop(
+    len: Expression,
+    elem_expr: impl Fn(Expression) -> Expression,
+    span: Span,
+) -> Expression {
+    let acc = var("__hash_acc");
+    let i = var("__hash_i");
+    // `__hash_acc = __hash_acc * 31 + elem(__hash_i)`
+    let step = bin(
+        bin(acc.clone(), BinaryOp::Mul, int(31), span),
+        BinaryOp::Add,
+        elem_expr(i.clone()),
+        span,
+    );
+    let while_expr = Expression::While(
+        Box::new(bin(i.clone(), BinaryOp::Lt, len, span)),
+        Block {
+            stmts: vec![
+                Statement::Expr(
+                    Expression::Assign(
+                        Box::new(acc.clone()),
+                        AssignOp::Assign,
+                        Box::new(step),
+                        span,
+                    ),
+                    span,
+                ),
+                Statement::Expr(
+                    Expression::Assign(
+                        Box::new(i.clone()),
+                        AssignOp::Assign,
+                        Box::new(bin(i.clone(), BinaryOp::Add, int(1), span)),
+                        span,
+                    ),
+                    span,
+                ),
+            ],
+            tail: None,
+            span,
+        },
+        None,
+        span,
+    );
+    Expression::Block(
+        Block {
+            stmts: vec![
+                let_mut("__hash_acc", Type::U(64), int(0)),
+                let_mut("__hash_i", Type::U(64), int(0)),
+                Statement::Expr(while_expr, span),
+            ],
+            tail: Some(Box::new(acc)),
+            span,
+        },
+        span,
+    )
+}
+
 /// 单个字段/载荷的哈希值表达式。
 fn hash_value(e: Expression, ty: &Type, span: Span) -> Expression {
     match ty {
@@ -577,8 +653,32 @@ fn hash_value(e: Expression, ty: &Type, span: Span) -> Expression {
             }
             acc.unwrap_or_else(|| int(0))
         }
-        // `str` / 切片：按 0 计（见模块文档）。切片长度是运行期值，定长展开
-        // 不适用；按内容计需要一个运行时循环（见 `docs/rust-parity.md`）。
+        // `str`：按字节内容哈希（`ptr[i] as u64` 逐字节折叠）。长度是运行期值，
+        // 用 `content_hash_loop` 生成循环。相等 ⇒ 字节序列相同 ⇒ 折叠相同。
+        Type::Str => {
+            let ptr = field(e.clone(), "ptr");
+            let len = field(e.clone(), "len");
+            content_hash_loop(len, |i| {
+                cast(
+                    Expression::Index(Box::new(ptr.clone()), Box::new(i), span),
+                    Type::U(64),
+                )
+            }, span)
+        }
+        // 切片：逐元素按内容哈希（`hash_value(e[i], T)` 递归）。相等 ⇒ 逐元素
+        // 相等 ⇒ 折叠相同；不同切片大概率不同。元素本身是 `str`/切片/元组/
+        // 数组时 `hash_value` 会继续递归。
+        Type::Slice(elem, _) => {
+            let len = field(e.clone(), "len");
+            let base = e;
+            content_hash_loop(len, |i| {
+                hash_value(
+                    Expression::Index(Box::new(base.clone()), Box::new(i), span),
+                    elem,
+                    span,
+                )
+            }, span)
+        }
         _ => int(0),
     }
 }
