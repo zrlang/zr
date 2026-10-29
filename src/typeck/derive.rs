@@ -307,11 +307,19 @@ fn eq_fn(
                     let pattern = variant_pattern(type_name, w, "o");
                     let body = if v.name == w.name {
                         let obinds = payload_binds(w, "o");
+                        let ospans = payload_bind_spans(w, "o");
                         let mut acc: Option<Expression> = None;
-                        for (a, b) in sbinds.iter().zip(obinds.iter()) {
-                            let cmp = bin(var(a), BinaryOp::Eq, var(b), span);
+                        for (k, (a, b)) in sbinds.iter().zip(obinds.iter()).enumerate() {
+                            // 结构体载荷的字段 span 让报错指向那个字段；元组
+                            // 载荷没有字段名，回退到枚举定义的位置。
+                            let fspan = ospans
+                                .get(k)
+                                .map(|(_, s)| *s)
+                                .filter(|s| *s != SPAN)
+                                .unwrap_or(span);
+                            let cmp = bin(var(a), BinaryOp::Eq, var(b), fspan);
                             acc = Some(match acc {
-                                Some(prev) => bin(prev, BinaryOp::And, cmp, span),
+                                Some(prev) => bin(prev, BinaryOp::And, cmp, fspan),
                                 None => cmp,
                             });
                         }
@@ -591,6 +599,22 @@ fn payload_binds(v: &ast::Variant, prefix: &str) -> Vec<String> {
         VariantPayload::Struct(fields) => fields
             .iter()
             .map(|f| format!("{prefix}_{}", f.name))
+            .collect(),
+    }
+}
+
+/// 变体载荷的绑定名 + 对应字段的 span。元组载荷没有字段名（fallback 到
+/// `SPAN`，即枚举定义的位置）；结构体载荷用字段名所在位置。诊断时让
+/// "某载荷字段缺 trait"的报错指向**那个字段**，而不是枚举定义整体。
+fn payload_bind_spans(v: &ast::Variant, prefix: &str) -> Vec<(String, Span)> {
+    match &v.payload {
+        VariantPayload::Unit => Vec::new(),
+        VariantPayload::Tuple(tys) => (0..tys.len())
+            .map(|i| (format!("{prefix}{i}"), SPAN))
+            .collect(),
+        VariantPayload::Struct(fields) => fields
+            .iter()
+            .map(|f| (format!("{prefix}_{}", f.name), f.span))
             .collect(),
     }
 }
