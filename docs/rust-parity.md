@@ -140,7 +140,7 @@
 | `use foo::*` | 不支持 | ❌ | ``zr: glob imports (`use foo::*`) require module system support (not yet implemented) `` |
 | `use std::core::Option` | 路径不带 `std::` | 🟡 | zr 的标准库模块直接叫 `core` / `io` / `string` / `collections`：`use core::Option;`。写 `std::core::Option` → ``zr: unknown module `std` `` |
 | `pub` / `pub(crate)` / `pub(super)` | 仅 `pub` | 🟡 | 没有 `pub(crate)` / `pub(super)` 的可见性检查 |
-| `#[derive(Clone, PartialEq, Eq, Hash, Default, Debug, ...)]` | 生成真实方法体 | 🟡 | `src/typeck/derive.rs` 在 AST 层生成 `Type__clone` / `__eq` / `__lt` / `__hash` / `__default` / `__debug`，与手写 `impl` 方法同形。结构体支持 `Clone/Copy/PartialEq/Eq/PartialOrd/Ord/Hash/Default/Debug`（含元组结构体、嵌套结构体）；枚举支持 `Clone/PartialEq/Eq/Hash/Debug`。`==`/`<` 等聚合比较改写成方法调用，**没 derive 就报错**。`Debug` 生成 `.debug() -> String`（Rust `{:?}` 风格；浮点/指针/数组/元组/`String` 字段显式报错）。仍缺：泛型类型 derive 报错、枚举 `Default`/`Ord` 报错。 |
+| `#[derive(Clone, PartialEq, Eq, Hash, Default, Debug, ...)]` | 生成真实方法体 | 🟡 | `src/typeck/derive.rs` 在 AST 层生成 `Type__clone` / `__eq` / `__lt` / `__hash` / `__default` / `__debug`，与手写 `impl` 方法同形。结构体支持 `Clone/Copy/PartialEq/Eq/PartialOrd/Ord/Hash/Default/Debug`（含元组结构体、嵌套结构体、**`str` 字段后的嵌套结构体字段**）；枚举支持 `Clone/PartialEq/Eq/Hash/Debug`（含**结构体变体载荷里的 `str` 字段**，`EnumField` 聚合特判修好后已对齐 Rust）。`==`/`<` 等聚合比较改写成方法调用，**没 derive 就报错**。`Debug` 生成 `.debug() -> String`（Rust `{:?}` 风格；浮点/指针/数组/元组/`String` 字段显式报错）。仍缺：泛型类型 derive 报错、枚举 `Default`/`Ord` 报错。 |
 | `#[repr(C)]` / `#[repr(u8)]` | 可用 | ✅ | |
 | `#[inline(...)]` / `#[link(...)]` / `#[test]` | 可用 | ✅ | `#[test]` 的函数会被编进产物并在 `main` 前调用 |
 | `static` / `static mut` | 标量可用 | ✅ | 初值能折成字面量的**标量**静态量会写进 `.data`：读、写、复合赋值、`&STATIC` / `&mut STATIC` 都正常。聚合静态量（结构体 / 数组 / 枚举）暂不生成数据，读取时明确报错；`static mut` 赋值不需要 `let mut`，非 `mut` 静态量赋值报错 |
@@ -248,7 +248,9 @@
 
 1. **`#[derive(...)]` 的剩余缺口**（方法体本身已能生成，见 §2.5 那一行）：
    `Debug` 已生成 `.debug()` 方法体（`Type__debug(self) -> String`，Rust `{:?}`
-   风格；浮点/指针/数组/元组/`String` 字段显式报错）；泛型类型上的 derive 明确报错；
+   风格；浮点/指针/数组/元组/`String` 字段显式报错；**结构体变体载荷里的
+   `str` 字段与 `str` 后嵌套字段两处组合错经 `EnumField` 聚合特判后也已对齐
+   Rust**）；泛型类型上的 derive 明确报错；
    枚举的 `Default` / `PartialOrd` / `Ord` 明确报错；字段类型缺少所需 trait 时
    报的是整个类型的方法检查失败，尚未精确指向字段。可接受的 derive 名：
    `Debug` `Clone` `Copy` `PartialEq` `Eq` `PartialOrd` `Ord` `Hash` `Default`；

@@ -225,9 +225,9 @@ README 里"指针与 unsafe"一节目前是**愿景**：
   **数组按内容**（`caab7a0`）、**`str`/切片按内容**（`41ec8f4`，`96_str_slice_hash.zr`）；
   `Debug` 也已生成 `.debug()` 方法体（`Type__debug(self) -> String`，Rust `{:?}` 风格，
   `100_debug_derive.zr` + 负向 `19_debug_float.zr`；浮点/指针/数组/元组/`String` 字段显式报错；
-  **剩余两处组合错**——结构体变体载荷里的 `str` 字段、命名结构体里 `str` 字段之后的
-  嵌套结构体字段，见 `CLAUDE.md` §7 的 `Debug` 说明）；**剩**：泛型类型 / 枚举 `Default` /
-  枚举 `Ord` 显式报错。
+  **结构体变体载荷里的 `str` 字段与 `str` 后嵌套字段两处"组合错"经 `EnumField`
+  聚合特判后也已对齐 Rust**，见 `CLAUDE.md` §7 的 `Debug` 说明）；**剩**：泛型类型 /
+  枚举 `Default` / 枚举 `Ord` 显式报错。
 - **`loop` 带值 break**：✅ 已实现（`87ef09a` + `daf9763`）——`let x = loop { break 7; }`
   不再静默得 0（`ExprKind::Break` 现在携带值，`Loop` 按其类型化）；
   `tests/cases/97_loop_value.zr`（含聚合 break 值）。`daf9763` 修掉聚合 break

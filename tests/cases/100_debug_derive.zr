@@ -3,14 +3,10 @@
 // 断言每个值在 Rust `{:?}` 下的精确输出：长度 + 关键字节（立即读，不经函数
 // 参数——`.debug()` 返回的 String 经函数参数二次读取会读到悬垂栈缓冲，见提交
 // 信息）。覆盖：命名结构体（标量 + str + bool + char）、元组结构体、单元/元组/
-// 结构体变体枚举、嵌套结构体（偏移 0）。长度与字节都对照 Rust 实际输出。
-//
-// 已知局限（此用例刻意避开，见提交信息）：
-//  - 结构体变体载荷里的 `str` 字段：`match` 绑定聚合载荷的既有 bug（`EnumField`
-//    对聚合载荷单字加载），`str` 载荷仍会段错误；标量 / 嵌套结构体载荷已修好。
-//  - 命名结构体里 `str` 字段**之后**的嵌套结构体字段：派生方法里读 `self.tag`
-//    （str）会部分移动 `self`，后续 `self.inner` 读到垃圾。嵌套结构体在偏移 0
-//    正常（本用例的 `Wrap` 就是这么测的）。
+// 结构体变体枚举、嵌套结构体（偏移 0）、**结构体变体载荷里的 `str` 字段**、
+// **命名结构体里 `str` 字段之后的嵌套结构体字段**。长度与字节都对照 Rust
+// 实际输出（后两类早先被认为是已知局限，实为 `EnumField` 聚合载荷单字加载的
+// 既有 bug；`is_aggregate` 特判修好后已对齐 Rust，长度 17 / 52）。
 #[derive(Debug)]
 struct Point { x: i64, y: i64, name: str, ok: bool, ch: char }
 #[derive(Debug)]
@@ -21,6 +17,10 @@ enum Shape { Circle, Rect(i64, i64), Named { w: i64, h: i64 } }
 struct Inner { v: i64 }
 #[derive(Debug)]
 struct Wrap { inner: Inner }
+#[derive(Debug)]
+enum Msg { Hi { who: str }, Bye }
+#[derive(Debug)]
+struct Outer { name: str, inner: Inner, tag: i64 }
 
 fn main() -> i32 {
     // 命名结构体：`Point { x: 10, y: -3, name: "bob", ok: true, ch: 'Z' }`（54 字节）。
@@ -72,6 +72,30 @@ fn main() -> i32 {
     if s.ptr[22] != b'v' { return 28; }
     if s.ptr[25] != b'7' { return 29; }
     if s.ptr[29] != b'}' { return 30; }
+
+    // 结构体变体载荷里的 `str` 字段（`EnumField` 聚合载荷，早先被当单字加载、
+    // 段错误；`is_aggregate` 特判修好后已对齐 Rust）：`Hi { who: "bob" }`（17 字节）。
+    let m = Msg::Hi { who: "bob" };
+    let s = m.debug();
+    if s.len != 17 { return 31; }
+    if s.ptr[0] != b'H' { return 32; }
+    if s.ptr[5] != b'w' { return 33; }
+    if s.ptr[10] != b'"' { return 34; }
+    if s.ptr[14] != b'"' { return 35; }
+    if s.ptr[16] != b'}' { return 36; }
+
+    // 命名结构体里 `str` 字段**之后**的嵌套结构体字段（早先被认为读垃圾）：
+    // `Outer { name: "bob", inner: Inner { v: 7 }, tag: 9 }`（52 字节）。
+    let o = Outer { name: "bob", inner: Inner { v: 7 }, tag: 9 };
+    let s = o.debug();
+    if s.len != 52 { return 37; }
+    if s.ptr[0] != b'O' { return 38; }
+    if s.ptr[14] != b'"' { return 39; }
+    if s.ptr[28] != b'I' { return 40; }
+    if s.ptr[36] != b'v' { return 41; }
+    if s.ptr[39] != b'7' { return 42; }
+    if s.ptr[41] != b'}' { return 43; }
+    if s.ptr[51] != b'}' { return 44; }
 
     return 0;
 }

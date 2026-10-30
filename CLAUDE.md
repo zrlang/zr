@@ -296,7 +296,12 @@ target/debug/zr prog.zr -O1 -o /tmp/prog && /tmp/prog
 根本没有 `attrs` 字段）。
 
 **已知局限**：
-- `Debug` 的 `.debug()` 已生成，但**结构体变体载荷里的 `str` 字段**与**命名结构体里 `str` 字段之后的嵌套结构体字段**这两个组合仍会错（前者是 `EnumField` 对聚合载荷单字加载的既有 bug，`str` 载荷段错误；后者是派生方法里读 `self.tag` 部分移动 `self`，后续字段读垃圾）——见 §7 末尾的说明
+- `Debug` 的 `.debug()` 已生成，覆盖命名/元组结构体、单元/元组/结构体变体枚举、
+  嵌套结构体、**结构体变体载荷里的 `str` 字段**、**命名结构体里 `str` 字段之后
+  的嵌套结构体字段**（后两类早先误判为已知局限，实为 `EnumField` 对聚合载荷单字
+  加载的既有 bug；`is_aggregate` 特判修好后已对齐 Rust `{:?}`，见 `01ae31d`）。
+  仍剩一个：`.debug()` 返回的 `String` 经**函数参数**二次读取会读到悬垂栈缓冲
+  （立即读在 `main` 里正常，见 `100_debug_derive.zr` 头部注释）。
 - 泛型类型上的 derive 不生成方法体（字段类型要靠单态化才知道）
 
 ---
@@ -339,15 +344,17 @@ target/debug/zr prog.zr -O1 -o /tmp/prog && /tmp/prog
    **指针/引用按地址**（`b5f5a56`）、**元组按内容**（`38f1ddd`）、**数组按内容**
    （`caab7a0`）、**`str`/切片按内容**（`41ec8f4`，新增 `tests/cases/96_str_slice_hash.zr`）
 
-   **`Debug` 剩余两处组合错**（本次只修了标量/嵌套-偏移 0 路径）：
+   **`Debug` 此前标记的"两处组合错"已全部对齐 Rust**（`01ae31d` 的
+   `EnumField` `is_aggregate` 特判其实一并修好了它们；早先的测试只用了错的
+   预期长度，误判为未修）：
    - **结构体变体载荷里的 `str` 字段**：`match` 绑定聚合载荷的既有 bug
      （`EnumField` 对聚合载荷单字加载，`str` 载荷读 `ptr` 半字、`len` 读垃圾，
-     段错误）。本次给 `EnumField` 补了 `is_aggregate` 特判（载荷字段值 = 地址，
-     与结构体 `Field` 一致），**嵌套结构体 / 元组载荷已修好**，`str` 载荷仍错
-     ——`str` 是 16 字节聚合，绑定/拷贝仍按单字。
-   - **命名结构体里 `str` 字段之后的嵌套结构体字段**：派生方法里读 `self.tag`
-     （str）会部分移动 `self`，后续 `self.inner` 读到垃圾；嵌套结构体在偏移 0
-     正常（`Wrap { inner: Inner }`）。
+     段错误）。`is_aggregate` 特判（载荷字段值 = 地址，与结构体 `Field` 一致）
+     修好后，`str` 载荷、嵌套结构体/元组载荷都已对齐 Rust `{:?}`
+     （`tests/cases/100_debug_derive.zr` 新增 `Msg::Hi { who: "bob" }`，len 17）。
+   - **命名结构体里 `str` 字段之后的嵌套结构体字段**：早先被认为读 `self.tag`
+     （str）部分移动 `self`、后续 `self.inner` 读到垃圾；实测已对齐 Rust
+     （`Outer { name: "bob", inner: Inner { v: 7 }, tag: 9 }`，len 52）。
 
    **P0-7（已修 `daf9763`）**：聚合（结构体/元组/数组）作为 `loop` 的 break
    值在 `-O3`/`-Oz` 触发寄存器分配 bug——值横跨循环出口被与常量 `8` 合并
@@ -418,8 +425,8 @@ target/debug/zr prog.zr -O1 -o /tmp/prog && /tmp/prog
 8. **更新 `tests/README.md` 与 `future/README.md`** —— ✅ 已完成（`fb4dfb2`；另 `1d38ca3` 修正 README / rust-parity / CONTRIBUTING / Cargo.toml）
 9. **`Debug` derive 方法体** —— ✅ 已完成（本次：`Type__debug(self) -> String`，
    标量/`str`/`bool`/`char`/嵌套（偏移 0）/单元/元组/结构体变体都对齐 Rust `{:?}`；
-   浮点/指针/数组/元组/`String` 字段显式报错；剩余 `str` 载荷与 `str` 后嵌套字段
-   两处组合错，见 §7 的 `Debug` 说明）
+   浮点/指针/数组/元组/`String` 字段显式报错；**结构体变体载荷里的 `str` 字段与
+   `str` 后嵌套字段两处"已知局限"经 `EnumField` 聚合特判后也已对齐 Rust**，见 §7）
 
 ---
 
