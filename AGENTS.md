@@ -148,11 +148,15 @@ README 里"指针与 unsafe"一节目前是**愿景**：
 - **没有 `dyn` 关键字**，trait 对象不可用，因此 `std/error` 导入不了。
 - **切片/数组索引不做越界检查**：`check_index_scalar` 不检查边界。
 - **借用检查是最小切片**：同位置的借用与已有借用重叠（`&mut` 独占、`&` 可共享，
-  至少一个可变）报 `cannot borrow ... while already borrowed`。**词法作用域近似**：
-  `let r = &mut x` 的借用存活到作用域结束，临时借用（`foo(&mut x)`）在语句结束
-  释放；`&mut x` 强转裸指针（字段类型 `*mut` 或 `as *mut T`）立即释放。
+  至少一个可变）报 `cannot borrow ... while already borrowed`；**写被借用位置**
+  （`x = 5` 而 `&x` / `&mut x` 存活）报 `cannot assign to ... while it is borrowed`
+  （字段级不相交 `&mut x.a` 后写 `x.b` 合法，由 `place_conflicts` 前缀判据处理）。
+  **词法作用域近似**：`let r = &mut x` 的借用存活到作用域结束，临时借用
+  （`foo(&mut x)`）在语句结束释放；`&mut x` 强转裸指针（字段类型 `*mut` 或
+  `as *mut T`）立即释放；`let` 初始化里的**调用实参**（`let v = early(&mut x)`）
+  是临时量不是绑定值（`with_value_pos`），语句结束释放。
   已知局限：let 绑定借用按作用域结束（不是最后使用），`let r = &mut x; use r; use x;`
-  会误报；读写被借用位置（use-while-borrowed）尚不检查。
+  会误报；**读**被借用位置（read-while-borrowed）尚不检查。
 - **移动语义不检查**：`let s2 = s1;` 之后再用 `s1` 不报错。
 - **`str` 是 `{ptr, len}` 结构体**，切片写成 `[]const T`（元素在后），不是 Rust 的 `&[T]`。
 - **`println` 是函数不是宏**：`println(s: str)`；格式化走 `println_fmt(fmt, &[FormatArg], n)`，
@@ -241,11 +245,13 @@ README 里"指针与 unsafe"一节目前是**愿景**：
 - **`unsafe` 关键字**：✅ 已实现（`unsafe { ... }` 块可解析和通过类型检查；当前不改变语义，按块表达式透传）。
 - **`dyn` 关键字**：✅ 词法+解析+类型检查骨架已实现；vtable 分派仍在未实现状态。
 - **借用检查**：🟡 最小切片已实现——同位置借用重叠（`&mut`+`&mut` / `&`+`&mut`）
-  报 `cannot borrow ... while already borrowed`；词法作用域近似（`let r = &mut x`
-  存活到作用域结束、临时借用语句结束释放、裸指针强转立即释放）；
-  `tests/negative/20_borrow_conflict.zr`。已知局限：let 绑定借用按作用域结束
-  （`let r = &mut x; use r; use x;` 会误报）、use-while-borrowed 尚不检查。
-  完整 NLL（最后使用、读写被借用位置）后续再做。
+  报 `cannot borrow ... while already borrowed`；**写被借用位置**（`x = 5` 而
+  `&x`/`&mut x` 存活）报 `cannot assign to ... while it is borrowed`；词法作用域
+  近似（`let r = &mut x` 存活到作用域结束、临时借用语句结束释放、裸指针强转
+  立即释放、`let` 初始化里的调用实参是临时量非绑定值）；
+  `tests/negative/20_borrow_conflict.zr`、`21_borrow_write.zr`。已知局限：let
+  绑定借用按作用域结束（`let r = &mut x; use r; use x;` 会误报）、读被借用位置
+  尚不检查。完整 NLL（最后使用、读被借用位置）后续再做。
 - **移动检查**：✅ 最小版已实现（`let b = a` 对含 drop glue 的类型是移动，读被移动的源报错）。
 - **元数据**（权限、时间戳）与 `tempfile`：✅ 已补齐（`db0b01f`）——`std/fs`
   新增 `temp_file()`/`temp_file_raw()`（`/tmp/zr_tmp_<纳秒>`）、`file_mtime(path)`、

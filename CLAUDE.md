@@ -162,7 +162,7 @@ target/debug/zr prog.zr -O1 -o /tmp/prog && /tmp/prog
 | `*const T` / `*mut T` 裸指针，`&x` / `&mut x` | ✅（语法层面） |
 | 裸指针解引用 / 写入 | ✅ |
 | **移动语义（use-after-move 检查）** | ✅ 最小版已实现（`let b = a` 后读 `a` 报 use-after-move；字段级/按值传参移动暂不覆盖） |
-| **借用检查（`&mut` 独占、别名）** | 🟡 最小切片已实现：同位置借用重叠（`&mut`+`&mut` / `&`+`&mut`）报 `cannot borrow ... while already borrowed`；词法作用域近似（`let r = &mut x` 存活到作用域结束、临时借用 `foo(&mut x)` 语句结束释放、`&mut x` 强转裸指针立即释放）；`tests/negative/20_borrow_conflict.zr`。已知局限：let 绑定借用按作用域结束（`let r = &mut x; use r; use x;` 会误报）、use-while-borrowed 尚不检查 |
+| **借用检查（`&mut` 独占、别名）** | 🟡 最小切片已实现：同位置借用重叠（`&mut`+`&mut` / `&`+`&mut`）报 `cannot borrow ... while already borrowed`；**写被借用位置**（`x = 5` 而 `&x`/`&mut x` 存活）报 `cannot assign to ... while it is borrowed`；词法作用域近似（`let r = &mut x` 存活到作用域结束、临时借用 `foo(&mut x)` 语句结束释放、`&mut x` 强转裸指针立即释放、`let` 初始化里的调用实参是临时量非绑定值）；`tests/negative/20_borrow_conflict.zr`、`21_borrow_write.zr`。已知局限：let 绑定借用按作用域结束（`let r = &mut x; use r; use x;` 会误报）、读被借用位置尚不检查 |
 | 切片越界检查 | 🟡 编译期常量下标越界已报 `index out of bounds`（变量下标暂不检查） |
 | **`unsafe` 关键字** | ✅ 已实现（`unsafe { ... }` 块可解析和通过类型检查；当前按块表达式透传） |
 | `Drop` trait 与析构 | ✅（`drop_impls`；数组/嵌套临时值析构有序） |
@@ -320,7 +320,7 @@ target/debug/zr prog.zr -O1 -o /tmp/prog && /tmp/prog
 
 | 项 | 现状 |
 |---|---|
-| 借用检查 | 🟡 最小切片已实现：同位置借用重叠（`&mut`+`&mut` / `&`+`&mut`）报 `cannot borrow ... while already borrowed`；词法作用域近似（`let r = &mut x` 存活到作用域结束、临时借用 `foo(&mut x)` 语句结束释放、`&mut x` 强转裸指针立即释放）；`tests/negative/20_borrow_conflict.zr`。已知局限：let 绑定借用按作用域结束（`let r = &mut x; use r; use x;` 会误报）、use-while-borrowed 尚不检查 |
+| 借用检查 | 🟡 最小切片已实现：同位置借用重叠（`&mut`+`&mut` / `&`+`&mut`）报 `cannot borrow ... while already borrowed`；**写被借用位置**（`x = 5` 而 `&x`/`&mut x` 存活）报 `cannot assign to ... while it is borrowed`；词法作用域近似（`let r = &mut x` 存活到作用域结束、临时借用 `foo(&mut x)` 语句结束释放、`&mut x` 强转裸指针立即释放、`let` 初始化里的调用实参是临时量非绑定值）；`tests/negative/20_borrow_conflict.zr`、`21_borrow_write.zr`。已知局限：let 绑定借用按作用域结束（`let r = &mut x; use r; use x;` 会误报）、读被借用位置尚不检查 |
 | 无 `unsafe` 关键字 | ✅ 已实现（`unsafe { ... }` 块可解析和通过类型检查） |
 | 无 `dyn` 关键字 | ✅ 解析+类型检查骨架已实现（vtable 分派仍在未实现状态） |
 | 切片/数组索引不检查越界 | ✅ 编译期常量下标越界已报 `index out of bounds`（变量下标暂不检查） |

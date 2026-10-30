@@ -316,9 +316,13 @@ impl Range {
         if self.step < 0 && self.current <= self.end {
             return 0 as *mut i64;
         }
-        let p = &self.current;
+        // `&self.current` 强转裸指针立即释放借用：`self.current = ...` 是
+        // 写回同一个字段，若保留 `p: &i64` 的共享借用则写被借用位置冲突
+        // （E0506）。这个迭代器模式就是"取当前位置的裸指针、前进、返回指针"，
+        // 借用只需活到强转那一步，转成 `*mut i64` 后不再参与借用检查。
+        let p = &self.current as *mut i64;
         self.current = self.current + self.step;
-        return p as *mut i64;
+        return p;
     }
 }
 

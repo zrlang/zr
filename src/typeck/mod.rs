@@ -243,6 +243,12 @@ struct BorrowRecord {
     /// （调用实参 / 临时结构体字段），在语句结束时释放——这正是
     /// `foo(&mut x); foo(&mut x);` 连续两句合法的关键（NLL 语义）。
     in_let_init: bool,
+    /// 是否正处在一个"非值位置"上下文里（调用实参、二元操作数等）。为真时
+    /// `let` 初始化里的借用**不是**绑定值的一部分（`let v = early(&mut x)`
+    /// 里 `&mut x` 是调用实参、`v` 拿的是调用结果），应作临时借用、语句结束
+    /// 释放，而不是 `let_bound`。`let r = Res { log: &mut log }` 的字段是
+    /// 值位置（结构体就是绑定值），`&mut log` 仍应 `let_bound`。
+    in_temp_context: bool,
     /// 词法作用域栈：每层是"名字 → DefId"的绑定表。
     ///
     /// 与 `scope_stack` 同步 push/pop，用于把源码里的标识符解析到
@@ -395,6 +401,7 @@ impl Default for TypeChecker {
             scope_depth: 0,
             live_borrows: Vec::new(),
             in_let_init: false,
+            in_temp_context: false,
             scope_stack: Vec::new(),
             local_scopes: Vec::new(),
             locals_by_def: HashMap::new(),
@@ -2457,6 +2464,23 @@ impl TypeChecker {
                 }
             }
             Expression::Assign(lhs, op, rhs, _) => {
+                // 借用检查：写被借用位置（`x = 5` 而 `&x` / `&mut x` 存活）。
+                // `&mut` 借用期间不能写原位置，`&` 借用期间更不能写（共享
+                // 借用只读）。`*r = 5` 走 `Unary(Deref)` 不在此列（那正是通过
+                // 引用写的合法途径）。字段级不相交（`&mut x.a` 后写 `x.b`）
+                // 由 `place_conflicts` 判为不相干。
+                if let Some(wplace) = borrow_place_of(lhs) {
+                    for b in &self.live_borrows {
+                        if place_conflicts(&b.place, &wplace) {
+                            return Err(CompileError::new(format!(
+                                "cannot assign to `{}` while it is {} borrowed",
+                                wplace,
+                                if b.mutable { "mutably" } else { "immutably" },
+                            ))
+                            .with_span(lhs.span()));
+                        }
+                    }
+                }
                 let l = self.check_expr(lhs, &Ty::Infer(InferId(0)))?;
                 let r = self.check_expr(rhs, &l.ty)?;
                 self.check_partial_move(&r, rhs.span())?;
@@ -2578,7 +2602,7 @@ impl TypeChecker {
                                 place,
                                 mutable,
                                 depth: self.scope_depth,
-                                let_bound: self.in_let_init,
+                                let_bound: self.in_let_init && !self.in_temp_context,
                                 span,
                             });
                         }
@@ -4667,7 +4691,7 @@ impl TypeChecker {
                 .get(i)
                 .cloned()
                 .unwrap_or_else(|| self.infer.fresh_infer(span));
-            let arg = self.check_expr(a, &param_ty)?;
+            let arg = self.with_value_pos(false, |s| s.check_expr(a, &param_ty))?;
             // 带捕获闭包（环境结构体 `__env_N`）传给 `fn(..)` 形参：环境值
             // 不是函数指针，被调方拿不到捕获 local，跨函数环境传递机制
             // 不存在，明确报错而不是把环境值当函数地址调用（运行必崩）。
@@ -8547,6 +8571,20 @@ impl TypeChecker {
         self.local_scopes.push(HashMap::new());
     }
 
+    /// 在 `value_pos` 语境里执行 `f`：`value_pos == true` 表示子表达式的结果
+    /// 仍直接是外层绑定的值（结构体/数组/元组字段），保持当前临时上下文；
+    /// `false` 表示子表达式是临时量的一部分（调用实参、二元操作数），置
+    /// `in_temp_context = true`（`let` 初始化里的借用就不算 `let_bound`）。
+    fn with_value_pos<T>(&mut self, value_pos: bool, f: impl FnOnce(&mut Self) -> T) -> T {
+        let saved = self.in_temp_context;
+        if !value_pos {
+            self.in_temp_context = true;
+        }
+        let r = f(self);
+        self.in_temp_context = saved;
+        r
+    }
+
     fn pop_scope(&mut self) {
         if let Some(locals) = self.scope_stack.pop() {
             for l in locals {
@@ -9565,6 +9603,16 @@ fn borrow_place_of(e: &Expression) -> Option<String> {
         Expression::Index(..) | Expression::Call(..) | Expression::Unary(..) => None,
         _ => None,
     }
+}
+
+/// 借用位置 `borrow` 是否覆盖访问位置 `access`。
+///
+/// `&mut x`（借用 `"x"`）覆盖写 `x`、`x.field`（`"x"` 是后者的前缀）；
+/// `&mut x.field`（借用 `"x.field"`）只覆盖写 `x.field`，不覆盖写 `x` 或
+/// `x.other`（字段级不相交借用合法，与 Rust 一致）。`"x"` 与 `"x.field"`
+/// 的字符串前缀判据正好实现"借用整结构体 → 写任一字段冲突"。
+fn place_conflicts(borrow: &str, access: &str) -> bool {
+    access == borrow || access.starts_with(&(borrow.to_owned() + "."))
 }
 
 /// 一个表达式是否**发散**（控制流不会从它正常返回）。
