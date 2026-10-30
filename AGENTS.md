@@ -245,6 +245,12 @@ README 里"指针与 unsafe"一节目前是**愿景**：
   与它同名，撞成一个 `z_file_size` 符号、MIR 去重只留首个，调用点可能走到 fd 版
   （str 被当 fd 读）。已修：`io::file_size` 改名 `file_size_fd`，`fs::file_size`
   现在是唯一的路径版（`99_fs_tempfile_metadata.zr` 加字面量/变量路径断言）。
+  同类冲突一并修掉：`slice::max/min`（与 `core::max/min` 二元版同名，`use
+  core::max` 会绑到先收集的 slice 版、`max(a,b)` 静默拿 `Option`）改名
+  `max_slice/min_slice`；`net::read_line`（与 `io::read_line` stdin 版同名）改名
+  `read_line_stream`（net.zr 目前有 `#[repr(C, align(4))]` 解析问题、加载不了，
+  改名为将来消除隐患）。根因是扁平符号表 + 路径导入不区分模块——`use core::max`
+  取 `symbols["max"]`（先收集者），不是 core 模块里的那个；根治需按模块限定。
 - **格式串**：命名参数 `{name}` 与多行 Debug `{:#?}` 没做；`#` 对 `{:?}` 被忽略，只输出一行。
 - **闭包**：**无捕获**闭包已可存进变量/当实参/返回（提升成 `__closure_N` 顶层函数指针）；**带捕获**闭包已可存进变量/嵌套/多次调用（`tests/cases/84_closure_capture_value.zr`），但跨函数传 env 仍有限制。
 - **`i128`/`u128`** 在 64 位目标上不可用（需寄存器对拆分）。

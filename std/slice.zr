@@ -210,7 +210,11 @@ pub fn sum<T>(s: []const T) -> T {
 }
 
 /// 取最大值。
-pub fn max<T: Ord>(s: []const T) -> Option<T> {
+///
+/// 名字带 `_slice` 后缀：`core::max(a, b)`（二元）与它同名会撞成一个
+/// `z_max__T` 符号，`use core::max` 可能绑到先收集的 `slice::max`（返回
+/// `Option`），`max(a, b)` 就静默拿到 `Option`。改名消除冲突。
+pub fn max_slice<T: Ord>(s: []const T) -> Option<T> {
     if s.len == 0 { return Option::None; }
     let mut m = s.ptr[0];
     let mut i = 1;
@@ -222,7 +226,9 @@ pub fn max<T: Ord>(s: []const T) -> Option<T> {
 }
 
 /// 取最小值。
-pub fn min<T: Ord>(s: []const T) -> Option<T> {
+///
+/// 与 `core::min(a, b)` 同名冲突，改 `_slice` 后缀（见 `max_slice` 注释）。
+pub fn min_slice<T: Ord>(s: []const T) -> Option<T> {
     if s.len == 0 { return Option::None; }
     let mut m = s.ptr[0];
     let mut i = 1;

@@ -18,8 +18,21 @@
 
 use fs::{temp_file, file_mtime, file_mode, file_size, file_size_raw, remove_file};
 use io::File;
+// max/min 命名冲突回归：`core::max(a,b)`（二元）与 `slice::max(s)`（1 参切片，
+// 已改名 `max_slice`）同名会撞成一个 `z_max__T` 符号，`use core::max` 可能绑到
+// 先收集的 slice 版（返回 `Option`），`max(a, b)` 就静默拿到 `Option`。这里
+// `use slice::len` 只是加载 slice 模块，不导入它的 max/min。
+use core::max;
+use core::min;
+use slice::len;
 
 fn main() -> i32 {
+    // 0) max/min 命名冲突：加载 slice 后 `max(a,b)` / `min(a,b)` 仍是 core 版。
+    let ma: i64 = 3;
+    let mb: i64 = 7;
+    if max(ma, mb) != 7 { return 30; }
+    if min(ma, mb) != 3 { return 31; }
+
     // 1) 临时文件：创建、写入、关闭。
     let f = temp_file();
     if !f.is_ok() { return 1; }

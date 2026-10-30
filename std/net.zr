@@ -828,7 +828,11 @@ impl TcpStream {
 
 /// 从 TcpStream 读取直到遇到换行符（简易 read_line）。
 /// 返回读取的字节数，buf 中以 NUL 结尾。
-pub fn read_line(stream: &TcpStream, buf: []u8) -> Result<usize, NetError> {
+///
+/// 名字带 `_stream` 后缀：`io::read_line(buf, cap)`（stdin 版）与它同名会撞成
+/// 一个 `z_read_line` 符号，加载 net 后 `use io::read_line` 可能绑到先收集的
+/// net 版（签名不同，`read_line(buf, cap)` 静默拿到错误结果）。改名消除冲突。
+pub fn read_line_stream(stream: &TcpStream, buf: []u8) -> Result<usize, NetError> {
     let mut total: usize = 0;
     while total < buf.len {
         let n = zr_recv(stream.inner.fd, offset(buf.ptr, total) as *mut u8, 1, 0);
