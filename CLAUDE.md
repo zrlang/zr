@@ -194,7 +194,7 @@ target/debug/zr prog.zr -O1 -o /tmp/prog && /tmp/prog
 | 模块 | 内容 | 备注 |
 |---|---|---|
 | `core` | `Option` / `Result` / `Eq` / `Ord` / `Copy` / `Clone` / `Display` | `Option` 方法齐全（`is_some`/`unwrap`/`map`）；**无 `PhantomData`** |
-| `io` | `println(s)` / `eprintln(s)` / `println_fmt(fmt, &[FormatArg], n)` / `read_bytes` / `stdin_read_line` / `File` | 格式串支持 `{}` `{:?}` `{:x}` `{:X}` `{:b}` `{:o}` `{:e}` `{:E}`、填充/对齐/`+`/`#`/`0`/宽度/精度、动态宽度 `{:1$}`、动态精度 `{:.*}`；缺命名参数 `{name}` 与 `{:#?}` |
+| `io` | `println(s)` / `eprintln(s)` / `println_fmt(fmt, &[FormatArg], n)` / `println_fmt_named(fmt, &[NamedArg], n)` / `read_bytes` / `stdin_read_line` / `File` | 格式串支持 `{}` `{:?}` `{:x}` `{:X}` `{:b}` `{:o}` `{:e}` `{:E}`、填充/对齐/`+`/`#`/`0`/宽度/精度、动态宽度 `{:1$}`、动态精度 `{:.*}`、命名参数 `{name}`（`println_fmt_named`）；缺 `{:#?}` |
 | `string` | `String` | 无 `BufRead::read_line` 形态的 API |
 | `collections` | `Vec`（`v[i]` 下标已支持，脱糖成 `v.data[i]`） | 路径调用 `Vec::new()` 的快速推断不再泄漏共享泛型占位符（`102_path_question.zr`） |
 | `async` | 运行时 | 仅部分平台完整 |
@@ -372,9 +372,11 @@ target/debug/zr prog.zr -O1 -o /tmp/prog && /tmp/prog
    `let v = Vec::new(); v.push(1)` 不再报 `cannot infer type parameter`；
    `tests/cases/98_generic_infer_usage.zr`，负向 `tests/negative/18_generic_infer_unused.zr`）
 5. **穷尽性报错信息误导**——✅ 已改进（`a526953`：枚举缺臂列出缺失变体名，`17_match_missing_variant.zr`；整型/标量仍保留尾 `_` 臂措辞）
-6. **格式串剩两处**：命名参数 `{name}` 与聚合类型的多行 Debug `{:#?}`
-   （标量/字符串的 `{:#?}` 与 `{:?}` 输出一致，符合 Rust；`#` 对 `{:?}`
-   只对聚合有影响，而聚合 Debug 还未实现）；其余规格已与 Rust 逐字符对齐
+6. **格式串剩一处**：聚合类型的多行 Debug `{:#?}`（标量/字符串的 `{:#?}` 与
+   `{:?}` 输出一致，符合 Rust；`#` 对 `{:?}` 只对聚合有影响，而聚合 Debug
+   还未实现）。**命名参数 `{name}` 已实现**——`println_fmt` 是函数不是宏，
+   `{name}` 需要按名查参，新增 `io::println_fmt_named(fmt, &[NamedArg], n)`
+   （`NamedArg { name: str, value: FormatArg }`）；其余规格已与 Rust 逐字符对齐
 7. **`Option` / `Result`（含变体 `Some` / `None` / `Ok` / `Err`）已在 prelude**——✅ 已实现（`4ed15d7`），无需显式 `use core::Option;`
 8. **无元数据 / 临时文件 API**——✅ 已修复（`db0b01f`）：`std/fs` 新增
    `temp_file()` / `temp_file_raw()`（`/tmp/zr_tmp_<纳秒>`，用已有 `zr_open` +
@@ -416,7 +418,8 @@ target/debug/zr prog.zr -O1 -o /tmp/prog && /tmp/prog
 按"依赖最少 + 影响最大"排序，每条都是可独立完成的工作单元：
 
 1. **`use x as y` 重命名修复** —— ✅ 已完成（`75_use_alias.zr`，含多段路径 `use core::Option as Opt`）
-2. **格式串 `{name}` 命名参数与 `{:#?}` 多行 Debug** —— P1 缺口，影响可读性
+2. **格式串 `{name}` 命名参数与 `{:#?}` 多行 Debug** —— P1 缺口，影响可读性。
+   `{name}` **✅ 已完成**（`println_fmt_named`，见 §3.8 / §7 P1-6）；`{:#?}` 未做
 3. **LTO 接线**（`src/opt/lto.rs` → `src/opt/mod.rs` → CLI 开关）—— P2
 4. **`use foo::*` glob 导入** —— ✅ 已完成（`40b5b45`，`90_glob_import.zr`）
 5. **穷尽性报错信息修措辞** —— ✅ 已完成（`a526953`：枚举缺臂列出缺失变体名，`17_match_missing_variant.zr`）

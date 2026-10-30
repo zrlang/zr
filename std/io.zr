@@ -1041,6 +1041,19 @@ pub struct FormatArg {
     pub str_len: usize,
 }
 
+/// 带名字的格式化参数：`{name}` 占位符按 `name` 在参数表里查值。
+///
+/// `println_fmt_named(fmt, &[NamedArg { name: "x", value: fmt_int(x) }, ..], n)`
+/// 里的 `{x}` 会定位到 `name == "x"` 的那一项。名字与值放同一个结构体里，
+/// 避免把名字数组和值数组分两次传（`&["x","y"]` 无法在 zr 里直接强转成
+/// `*const str`）。
+pub struct NamedArg {
+    /// 占位符名字（`{x}` 里的 `x`）。
+    pub name: str,
+    /// 对应参数。
+    pub value: FormatArg,
+}
+
 /// 一个整数参数。
 pub fn fmt_int(n: i64) -> FormatArg {
     return FormatArg { kind: 0, int_value: n, float_bits: 0, str_ptr: 0 as *const u8, str_len: 0 };
@@ -1333,6 +1346,285 @@ pub fn print_fmt(fmt: str, args: *const FormatArg, nargs: usize) {
 /// 同 `print_fmt`，但末尾补一个换行。
 pub fn println_fmt(fmt: str, args: *const FormatArg, nargs: usize) {
     print_fmt(fmt, args, nargs);
+    write_byte(STDOUT_FD, b'\n');
+}
+
+/// 标识符起始字符（`{name}` 的名字首字符）。
+fn is_ident_start(c: u8) -> bool {
+    return (c >= b'a' && c <= b'z') || (c >= b'A' && c <= b'Z') || c == b'_';
+}
+
+/// 标识符后续字符。
+fn is_ident_cont(c: u8) -> bool {
+    return is_ident_start(c) || is_digit(c);
+}
+
+/// 在 `args[0..nargs]` 里按名字查找参数下标；没找到返回 -1。
+fn find_named_arg(args: *const NamedArg, nargs: usize, name_ptr: *const u8, name_len: usize) -> i32 {
+    let mut i: usize = 0;
+    while i < nargs {
+        let n = args[i].name;
+        if n.len == name_len {
+            let mut same = true;
+            let mut k: usize = 0;
+            while k < name_len {
+                if n.ptr[k] != name_ptr[k] {
+                    same = false;
+                    break;
+                }
+                k = k + 1;
+            }
+            if same {
+                return i as i32;
+            }
+        }
+        i = i + 1;
+    }
+    return -1;
+}
+
+/// 同 `print_fmt`，但支持命名参数 `{name}`。
+///
+/// `args` 是 `NamedArg`（名字 + 值）数组。`{name}` 在 `args[0..nargs]` 里按
+/// 名字查表，取到对应下标；找不到时按字面 `{name}` 输出（不报错——zr 的
+/// 格式化是运行期函数，没有编译期检查能力，静默保留原文比输出错值安全）。
+///
+/// 与 `print_fmt` 唯一的解析差异是 `{` 后跟标识符时先做名字查找；其余
+/// （`{0}` 显式位置、`{}` 隐式位置、`{:x}` 等规格、动态宽度/精度）一致。
+pub fn print_fmt_named(fmt: str, args: *const NamedArg, nargs: usize) {
+    let mut ai = 0;
+    let mut i = 0;
+    while i < fmt.len {
+        let c = fmt.ptr[i];
+        if c == b'{' {
+            // `{{` 是字面的花括号
+            if i + 1 < fmt.len && fmt.ptr[i + 1] == b'{' {
+                write_byte(STDOUT_FD, b'{');
+                i = i + 2;
+                continue;
+            }
+            let mut j = i + 1;
+            let mut argi = ai;
+            let mut explicit = false;
+            // 命名参数 `{name}`：标识符开头。必须在数字检查之前——`{0}`
+            // 的位置开头是数字，`{:x}` 开头是 `:`，都不算标识符。
+            if j < fmt.len && is_ident_start(fmt.ptr[j]) {
+                let name_start = j;
+                while j < fmt.len && is_ident_cont(fmt.ptr[j]) {
+                    j = j + 1;
+                }
+                let idx = find_named_arg(args, nargs, &fmt.ptr[name_start], j - name_start);
+                if idx >= 0 {
+                    argi = idx as usize;
+                    explicit = true;
+                } else {
+                    // 名字没匹配：按字面 `{name}` 输出（`{` + 其余字符走
+                    // 普通字符循环），不要误当隐式位置用下一个参数。
+                    write_byte(STDOUT_FD, b'{');
+                    i = i + 1;
+                    continue;
+                }
+            }
+            if j < fmt.len && is_digit(fmt.ptr[j]) {
+                let mut idx: usize = 0;
+                while j < fmt.len && is_digit(fmt.ptr[j]) {
+                    idx = idx * 10 + ((fmt.ptr[j] - b'0') as usize);
+                    j = j + 1;
+                }
+                argi = idx;
+                explicit = true;
+            }
+            let mut fill: u8 = b' ';
+            let mut align: i32 = ALIGN_DEFAULT;
+            let mut plus = false;
+            let mut alt = false;
+            let mut zero = false;
+            let mut width: usize = 0;
+            let mut prec: i32 = -1;
+            let mut kind: i32 = SPEC_DISPLAY;
+            // 动态宽度 / 动态精度：`{:1$}` / `{:.1$}` 的宽度/精度从参数里取，
+            // 这两个变量存参数下标（-1 = 没写）。
+            let mut width_argi: i32 = -1;
+            let mut prec_argi: i32 = -1;
+            // `{:.*}`：精度取**下一个隐式**参数，值参数再往后挪一位。
+            let mut prec_star = false;
+            if j < fmt.len && fmt.ptr[j] == b':' {
+                j = j + 1;
+                // 填充 + 对齐（填充字符后面必须跟一个对齐符）
+                if j + 1 < fmt.len && is_align(fmt.ptr[j + 1]) {
+                    fill = fmt.ptr[j];
+                    align = align_of(fmt.ptr[j + 1]);
+                    j = j + 2;
+                } else if j < fmt.len && is_align(fmt.ptr[j]) {
+                    align = align_of(fmt.ptr[j]);
+                    j = j + 1;
+                }
+                if j < fmt.len && fmt.ptr[j] == b'+' {
+                    plus = true;
+                    j = j + 1;
+                } else if j < fmt.len && fmt.ptr[j] == b'-' {
+                    j = j + 1;
+                }
+                if j < fmt.len && fmt.ptr[j] == b'#' {
+                    alt = true;
+                    j = j + 1;
+                }
+                if j < fmt.len && fmt.ptr[j] == b'0' {
+                    zero = true;
+                    j = j + 1;
+                }
+                if j < fmt.len && is_digit(fmt.ptr[j]) {
+                    let mut w: usize = 0;
+                    while j < fmt.len && is_digit(fmt.ptr[j]) {
+                        w = w * 10 + ((fmt.ptr[j] - b'0') as usize);
+                        j = j + 1;
+                    }
+                    if j < fmt.len && fmt.ptr[j] == b'$' {
+                        // 动态宽度：`{:1$}` 用第 1 个参数当宽度
+                        width_argi = w as i32;
+                        j = j + 1;
+                    } else {
+                        width = w;
+                    }
+                }
+                if j < fmt.len && fmt.ptr[j] == b'.' {
+                    j = j + 1;
+                    if j < fmt.len && fmt.ptr[j] == b'*' {
+                        prec_star = true;
+                        j = j + 1;
+                    } else {
+                        let mut p: i32 = 0;
+                        // `.` 后面**一个数字都没有**时 Rust 视作"没写精度"
+                        // （`format!("{:.}", 2.5)` == "2.5"），所以只在真读到
+                        // 数字时才置 `prec`。
+                        let mut has_digits = false;
+                        while j < fmt.len && is_digit(fmt.ptr[j]) {
+                            p = p * 10 + ((fmt.ptr[j] - b'0') as i32);
+                            j = j + 1;
+                            has_digits = true;
+                        }
+                        if j < fmt.len && fmt.ptr[j] == b'$' {
+                            // 动态精度：`{:.1$}` 用第 1 个参数当精度
+                            prec_argi = p;
+                            j = j + 1;
+                        } else if has_digits {
+                            prec = p;
+                        }
+                    }
+                }
+                if j < fmt.len {
+                    let t = fmt.ptr[j];
+                    if t == b'?' {
+                        kind = SPEC_DEBUG;
+                        j = j + 1;
+                    } else if t == b'x' {
+                        kind = SPEC_HEX_LOWER;
+                        j = j + 1;
+                    } else if t == b'X' {
+                        kind = SPEC_HEX_UPPER;
+                        j = j + 1;
+                    } else if t == b'b' {
+                        kind = SPEC_BIN;
+                        j = j + 1;
+                    } else if t == b'o' {
+                        kind = SPEC_OCT;
+                        j = j + 1;
+                    } else if t == b'e' {
+                        kind = SPEC_EXP_LOWER;
+                        j = j + 1;
+                    } else if t == b'E' {
+                        kind = SPEC_EXP_UPPER;
+                        j = j + 1;
+                    }
+                }
+            }
+            if j < fmt.len && fmt.ptr[j] == b'}' {
+                // 动态精度/宽度要在写之前从参数里解出来。`.*` 会顺带把
+                // "值"往后推一位，所以先标记值已经定位好，避免末尾再自增。
+                let mut value_ready = false;
+                if prec_star {
+                    if ai < nargs {
+                        prec = args[ai].value.int_value as i32;
+                    }
+                    ai = ai + 1;
+                    if !explicit {
+                        argi = ai;
+                        ai = ai + 1;
+                        value_ready = true;
+                    }
+                }
+                if width_argi >= 0 && (width_argi as usize) < nargs {
+                    width = args[width_argi as usize].value.int_value as usize;
+                }
+                if prec_argi >= 0 && (prec_argi as usize) < nargs {
+                    prec = args[prec_argi as usize].value.int_value as i32;
+                }
+                if argi < nargs {
+                    let mut flags: u64 = 0;
+                    flags = ((kind as u64) << 24) | ((align as u64) << 16) | ((fill as u64) << 8);
+                    if plus { flags = flags | FLAG_PLUS; }
+                    if alt { flags = flags | FLAG_ALT; }
+                    if zero { flags = flags | FLAG_ZERO; }
+                    write_arg(STDOUT_FD, &args[argi].value, flags, width, prec);
+                    if !explicit && !value_ready {
+                        ai = ai + 1;
+                    }
+                }
+                i = j + 1;
+                continue;
+            }
+            // 不是合法的占位符：原样输出
+            write_byte(STDOUT_FD, c);
+            i = i + 1;
+            continue;
+        }
+        if c == b'}' {
+            // `}}` 是字面的花括号
+            if i + 1 < fmt.len && fmt.ptr[i + 1] == b'}' {
+                write_byte(STDOUT_FD, b'}');
+                i = i + 2;
+                continue;
+            }
+            write_byte(STDOUT_FD, c);
+            i = i + 1;
+            continue;
+        }
+        if c == b'\\' {
+            // 转义序列
+            i = i + 1;
+            if i < fmt.len {
+                let e = fmt.ptr[i];
+                if e == b'n' {
+                    write_byte(STDOUT_FD, b'\n');
+                } else if e == b'r' {
+                    write_byte(STDOUT_FD, b'\r');
+                } else if e == b't' {
+                    write_byte(STDOUT_FD, b'\t');
+                } else if e == b'0' {
+                    write_byte(STDOUT_FD, 0);
+                } else if e == b'\\' {
+                    write_byte(STDOUT_FD, b'\\');
+                } else if e == b'"' {
+                    write_byte(STDOUT_FD, b'"');
+                } else if e == b'\'' {
+                    write_byte(STDOUT_FD, b'\'');
+                } else {
+                    // 不认识的转义：原样输出反斜杠与该字符
+                    write_byte(STDOUT_FD, b'\\');
+                    write_byte(STDOUT_FD, e);
+                }
+                i = i + 1;
+            }
+            continue;
+        }
+        write_byte(STDOUT_FD, c);
+        i = i + 1;
+    }
+}
+
+/// 同 `print_fmt_named`，但末尾补一个换行。
+pub fn println_fmt_named(fmt: str, args: *const NamedArg, nargs: usize) {
+    print_fmt_named(fmt, args, nargs);
     write_byte(STDOUT_FD, b'\n');
 }
 
