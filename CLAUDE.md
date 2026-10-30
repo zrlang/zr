@@ -348,8 +348,10 @@ target/debug/zr prog.zr -O1 -o /tmp/prog && /tmp/prog
    定义处立即调用（单态化内联）。**带捕获**闭包仍只支持立即调用——存进变量 /
    当实参 / 返回报 `closures can only be invoked immediately where they are defined`
 3. **`i128` / `u128` 在 64 位目标上不可用**（需寄存器对拆分）
-4. **泛型推断只从实参和期望返回类型推断**，不看用法体
-   （`let v = Vec::new(); v.push(1)` 推不出 `T`，需 `let v: Vec<i32>`）
+4. **泛型推断只从实参和期望返回类型推断**，不看用法体——✅ 已修复（`bab298c`：
+   延迟单态化，`try_instantiate_call` 推不出时留推断变量、等用法体约束；
+   `let v = Vec::new(); v.push(1)` 不再报 `cannot infer type parameter`；
+   `tests/cases/98_generic_infer_usage.zr`，负向 `tests/negative/18_generic_infer_unused.zr`）
 5. **穷尽性报错信息误导**——✅ 已改进（`a526953`：枚举缺臂列出缺失变体名，`17_match_missing_variant.zr`；整型/标量仍保留尾 `_` 臂措辞）
 6. **格式串剩两处**：命名参数 `{name}` 与聚合类型的多行 Debug `{:#?}`
    （标量/字符串的 `{:#?}` 与 `{:?}` 输出一致，符合 Rust；`#` 对 `{:?}`

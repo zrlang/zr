@@ -128,13 +128,16 @@ i64 读，运行期越界 SIGSEGV（`/tmp/sl_bug.zr`）。`let a: []const i64 = 
 
 ### P1-4 泛型推断从用法体推断
 
-现状：`let v = Vec::new(); v.push(1)` 报 `cannot infer type parameter T`（实测），
-`Vec::new()` 的 `T` 无实参可推、需要延迟单态化。
+现状：✅ 已修（`bab298c`）。`try_instantiate_call` 推不出类型参数时留推断变量、
+按它实例化，用法体（`v.push(1)` 把 `Vec<T>` 约束成 `Vec<i32>`）随后把类型定下；
+`check_instance_body` 里若仍停在未解析推断变量（`let v = Vec::new();` 后 `v` 再没
+被用过）才明确报 `cannot infer type parameter`（报在真实调用点）。
+`tests/cases/98_generic_infer_usage.zr`、负向 `tests/negative/18_generic_infer_unused.zr`。
 
 | 子任务 | 内容 | 状态 |
 |---|---|---|
-| P1-4a | 泛型函数调用返回 `Vec<?T>`（`?T` 为推断变量）不立即报错，延迟到后续使用点约束 | ⬜ |
-| P1-4b | 方法调用（`v.push(1)`）把接收者的 `?T` 与实参类型 unify | ⬜ |
+| P1-4a | 泛型函数调用返回 `Vec<?T>`（`?T` 为推断变量）不立即报错，延迟到后续使用点约束 | ✅ `bab298c` |
+| P1-4b | 方法调用（`v.push(1)`）把接收者的 `?T` 与实参类型 unify | ✅ `bab298c` |
 
 ### P1-5 格式串 `{name}` 与 `{:#?}` 聚合
 

@@ -237,6 +237,11 @@ README 里"指针与 unsafe"一节目前是**愿景**：
 - **格式串**：命名参数 `{name}` 与多行 Debug `{:#?}` 没做；`#` 对 `{:?}` 被忽略，只输出一行。
 - **闭包**：**无捕获**闭包已可存进变量/当实参/返回（提升成 `__closure_N` 顶层函数指针）；**带捕获**闭包已可存进变量/嵌套/多次调用（`tests/cases/84_closure_capture_value.zr`），但跨函数传 env 仍有限制。
 - **`i128`/`u128`** 在 64 位目标上不可用（需寄存器对拆分）。
+- **泛型推断**：✅ 已改进（`bab298c`）——`try_instantiate_call` 推不出类型参数时
+  留推断变量、等用法体约束（`let v = Vec::new(); v.push(1)` 不再报
+  `cannot infer type parameter`）；`check_instance_body` 里若仍停在未解析推断变量
+  才报错（`tests/cases/98_generic_infer_usage.zr`，负向
+  `tests/negative/18_generic_infer_unused.zr`）。
 - **穷尽性报错**：✅ 已改进（`a526953`：枚举缺臂列出缺失变体名，`17_match_missing_variant.zr`；整型/标量仍保留尾 `_` 臂措辞）。
 - **文档债**：✅ 已清（`fb4dfb2` 修 `tests/README.md` / `future/README.md`；`1d38ca3` 修 README 安全模型节 / `rust-parity.md` / `CONTRIBUTING.md` / `Cargo.toml` description）。
 
