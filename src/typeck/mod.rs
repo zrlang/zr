@@ -4313,6 +4313,24 @@ impl TypeChecker {
     ) -> Result<HirExpr> {
         let idx = self.check_expr(index, &Ty::Int(64))?;
         let recv_ty = self.infer.resolve(&recv.ty);
+        // `Vec` 之类的"data: *mut T"结构体支持下标：`v[i]` 脱糖成 `v.data[i]`
+        // （指针下标，读/写都走指针算术，元素类型 = `data` 指向的类型）。这样
+        // `Vec<u8>` 就能像 Rust 一样 `v[i]`（读）与 `v[i] = x`（写）。
+        // `net.zr` 靠它加载（`buf[i]` 读 `Vec<u8>`）。
+        if let Ty::Named(id, args) = &recv_ty {
+            let fields = self.struct_field_tys(*id, args);
+            if let Some((_, data_ty, _)) = fields.iter().find(|(n, _, _)| n == "data") {
+                let data_ty = self.infer.resolve(data_ty);
+                if matches!(data_ty, Ty::Pointer(..) | Ty::Reference(..)) {
+                    let data_expr = HirExpr {
+                        kind: ExprKind::Field(Box::new(recv), "data".to_string()),
+                        ty: data_ty.clone(),
+                        span,
+                    };
+                    return self.check_index_scalar(data_expr, index, span);
+                }
+            }
+        }
         // 指针/引用指向聚合时，元素是聚合的**成员**而不是聚合本身：
         // `p: *mut [u8; 16]` 的 `p[k]` 是 `u8`。早先这里直接把 pointee 当
         // 元素类型，于是 `p[k]` 被推断成 `[u8; 16]`，下游按 16 字节步长缩放、

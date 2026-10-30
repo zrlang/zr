@@ -49,7 +49,7 @@ target/debug/zr prog.zr -O1 -o /tmp/prog   # 编译单个程序
   `ld` 直接断言崩溃（`atomShouldReplaceExisting`）。先 `nm` 看目标文件有没有
   重复符号，再下结论。已修复（提交 `1ef4a02`：MIR 按最终符号名去重，保留首个
   用户定义）。
-- 测试：`tests/zr_language.rs` 把 100 个 `tests/cases/*.zr` 各在
+- 测试：`tests/zr_language.rs` 把 101 个 `tests/cases/*.zr` 各在
   `-O0/-O1/-O2/-O3/-Oz` 跑一遍（460 次编译+运行）。退出码 0 = 过，非 0 = 失败（编号指向失败的断言）。
   宿主端另有 `io_print_matches_rust` 等 Rust 对照用例。
 - **没有负向测试机制。** `tests/cases/` 下每个 `.zr` 都必须编译通过并返回 0。
@@ -198,7 +198,7 @@ README 里"指针与 unsafe"一节目前是**愿景**：
 ### `cargo test` 当前基线（2026-10-29，全绿）
 
 - `cargo test --bin zr`：265 项。
-- `cargo test --test zr_language`：100 个用例 × 5 个优化等级 = 500 项，另有 3 个宿主端
+- `cargo test --test zr_language`：101 个用例 × 5 个优化等级 = 505 项，另有 3 个宿主端
   对照用例（`io_print_matches_rust`——逐字符对比 Rust 的格式化输出，含 `{:e}` / `{:E}`
   与大浮点 Display（`|v| ≥ 2⁶⁴` 不带 `.0`）的回归；`extern_c_write_prints_string_literal`；
   `toolchain_subcommands_emit`——`zr fmt` / `zr fmt --check` / `zr pkg init` / `zr lsp`
@@ -259,6 +259,11 @@ README 里"指针与 unsafe"一节目前是**愿景**：
   `cannot infer type parameter`）；`check_instance_body` 里若仍停在未解析推断变量
   才报错（`tests/cases/98_generic_infer_usage.zr`，负向
   `tests/negative/18_generic_infer_unused.zr`）。
+- **`Vec<T>` 下标 `v[i]`**：✅ 已实现——早先 `check_index_scalar` 只认数组/切片/
+  `str`/指针，`v[i]` 报 `cannot index a value of type Vec<u8>`（`net.zr` 的
+  `buf[i]` 因此加载不了）。现在 `v[i]` 脱糖成 `v.data[i]`（`data` 是 `*mut T`
+  字段，指针下标读/写都走指针算术，元素 = `data` 指向的类型）；
+  `tests/cases/101_vec_indexing.zr`（读/写、`i64` 元素宽度）。
 - **穷尽性报错**：✅ 已改进（`a526953`：枚举缺臂列出缺失变体名，`17_match_missing_variant.zr`；整型/标量仍保留尾 `_` 臂措辞）。
 - **文档债**：✅ 已清（`fb4dfb2` 修 `tests/README.md` / `future/README.md`；`1d38ca3` 修 README 安全模型节 / `rust-parity.md` / `CONTRIBUTING.md` / `Cargo.toml` description）。
 

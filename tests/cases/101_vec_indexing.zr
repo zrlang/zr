@@ -1,0 +1,32 @@
+// 覆盖：`Vec<T>` 的下标 `v[i]`（读与写）。
+//
+// 早先 `Vec` 不支持 `[]`：`check_index_scalar` 只认数组/切片/`str`/指针，`v[i]`
+// 报 `cannot index a value of type Vec<u8>`（`net.zr` 的 `buf[i]` 因此加载不了）。
+// 现在 `v[i]` 脱糖成 `v.data[i]`（`data` 是 `*mut T` 字段，指针下标读/写都走
+// 指针算术），元素类型 = `data` 指向的类型。
+use collections::Vec;
+
+fn main() -> i32 {
+    // 1. 读：push 三个元素后下标读。
+    let mut v = Vec::with_capacity(8);
+    v.push(10u8);
+    v.push(20u8);
+    v.push(30u8);
+    if v[0] != 10 { return 1; }
+    if v[2] != 30 { return 2; }
+
+    // 2. 写：`v[i] = x` 走 `data` 指针写回，再读回验证。
+    v[1] = 99;
+    if v[1] != 99 { return 3; }
+
+    // 3. `i64` 元素（非字节）：验证元素宽度（`data` 指针按元素类型缩放）。
+    let mut w = Vec::with_capacity(4);
+    w.push(1000i64);
+    w.push(2000i64);
+    if w[0] != 1000 { return 4; }
+    if w[1] != 2000 { return 5; }
+    w[0] = 7000;
+    if w[0] != 7000 { return 6; }
+
+    return 0;
+}
