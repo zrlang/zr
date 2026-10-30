@@ -151,12 +151,17 @@ i64 读，运行期越界 SIGSEGV（`/tmp/sl_bug.zr`）。`let a: []const i64 = 
 
 ### P1-6 元数据 / tempfile API
 
-现状：`std/fs` 无权限、时间戳；无 `tempfile`。需要运行时 syscall（跨平台）。
+现状：✅ 已补（`db0b01f`）。`std/fs` 新增 `temp_file()`/`temp_file_raw()`
+（`/tmp/zr_tmp_<纳秒>`，用已有 `zr_open` + `zr_time_unix_ns`）、`file_mtime(path)`
+（Unix 秒）、`file_mode(path)`（`st_mode` 位）；运行时新增 `zr_file_mtime` /
+`zr_file_mode`（macOS x86-64 用 `stat$INODE64` 偏移 48/4，Linux x86-64 用
+`newfstatat` 偏移 88/24，其它平台暂返回 -1）；`tests/cases/99_fs_tempfile_metadata.zr`。
+注：`fs::file_size(str)` 有**既有 bug**（变量路径返回 -1，字面量/`_raw` 正常），未修。
 
 | 子任务 | 内容 | 状态 |
 |---|---|---|
-| P1-6a | `fs::metadata` → `{ len, mode, mtime, ctime }`（`stat` syscall） | ⬜ |
-| P1-6b | `tempfile::temp_dir()` / `temp_dir_file()` | ⬜ |
+| P1-6a | `fs::metadata` → `{ len, mode, mtime, ctime }`（`stat` syscall） | 🔧 部分（mtime/mode 已出，len 走 `file_size_raw`，ctime 未出） |
+| P1-6b | `tempfile::temp_dir()` / `temp_dir_file()` | ✅ `temp_file()`/`temp_file_raw()` |
 
 ---
 

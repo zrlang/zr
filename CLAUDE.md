@@ -357,7 +357,12 @@ target/debug/zr prog.zr -O1 -o /tmp/prog && /tmp/prog
    （标量/字符串的 `{:#?}` 与 `{:?}` 输出一致，符合 Rust；`#` 对 `{:?}`
    只对聚合有影响，而聚合 Debug 还未实现）；其余规格已与 Rust 逐字符对齐
 7. **`Option` / `Result`（含变体 `Some` / `None` / `Ok` / `Err`）已在 prelude**——✅ 已实现（`4ed15d7`），无需显式 `use core::Option;`
-8. **无元数据 / 临时文件 API**：权限、时间戳、`tempfile` 缺失
+8. **无元数据 / 临时文件 API**——✅ 已修复（`db0b01f`）：`std/fs` 新增
+   `temp_file()` / `temp_file_raw()`（`/tmp/zr_tmp_<纳秒>`，用已有 `zr_open` +
+   `zr_time_unix_ns`）、`file_mtime(path)`（Unix 秒）、`file_mode(path)`（`st_mode` 位）；
+   运行时新增 `zr_file_mtime` / `zr_file_mode`（macOS x86-64 用 `stat$INODE64` 的
+   偏移 48 / 4；Linux x86-64 用 `newfstatat` 的偏移 88 / 24；其它平台暂返回 -1）；
+   新增 `tests/cases/99_fs_tempfile_metadata.zr`
 
 ### P2 — 工具链与生态
 
