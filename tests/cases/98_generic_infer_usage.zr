@@ -1,0 +1,75 @@
+//=============================================================================
+// 泛型推断从用法体反推（P1-4）
+//
+// 早先 `try_instantiate_call` 只从**实参**和**期望返回类型**推类型参数，推不出
+// 就报 `cannot infer type parameter`。于是常见 Rust 写法
+//   let v = Vec::new();
+//   v.push(1);            // 用法体把 `T` 约束成 `i32`
+// 编译失败——`Vec::new()` 的 `T` 在调用点（`let` 无注解、RHS 期望类型是未解
+// 推断变量）推不出来。
+//
+// 现在：推不出时先留一个推断变量、按它实例化，等用法体（`push` 的参数把
+// `Vec<T>` 约束成 `Vec<i32>`）把类型定下来；`check_instance_body` 里若仍停在
+// 未解析推断变量（`let v = Vec::new();` 后 `v` 再没被用过）则明确报
+// `cannot infer type parameter`。
+//
+// 本用例全部必须在 `-O0..-O3/-Oz` 下编译并返回 0。
+//=============================================================================
+
+use collections::Vec;
+
+// 通用：`new()` 后 `push`/`get` 约束 `T`。
+fn deferred_from_usage() -> i32 {
+    let v = Vec::new();
+    v.push(1);
+    v.push(2);
+    v.push(3);
+    let n = v.len();
+    if n != 3 { return 1; }
+    let s = v.get(0) + v.get(1) + v.get(2);
+    if s != 6 { return 2; }   // 1+2+3
+    return 0;
+}
+
+// 期望返回类型直接定下 `T`（原来就能过，防回归）。
+fn from_expected() -> i32 {
+    let v: Vec<i32> = Vec::new();
+    v.push(5);
+    if v.get(0) != 5 { return 3; }
+    return 0;
+}
+
+// 非默认整型元素（`i64`）也要能反推（注：字面量默认 `i32`，需写 `1i64`；
+// 早先 `Vec<str>` 有独立 bug——显式注解也崩，不在本特性范围）。
+fn deferred_i64() -> i32 {
+    let s = Vec::new();
+    s.push(1i64);
+    s.push(2i64);
+    if s.len() != 2 { return 4; }
+    if s.get(0) != 1i64 || s.get(1) != 2i64 { return 7; }
+    return 0;
+}
+
+// 泛型自由函数：参数推不出来时靠返回值用法约束。
+fn first<T>(x: T, y: T) -> T { return x; }
+
+fn via_method_usage() -> i32 {
+    let z = first(7, 8);        // T 从实参推出 i32（原来就能过）
+    if z != 7 { return 5; }
+    let mut acc: i64 = 0;
+    acc = acc + z;
+    if acc != 7 { return 6; }
+    return 0;
+}
+
+fn main() -> i32 {
+    let r1 = deferred_from_usage();
+    if r1 != 0 { return r1; }
+    let r2 = from_expected();
+    if r2 != 0 { return r2; }
+    let r3 = deferred_i64();
+    if r3 != 0 { return r3; }
+    let r4 = via_method_usage();
+    if r4 != 0 { return r4; }
+    return 0;
+}

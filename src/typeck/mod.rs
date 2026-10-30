@@ -315,6 +315,8 @@ struct MonoInstance {
     id: DefId,
     /// 泛型参数名 → 具体类型。
     subst: Vec<(String, Ty)>,
+    /// 实例化发生处的源码位置（`cannot infer type parameter` 报在这）。
+    span: ast::Span,
 }
 
 impl Default for TypeChecker {
@@ -6483,11 +6485,12 @@ impl TypeChecker {
             match subst.get(n) {
                 Some(t) => ordered.push(self.infer.resolve(t)),
                 None => {
-                    return Err(CompileError::type_error(format!(
-                        "cannot infer type parameter `{n}` for `{}`",
-                        ast_fn.name
-                    ))
-                    .with_span(span))
+                    // P1-4：从实参/期望类型推不出该类型参数时，先留一个推断
+                    // 变量、按它实例化，等用法体（`let v = Vec::new();
+                    // v.push(1)` 里的 `push` 把 `T` 约束成 `i32`）把它定下来。
+                    // 早先这里直接报 `cannot infer type parameter`，让常见
+                    // Rust 写法（先 `new()` 再 `push`）编译失败。
+                    ordered.push(self.infer.fresh_infer(span));
                 }
             }
         }
@@ -6554,6 +6557,7 @@ impl TypeChecker {
             base,
             id,
             subst: subst.clone(),
+            span,
         });
         let sig = self.build_instance_signature(ast_fn, id, &subst)?;
         self.functions.insert(id, sig);
@@ -6603,6 +6607,22 @@ impl TypeChecker {
         let Some(ast_fn) = self.generic_asts.get(&inst.base).cloned() else {
             return Ok(());
         };
+        // P1-4：泛型实例的类型参数若仍是未解析的推断变量，说明调用点既没从
+        // 实参/期望类型推出、也没被用法体约束（`let v = Vec::new();` 之后 `v`
+        // 再没被用过，`T` 无从定下）。早先把 `Vec::new()` 直接报
+        // `cannot infer type parameter`；现在留推断变量等用法体，到这里仍是
+        // 未解析就明确报错，别让后端把 `_` 当 i64 编出错误程序。
+        for (_, ty) in &inst.subst {
+            if ty_has_unresolved_infer(ty, &self.infer.vars) {
+                let name = self.generic_names.get(&inst.base).map(|ns| ns.join(", ")).unwrap_or_default();
+                return Err(CompileError::type_error(format!(
+                    "cannot infer type parameter{} for `{}`",
+                    if name.is_empty() { String::new() } else { format!(" `{name}`") },
+                    ast_fn.name
+                ))
+                .with_span(inst.span));
+            }
+        }
         let saved_types = std::mem::take(&mut self.type_params);
         let saved_scopes = std::mem::take(&mut self.local_scopes);
         let saved_stack = std::mem::take(&mut self.scope_stack);

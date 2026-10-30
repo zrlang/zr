@@ -1,0 +1,14 @@
+// 负向用例：`Vec::new()` 的类型参数 `T` 既没从实参/期望类型推出、也没被用法体
+// 约束，必须明确报错（P1-4 延迟单态化：推不出时先留推断变量，函数体检查完仍
+// 停在未解析推断变量就报 `cannot infer type parameter`）。早先把 `Vec::new()`
+// 在调用点直接报错，导致 `let v = Vec::new(); v.push(1);` 这种常见写法失败；
+// 现在改成延迟推断，但**真正推不出**（`v` 之后再没被用过）仍要拦下，不能
+// 让后端把 `_` 当 i64 编出错误程序。
+//
+// expect: cannot infer type parameter
+use collections::Vec;
+
+fn main() -> i32 {
+    let v = Vec::new();
+    return 0;
+}
