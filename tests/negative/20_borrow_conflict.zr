@@ -1,0 +1,13 @@
+// 负向用例：借用检查——同一位置的可变借用不能与已有借用重叠。
+// `let r1 = &mut x; let r2 = &mut x;` 里 r1 的 `&mut x` 存活到作用域结束
+// （绑定到 let），r2 的 `&mut x` 与它重叠，必须报错（Rust 的 E0499）。
+// 早先 `infer.rs::check_borrows` 是空壳，这种代码能编译，`r2` 静默拿到
+// 与 r1 指向同一位置的另一个可变引用，改一处等于改两处。
+//
+// expect: cannot borrow `x` as mutable while already borrowed as mutable
+fn main() -> i32 {
+    let mut x = 0;
+    let r1 = &mut x;
+    let r2 = &mut x;
+    return 0;
+}

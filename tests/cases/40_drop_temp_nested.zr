@@ -7,7 +7,7 @@
 
 struct Res {
     id: i32,
-    log: &mut i32,
+    log: *mut i32,
 }
 
 impl Drop for Res {
@@ -16,11 +16,11 @@ impl Drop for Res {
     }
 }
 
-fn nested_return(log: &mut i32) -> i32 {
+fn nested_return(log: *mut i32) -> i32 {
     return Res { id: 9, log }.id;
 }
 
-fn tail_expr(log: &mut i32) -> i32 {
+fn tail_expr(log: *mut i32) -> i32 {
     Res { id: 10, log }.id
 }
 

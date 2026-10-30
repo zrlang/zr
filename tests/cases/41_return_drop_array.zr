@@ -7,7 +7,7 @@
 
 struct Res {
     id: i32,
-    log: &mut i32,
+    log: *mut i32,
 }
 
 impl Drop for Res {
@@ -16,12 +16,12 @@ impl Drop for Res {
     }
 }
 
-fn make(log: &mut i32) -> [Res; 2] {
+fn make(log: *mut i32) -> [Res; 2] {
     let a = [Res { id: 1, log }, Res { id: 2, log }];
     return a;
 }
 
-fn make_tail(log: &mut i32) -> [Res; 2] {
+fn make_tail(log: *mut i32) -> [Res; 2] {
     [Res { id: 3, log }, Res { id: 4, log }]
 }
 

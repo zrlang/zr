@@ -6,7 +6,7 @@
 
 struct Res {
     id: i32,
-    log: &mut i32,
+    log: *mut i32,
 }
 
 impl Drop for Res {

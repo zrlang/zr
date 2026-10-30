@@ -100,9 +100,27 @@ fn find_loop_ctx(ctxs: &[LoopBreakCtx], label: Option<&str>) -> Option<usize> {
     }
 }
 
+/// 一次借用记录（借用检查用）。
+#[derive(Debug, Clone)]
+struct BorrowRecord {
+    /// 规范化的借用位置（`x` / `x.field`）。`&mut x[0]` 这类无法稳定
+    /// 跟踪下标的位置返回 `None`，跳过（不误报）。
+    place: String,
+    /// 是否 `&mut`（可变借用独占，`&` 共享）。
+    mutable: bool,
+    /// 创建时的作用域深度（`pop_scope` 清到该深度时借用失效）。
+    depth: usize,
+    /// 是否绑定到 `let` 变量。为真时借用存活到作用域结束；为假（临时借用）
+    /// 在语句结束时释放。
+    let_bound: bool,
+    /// 借用来源表达式的位置。同一 AST 节点被类型检查**重查**（如未标注
+    /// 构造器的 `check_ctor_args` 第二遍）时按 `(place, span)` 去重，避免
+    /// 把同一次借用记成两次而误报冲突。
+    span: ast::Span,
+}
+
 /// 类型检查器。
-#[derive(Debug)]
-pub struct TypeChecker {
+#[derive(Debug)]pub struct TypeChecker {
     /// 目标允许的最大整数位宽（默认 128，即不额外限制）。
     max_int_bits: u16,
     /// 目标指针位宽（默认 64）；`usize` / `isize` 按它展开。
@@ -212,6 +230,19 @@ pub struct TypeChecker {
     scope_depth: usize,
     /// 作用域栈：每层记录在该层引入的局部变量。
     scope_stack: Vec<Vec<LocalId>>,
+    /// 当前活跃的借用（借用检查：`&mut` 独占、`&` 可共享）。
+    ///
+    /// **词法作用域近似**：一次借用 `&x` / `&mut x` 从创建点存活到所在块
+    /// 结束（`pop_scope` 时按深度清除），而不是 NLL 的"到最后一次使用"。
+    /// 因此 `let r = &mut x; use r; use x;`（同一块内 `r` 的最后使用之后又
+    /// 用 `x`）会被误报——这是本最小版的已知限制，后续用活跃分析（last
+    /// use）收紧。这里先做无假阴性（不漏报真冲突）、接受可能假阳性。
+    live_borrows: Vec<BorrowRecord>,
+    /// 是否正在检查 `let` 的初始化表达式。为真时创建的借用标记为
+    /// `let_bound`（绑定到变量，存活到作用域结束）；为假时是**临时借用**
+    /// （调用实参 / 临时结构体字段），在语句结束时释放——这正是
+    /// `foo(&mut x); foo(&mut x);` 连续两句合法的关键（NLL 语义）。
+    in_let_init: bool,
     /// 词法作用域栈：每层是"名字 → DefId"的绑定表。
     ///
     /// 与 `scope_stack` 同步 push/pop，用于把源码里的标识符解析到
@@ -362,6 +393,8 @@ impl Default for TypeChecker {
             next_local: 1,
             next_bb: 0,
             scope_depth: 0,
+            live_borrows: Vec::new(),
+            in_let_init: false,
             scope_stack: Vec::new(),
             local_scopes: Vec::new(),
             locals_by_def: HashMap::new(),
@@ -1863,6 +1896,7 @@ impl TypeChecker {
             self.current_function = Some(id);
             self.current_is_async = f.is_async;
             self.scope_stack.clear();
+            self.live_borrows.clear();
             self.push_scope();
 
             // 函数体按 async fn 的真实输出类型检查；对外签名仍是 Future。
@@ -1951,7 +1985,17 @@ impl TypeChecker {
         self.moving_now.clear();
         let mut stmts = Vec::new();
         for s in &b.stmts {
+            let borrow_start = self.live_borrows.len();
             stmts.push(self.check_stmt(s)?);
+            // 借用检查：释放本语句创建的**临时**借用（未绑定到 `let`）。
+            // `foo(&mut x);` 的 `&mut x` 是调用实参临时量，语句结束即失效，
+            // 所以 `foo(&mut x); foo(&mut x);` 连续两句合法。绑定到 `let`
+            // 的借用（`let r = &mut x;`）不被释放，存活到作用域结束。
+            while self.live_borrows.len() > borrow_start
+                && !self.live_borrows.last().unwrap().let_bound
+            {
+                self.live_borrows.pop();
+            }
         }
         let diverges = block_diverges(b);
         let tail = if let Some(t) = &b.tail {
@@ -2033,7 +2077,15 @@ impl TypeChecker {
                     }
                     let h = match (pre_checked, ty_ann) {
                         (Some(h), _) => h,
-                        (None, _) => self.check_expr(e, &ty)?,
+                        (None, _) => {
+                            // 借用检查：`let r = &mut x` 的 `&mut x` 绑定到 r，
+                            // 存活到作用域结束；`let r = Res { log: &mut log }`
+                            // 里的 `&mut log` 同样绑定到 r。
+                            self.in_let_init = true;
+                            let h = self.check_expr(e, &ty)?;
+                            self.in_let_init = false;
+                            h
+                        }
                     };
                     // 从 `moving_now` 取出并登记为已移动。
                     if let Expression::Variable(name, _) = e {
@@ -2492,6 +2544,46 @@ impl TypeChecker {
                 });
             }
             Expression::AddrOf(e, m, _) => {
+                // 借用检查：记录这次借用并检测与已有借用的冲突。`&mut` 独占，
+                // `&` 可共享；同一位置 `&`+`&mut` 或 `&mut`+`&mut` 重叠即报。
+                //
+                // `&mut x` 被强转成裸指针（`*mut T`，如 `Res { p: &mut x }`
+                // 且 `p: *mut i32`）时**立即释放借用**——裸指针不参与借用
+                // 检查（与 Rust 的 `&mut T` → `*mut T` 强转一致）。只有
+                // `&mut` / `&` 引用（`Ty::Reference`）才持有借用。
+                let mutable = matches!(m, ast::Mutability::Mutable);
+                if let Some(place) = borrow_place_of(e) {
+                    let coerced_to_raw =
+                        matches!(self.infer.resolve(expected), Ty::Pointer(..));
+                    if !coerced_to_raw {
+                        // 同一 AST 借用节点被重查（`check_ctor_args` 第二遍）
+                        // 时已记过，直接跳过，不再重复记、也不重复比冲突。
+                        let already = self
+                            .live_borrows
+                            .iter()
+                            .any(|b| b.place == place && b.span == span);
+                        if !already {
+                            for b in &self.live_borrows {
+                                if b.place == place && (b.mutable || mutable) {
+                                    return Err(CompileError::new(format!(
+                                        "cannot borrow `{}` as {} while already borrowed as {}",
+                                        place,
+                                        if mutable { "mutable" } else { "immutable" },
+                                        if b.mutable { "mutable" } else { "immutable" },
+                                    ))
+                                    .with_span(span));
+                                }
+                            }
+                            self.live_borrows.push(BorrowRecord {
+                                place,
+                                mutable,
+                                depth: self.scope_depth,
+                                let_bound: self.in_let_init,
+                                span,
+                            });
+                        }
+                    }
+                }
                 let inner = self.check_expr(e, &Ty::Infer(InferId(0)))?;
                 reject_float_address(&self.infer, &inner.ty, span)?;
                 let ty = Ty::Pointer(Box::new(inner.ty.clone()), *m);
@@ -2504,6 +2596,24 @@ impl TypeChecker {
             Expression::Cast(e, target, _) => {
                 let target_ty = self.ast_to_hir_type(target)?;
                 let inner = self.check_expr(e, &Ty::Infer(InferId(0)))?;
+                // `&mut x as *mut T`：显式强转裸指针时立即释放借用（裸指针
+                // 不参与借用检查）。`&mut x` 在 AddrOf 处因为操作数的期望类型
+                // 是推断变量（`as` 的操作数），被当成引用记录了借用；这里目标
+                // 是裸指针、操作数是取地址，就把刚记的借用弹出。
+                if matches!(self.infer.resolve(&target_ty), Ty::Pointer(..)) {
+                    // `e` 是 `&mut drops`（AddrOf），穿透取它的借用位置。
+                    let place = match e.as_ref() {
+                        Expression::AddrOf(inner, ..) => borrow_place_of(inner),
+                        _ => borrow_place_of(e),
+                    };
+                    if let Some(place) = place {
+                        if let Some(last) = self.live_borrows.last() {
+                            if last.place == place && last.depth == self.scope_depth {
+                                self.live_borrows.pop();
+                            }
+                        }
+                    }
+                }
                 self.validate_cast(&inner.ty, &target_ty, span)?;
                 // 操作数必须保留。早先这里只做类型检查就把表达式扔了，
                 // HIR 里只剩下目标类型，`x as i32` 到 MIR 就变成了 Unit。
@@ -8447,6 +8557,9 @@ impl TypeChecker {
         }
         self.local_scopes.pop();
         self.scope_depth = self.scope_depth.saturating_sub(1);
+        // 借用检查：本块（以及更深的块）里创建的借用随作用域结束失效。
+        // 深度大于当前深度的借用都属于被弹掉的块。
+        self.live_borrows.retain(|b| b.depth <= self.scope_depth);
     }
 
     /// 在当前作用域里绑定一个局部变量名，返回它的 `DefId`。
@@ -9435,6 +9548,22 @@ fn block_diverges(b: &AstBlock) -> bool {
             matches!(e, Expression::Return(..) | Expression::Throw(..))
         }
         _ => false,
+    }
+}
+
+/// 从取地址的操作数里提取规范化的借用位置。
+///
+/// `&x` → `"x"`，`&x.field` → `"x.field"`。返回 `None` 表示无法稳定跟踪
+/// 的位置（如 `&mut arr[i]` 的下标、`&*p` 的解引用、临时值），跳过借用
+/// 检查——不误报。取地址的目标必须是"位置"（place），不能是临时值。
+fn borrow_place_of(e: &Expression) -> Option<String> {
+    match e {
+        Expression::Variable(name, _) => Some(name.clone()),
+        Expression::Path(segs, _) => Some(segs.join("::")),
+        Expression::Field(base, field, _) => Some(format!("{}.{}", borrow_place_of(base)?, field)),
+        // 下标 / 调用 / 一元（含 `*p` 解引用）都不是稳定可跟踪的位置。
+        Expression::Index(..) | Expression::Call(..) | Expression::Unary(..) => None,
+        _ => None,
     }
 }
 
