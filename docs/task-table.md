@@ -233,7 +233,7 @@ i64 读，运行期越界 SIGSEGV（`/tmp/sl_bug.zr`）。`let a: []const i64 = 
 | P1-1b Hash 元组按内容 | `29fc950` 后 | ✅ |
 | P1-1b Hash 数组按内容 | `caab7a0` | ✅ |
 | P1-1b Hash `str`/切片按内容 | `41ec8f4` | ✅ |
-| P1-1c Debug 方法体 | 本次（未提交） | ✅ |
+| P1-1c Debug 方法体 | `01ae31d` | ✅ |
 | P0-4 str/切片字段布局 | `1161b65` | ✅ |
 | P0-5 切片字段按期望收窄 | `273d6f4` | ✅ |
 | P0-6 `loop` 带值 break | `87ef09a` | ✅ |
