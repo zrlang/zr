@@ -15,6 +15,7 @@
 // 线程安全：本模块所有类型均非线程安全；并发访问需由调用者加锁。
 //=============================================================================
 
+use collections::Vec;
 use core::{
     Option, Result, panic,
     zr_alloc, zr_dealloc,
@@ -374,7 +375,7 @@ impl Ipv6Addr {
 
 /// 通用的套接字地址存储（结构体对齐到 28 字节，兼容 sockaddr_storage）。
 /// 布局：第 0 字节 = 家族标签（0=V4, 1=V6），后续为地址字节与端口。
-#[repr(C, align(4))]
+#[repr(C, align = 4)]
 pub struct SockAddrStorage {
     /// 第 0 字节：0 = V4，1 = V6。
     pub family: u8,
@@ -700,7 +701,7 @@ impl Socket {
             AddrFamily::V4 => AddrFamily::V4,
             AddrFamily::V6 => AddrFamily::V6,
         };
-        let addr = SocketAddr::from_storage(&s).unwrap_or_else(
+        let addr = SocketAddr::from_storage(&s).unwrap_or(
             SocketAddr::V4(Ipv4Addr::localhost(), 0)
         );
         let _ = fam;
@@ -967,7 +968,7 @@ impl UdpSocket {
         if n < 0 {
             return Result::Err(NetError::from_errno());
         }
-        let addr = SocketAddr::from_storage(&s).unwrap_or_else(
+        let addr = SocketAddr::from_storage(&s).unwrap_or(
             SocketAddr::V4(Ipv4Addr::localhost(), 0)
         );
         return Result::Ok((n as usize, addr));
