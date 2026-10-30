@@ -775,6 +775,56 @@ zr_file_size:
     ret
 
 #------------------------------------------------------------------------------
+# zr_file_mtime(path) -> i64
+#   rdi = path（NUL 结尾）
+# 返回最后修改时间（Unix 秒）；不存在或出错返回 -1。
+# Linux x86-64 `struct stat`：st_mtim.tv_sec 在偏移 88。
+#------------------------------------------------------------------------------
+    .globl zr_file_mtime
+zr_file_mtime:
+    subq    $160, %rsp
+    leaq    0(%rsp), %rdx      # statbuf
+    movq    %rdi, %rsi         # path
+    movq    $-100, %rdi        # AT_FDCWD
+    xorq    %r10, %r10         # flags = 0
+    movq    $262, %rax         # SYS_newfstatat
+    syscall
+    testq   %rax, %rax
+    jnz     .fmtime_err
+    movq    88(%rsp), %rax    # st_mtim.tv_sec
+    jmp     .fmtime_done
+.fmtime_err:
+    movq    $-1, %rax
+.fmtime_done:
+    addq    $160, %rsp
+    ret
+
+#------------------------------------------------------------------------------
+# zr_file_mode(path) -> i64
+#   rdi = path（NUL 结尾）
+# 返回 st_mode（含类型位与权限位）；不存在或出错返回 -1。
+# Linux x86-64 `struct stat`：st_mode 在偏移 24（uint32）。
+#------------------------------------------------------------------------------
+    .globl zr_file_mode
+zr_file_mode:
+    subq    $160, %rsp
+    leaq    0(%rsp), %rdx      # statbuf
+    movq    %rdi, %rsi         # path
+    movq    $-100, %rdi        # AT_FDCWD
+    xorq    %r10, %r10         # flags = 0
+    movq    $262, %rax         # SYS_newfstatat
+    syscall
+    testq   %rax, %rax
+    jnz     .fmode_err
+    movl    24(%rsp), %eax    # st_mode
+    jmp     .fmode_done
+.fmode_err:
+    movq    $-1, %rax
+.fmode_done:
+    addq    $160, %rsp
+    ret
+
+#------------------------------------------------------------------------------
 # zr_readdir_count(path) -> i64
 #   rdi = path（NUL 结尾）
 # 打开目录并用 getdents64 枚举，返回条目数（不含 "." 与 ".."）；

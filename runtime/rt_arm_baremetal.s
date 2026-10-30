@@ -267,7 +267,24 @@ zr_file_size:
     mvn     r0, #0
     bx      lr
 
-    .globl zr_readdir_count
+    #------------------------------------------------------------------------------
+# zr_file_mtime(path) -> i64
+#   该平台未实现，返回 -1（与 zr_file_size 的空实现一致）。
+#------------------------------------------------------------------------------
+    .globl zr_file_mtime
+zr_file_mtime:
+    mvn     r0, #0
+    bx      lr
+
+#------------------------------------------------------------------------------
+# zr_file_mode(path) -> i64
+#   该平台未实现，返回 -1（与 zr_file_size 的空实现一致）。
+#------------------------------------------------------------------------------
+    .globl zr_file_mode
+zr_file_mode:
+    mvn     r0, #0
+    bx      lr
+.globl zr_readdir_count
 zr_readdir_count:
     mvn     r0, #0
     bx      lr

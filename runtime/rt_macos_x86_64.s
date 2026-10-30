@@ -740,6 +740,56 @@ _zr_file_size:
     ret
 
 #------------------------------------------------------------------------------
+# zr_file_mtime(path) -> i64
+#   返回最后修改时间（Unix 秒）；不存在或出错返回 -1。
+#   macOS `struct stat`：st_mtimespec 在偏移 48（tv_sec 8 字节 + tv_nsec 8 字节）。
+#------------------------------------------------------------------------------
+    .globl _zr_file_mtime
+_zr_file_mtime:
+    push    rbp
+    mov     rbp, rsp
+    and     rsp, -16
+    sub     rsp, 144
+    mov     rsi, rsp
+    call    _stat$INODE64
+    test    eax, eax
+    jnz     .fmtime_err
+    mov     rax, qword ptr [rsp+48]    // st_mtimespec.tv_sec
+    jmp     .fmtime_done
+.fmtime_err:
+    mov     rax, -1
+.fmtime_done:
+    add     rsp, 144
+    mov     rsp, rbp
+    pop     rbp
+    ret
+
+#------------------------------------------------------------------------------
+# zr_file_mode(path) -> i64
+#   返回 st_mode（含类型位与权限位）；不存在或出错返回 -1。
+#   macOS `struct stat`：st_mode 在偏移 4（uint16，零扩展到 64 位）。
+#------------------------------------------------------------------------------
+    .globl _zr_file_mode
+_zr_file_mode:
+    push    rbp
+    mov     rbp, rsp
+    and     rsp, -16
+    sub     rsp, 144
+    mov     rsi, rsp
+    call    _stat$INODE64
+    test    eax, eax
+    jnz     .fmode_err
+    movzx   eax, word ptr [rsp+4]      // st_mode
+    jmp     .fmode_done
+.fmode_err:
+    mov     rax, -1
+.fmode_done:
+    add     rsp, 144
+    mov     rsp, rbp
+    pop     rbp
+    ret
+
+#------------------------------------------------------------------------------
 # zr_readdir_count(path) -> i64
 #   目录项个数；出错返回 -1。（包含 "." 与 ".."）
 #------------------------------------------------------------------------------

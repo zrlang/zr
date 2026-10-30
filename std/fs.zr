@@ -14,9 +14,15 @@
 //   fs::read_dir_count(path)      -> i64    条目个数（不含 "." / ".."）
 //   fs::read_dir_name(path, i, buf, cap) -> i64  第 i 项名字长度，出错 -1
 //   fs::current_dir(buf, cap)     -> i64    当前目录长度，出错 -1
+//   fs::temp_file()               -> io::File  创建临时文件（可写），fd 或 -1
+//   fs::temp_file_raw()           -> i32    临时文件 fd，出错 -1
+//   fs::file_mtime(path)          -> i64    修改时间（Unix 秒），出错 -1
+//   fs::file_mode(path)           -> i64    mode 位（st_mode），出错 -1
 //
 // 目录遍历跳过 "." 与 ".."：下标 0..count-1 直接对应真实条目。
 //=============================================================================
+
+use io::{File, FILE_WRITE};
 
 //----- 外部运行时 -------------------------------------------------------------
 
@@ -58,6 +64,22 @@ extern "C" {
 
 extern "C" {
     fn zr_getcwd(buf: *mut u8, cap: usize) -> i64;
+}
+
+extern "C" {
+    fn zr_time_unix_ns() -> i64;
+}
+
+extern "C" {
+    fn zr_open(path: *const u8, mode: i32) -> isize;
+}
+
+extern "C" {
+    fn zr_file_mtime(path: *const u8) -> i64;
+}
+
+extern "C" {
+    fn zr_file_mode(path: *const u8) -> i64;
 }
 
 //----- 辅助 -------------------------------------------------------------------
@@ -179,6 +201,84 @@ pub fn current_dir(buf: *mut u8, cap: usize) -> i64 {
     return zr_getcwd(buf, cap);
 }
 
+//----- 临时文件 ---------------------------------------------------------------
+//
+// 没有 `TMPDIR` 环境变量接口，固定用 `/tmp`。名字 = `/tmp/zr_tmp_<纳秒时间戳>`，
+// 纳秒级时间戳碰撞概率极低；`zr_open` 的 `FILE_WRITE` 模式是
+// `O_WRONLY|O_CREAT|O_TRUNC`，名字唯一所以不会截断到已存在的文件。
+
+/// 把 `v` 的十进制数字写进 `buf[pos..]`，返回写后的位置。
+fn append_u64(buf: *mut u8, pos: usize, mut v: u64) -> usize {
+    let mut tmp: [u8; 20] = [0; 20];
+    let mut n: usize = 0;
+    if v == 0 {
+        tmp[0] = 48;
+        n = 1;
+    } else {
+        while v > 0 {
+            tmp[n] = ((v % 10) as u8 + 48) as u8;
+            v = v / 10;
+            n = n + 1;
+        }
+    }
+    let mut i: usize = 0;
+    while i < n {
+        buf[pos + i] = tmp[n - 1 - i];
+        i = i + 1;
+    }
+    return pos + n;
+}
+
+/// 创建临时文件，返回文件描述符（可写）；失败返回 -1。
+pub fn temp_file_raw() -> i32 {
+    let mut buf: [u8; 256] = [0; 256];
+    let mut i: usize = 0;
+    let prefix: str = "/tmp/zr_tmp_";
+    while i < prefix.len {
+        buf[i] = prefix.ptr[i];
+        i = i + 1;
+    }
+    let ns = zr_time_unix_ns();
+    if ns < 0 {
+        return -1;
+    }
+    i = append_u64(&mut buf[0], i, ns as u64);
+    buf[i] = 0;
+    let fd = zr_open(&buf[0] as *const u8, FILE_WRITE);
+    if fd < 0 {
+        return -1;
+    }
+    return fd as i32;
+}
+
+/// 创建临时文件并包装成 `io::File`；`is_ok()` 判断是否成功。
+pub fn temp_file() -> File {
+    return File { fd: temp_file_raw() };
+}
+
+//----- 元数据 ---------------------------------------------------------------
+//
+// `st_mtimespec.tv_sec`（Unix 秒）与 `st_mode` 由运行时的 `zr_file_mtime` /
+// `zr_file_mode` 提供；`st_mode` 的低 12 位是权限位，高 4 位是文件类型。
+
+/// 文件 / 目录的最后修改时间（Unix 秒）；不存在或出错返回 -1。
+pub fn file_mtime(path: str) -> i64 {
+    let mut buf: [u8; 1024] = [0; 1024];
+    if !to_cstr(path, &mut buf[0], 1024) {
+        return -1;
+    }
+    return zr_file_mtime(&buf[0] as *const u8);
+}
+
+/// 文件 / 目录的 `st_mode` 位（含类型位与权限位）；不存在或出错返回 -1。
+pub fn file_mode(path: str) -> i64 {
+    let mut buf: [u8; 1024] = [0; 1024];
+    if !to_cstr(path, &mut buf[0], 1024) {
+        return -1;
+    }
+    return zr_file_mode(&buf[0] as *const u8);
+}
+
 //----- 原始指针接口 -----------------------------------------------------------
 //
 // 路径必须是 NUL 结尾。适合调用方自己拼好路径（例如 path::join 之后补 0），
@@ -210,6 +310,14 @@ pub fn is_dir_raw(path: *const u8) -> bool {
 
 pub fn file_size_raw(path: *const u8) -> i64 {
     return zr_file_size(path);
+}
+
+pub fn file_mtime_raw(path: *const u8) -> i64 {
+    return zr_file_mtime(path);
+}
+
+pub fn file_mode_raw(path: *const u8) -> i64 {
+    return zr_file_mode(path);
 }
 
 pub fn read_dir_count_raw(path: *const u8) -> i64 {
