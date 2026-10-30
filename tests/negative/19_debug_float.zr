@@ -1,0 +1,11 @@
+// 负向用例：`#[derive(Debug)]` 对不支持的字段类型（浮点 / 指针 / 数组 / 元组 /
+// `String`）必须显式报错，不能静默生成错误代码（“explicit error” 哲学，与
+// `unsupported_default` 一致）。这里用 `f64` 字段钉住报错文案。
+//
+// expect: this field type is not supported yet
+#[derive(Debug)]
+struct S { x: f64 }
+
+fn main() -> i32 {
+    return 0;
+}

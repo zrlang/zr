@@ -21,9 +21,9 @@
 //! | `PartialEq` / `Eq` | `fn Type__eq(self, other: Self) -> bool` |
 //! | `PartialOrd` / `Ord` | `lt` / `le` / `gt` / `ge`（仅结构体） |
 //! | `Hash` | `fn Type__hash(self) -> u64` |
+//! | `Debug` | `fn Type__debug(self) -> String`（Rust `{:?}` 风格；浮点/指针/数组/元组字段暂不支持，显式报错） |
 //!
-//! `Copy` 是纯标记 trait，不生成方法。`Debug` 仍是标记：它要先把值渲染成
-//! 字符串，缺一套运行期格式化设施（见 `docs/rust-parity.md`）。
+//! `Copy` 是纯标记 trait，不生成方法。
 //!
 //! ## 已知限定（都选择"显式报错"而不是静默编出错的代码）
 //!
@@ -76,7 +76,8 @@ pub fn derive_methods(type_name: &str, type_def: &ast::TypeDef, traits: &[String
     let want_eq = traits.iter().any(|t| t == "PartialEq" || t == "Eq");
     let want_ord = traits.iter().any(|t| t == "PartialOrd" || t == "Ord");
     let want_hash = traits.iter().any(|t| t == "Hash");
-    if !(want_clone || want_default || want_eq || want_ord || want_hash) {
+    let want_debug = traits.iter().any(|t| t == "Debug");
+    if !(want_clone || want_default || want_eq || want_ord || want_hash || want_debug) {
         return Ok(out);
     }
 
@@ -157,6 +158,9 @@ pub fn derive_methods(type_name: &str, type_def: &ast::TypeDef, traits: &[String
     }
     if want_hash {
         out.push(hash_fn(type_name, &self_ty, fields.as_deref(), variants.as_deref(), span)?);
+    }
+    if want_debug {
+        out.push(debug_fn(type_name, &self_ty, fields.as_deref(), variants.as_deref(), span)?);
     }
     Ok(out)
 }
@@ -795,6 +799,14 @@ fn payload_types(v: &ast::Variant) -> Vec<Type> {
     }
 }
 
+/// 结构体载荷的字段名（与 `payload_binds` 同序）；元组 / Unit 变体返回空。
+fn payload_field_names(v: &ast::Variant) -> Vec<String> {
+    match &v.payload {
+        VariantPayload::Struct(fields) => fields.iter().map(|f| f.name.clone()).collect(),
+        _ => Vec::new(),
+    }
+}
+
 /// 对 `self` 按变体分派，每个臂由 `build` 给出臂体。
 ///
 /// `build(variant, bind_names)` 拿到的绑定名与 `variant_pattern` 用同一套
@@ -953,5 +965,277 @@ fn is_named_like(ty: &Type) -> bool {
     matches!(
         ty,
         Type::Named { .. } | Type::Optional(_) | Type::ErrorUnion(..)
+    )
+}
+
+// ----------------------------------------------------------------------
+// `#[derive(Debug)]`：`fn Type__debug(self) -> String`
+// ----------------------------------------------------------------------
+
+/// `fn Type__debug(self) -> String`：把值渲染成 Rust 风格的 Debug 字符串。
+///
+/// 生成的 `Type__debug` 是**自由函数**（与 `__eq` / `__hash` 一致），调用方
+/// 通过 `impl_targets` 路由到 `.debug()` 方法。返回 `String`（`std/string.zr`），
+/// 调用方用 `s.ptr` / `s.len` 读字节，或再交给 `String` 的其它方法。
+///
+/// 字段渲染规则（与 Rust `{:?}` 对齐的常见形态）：
+/// - 整数 / 无符号 → `push_int` / `push_uint`（十进制）；
+/// - `bool` → `true` / `false`；
+/// - `char` → `'c'`（带单引号）；
+/// - `str` / `[]const u8` → `"内容"`（带双引号）；
+/// - 命名类型（结构体 / 枚举，含 `Option` / `Result` 的糖）→ 递归
+///   `Inner__debug`，用 `push_str` 追加。目标类型没 derive Debug 时这里报
+///   "cannot find value `Inner__debug`"——与 Rust 的
+///   "`Inner` doesn't implement `Debug`" 位置一致；
+/// - 其余类型（浮点 / 指针 / 数组 / 元组 / 函数指针…）**显式报错**，避免
+///   生成一段找不到符号的代码或静默编出错的输出。浮点稍后按需补。
+fn debug_fn(
+    type_name: &str,
+    self_ty: &Type,
+    fields: Option<&[FieldInfo]>,
+    variants: Option<&[ast::Variant]>,
+    span: Span,
+) -> Result<Function> {
+    let mut stmts = vec![let_mut(
+        "__s",
+        named("String"),
+        call_path(&["String".to_string(), "new".to_string()], Vec::new()),
+    )];
+    if let Some(fields) = fields {
+        // 结构体：`Point { x: 1, y: 2 }` / `Pair(1, false)`；空结构体只打名字
+        // （Rust 一致）。元组结构体要像 Rust 一样打 `Pair(1, false)`，不是
+        // `Pair { 0: 1, 1: false }`——早先按命名结构体处理，字段名是下标。
+        if fields.is_empty() {
+            stmts.push(stmt_expr(push_bytes_lit(type_name), span));
+        } else if is_tuple_struct(fields) {
+            stmts.push(stmt_expr(push_bytes_lit(&format!("{type_name}(")), span));
+            for (i, f) in fields.iter().enumerate() {
+                if i > 0 {
+                    stmts.push(stmt_expr(push_bytes_lit(", "), span));
+                }
+                let v = debug_value(field_at(self_expr(), &f.name, f.span), &f.ty, f.span)?;
+                stmts.push(stmt_expr(v, f.span));
+            }
+            stmts.push(stmt_expr(push_bytes_lit(")"), span));
+        } else {
+            stmts.push(stmt_expr(push_bytes_lit(&format!("{type_name} {{ ")), span));
+            for (i, f) in fields.iter().enumerate() {
+                if i > 0 {
+                    stmts.push(stmt_expr(push_bytes_lit(", "), span));
+                }
+                stmts.push(stmt_expr(push_bytes_lit(&format!("{}: ", f.name)), span));
+                let v = debug_value(field_at(self_expr(), &f.name, f.span), &f.ty, f.span)?;
+                stmts.push(stmt_expr(v, f.span));
+            }
+            stmts.push(stmt_expr(push_bytes_lit(" }"), span));
+        }
+    } else {
+        // 枚举：`Circle` / `Rect(1, 2)` / `Named { label: "box", w: 2 }`——
+        // 结构体载荷要像 Rust 一样打字段名，不是打位置。
+        let arms = variants
+            .unwrap_or(&[])
+            .iter()
+            .map(|v| -> Result<ast::Arm> {
+                let pts = payload_types(v);
+                let mut arm_stmts = Vec::new();
+                if pts.is_empty() {
+                    arm_stmts.push(stmt_expr(push_bytes_lit(&v.name), span));
+                } else {
+                    // 结构体载荷：`Name { f1: v1, f2: v2 }`；元组载荷：`Name(v1, v2)`。
+                    let is_struct = matches!(v.payload, VariantPayload::Struct(_));
+                    let head = if is_struct {
+                        format!("{} {{ ", v.name)
+                    } else {
+                        format!("{}(", v.name)
+                    };
+                    arm_stmts.push(stmt_expr(push_bytes_lit(&head), span));
+                    let binds = payload_binds(v, "s");
+                    let fnames = payload_field_names(v);
+                    for (k, ty) in pts.iter().enumerate() {
+                        if k > 0 {
+                            arm_stmts.push(stmt_expr(push_bytes_lit(", "), span));
+                        }
+                        if is_struct {
+                            arm_stmts.push(stmt_expr(
+                                push_bytes_lit(&format!("{}: ", fnames[k])),
+                                span,
+                            ));
+                        }
+                        let v = debug_value(var(&binds[k]), ty, span)?;
+                        arm_stmts.push(stmt_expr(v, span));
+                    }
+                    arm_stmts.push(stmt_expr(push_bytes_lit(if is_struct { " }" } else { ")" }), span));
+                }
+                Ok(ast::Arm {
+                    pattern: variant_pattern(type_name, v, "s"),
+                    guard: None,
+                    body: Box::new(Expression::Block(
+                        Block {
+                            stmts: arm_stmts,
+                            tail: None,
+                            span,
+                        },
+                        span,
+                    )),
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        stmts.push(Statement::Expr(
+            Expression::Match(Box::new(self_expr()), arms, span),
+            span,
+        ));
+    }
+    let block = Block {
+        stmts,
+        tail: Some(Box::new(var("__s"))),
+        span,
+    };
+    Ok(make_fn(
+        type_name,
+        "debug",
+        Some(receiver(self_ty)),
+        Vec::new(),
+        named("String"),
+        Expression::Block(block, span),
+    ))
+}
+
+/// 把 `expr` 的值以 Rust `{:?}` 风格追加到 `__s`，返回一个 `()` 表达式。
+///
+/// 不支持的字段类型直接报错（`CompileError`），绝不生成静默出错的代码。
+fn debug_value(e: Expression, ty: &Type, span: Span) -> Result<Expression> {
+    let ok = match ty {
+        Type::I(_) => push_int_expr(e),
+        Type::U(_) => push_uint_expr(e),
+        Type::Bool => if_expr(
+            e,
+            push_bytes_lit("true"),
+            push_bytes_lit("false"),
+            span,
+        ),
+        Type::Char => block_expr(
+            vec![
+                stmt_expr(push_byte_expr(int(39)), span), // b'\''
+                stmt_expr(method_call(var("__s"), "push", vec![e]), span),
+                stmt_expr(push_byte_expr(int(39)), span),
+            ],
+            span,
+        ),
+        // `str` 与 `[]const u8` 都是 `{ptr, len}`，`push_bytes` 收 `[]const u8`，
+        // 两者可直接传（`str` 字面量与变量都实测能隐式转切片）。
+        Type::Str | Type::Slice(_, _) => block_expr(
+            vec![
+                stmt_expr(push_byte_expr(int(34)), span), // b'"'
+                stmt_expr(push_bytes_expr(e), span),
+                stmt_expr(push_byte_expr(int(34)), span),
+            ],
+            span,
+        ),
+        // 命名类型（结构体 / 枚举，含 `Option<T>` / `Result<T,E>` 的糖）递归。
+        // `String` 字段除外：`String` 是 `{ptr,len,capacity}` 三字段，不能当
+        // 切片直接传，且它自己的 `String__debug` 只在 String derive Debug 后
+        // 才存在——干脆报错，调用方用 `push_str` 自己接。
+        Type::Named { path, .. }
+            if path.last().map(String::as_str) == Some("String") =>
+        {
+            return Err(CompileError::type_error(format!(
+                "cannot derive `Debug`: `String` field needs explicit handling"
+            ))
+            .with_span(span));
+        }
+        Type::Named { path, .. } => {
+            let last = path.last().cloned().unwrap_or_default();
+            let nested = call_path_at(&[format!("{last}__debug")], vec![e], span);
+            // `{ let __n = Inner__debug(e); __s.push_str(&__n); }`
+            block_expr(
+                vec![
+                    Statement::Var(
+                        binding("__n"),
+                        Some(named("String")),
+                        Some(nested),
+                        span,
+                    ),
+                    stmt_expr(
+                        method_call(
+                            var("__s"),
+                            "push_str",
+                            vec![Expression::AddrOf(
+                                Box::new(var("__n")),
+                                Mutability::Immutable,
+                                span,
+                            )],
+                        ),
+                        span,
+                    ),
+                ],
+                span,
+            )
+        }
+        _ => {
+            return Err(CompileError::type_error(format!(
+                "cannot derive `Debug`: this field type is not supported yet"
+            ))
+            .with_span(span));
+        }
+    };
+    Ok(ok)
+}
+
+// ----------------------------------------------------------------------
+// Debug 专用的 AST 构造小工具
+// ----------------------------------------------------------------------
+
+fn str_lit(s: &str) -> Expression {
+    Expression::Literal(Literal::String(s.to_string()), SPAN)
+}
+
+fn stmt_expr(e: Expression, span: Span) -> Statement {
+    Statement::Expr(e, span)
+}
+
+/// `__s.push_bytes("...")`——str 字面量隐式转 `[]const u8`。
+fn push_bytes_lit(s: &str) -> Expression {
+    push_bytes_expr(str_lit(s))
+}
+
+fn push_bytes_expr(e: Expression) -> Expression {
+    method_call(var("__s"), "push_bytes", vec![e])
+}
+
+fn push_int_expr(e: Expression) -> Expression {
+    method_call(var("__s"), "push_int", vec![e])
+}
+
+fn push_uint_expr(e: Expression) -> Expression {
+    method_call(var("__s"), "push_uint", vec![e])
+}
+
+fn push_byte_expr(e: Expression) -> Expression {
+    method_call(var("__s"), "push_byte", vec![e])
+}
+
+/// `if cond { then } else { else }`（两个分支都是 `()` 表达式）。
+fn if_expr(cond: Expression, then_e: Expression, else_e: Expression, span: Span) -> Expression {
+    Expression::If(
+        Box::new(cond),
+        Block {
+            stmts: vec![stmt_expr(then_e, span)],
+            tail: None,
+            span,
+        },
+        Some(Box::new(else_e)),
+        span,
+    )
+}
+
+/// `{ stmts... }`——块表达式，无尾值（type `()`）。
+fn block_expr(stmts: Vec<Statement>, span: Span) -> Expression {
+    Expression::Block(
+        Block {
+            stmts,
+            tail: None,
+            span,
+        },
+        span,
     )
 }

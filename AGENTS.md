@@ -49,7 +49,7 @@ target/debug/zr prog.zr -O1 -o /tmp/prog   # 编译单个程序
   `ld` 直接断言崩溃（`atomShouldReplaceExisting`）。先 `nm` 看目标文件有没有
   重复符号，再下结论。已修复（提交 `1ef4a02`：MIR 按最终符号名去重，保留首个
   用户定义）。
-- 测试：`tests/zr_language.rs` 把 97 个 `tests/cases/*.zr` 各在
+- 测试：`tests/zr_language.rs` 把 100 个 `tests/cases/*.zr` 各在
   `-O0/-O1/-O2/-O3/-Oz` 跑一遍（460 次编译+运行）。退出码 0 = 过，非 0 = 失败（编号指向失败的断言）。
   宿主端另有 `io_print_matches_rust` 等 Rust 对照用例。
 - **没有负向测试机制。** `tests/cases/` 下每个 `.zr` 都必须编译通过并返回 0。
@@ -198,12 +198,12 @@ README 里"指针与 unsafe"一节目前是**愿景**：
 ### `cargo test` 当前基线（2026-10-29，全绿）
 
 - `cargo test --bin zr`：265 项。
-- `cargo test --test zr_language`：97 个用例 × 5 个优化等级 = 485 项，另有 3 个宿主端
+- `cargo test --test zr_language`：100 个用例 × 5 个优化等级 = 500 项，另有 3 个宿主端
   对照用例（`io_print_matches_rust`——逐字符对比 Rust 的格式化输出，含 `{:e}` / `{:E}`
   与大浮点 Display（`|v| ≥ 2⁶⁴` 不带 `.0`）的回归；`extern_c_write_prints_string_literal`；
   `toolchain_subcommands_emit`——`zr fmt` / `zr fmt --check` / `zr pkg init` / `zr lsp`
   与 `--emit-llvm` / `--wat` 的发射验证）。
-- `cargo test --test zr_negative`：17 个负向用例（含新加的越界、use-after-move 与枚举缺臂 `17_match_missing_variant.zr`）。
+- `cargo test --test zr_negative`：19 个负向用例（含新加的越界、use-after-move 与枚举缺臂 `17_match_missing_variant.zr`、`19_debug_float.zr`）。
 
 ### 最近修掉的静默 bug（都在 `tests/` 里留了钉子）
 
@@ -220,11 +220,14 @@ README 里"指针与 unsafe"一节目前是**愿景**：
 
 以下项已在本分支上完成或部分完成，更新如下：
 
-- **`#[derive]`**：方法体已生成（`PartialEq`/`Eq`/`Hash`/`PartialOrd`/`Ord`/`Default`），
+- **`#[derive]`**：方法体已生成（`PartialEq`/`Eq`/`Hash`/`PartialOrd`/`Ord`/`Default`/`Debug`），
   `Hash` 已覆盖**指针/引用按地址**（`b5f5a56`）、**元组按内容**（`38f1ddd`）、
   **数组按内容**（`caab7a0`）、**`str`/切片按内容**（`41ec8f4`，`96_str_slice_hash.zr`）；
-  **剩**：`Debug` 仍是标记 trait（不生成方法体）；泛型类型 / 枚举 `Default` /
-  枚举 `Ord` 显式报错；字段级诊断不精确。
+  `Debug` 也已生成 `.debug()` 方法体（`Type__debug(self) -> String`，Rust `{:?}` 风格，
+  `100_debug_derive.zr` + 负向 `19_debug_float.zr`；浮点/指针/数组/元组/`String` 字段显式报错；
+  **剩余两处组合错**——结构体变体载荷里的 `str` 字段、命名结构体里 `str` 字段之后的
+  嵌套结构体字段，见 `CLAUDE.md` §7 的 `Debug` 说明）；**剩**：泛型类型 / 枚举 `Default` /
+  枚举 `Ord` 显式报错。
 - **`loop` 带值 break**：✅ 已实现（`87ef09a` + `daf9763`）——`let x = loop { break 7; }`
   不再静默得 0（`ExprKind::Break` 现在携带值，`Loop` 按其类型化）；
   `tests/cases/97_loop_value.zr`（含聚合 break 值）。`daf9763` 修掉聚合 break

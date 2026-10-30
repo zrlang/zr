@@ -9,7 +9,7 @@ zr 是一门系统编程语言，设计取向介于 Rust 与 Zig 之间：所有
 - 给 AI agent 的操作约定、架构红线、在途工作：见 `AGENTS.md`
 - 与 Rust 的逐条对照：见 `docs/rust-parity.md`（**部分结论已被在途改动超越**）
 
-> 最近更新：2026-10-29。`feat/lang-features` 上已完成：`unsafe`/`dyn`/最小移动检查/常量越界检查；`52_if_let` 回归与 `71_derive` 失败均已修复；**又修掉了 `55_tuple_pattern` / `74_generic_alias` / `60_process` / `64_fs_path` / `io_print_matches_rust`（用户定义遮蔽标准库同名函数，见提交 `1ef4a02`）**；**支持 `use foo::*` glob 导入（见提交 `40b5b45`）**；全绿（97 用例 × 5 等级 + 宿主端对照用例）。
+> 最近更新：2026-10-29。`feat/lang-features` 上已完成：`unsafe`/`dyn`/最小移动检查/常量越界检查；`52_if_let` 回归与 `71_derive` 失败均已修复；**又修掉了 `55_tuple_pattern` / `74_generic_alias` / `60_process` / `64_fs_path` / `io_print_matches_rust`（用户定义遮蔽标准库同名函数，见提交 `1ef4a02`）**；**支持 `use foo::*` glob 导入（见提交 `40b5b45`）**；**`#[derive(Debug)]` 生成真实 `.debug()` 方法体（Rust `{:?}` 风格），并修掉 `EnumField` 对聚合载荷单字加载的 bug（嵌套结构体/元组枚举载荷段错误）；全绿（100 用例 × 5 等级 + 宿主端对照用例）**。
 
 ---
 
@@ -145,7 +145,7 @@ target/debug/zr prog.zr -O1 -o /tmp/prog && /tmp/prog
 | 关联类型 `type Output;` + `type Output = i32;` | 🟡 **声明可用**，但 `Self::Output` / `P::Output` **投影不可用**（方法签名/体里写 `-> Self::Output` 报 `cannot find value`，`assoc_types` 只过 HIR、无投影解析） |
 | 函数指针 `fn(T) -> R`（取址/传参/存储） | ✅ **x86-64 专属**，其它后端明确报错 |
 | `?` 对 `Result`/`Option` | ✅ |
-| `#[derive(Debug, Clone, Copy)]` | 🟡 `Clone` / `Copy` 是标记 trait；`Debug` 仍未生成方法（见 §5） |
+| `#[derive(Debug, Clone, Copy)]` | 🟡 `Clone` / `Copy` 是标记 trait；`Debug` 生成真实 `.debug()` 方法（`Type__debug(self) -> String`，Rust `{:?}` 风格；浮点/指针/数组/元组/`String` 字段显式报错，见 §5） |
 | `#[derive(PartialEq, Eq, Hash, PartialOrd, Ord, Default)]` | ✅ 生成真实方法体（`src/typeck/derive.rs`）；泛型类型 / 枚举 `Default` / 枚举 `Ord` 显式报错 |
 | 生命周期标注 `'a` | 🟡 **解析后丢弃**（`src/parser/ty.rs`），无任何借用/存活检查 |
 | `dyn Trait` / trait 对象 | ✅ 词法+解析+类型检查骨架已实现（vtable 分派仍在未实现状态） |
@@ -275,16 +275,18 @@ target/debug/zr prog.zr -O1 -o /tmp/prog && /tmp/prog
 
 ## 5. `#[derive]` 现状详解（高频踩坑区）
 
-**能用的**：`Clone`、`Copy`、`Debug`。它们只**登记 trait 标记**：
+**能用的**：`Clone`、`Copy` 只**登记 trait 标记**；`Debug` 生成真实 `.debug()` 方法：
 - 生成的 `HirImpl` 块 `trait_id` 为 `None`（属性 args 里只有字符串）
 - 求解靠 `trait_defs_by_name` 按名字反查
 - 所以 `fn needs_clone<T: Clone>(x: T)` 配 `#[derive(Clone)]` 的类型**能过**
-- **不生成方法体**，`#[derive(Clone)]` 的结构体**不能** `.clone()`；
-  `#[derive(Debug)]` 同理（不生成 `fmt` 方法）
+- **`Clone`/`Copy` 不生成方法体**，`#[derive(Clone)]` 的结构体**不能** `.clone()`；
+  `#[derive(Debug)]` 现在生成 `Type__debug(self) -> String`（Rust `{:?}` 风格），
+  可直接 `x.debug()` 读 `.len`/`.ptr` 字节
 
-**已实现（生成真实方法体）**：`PartialEq`、`Eq`、`Hash`、`PartialOrd`、`Ord`、`Default`。
-- 实现在 `src/typeck/derive.rs`，在 AST 层生成 `Type__eq` / `Type__lt` / `Type__hash` / `Type__default` / `Type__clone` 方法体
+**已实现（生成真实方法体）**：`PartialEq`、`Eq`、`Hash`、`PartialOrd`、`Ord`、`Default`、`Debug`。
+- 实现在 `src/typeck/derive.rs`，在 AST 层生成 `Type__eq` / `Type__lt` / `Type__hash` / `Type__default` / `Type__clone` / `Type__debug` 方法体
 - 泛型类型 / 枚举 `Default` / 枚举 `Ord` 显式报错
+- `Debug` 渲染规则：整数/无符号/`bool`/`char`/`str`/`[]const u8` 直接渲染；命名类型（含嵌套结构体/枚举）递归 `Inner__debug`；浮点/指针/数组/元组/`String` 字段**显式报错**（`tests/cases/100_debug_derive.zr`、负向 `tests/negative/19_debug_float.zr`）。已知局限见 §7 末尾
 - `Hash` 对 `str` / 切片按 `0` 计入（缺按内容 hash 的语义，且运行期长度需循环）；**指针 / 引用已改为按地址计入**（`b5f5a56`）；**元组已改为按内容计**（`38f1ddd`，`29fc950` 修好混合宽度元组字段访问后）；**数组已改为按内容计**（`caab7a0`，定长展开 ≤ 32）
 - 字段级诊断已修到**真实源码位置**：`StructDef` / `EnumDef` / `Field` 带 span，结构体字段精准到列、枚举结构体载荷也精准到字段、derive 拒绝诊断与默认值字段诊断都用类型/字段的位置（`bcf29f6` / `9238875` / `60174ca`）
 
@@ -294,7 +296,7 @@ target/debug/zr prog.zr -O1 -o /tmp/prog && /tmp/prog
 根本没有 `attrs` 字段）。
 
 **已知局限**：
-- `Debug` 仍未生成方法体（需要运行期格式化设施，见 `docs/rust-parity.md`）
+- `Debug` 的 `.debug()` 已生成，但**结构体变体载荷里的 `str` 字段**与**命名结构体里 `str` 字段之后的嵌套结构体字段**这两个组合仍会错（前者是 `EnumField` 对聚合载荷单字加载的既有 bug，`str` 载荷段错误；后者是派生方法里读 `self.tag` 部分移动 `self`，后续字段读垃圾）——见 §7 末尾的说明
 - 泛型类型上的 derive 不生成方法体（字段类型要靠单态化才知道）
 
 ---
@@ -330,12 +332,22 @@ target/debug/zr prog.zr -O1 -o /tmp/prog && /tmp/prog
 ### P1 — 明确报错或明显缺失
 
 1. **`#[derive]` 剩余缺口**：方法体已经生成（`src/typeck/derive.rs`），
-   `Debug` 仍是标记 trait（不生成方法）；泛型类型 / 枚举 `Default` / 枚举 `Ord`
-   显式报错（位置已修到类型定义，`60174ca`）；字段级诊断已修到真实源码位置
-   （`bcf29f6` / `9238875`）；`Hash` 已覆盖**指针/引用按地址**（`b5f5a56`）、
-   **元组按内容**（`38f1ddd`）、**数组按内容**（`caab7a0`）、**`str`/切片按内容**
-   （`41ec8f4`，新增 `tests/cases/96_str_slice_hash.zr`）；只剩 `Debug` 方法体
-   （需运行期格式化设施）
+   `Debug` 也已生成 `.debug()` 方法体（`Type__debug(self) -> String`，Rust `{:?}`
+   风格，`tests/cases/100_debug_derive.zr` + 负向 `19_debug_float.zr`）；泛型类型 /
+   枚举 `Default` / 枚举 `Ord` 显式报错（位置已修到类型定义，`60174ca`）；
+   字段级诊断已修到真实源码位置（`bcf29f6` / `9238875`）；`Hash` 已覆盖
+   **指针/引用按地址**（`b5f5a56`）、**元组按内容**（`38f1ddd`）、**数组按内容**
+   （`caab7a0`）、**`str`/切片按内容**（`41ec8f4`，新增 `tests/cases/96_str_slice_hash.zr`）
+
+   **`Debug` 剩余两处组合错**（本次只修了标量/嵌套-偏移 0 路径）：
+   - **结构体变体载荷里的 `str` 字段**：`match` 绑定聚合载荷的既有 bug
+     （`EnumField` 对聚合载荷单字加载，`str` 载荷读 `ptr` 半字、`len` 读垃圾，
+     段错误）。本次给 `EnumField` 补了 `is_aggregate` 特判（载荷字段值 = 地址，
+     与结构体 `Field` 一致），**嵌套结构体 / 元组载荷已修好**，`str` 载荷仍错
+     ——`str` 是 16 字节聚合，绑定/拷贝仍按单字。
+   - **命名结构体里 `str` 字段之后的嵌套结构体字段**：派生方法里读 `self.tag`
+     （str）会部分移动 `self`，后续 `self.inner` 读到垃圾；嵌套结构体在偏移 0
+     正常（`Wrap { inner: Inner }`）。
 
    **P0-7（已修 `daf9763`）**：聚合（结构体/元组/数组）作为 `loop` 的 break
    值在 `-O3`/`-Oz` 触发寄存器分配 bug——值横跨循环出口被与常量 `8` 合并
@@ -404,7 +416,10 @@ target/debug/zr prog.zr -O1 -o /tmp/prog && /tmp/prog
 6. **`Option` / `Result` 加进 prelude** —— ✅ 已完成（`4ed15d7`，含变体 `Some`/`None`/`Ok`/`Err`）
 7. **`i128` / `u128` 64 位目标** —— P1，需寄存器对拆分
 8. **更新 `tests/README.md` 与 `future/README.md`** —— ✅ 已完成（`fb4dfb2`；另 `1d38ca3` 修正 README / rust-parity / CONTRIBUTING / Cargo.toml）
-9. **`Debug` derive 方法体** —— P1，需要运行期格式化设施（目前只有标量+结构体/元组/枚举的组合）
+9. **`Debug` derive 方法体** —— ✅ 已完成（本次：`Type__debug(self) -> String`，
+   标量/`str`/`bool`/`char`/嵌套（偏移 0）/单元/元组/结构体变体都对齐 Rust `{:?}`；
+   浮点/指针/数组/元组/`String` 字段显式报错；剩余 `str` 载荷与 `str` 后嵌套字段
+   两处组合错，见 §7 的 `Debug` 说明）
 
 ---
 

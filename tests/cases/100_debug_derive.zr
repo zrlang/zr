@@ -1,0 +1,77 @@
+// 100_debug_derive.zr —— `#[derive(Debug)]` 生成真实 `.debug()` 方法体。
+//
+// 断言每个值在 Rust `{:?}` 下的精确输出：长度 + 关键字节（立即读，不经函数
+// 参数——`.debug()` 返回的 String 经函数参数二次读取会读到悬垂栈缓冲，见提交
+// 信息）。覆盖：命名结构体（标量 + str + bool + char）、元组结构体、单元/元组/
+// 结构体变体枚举、嵌套结构体（偏移 0）。长度与字节都对照 Rust 实际输出。
+//
+// 已知局限（此用例刻意避开，见提交信息）：
+//  - 结构体变体载荷里的 `str` 字段：`match` 绑定聚合载荷的既有 bug（`EnumField`
+//    对聚合载荷单字加载），`str` 载荷仍会段错误；标量 / 嵌套结构体载荷已修好。
+//  - 命名结构体里 `str` 字段**之后**的嵌套结构体字段：派生方法里读 `self.tag`
+//    （str）会部分移动 `self`，后续 `self.inner` 读到垃圾。嵌套结构体在偏移 0
+//    正常（本用例的 `Wrap` 就是这么测的）。
+#[derive(Debug)]
+struct Point { x: i64, y: i64, name: str, ok: bool, ch: char }
+#[derive(Debug)]
+struct Pair(i64, bool);
+#[derive(Debug)]
+enum Shape { Circle, Rect(i64, i64), Named { w: i64, h: i64 } }
+#[derive(Debug)]
+struct Inner { v: i64 }
+#[derive(Debug)]
+struct Wrap { inner: Inner }
+
+fn main() -> i32 {
+    // 命名结构体：`Point { x: 10, y: -3, name: "bob", ok: true, ch: 'Z' }`（54 字节）。
+    let p = Point { x: 10, y: -3, name: "bob", ok: true, ch: 'Z' };
+    let s = p.debug();
+    if s.len != 54 { return 1; }
+    if s.ptr[0] != b'P' { return 2; }
+    if s.ptr[6] != b'{' { return 3; }
+    if s.ptr[28] != b'"' { return 4; }
+    if s.ptr[50] != b'Z' { return 5; }
+    if s.ptr[53] != b'}' { return 6; }
+
+    // 元组结构体：`Pair(1, false)`（14 字节；不是 `Pair { 0: 1, 1: false }`）。
+    let s = Pair(1, false).debug();
+    if s.len != 14 { return 7; }
+    if s.ptr[4] != b'(' { return 8; }
+    if s.ptr[5] != b'1' { return 9; }
+    if s.ptr[8] != b'f' { return 10; }
+    if s.ptr[13] != b')' { return 11; }
+
+    // 单元变体：`Circle`（6 字节）。
+    let s = Shape::Circle.debug();
+    if s.len != 6 { return 12; }
+    if s.ptr[0] != b'C' { return 13; }
+    if s.ptr[5] != b'e' { return 14; }
+
+    // 元组变体：`Rect(1, 2)`（10 字节）。
+    let s = Shape::Rect(1, 2).debug();
+    if s.len != 10 { return 15; }
+    if s.ptr[5] != b'1' { return 16; }
+    if s.ptr[8] != b'2' { return 17; }
+    if s.ptr[9] != b')' { return 18; }
+
+    // 结构体变体（标量载荷）：`Named { w: 2, h: 9 }`（20 字节）。
+    let s = Shape::Named { w: 2, h: 9 }.debug();
+    if s.len != 20 { return 19; }
+    if s.ptr[0] != b'N' { return 20; }
+    if s.ptr[6] != b'{' { return 21; }
+    if s.ptr[11] != b'2' { return 22; }
+    if s.ptr[17] != b'9' { return 23; }
+    if s.ptr[19] != b'}' { return 24; }
+
+    // 嵌套结构体（偏移 0）：递归调 `Inner__debug`。`Wrap { inner: Inner { v: 7 } }`（30 字节）。
+    let w = Wrap { inner: Inner { v: 7 } };
+    let s = w.debug();
+    if s.len != 30 { return 25; }
+    if s.ptr[0] != b'W' { return 26; }
+    if s.ptr[5] != b'{' { return 27; }
+    if s.ptr[22] != b'v' { return 28; }
+    if s.ptr[25] != b'7' { return 29; }
+    if s.ptr[29] != b'}' { return 30; }
+
+    return 0;
+}

@@ -7,7 +7,6 @@
 
 use core::{zr_alloc, zr_dealloc, zr_realloc, Option, panic};
 use mem::{memcmp, NULL};
-use io::{write_uint, write_int, print_fmt, FormatArg};
 
 /// 一个可增长的 UTF-8 字符串。
 pub struct String {

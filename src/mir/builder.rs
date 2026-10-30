@@ -682,19 +682,29 @@ fn lower_expr(b: &mut Builder, expr: &HirExpr) -> MirValue {
             let Some(off) = offsets.get(*index).copied() else {
                 return MirValue::Unit;
             };
-            let base = lower_expr(b, value);
-            let at = offset_addr(b, base, layout.payload_off + off);
             let field_tys = variant_field_tys_of(b, *def_id, *variant, targs);
             let Some(field_ty) = field_tys.get(*index).cloned() else {
                 return MirValue::Unit;
             };
-            let name = b.temp();
-            b.current_block_mut().instrs.push(MirInstr::Load(
-                name.clone(),
-                at,
-                reg_ty_of(&field_ty),
-            ));
-            MirValue::Var(name)
+            let base = lower_expr(b, value);
+            let at = offset_addr(b, base, layout.payload_off + off);
+            // 聚合类型（`str` / 切片 / 结构体 / 元组 / 枚举 / 数组）的载荷字段值
+            // 就是它自己的地址，不再 Load 首字段——与普通结构体 `Field` 访问
+            // 一致（`builder.rs` 的 `Field` 分支）。早先这里**漏掉这个特判**，
+            // 聚合载荷字段走 `reg_ty_of`（`str`/切片被当成 `Int(64)`）单字加载，
+            // 于是 `match` 绑定 `E::B { name: n, .. }` 里的 `n` 只读到 `str` 的
+            // `ptr` 半字（`n.len` 读垃圾），嵌套结构体载荷直接段错误。
+            if is_aggregate(b, &field_ty) {
+                at
+            } else {
+                let name = b.temp();
+                b.current_block_mut().instrs.push(MirInstr::Load(
+                    name.clone(),
+                    at,
+                    reg_ty_of(&field_ty),
+                ));
+                MirValue::Var(name)
+            }
         }
         Field(recv, name) => {
             let base = lower_expr(b, recv);

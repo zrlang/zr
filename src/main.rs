@@ -625,26 +625,16 @@ fn compile(input: &str, cmd: &Cli) -> Result<std::path::PathBuf, String> {
     // 嵌套导入（与 `parse_use_tree` 的段追加顺序一致——每往右推一层就包一个
     // 新 Group，旧树是 Group 的第一个元素）；枚举变体在 zr 里是模块内符号，
     // 不会与用户本地的同名绑定冲突（同名时用户的绑定遮蔽 prelude）。
-    const PRELUDE_IMPORTS: &[&str] = &[
-        "core::Option",
-        "core::Result",
-        "core::Option::Some",
-        "core::Option::None",
-        "core::Result::Ok",
-        "core::Result::Err",
-    ];
-    for path in PRELUDE_IMPORTS {
+    // 把一条 `use` 路径注入 root 程序（带一个"把新段追加到现有树"的顺序）。
+    //
+    // `use core::Option` → `Group([Name("core"), Name("Option")])`
+    // `use core::Option::Some` → `Group([Name("core"), Group([Name("Option"), Name("Some")])])`
+    let inject_import = |ast: &mut parser::ast::Program, path: &str| {
         let segments: Vec<&str> = path.split("::").collect();
-        // 构造嵌套 `Group([Name(seg0), Group([Name(seg1), ...])])`——与
-        // `parse_use_tree` 的段追加顺序一致（新段往后追加，旧树是 Group 的
-        // 第一个元素）。
-        // `use core::Option` → `Group([Name("core"), Name("Option")])`
-        // `use core::Option::Some` → `Group([Name("core"), Group([Name("Option"), Name("Some")])])`
-        let mut tree = if segments.is_empty() {
-            continue;
-        } else {
-            parser::ast::UseTree::Name(segments[segments.len() - 1].to_string())
-        };
+        if segments.is_empty() {
+            return;
+        }
+        let mut tree = parser::ast::UseTree::Name(segments[segments.len() - 1].to_string());
         for &seg in segments.iter().rev().skip(1) {
             tree = parser::ast::UseTree::Group(vec![
                 parser::ast::UseTree::Name(seg.to_string()),
@@ -658,6 +648,23 @@ fn compile(input: &str, cmd: &Cli) -> Result<std::path::PathBuf, String> {
                 span: parser::ast::Span::unknown(),
             },
         );
+    };
+    const PRELUDE_IMPORTS: &[&str] = &[
+        "core::Option",
+        "core::Result",
+        "core::Option::Some",
+        "core::Option::None",
+        "core::Result::Ok",
+        "core::Result::Err",
+        // `#[derive(Debug)]` 生成的 `Type__debug(self) -> String` 直接用
+        // `String` 构造/拼接，用户不必在用到 derive 的模块里手写
+        // `use string::String`。`std/string.zr` 只依赖 `core`/`mem`
+        // （早先那条 `use io::..` 是死导入，会把 `io.zr` 拖进每个程序），
+        // 所以无条件注入的代价可忽略。
+        "string::String",
+    ];
+    for path in PRELUDE_IMPORTS {
+        inject_import(&mut ast, path);
     }
 
     // 3.4 增量编译命中检查。
@@ -822,6 +829,7 @@ fn compile(input: &str, cmd: &Cli) -> Result<std::path::PathBuf, String> {
     }
 }
 
+/// root 程序（含 `mod foo;` 加载进来的模块与内联模块）里是否出现
 /// 解析 `--target`（空串表示宿主平台）。
 fn resolve_target(triple: &str) -> Result<Target, String> {
     if triple.is_empty() {
