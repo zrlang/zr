@@ -333,6 +333,7 @@ target/debug/zr prog.zr -O1 -o /tmp/prog && /tmp/prog
 | `str`/切片字段布局错位 | ✅ 已修复（`1161b65`）：`type_size_align` 把 `str`/切片当 8 字节（应为 16 `{ptr,len}`），`S { name: str, x: i64 }` 的 `name.len` 读到 `x` 的值；新增 `tests/cases/95_str_slice_layout.zr` |
 | 切片字段初始化静默存坏数据 | ✅ 已修复（`273d6f4`）：数组字面量不按切片期望元素类型收窄，`S { arr: []const i64 }` 用 `[10,20,30]` 静默强转成 `[]const i64`，运行期 SIGSEGV |
 | `loop` 表达式不产生 `break` 值 | ✅ 已修复（`87ef09a` + `daf9763`）：`ExprKind::Break` 只记标签丢弃值、`Loop` 恒 `Never`，`let x = loop { break 7; }` 静默得 0；`break` 现在携带值、`Loop` 按其类型化；新增 `tests/cases/97_loop_value.zr`（含**聚合** break 值，`daf9763` 修掉 `-O3`/`-Oz` 的寄存器分配缺陷） |
+| 标准库同名函数扁平符号冲突 | ✅ 已知实例已修（`8e42512`、`7e0e99c`）：`io::file_size(fd)`/`fs::file_size(str)`（撞 `z_file_size`）、`slice::max/min`/`core::max/min`（撞 `z_max__T`/`z_min__T`）、`net::read_line`/`io::read_line`（撞 `z_read_line`）——两个 std 模块各有一个同名顶层 `pub fn`，扁平符号表 mangle 成同一符号、MIR 去重只留首个，调用点可能走到错的一侧（`file_size` 把 `str` 当 `fd` 静默 -1；`max` 静默拿 `Option`）。已把内部版改名消除冲突。**根因未根治**：`use core::max` 取 `symbols["max"]`（先收集者）而不是 core 模块里的那个，`resolve_name` 靠 `use_aliases` 能拿对但 `infer_expr_ty` 的 `Variable` 分支直接 `symbols.get(name)`；`use nonexistent::name`（如 `use io::file_size`，io 已无此名）还会静默回退到同名其它模块版——根治需按模块限定符号 |
 ### P1 — 明确报错或明显缺失
 
 1. **`#[derive]` 剩余缺口**：方法体已经生成（`src/typeck/derive.rs`），
