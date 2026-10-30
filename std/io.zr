@@ -2012,7 +2012,12 @@ pub fn file_seek(fd: i32, offset: i64, whence: i32) -> i64 {
 /// 取文件的大小（字节）。出错返回 -1。
 ///
 /// 对终端这类没有大小的设备返回 -1。
-pub fn file_size(fd: i32) -> i64 {
+///
+/// 名字带 `_fd` 后缀：`fs::file_size(str)` 按**路径**取大小，两者同名会在
+/// 扁平符号表里撞成同一个 `z_file_size`，MIR 去重只保留首个，调用点与函数体
+/// 可能不一致（`use fs::file_size` 后仍会静默走到 fd 版，str 被当 fd 读）。
+/// 这个 fd 版只被 `File::size` 内部调用，改带 `_fd` 消除冲突。
+pub fn file_size_fd(fd: i32) -> i64 {
     return zr_fstat_size(fd);
 }
 
@@ -2117,7 +2122,7 @@ impl File {
 
     /// 文件的大小（字节），出错返回 -1。
     pub fn size(&self) -> i64 {
-        return file_size(self.fd);
+        return file_size_fd(self.fd);
     }
 
     /// 是不是终端。

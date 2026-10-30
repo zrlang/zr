@@ -16,7 +16,7 @@
 // 本用例全部必须在 `-O0..-O3/-Oz` 下编译并返回 0。
 //=============================================================================
 
-use fs::{temp_file, file_mtime, file_mode, file_size_raw, remove_file};
+use fs::{temp_file, file_mtime, file_mode, file_size, file_size_raw, remove_file};
 use io::File;
 
 fn main() -> i32 {
@@ -35,9 +35,10 @@ fn main() -> i32 {
     if (mode & 0x4000) == 0 { return 5; }   // S_IFDIR = 0x4000
 
     // 3) 元数据：一个真实存在的常规文件，类型位应是 S_IFREG（0x8000）。
-    //    用 `file_size_raw` 而非 `file_size`：后者会被 prelude 里 `io::file_size`
-    //    （按 fd 取大小）遮蔽——传 `str` 会被静默当 fd，返回 -1（既有命名冲突，
-    //    属另一处 bug，不在此修复）。
+    //    `file_size` 按**路径**取大小（`fs::file_size(str)`）；早先它与
+    //    `io::file_size(fd)`（`File::size` 的 fd 版）同名，撞成一个 `z_file_size`
+    //    符号、MIR 去重只留首个，调用点可能走到 fd 版（str 被当 fd 读，静默
+    //    返回 -1）。io 版已改名 `file_size_fd`，现在 `file_size` 唯一（路径版）。
     let path = "/tmp/zr_fs_meta_test";
     remove_file(path);                       // 清理上次残留（可失败）
     let g = File::open(path, 1);             // FILE_WRITE = 1（截断创建）
@@ -48,17 +49,21 @@ fn main() -> i32 {
     let fmode = file_mode(path);
     if fmode <= 0 { return 8; }
     if (fmode & 0x8000) == 0 { return 9; }   // S_IFREG = 0x8000
+    // 路径版 `file_size`（字面量 + 变量路径都走这条，不再被 io::file_size 遮蔽）。
+    if file_size(path) != 4 { return 10; }
+    let pathvar = path;                       // 变量路径：早先返回 -1 的误判根因
+    if file_size(pathvar) != 4 { return 11; }
     let mut pb: [u8; 64] = [0; 64];
     let mut i: usize = 0;
     while i < path.len { pb[i] = path.ptr[i]; i = i + 1; }
     pb[i] = 0;
-    if file_size_raw(&pb[0] as *const u8) != 4 { return 10; }
+    if file_size_raw(&pb[0] as *const u8) != 4 { return 12; }
     remove_file(path);
 
     // 4) 元数据：不存在的路径应返回 -1（不是垃圾值）。
     let missing = "/tmp/zr_no_such_path_xyz";
-    if file_mtime(missing) != -1 { return 11; }
-    if file_mode(missing) != -1 { return 12; }
+    if file_mtime(missing) != -1 { return 13; }
+    if file_mode(missing) != -1 { return 14; }
 
     return 0;
 }
