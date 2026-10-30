@@ -1,12 +1,13 @@
 // 100_debug_derive.zr —— `#[derive(Debug)]` 生成真实 `.debug()` 方法体。
 //
-// 断言每个值在 Rust `{:?}` 下的精确输出：长度 + 关键字节（立即读，不经函数
-// 参数——`.debug()` 返回的 String 经函数参数二次读取会读到悬垂栈缓冲，见提交
-// 信息）。覆盖：命名结构体（标量 + str + bool + char）、元组结构体、单元/元组/
+// 断言每个值在 Rust `{:?}` 下的精确输出：长度 + 关键字节 +（对最大用例）
+// 经 `expect` 函数参数二次读取的逐字符比对（`.debug()` 返回的 `String`
+// 跨函数传递也正常，早先误判为悬垂栈缓冲，实为测试预期长度算错）。
+// 覆盖：命名结构体（标量 + str + bool + char）、元组结构体、单元/元组/
 // 结构体变体枚举、嵌套结构体（偏移 0）、**结构体变体载荷里的 `str` 字段**、
 // **命名结构体里 `str` 字段之后的嵌套结构体字段**。长度与字节都对照 Rust
-// 实际输出（后两类早先被认为是已知局限，实为 `EnumField` 聚合载荷单字加载的
-// 既有 bug；`is_aggregate` 特判修好后已对齐 Rust，长度 17 / 52）。
+// 实际输出（后三类早先被认为是已知局限，实为 `EnumField` 聚合载荷单字加载的
+// 既有 bug / 预期长度算错；`is_aggregate` 特判修好后已对齐 Rust，长度 17 / 52 / 54）。
 #[derive(Debug)]
 struct Point { x: i64, y: i64, name: str, ok: bool, ch: char }
 #[derive(Debug)]
@@ -22,6 +23,20 @@ enum Msg { Hi { who: str }, Bye }
 #[derive(Debug)]
 struct Outer { name: str, inner: Inner, tag: i64 }
 
+// `expect`：`.debug()` 返回的 `String` 经**函数参数**二次读取（不再是 main 里
+// 立即读）。早先认为这条路径会读到悬垂栈缓冲（byte 16 = NUL），实测在
+// O0–Oz 都逐字符对齐——与 `EnumField` 聚合特判一样是误判，见提交信息。
+// 逐字符比对长度与每个字节。
+fn expect(s: String, want: str) -> i32 {
+    if s.len != want.len { return 1; }
+    let mut i: usize = 0;
+    while i < s.len {
+        if s.ptr[i] != want.ptr[i] { return 2; }
+        i += 1;
+    }
+    return 0;
+}
+
 fn main() -> i32 {
     // 命名结构体：`Point { x: 10, y: -3, name: "bob", ok: true, ch: 'Z' }`（54 字节）。
     let p = Point { x: 10, y: -3, name: "bob", ok: true, ch: 'Z' };
@@ -32,6 +47,9 @@ fn main() -> i32 {
     if s.ptr[28] != b'"' { return 4; }
     if s.ptr[50] != b'Z' { return 5; }
     if s.ptr[53] != b'}' { return 6; }
+    // 经函数参数二次读取也逐字符对齐（`expect` 的返回值 0/1/2，这里统一映射）。
+    let r = expect(s, "Point { x: 10, y: -3, name: \"bob\", ok: true, ch: 'Z' }");
+    if r != 0 { return 100 + r; }
 
     // 元组结构体：`Pair(1, false)`（14 字节；不是 `Pair { 0: 1, 1: false }`）。
     let s = Pair(1, false).debug();
