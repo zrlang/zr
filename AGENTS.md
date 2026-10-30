@@ -293,6 +293,12 @@ README 里"指针与 unsafe"一节目前是**愿景**：
   `zr_freeaddrinfo` / `zr_inet_ntop` / `zr_inet_pton` / `zr_htons` / `zr_ntohs` /
   `zr_htonl` / `zr_ntohl` / `zr_set_nonblocking` / `zr_errno`，均薄封装 libSystem
   的 BSD 套接字 API），`net` 现在全链路可加载并运行（创建 + 关闭套接字实测）。
+  **macOS arm64 版已同样补齐**（`b _socket` 尾调用；`zr_set_nonblocking` 用
+  callee-saved x19/x20 跨两次 `fcntl`；`zr_errno` 经 `___error`；19 个符号经
+  `clang -target arm64-apple-macos` 汇编验证、重定位指向正确 libc 符号，本机
+  是 x86-64 无法运行验证）。**Linux 运行时是纯 syscall 设计（不依赖 libc），
+  `getaddrinfo` / `inet_ntop` / `inet_pton` 不是 syscall、无法原样实现**——要
+  么给 Linux 运行时接 libc，要么这 3 个在 Linux 上返回错误；未做。
   `tests/cases/104_socket_runtime.zr`（钉住）。
 - **穷尽性报错**：✅ 已改进（`a526953`：枚举缺臂列出缺失变体名，`17_match_missing_variant.zr`；整型/标量仍保留尾 `_` 臂措辞）。
 - **文档债**：✅ 已清（`fb4dfb2` 修 `tests/README.md` / `future/README.md`；`1d38ca3` 修 README 安全模型节 / `rust-parity.md` / `CONTRIBUTING.md` / `Cargo.toml` description）。

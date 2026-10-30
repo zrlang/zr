@@ -263,3 +263,136 @@ _zr_time_ns:
 _zr_time_unix_ns:
     mov     x0, #-1
     ret
+
+#==============================================================================
+# BSD 套接字封装（net.zr 的 extern "C" 对接 libSystem，arm64 版）
+#==============================================================================
+# 这些是薄封装：参数已经在 AAPCS64 的 x0..x7 里，直接尾调用 libc 函数。
+# 尾调用用 `b`（不修改 x30，被调函数返回时直接回到本函数调用者）。
+# macOS 的 BSD 套接字函数都在 libSystem 里，符号带前导下划线。
+
+# zr_socket(domain, type, protocol) -> fd
+    .globl _zr_socket
+_zr_socket:
+    b       _socket
+
+# zr_bind(fd, addr, addrlen) -> i32
+    .globl _zr_bind
+_zr_bind:
+    b       _bind
+
+# zr_connect(fd, addr, addrlen) -> i32
+    .globl _zr_connect
+_zr_connect:
+    b       _connect
+
+# zr_listen(fd, backlog) -> i32
+    .globl _zr_listen
+_zr_listen:
+    b       _listen
+
+# zr_accept(fd, addr, addrlen) -> fd
+    .globl _zr_accept
+_zr_accept:
+    b       _accept
+
+# zr_recv(fd, buf, len, flags) -> isize
+    .globl _zr_recv
+_zr_recv:
+    b       _recv
+
+# zr_send(fd, buf, len, flags) -> isize
+    .globl _zr_send
+_zr_send:
+    b       _send
+
+# zr_setsockopt(fd, level, optname, optval, optlen) -> i32
+    .globl _zr_setsockopt
+_zr_setsockopt:
+    b       _setsockopt
+
+# zr_getsockopt(fd, level, optname, optval, optlen) -> i32
+    .globl _zr_getsockopt
+_zr_getsockopt:
+    b       _getsockopt
+
+# zr_getaddrinfo(node, service, hints, res) -> i32
+    .globl _zr_getaddrinfo
+_zr_getaddrinfo:
+    b       _getaddrinfo
+
+# zr_freeaddrinfo(res)
+    .globl _zr_freeaddrinfo
+_zr_freeaddrinfo:
+    b       _freeaddrinfo
+
+# zr_inet_ntop(af, src, dst, size) -> *const u8
+    .globl _zr_inet_ntop
+_zr_inet_ntop:
+    b       _inet_ntop
+
+# zr_inet_pton(af, src, dst) -> i32
+    .globl _zr_inet_pton
+_zr_inet_pton:
+    b       _inet_pton
+
+# zr_htons(x) -> u16
+    .globl _zr_htons
+_zr_htons:
+    b       _htons
+
+# zr_ntohs(x) -> u16
+    .globl _zr_ntohs
+_zr_ntohs:
+    b       _ntohs
+
+# zr_htonl(x) -> u32
+    .globl _zr_htonl
+_zr_htonl:
+    b       _htonl
+
+# zr_ntohl(x) -> u32
+    .globl _zr_ntohl
+_zr_ntohl:
+    b       _ntohl
+
+# zr_set_nonblocking(fd, nonblocking) -> i32
+#   x0=fd, x1=nonblocking（非 0 = 置 O_NONBLOCK）
+# 两次 fcntl（F_GETFL=3 / F_SETFL=4），fd 与标志跨调用用 callee-saved x19/x20。
+    .globl _zr_set_nonblocking
+_zr_set_nonblocking:
+    stp     x29, x30, [sp, #-32]!
+    mov     x29, sp
+    str     x19, [sp, #16]
+    str     x20, [sp, #24]
+    mov     x19, x0             // fd
+    mov     x20, x1             // nonblocking
+    mov     x0, x19
+    mov     x1, #3              // F_GETFL
+    bl      _fcntl
+    mov     x2, x0              // 当前 flags
+    cmp     x20, #0
+    b.eq    1f
+    orr     x2, x2, #4          // 置 O_NONBLOCK（macOS 上 O_NONBLOCK = 0x4）
+    b       2f
+1:
+    bic     x2, x2, #4          // 清 O_NONBLOCK（~4，bic 按位清）
+2:
+    mov     x0, x19
+    mov     x1, #4              // F_SETFL
+    bl      _fcntl
+    ldr     x19, [sp, #16]
+    ldr     x20, [sp, #24]
+    ldp     x29, x30, [sp], #32
+    ret
+
+# zr_errno() -> i32
+#   macOS 的 errno 是线程局部存储，经 `__error()` 取地址；返回其值。
+    .globl _zr_errno
+_zr_errno:
+    stp     x29, x30, [sp, #-16]!
+    mov     x29, sp
+    bl      ___error
+    ldr     w0, [x0]
+    ldp     x29, x30, [sp], #16
+    ret
