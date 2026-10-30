@@ -822,8 +822,16 @@ impl TcpStream {
 
     /// 把 stream 转为原始的 Socket（转移所有权）。
     pub fn into_socket(self) -> Socket {
-        let s = self.inner;
-        return s;
+        // 不能 `let s = self.inner;`——`Socket` 实现 Drop，zr 与 Rust 一样禁止
+        // 从带 Drop 的类型里移出 Drop 字段（E0509）。`TcpStream` 本身没有 Drop
+        // impl（析构靠内嵌 `Socket`），但 zr 的 `self` 按值表示对非 Copy 类型
+        // 仍可能是借用形态，触发同一检查。这里改成按字段拷贝出标量再构造：
+        // `Socket` 的字段都是标量/枚举（无 Drop glue），读它们不是移动。
+        return Socket {
+            fd: self.inner.fd,
+            family: self.inner.family,
+            sock_type: self.inner.sock_type,
+        };
     }
 }
 

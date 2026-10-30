@@ -1,0 +1,23 @@
+// 覆盖：`net` 模块可加载（类型检查 → 代码生成 → 链接 → 运行），以及 BSD 套接字
+// 运行时（`zr_socket` / `zr_close` / `zr_errno`）可用。
+//
+// `std/net.zr` 是一个从未被测试加载的破损标准库模块：早先它在类型检查阶段就
+// 挂掉（`#[repr(C, align(4))]` 语法、缺 `Vec` 导入、`unwrap_or_else` 实参是值
+// 非闭包、内联模块 `af::INET` 无法解析、`into_socket` 从 Drop 类型移字段）。
+// 修完这些后 `net` 能通过类型检查并生成目标文件，但链接仍失败——`net.zr` 声明
+// 的 `zr_socket` / `zr_bind` / `zr_accept` 等 BSD 套接字封装在运行时里没有
+// 对应实现（`undefined symbol: _zr_accept`）。本用例钉住"运行时补齐了套接字
+// 封装、`net` 全链路可加载"：创建 + 关闭一个 TCP 套接字，断言 fd 非负。
+// `sock_type` / `protocol` 是 net.zr 里的内联模块，条目已扁平并入顶层，
+// `sock_type::STREAM` 走内联模块限定路径解析（顶层 `STREAM`）。
+use net::{Socket, AddrFamily};
+
+fn main() -> i32 {
+    let s = Socket::new(AddrFamily::V4, sock_type::STREAM, protocol::AUTO);
+    if s.is_err() { return 1; }
+    let sock = s.unwrap();
+    let fd = sock.fd();
+    if fd < 0 { return 2; }
+    sock.close();
+    return 0;
+}

@@ -1010,3 +1010,244 @@ _zr_time_unix_ns:
     mov     rsp, rbp
     pop     rbp
     ret
+
+#==============================================================================
+# BSD 套接字封装（net.zr 的 extern "C" 对接 libSystem）
+#==============================================================================
+# 这些是薄封装：参数已经在 SysV 寄存器里（rdi/rsi/rdx/rcx/r8/r9），直接透传。
+# macOS 的 BSD 套接字函数都在 libSystem 里，符号带前导下划线。
+
+# zr_socket(domain, type, protocol) -> fd
+    .globl _zr_socket
+_zr_socket:
+    push    rbp
+    mov     rbp, rsp
+    and     rsp, -16
+    call    _socket
+    mov     rsp, rbp
+    pop     rbp
+    ret
+
+# zr_bind(fd, addr, addrlen) -> i32
+    .globl _zr_bind
+_zr_bind:
+    push    rbp
+    mov     rbp, rsp
+    and     rsp, -16
+    call    _bind
+    mov     rsp, rbp
+    pop     rbp
+    ret
+
+# zr_connect(fd, addr, addrlen) -> i32
+    .globl _zr_connect
+_zr_connect:
+    push    rbp
+    mov     rbp, rsp
+    and     rsp, -16
+    call    _connect
+    mov     rsp, rbp
+    pop     rbp
+    ret
+
+# zr_listen(fd, backlog) -> i32
+    .globl _zr_listen
+_zr_listen:
+    push    rbp
+    mov     rbp, rsp
+    and     rsp, -16
+    call    _listen
+    mov     rsp, rbp
+    pop     rbp
+    ret
+
+# zr_accept(fd, addr, addrlen) -> fd
+    .globl _zr_accept
+_zr_accept:
+    push    rbp
+    mov     rbp, rsp
+    and     rsp, -16
+    call    _accept
+    mov     rsp, rbp
+    pop     rbp
+    ret
+
+# zr_recv(fd, buf, len, flags) -> isize
+    .globl _zr_recv
+_zr_recv:
+    push    rbp
+    mov     rbp, rsp
+    and     rsp, -16
+    call    _recv
+    mov     rsp, rbp
+    pop     rbp
+    ret
+
+# zr_send(fd, buf, len, flags) -> isize
+    .globl _zr_send
+_zr_send:
+    push    rbp
+    mov     rbp, rsp
+    and     rsp, -16
+    call    _send
+    mov     rsp, rbp
+    pop     rbp
+    ret
+
+# zr_setsockopt(fd, level, optname, optval, optlen) -> i32
+#   5 个整数参数：rdi/rsi/rdx/rcx/r8（第 5 个在 r8，已经是 SysV 位）。
+    .globl _zr_setsockopt
+_zr_setsockopt:
+    push    rbp
+    mov     rbp, rsp
+    and     rsp, -16
+    call    _setsockopt
+    mov     rsp, rbp
+    pop     rbp
+    ret
+
+# zr_getsockopt(fd, level, optname, optval, optlen) -> i32
+    .globl _zr_getsockopt
+_zr_getsockopt:
+    push    rbp
+    mov     rbp, rsp
+    and     rsp, -16
+    call    _getsockopt
+    mov     rsp, rbp
+    pop     rbp
+    ret
+
+# zr_getaddrinfo(node, service, hints, res) -> i32
+    .globl _zr_getaddrinfo
+_zr_getaddrinfo:
+    push    rbp
+    mov     rbp, rsp
+    and     rsp, -16
+    call    _getaddrinfo
+    mov     rsp, rbp
+    pop     rbp
+    ret
+
+# zr_freeaddrinfo(res)
+    .globl _zr_freeaddrinfo
+_zr_freeaddrinfo:
+    push    rbp
+    mov     rbp, rsp
+    and     rsp, -16
+    call    _freeaddrinfo
+    mov     rsp, rbp
+    pop     rbp
+    ret
+
+# zr_inet_ntop(af, src, dst, size) -> ptr
+    .globl _zr_inet_ntop
+_zr_inet_ntop:
+    push    rbp
+    mov     rbp, rsp
+    and     rsp, -16
+    call    _inet_ntop
+    mov     rsp, rbp
+    pop     rbp
+    ret
+
+# zr_inet_pton(af, src, dst) -> i32
+    .globl _zr_inet_pton
+_zr_inet_pton:
+    push    rbp
+    mov     rbp, rsp
+    and     rsp, -16
+    call    _inet_pton
+    mov     rsp, rbp
+    pop     rbp
+    ret
+
+# zr_htons(hostshort) -> u16
+    .globl _zr_htons
+_zr_htons:
+    push    rbp
+    mov     rbp, rsp
+    and     rsp, -16
+    call    _htons
+    mov     rsp, rbp
+    pop     rbp
+    ret
+
+# zr_ntohs(netshort) -> u16
+    .globl _zr_ntohs
+_zr_ntohs:
+    push    rbp
+    mov     rbp, rsp
+    and     rsp, -16
+    call    _ntohs
+    mov     rsp, rbp
+    pop     rbp
+    ret
+
+# zr_htonl(hostlong) -> u32
+    .globl _zr_htonl
+_zr_htonl:
+    push    rbp
+    mov     rbp, rsp
+    and     rsp, -16
+    call    _htonl
+    mov     rsp, rbp
+    pop     rbp
+    ret
+
+# zr_ntohl(netlong) -> u32
+    .globl _zr_ntohl
+_zr_ntohl:
+    push    rbp
+    mov     rbp, rsp
+    and     rsp, -16
+    call    _ntohl
+    mov     rsp, rbp
+    pop     rbp
+    ret
+
+# zr_set_nonblocking(fd, nonblocking) -> i32
+#   读当前标志（F_GETFL=3），按 nonblocking 置/清 O_NONBLOCK（macOS = 0x4），
+#   再写回（F_SETFL=4）。fd 与 flag 要跨两次 fcntl 调用，用被调用方保存的
+#   rbx/r12（SysV 里 rbx、r12-r15 是 callee-saved）。
+    .globl _zr_set_nonblocking
+_zr_set_nonblocking:
+    push    rbp
+    mov     rbp, rsp
+    and     rsp, -16
+    push    rbx
+    push    r12
+    mov     ebx, edi                 // ebx = fd
+    mov     r12d, esi                // r12d = nonblocking
+    mov     edi, ebx
+    mov     esi, 3                   // F_GETFL
+    call    _fcntl
+    mov     ecx, eax                 // ecx = 当前 flags
+    test    r12d, r12d
+    je      1f
+    or      ecx, 4                   // 置 O_NONBLOCK
+    jmp     2f
+1:
+    and     ecx, -5                  // 清 O_NONBLOCK（~4）
+2:
+    mov     edi, ebx
+    mov     esi, 4                   // F_SETFL
+    mov     edx, ecx
+    call    _fcntl
+    pop     r12
+    pop     rbx
+    mov     rsp, rbp
+    pop     rbp
+    ret
+
+# zr_errno() -> i32
+#   macOS 的 errno 是线程局部存储，经 `__error()` 取地址。
+    .globl _zr_errno
+_zr_errno:
+    push    rbp
+    mov     rbp, rsp
+    and     rsp, -16
+    call    ___error
+    mov     eax, dword ptr [rax]
+    mov     rsp, rbp
+    pop     rbp
+    ret

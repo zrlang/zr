@@ -49,7 +49,7 @@ target/debug/zr prog.zr -O1 -o /tmp/prog   # 编译单个程序
   `ld` 直接断言崩溃（`atomShouldReplaceExisting`）。先 `nm` 看目标文件有没有
   重复符号，再下结论。已修复（提交 `1ef4a02`：MIR 按最终符号名去重，保留首个
   用户定义）。
-- 测试：`tests/zr_language.rs` 把 103 个 `tests/cases/*.zr` 各在
+- 测试：`tests/zr_language.rs` 把 104 个 `tests/cases/*.zr` 各在
   `-O0/-O1/-O2/-O3/-Oz` 跑一遍（460 次编译+运行）。退出码 0 = 过，非 0 = 失败（编号指向失败的断言）。
   宿主端另有 `io_print_matches_rust` 等 Rust 对照用例。
 - **没有负向测试机制。** `tests/cases/` 下每个 `.zr` 都必须编译通过并返回 0。
@@ -198,7 +198,7 @@ README 里"指针与 unsafe"一节目前是**愿景**：
 ### `cargo test` 当前基线（2026-10-29，全绿）
 
 - `cargo test --bin zr`：265 项。
-- `cargo test --test zr_language`：103 个用例 × 5 个优化等级 = 515 项，另有 3 个宿主端
+- `cargo test --test zr_language`：104 个用例 × 5 个优化等级 = 520 项，另有 3 个宿主端
   对照用例（`io_print_matches_rust`——逐字符对比 Rust 的格式化输出，含 `{:e}` / `{:E}`
   与大浮点 Display（`|v| ≥ 2⁶⁴` 不带 `.0`）的回归；`extern_c_write_prints_string_literal`；
   `toolchain_subcommands_emit`——`zr fmt` / `zr fmt --check` / `zr pkg init` / `zr lsp`
@@ -281,6 +281,19 @@ README 里"指针与 unsafe"一节目前是**愿景**：
   单独登记（`flattened`，与**加载**模块 `known_modules` 区分），`resolve_path`
   看到首段是内联模块时把叶子段拿到顶层符号表解析：`af::INET` → 顶层 `INET`。
   `tests/cases/103_inline_mod.zr`（常量 + 函数都钉住）。
+- **`net` 模块可加载 + BSD 套接字运行时**：✅ 已实现——`std/net.zr` 是一个从未
+  被测试加载的破损标准库模块，早先它在类型检查阶段就挂掉（`#[repr(C,
+  align(4))]` 语法、缺 `Vec` 导入、`unwrap_or_else` 实参是值非闭包、内联模块
+  `af::INET` 无法解析、`into_socket` 从 Drop 类型移字段）。修完后 `net` 能通过
+  类型检查并生成目标文件，但链接仍失败——`net.zr` 声明的 `zr_socket` /
+  `zr_bind` / `zr_accept` 等 BSD 套接字封装在运行时里没有对应实现
+  （`undefined symbol: _zr_accept`）。已给 macOS x86-64 运行时补齐 19 个套接字
+  封装（`zr_socket` / `zr_bind` / `zr_connect` / `zr_listen` / `zr_accept` /
+  `zr_recv` / `zr_send` / `zr_setsockopt` / `zr_getsockopt` / `zr_getaddrinfo` /
+  `zr_freeaddrinfo` / `zr_inet_ntop` / `zr_inet_pton` / `zr_htons` / `zr_ntohs` /
+  `zr_htonl` / `zr_ntohl` / `zr_set_nonblocking` / `zr_errno`，均薄封装 libSystem
+  的 BSD 套接字 API），`net` 现在全链路可加载并运行（创建 + 关闭套接字实测）。
+  `tests/cases/104_socket_runtime.zr`（钉住）。
 - **穷尽性报错**：✅ 已改进（`a526953`：枚举缺臂列出缺失变体名，`17_match_missing_variant.zr`；整型/标量仍保留尾 `_` 臂措辞）。
 - **文档债**：✅ 已清（`fb4dfb2` 修 `tests/README.md` / `future/README.md`；`1d38ca3` 修 README 安全模型节 / `rust-parity.md` / `CONTRIBUTING.md` / `Cargo.toml` description）。
 
