@@ -1,0 +1,22 @@
+// 覆盖：内联模块 `mod af { ... }` 的限定路径访问。
+//
+// 模块系统是扁平命名空间：`mod af { pub const INET }` 的 `INET` 被直接合并进
+// 顶层，`af` 本身不是符号。早先 `af::INET` 报「cannot find value `af` in this
+// scope」（`net.zr` 的 `family: af::INET` 因此加载不了）——`resolve_path` 不认
+// 内联模块名，叶子段也没去顶层查。现在内联模块名单独登记（`flattened`，与
+// **加载**模块 `known_modules` 区分），`resolve_path` 看到首段是内联模块时把
+// 叶子段拿到顶层符号表解析：`af::INET` → 顶层 `INET`。
+mod af {
+    pub const INET: i32 = 2;
+    pub const INET6: i32 = 10;
+    pub fn pick() -> i32 { return 5; }
+}
+
+fn main() -> i32 {
+    // 内联模块常量：早先 `af` 不是符号，`af::INET` 报 cannot find value。
+    if af::INET != 2 { return 1; }
+    if af::INET6 != 10 { return 2; }
+    // 内联模块函数：`af::pick` → 顶层 `pick`。
+    if af::pick() != 5 { return 3; }
+    return 0;
+}

@@ -247,6 +247,13 @@ pub struct TypeChecker {
     /// 限定符——标准库的定义已经被并进当前编译单元，所以这里只需要
     /// 知道"这个名字是模块"，不用再解析成 DefId。
     known_modules: HashSet<String>,
+    /// 内联模块名（`mod af { ... }`）。模块系统是扁平命名空间，内联模块的
+    /// 条目被直接合并进顶层，模块名本身不是符号；但源码里 `af::INET` 这样的
+    /// 限定路径仍要能解析——`resolve_path` 据此把叶子段拿到顶层符号表解析。
+    /// 与 `known_modules` 分开：`known_modules` 是**加载**的模块（条目在各自
+    /// 文件里，`core::Option::Some` 得走既有路径），`flattened_modules` 是
+    /// **内联**模块（条目真的在顶层，`af::INET` 要解析顶层 `INET`）。
+    flattened_modules: HashSet<String>,
     /// 每个模块导出的条目名（`use foo::*` 按它把模块的全部顶层名字导入）。
     module_exports: std::collections::HashMap<String, Vec<String>>,
     /// 警告集合（deprecated 使用等）。
@@ -365,6 +372,7 @@ impl Default for TypeChecker {
             use_aliases: HashMap::new(),
             variant_aliases: HashMap::new(),
             known_modules: HashSet::new(),
+            flattened_modules: HashSet::new(),
             module_exports: std::collections::HashMap::new(),
             warnings: Vec::new(),
             cfg_target: attributes::CfgTarget::host(),
@@ -391,6 +399,11 @@ impl TypeChecker {
     /// 告知类型检查器哪些名字是已加载的标准库模块。
     pub fn set_known_modules(&mut self, modules: HashSet<String>) {
         self.known_modules = modules;
+    }
+
+    /// 告知类型检查器哪些名字是内联模块（条目已扁平并入顶层）。
+    pub fn set_flattened_modules(&mut self, modules: HashSet<String>) {
+        self.flattened_modules = modules;
     }
 
     /// 告知类型检查器每个模块导出的条目名，供 `use foo::*` 导入。
@@ -7483,6 +7496,17 @@ impl TypeChecker {
             }
         }
         let first = path[0].clone();
+        // 内联模块的限定路径 `af::INET`：模块系统是扁平命名空间，`mod af { .. }`
+        // 的条目被合并进顶层、`af` 本身不是符号。这里 `af` 只在"是内联模块"
+        // 时成立，把叶子段拿到顶层符号表解析——`INET` 真的在顶层。
+        // 与 `known_modules`（加载的模块）区分：`core::Option::Some` 的 `core`
+        // 不是内联模块，不能这样回落（会错把 `Some` 当顶层符号）。
+        if path.len() > 1 && self.flattened_modules.contains(&first) {
+            let leaf = &path[path.len() - 1];
+            if let Some(id) = self.symbols.get(leaf).copied() {
+                return Ok(id);
+            }
+        }
         let id = self.resolve_name(&first, span)?;
         for seg in &path[1..] {
             // 路径继续：查找 id 的成员

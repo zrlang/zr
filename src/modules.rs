@@ -26,6 +26,10 @@ pub struct LoadReport {
     pub files: Vec<(PathBuf, u64)>,
     /// 被 `mod` / `use` 拉进来的模块名。
     pub modules: Vec<String>,
+    /// 内联模块名（`mod af { ... }`）。模块系统是扁平命名空间，内联模块的条目
+    /// 被直接合并进顶层，模块名本身不是符号；但源码里 `af::INET` 这样的限定
+    /// 路径仍要能解析——`resolve_path` 据此把叶子段拿到顶层符号表解析。
+    pub flattened: Vec<String>,
 }
 
 /// 收集一个模块（`Program`）里定义的所有顶层条目名，供 `use foo::*` 导入。
@@ -79,6 +83,8 @@ pub struct Loaded {
     pub error: Option<String>,
     /// 并入主程序的模块名（类型检查用得上：`io` 这类段要当模块看待）。
     pub modules: Vec<String>,
+    /// 内联模块名（`mod af { ... }`，条目已扁平并入顶层，见 `LoadReport`）。
+    pub flattened: Vec<String>,
     /// 每个模块导出的条目名（`use core::*` 要按它导入全部名字）。
     ///
     /// 键是模块名（`core` / `io`），值是模块里定义的顶层条目名（函数、
@@ -96,12 +102,14 @@ pub fn load(prog: &mut Program, base_dir: &Path) -> Loaded {
     let mut out = Loaded {
         error: None,
         modules: Vec::new(),
+        flattened: Vec::new(),
         module_exports: std::collections::HashMap::new(),
         report: LoadReport::default(),
     };
     let mut loader = Loader {
         seen: std::collections::HashSet::new(),
         modules: std::collections::HashSet::new(),
+        flattened: std::collections::HashSet::new(),
         report: &mut out.report,
         module_exports: &mut out.module_exports,
     };
@@ -110,7 +118,10 @@ pub fn load(prog: &mut Program, base_dir: &Path) -> Loaded {
     let inline = std::mem::take(&mut prog.modules);
     for decl in inline {
         match decl {
-            ModuleDecl::Inline(_, items) => loader.absorb_items(prog, items, base_dir),
+            ModuleDecl::Inline(name, items) => {
+                loader.flattened.insert(name.clone());
+                loader.absorb_items(prog, items, base_dir);
+            }
             ModuleDecl::Load(name) => {
                 if let Err(e) = loader.load_mod_file(prog, &name, base_dir, 0) {
                     out.error = Some(e);
@@ -126,9 +137,23 @@ pub fn load(prog: &mut Program, base_dir: &Path) -> Loaded {
         return out;
     }
 
-    out.modules = loader.modules.into_iter().collect();
+    // 先把 `loader` 里的集合取出来再 `drop`：`loader` 可变借用了
+    // `out.report` / `out.module_exports`，不结束借用就不能写 `out.report.*`。
+    // 用 `mem::take` 逐个取出（`into_iter` 会部分移动 `loader`）。
+    let modules = std::mem::take(&mut loader.modules)
+        .into_iter()
+        .collect::<Vec<_>>();
+    let flattened = std::mem::take(&mut loader.flattened)
+        .into_iter()
+        .collect::<Vec<_>>();
+    drop(loader);
+
+    out.modules = modules;
     out.modules.sort();
+    out.flattened = flattened;
+    out.flattened.sort();
     out.report.modules = out.modules.clone();
+    out.report.flattened = out.flattened.clone();
     out
 }
 
@@ -137,6 +162,8 @@ struct Loader<'a> {
     seen: std::collections::HashSet<PathBuf>,
     /// 已加载的模块名。
     modules: std::collections::HashSet<String>,
+    /// 内联模块名（条目扁平并入顶层，模块名本身不是符号）。
+    flattened: std::collections::HashSet<String>,
     report: &'a mut LoadReport,
     /// 模块名 → 导出的条目名（`use foo::*` 用）。
     module_exports: &'a mut std::collections::HashMap<String, Vec<String>>,
@@ -268,8 +295,11 @@ impl Loader<'_> {
                 ModuleItem::Static(s) => prog.statics.push(s),
                 ModuleItem::Use(u) => nested_uses.push(u),
                 ModuleItem::Module(ModuleDecl::Inline(name, inner)) => {
-                    // 登记模块名，`name::item` 才能被当成路径解析
-                    self.modules.insert(name);
+                    // 登记为内联（扁平）模块：`mod af { pub const INET }` 的
+                    // `INET` 被合并进顶层，`af::INET` 靠 `flattened` 里的名字
+                    // 把叶子段拿到顶层解析。不能进 `modules`（`known_modules`）
+                    // ——那是**加载**模块，`core::Option::Some` 得走既有路径。
+                    self.flattened.insert(name);
                     self.absorb_items(prog, inner, dir)
                 }
                 ModuleItem::Module(ModuleDecl::Load(name)) => {

@@ -49,7 +49,7 @@ target/debug/zr prog.zr -O1 -o /tmp/prog   # 编译单个程序
   `ld` 直接断言崩溃（`atomShouldReplaceExisting`）。先 `nm` 看目标文件有没有
   重复符号，再下结论。已修复（提交 `1ef4a02`：MIR 按最终符号名去重，保留首个
   用户定义）。
-- 测试：`tests/zr_language.rs` 把 102 个 `tests/cases/*.zr` 各在
+- 测试：`tests/zr_language.rs` 把 103 个 `tests/cases/*.zr` 各在
   `-O0/-O1/-O2/-O3/-Oz` 跑一遍（460 次编译+运行）。退出码 0 = 过，非 0 = 失败（编号指向失败的断言）。
   宿主端另有 `io_print_matches_rust` 等 Rust 对照用例。
 - **没有负向测试机制。** `tests/cases/` 下每个 `.zr` 都必须编译通过并返回 0。
@@ -198,7 +198,7 @@ README 里"指针与 unsafe"一节目前是**愿景**：
 ### `cargo test` 当前基线（2026-10-29，全绿）
 
 - `cargo test --bin zr`：265 项。
-- `cargo test --test zr_language`：102 个用例 × 5 个优化等级 = 510 项，另有 3 个宿主端
+- `cargo test --test zr_language`：103 个用例 × 5 个优化等级 = 515 项，另有 3 个宿主端
   对照用例（`io_print_matches_rust`——逐字符对比 Rust 的格式化输出，含 `{:e}` / `{:E}`
   与大浮点 Display（`|v| ≥ 2⁶⁴` 不带 `.0`）的回归；`extern_c_write_prints_string_literal`；
   `toolchain_subcommands_emit`——`zr fmt` / `zr fmt --check` / `zr pkg init` / `zr lsp`
@@ -275,6 +275,12 @@ README 里"指针与 unsafe"一节目前是**愿景**：
   `req.push(u8)` 报「T inferred as both SocketAddr and u8」；
   现在 `generic_call_target` 也认 `Path`、泛型路径调用返回新推断变量。
   `tests/cases/102_path_question.zr`（两者都钉住）。
+- **内联模块的限定路径访问**：✅ 已实现——`mod af { pub const INET }` 的条目被
+  扁平并入顶层、`af` 本身不是符号，早先 `af::INET` 报「cannot find value `af`
+  in this scope」（`net.zr` 的 `family: af::INET` 因此加载不了）。现在内联模块名
+  单独登记（`flattened`，与**加载**模块 `known_modules` 区分），`resolve_path`
+  看到首段是内联模块时把叶子段拿到顶层符号表解析：`af::INET` → 顶层 `INET`。
+  `tests/cases/103_inline_mod.zr`（常量 + 函数都钉住）。
 - **穷尽性报错**：✅ 已改进（`a526953`：枚举缺臂列出缺失变体名，`17_match_missing_variant.zr`；整型/标量仍保留尾 `_` 臂措辞）。
 - **文档债**：✅ 已清（`fb4dfb2` 修 `tests/README.md` / `future/README.md`；`1d38ca3` 修 README 安全模型节 / `rust-parity.md` / `CONTRIBUTING.md` / `Cargo.toml` description）。
 

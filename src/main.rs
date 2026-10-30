@@ -729,6 +729,9 @@ fn compile(input: &str, cmd: &Cli) -> Result<std::path::PathBuf, String> {
 
     let mut checker = typeck::TypeChecker::new();
     checker.set_known_modules(loaded.modules.iter().cloned().collect());
+    // 内联模块（`mod af { .. }`）的条目扁平并入顶层，但 `af::INET` 这样的
+    // 限定路径仍要解析：`resolve_path` 据此把叶子段拿到顶层符号表。
+    checker.set_flattened_modules(loaded.flattened.iter().cloned().collect());
     // 每个模块导出的条目名：`use core::*` 要按它导入全部顶层名字。
     checker.set_module_exports(loaded.module_exports);
     // 32 位目标支持多字长（i64）运算：值走 8 字节栈槽，用两条 32 位指令
