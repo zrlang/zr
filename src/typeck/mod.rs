@@ -5913,6 +5913,19 @@ impl TypeChecker {
                 return Some(*id);
             }
         }
+        // `Vec::new` 这类**路径**调用：早先只认 `Variable`，`Vec::new()` 的
+        // 快速推断会走 `infer_expr_ty(Path)` 拿到**未替换**的泛型签名
+        // （`Vec<T>` 里的 `T` 是共享占位符），`let req = Vec::new()` 就绑到
+        // 共享占位符上；同文件里另一个 `Vec<SocketAddr>` 实例化把占位符绑成
+        // `SocketAddr`，`req` 泄漏成 `Vec<SocketAddr>`（`net.zr` 的
+        // `req.push(buf[m])` 报「T inferred as both SocketAddr and u8」）。
+        if let Expression::Path(path, _) = callee {
+            if let Ok(id) = self.resolve_path(path, ast::Span::unknown()) {
+                if self.generic_names.contains_key(&id) {
+                    return Some(id);
+                }
+            }
+        }
         None
     }
 
@@ -7714,6 +7727,29 @@ impl TypeChecker {
                         // 函数名的类型是**函数类型**，不是返回类型。返回
                         // 类型会让上游 `Call` 分支取不到签名，`let x = f();`
                         // 的 `x` 就退化成 `_`（f32 返回值尤其致命）。
+                        Ty::Function {
+                            params: f.params.iter().map(|p| p.ty.clone()).collect(),
+                            ret: Box::new(f.return_type.clone()),
+                            is_async: f.is_async,
+                            abi: hir::Abi::Zr,
+                        }
+                    } else {
+                        self.infer.fresh_infer(e.span())
+                    }
+                } else {
+                    self.infer.fresh_infer(e.span())
+                }
+            }
+            Expression::Path(path, _) => {
+                // `TcpListener::bind` 这类**路径**调用：早先 `infer_expr_ty`
+                // 没有 `Path` 分支，`TcpListener::bind(addr)?` 里 `?` 拿不到
+                // 调用返回类型，退化成"当前函数返回类型"兜底——`serve_echo`
+                // 返回 `Result<(), NetError>`，于是 `listener` 被推断成 `()`
+                // （`Tuple([])`），`.accept` 报「tuple index out of range:
+                // accept」。与 `Variable` 分支一样把路径解析成函数类型，让
+                // `?`（及其它快速推断）拿到真实返回载荷。
+                if let Ok(id) = self.resolve_path(path, e.span()) {
+                    if let Some(f) = self.functions.get(&id) {
                         Ty::Function {
                             params: f.params.iter().map(|p| p.ty.clone()).collect(),
                             ret: Box::new(f.return_type.clone()),

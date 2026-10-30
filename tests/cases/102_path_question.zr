@@ -1,0 +1,52 @@
+// 覆盖：多段路径调用的 `?`（未注解）与泛型路径调用的快速推断。
+//
+// 1. `Maker::make()?`（**多段路径**调用，`TcpListener::bind(addr)?` 是真实
+//    场景）：`infer_expr_ty` 早先没有 `Expression::Path` 分支，`?` 看不到调用
+//    返回类型，退化成"当前函数返回类型"兜底——`serve_echo`（返回
+//    `Result<(), NetError>`）里 `listener` 被推断成 `()`（`Tuple([])`），
+//    `.accept` 报「tuple index out of range: accept」。现在 `Path` 分支把路径
+//    解析成函数类型，`?` 拿到真实载荷。
+//
+// 2. `Vec::new()`（**泛型路径**调用）：`generic_call_target` 早先只认
+//    `Variable`，`Vec::new()` 的快速推断拿到**未替换**的泛型签名
+//    （`Vec<T>` 里 `T` 是共享占位符），同文件另一个 `Vec<i64>` 实例化把占位符
+//    绑成 i64，`v.push(9u8)` 报「T inferred as both i64 and u8」。现在
+//    `generic_call_target` 也认 `Path`，泛型路径调用返回新推断变量。
+use collections::Vec;
+
+struct Pair { x: i64 }
+
+struct Maker { }
+
+impl Maker {
+    pub fn make() -> Result<Pair, i64> {
+        return Result::Ok(Pair { x: 7 });
+    }
+}
+
+fn question_from_path() -> Result<(), i64> {
+    // 未注解的多段路径调用 `?`：早先 `p` 被推断成 `()`，`p.x` 报"tuple index"。
+    let p = Maker::make()?;
+    if p.x != 7 { return Result::Err(1); }
+    return Result::Ok(());
+}
+
+fn generic_path_call() -> Result<(), i64> {
+    // 泛型路径调用：早先 `v` 泄漏共享占位符，`push(9u8)` 与 `Vec<i64>` 冲突。
+    let v = Vec::new();
+    v.push(9u8);
+    if v[0] != 9 { return Result::Err(2); }
+    return Result::Ok(());
+}
+
+fn main() -> i32 {
+    match question_from_path() {
+        Result::Ok(()) => {},
+        Result::Err(_) => return 1,
+    }
+    match generic_path_call() {
+        Result::Ok(()) => {},
+        Result::Err(_) => return 2,
+    }
+    return 0;
+}
