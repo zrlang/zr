@@ -339,7 +339,24 @@ README 里"指针与 unsafe"一节目前是**愿景**：
   **macOS arm64 版已同样补齐**（`b _socket` 尾调用；`zr_set_nonblocking` 用
   callee-saved x19/x20 跨两次 `fcntl`；`zr_errno` 经 `___error`；19 个符号经
   `clang -target arm64-apple-macos` 汇编验证、重定位指向正确 libc 符号，本机
-  是 x86-64 无法运行验证）。**Linux 运行时是纯 syscall 设计（不依赖 libc），
+  是 x86-64 无法运行验证）。
+   **Windows（Winsock）版已同样补齐**：`rt_windows_x86_64.s` 与
+   `rt_windows_arm64.s` 的 19 个封装走 `ws2_32.dll`（`socket`/`bind`/`connect`/
+   `listen`/`accept`/`recv`/`send`/`setsockopt`/`getsockopt`/`getaddrinfo`/
+   `freeaddrinfo` 同名导出；`inet_ntop`/`inet_pton` 在 Winsock2 里叫
+   `InetNtopA`/`InetPtonA`；`htons`/`ntohs`/`htonl`/`ntohl` 不是 ws2_32 导出
+   （头文件内联字节交换），运行时自己实现（`rol`/`bswap`）；`set_nonblocking`
+   用 `ioctlsocket(FIONBIO)`（BSD 的 `fcntl` 在 Windows 不存在）；`zr_errno`
+   用 `WSAGetLastError`）。每个走 Winsock 的封装先经 `zr_wsa_init` 惰性
+   `WSAStartup`（`.bss` 里的 flag 保证只调一次，直接调 bind/connect 也不会拿
+   `WSANOTINITIALISED`）。MS x64 ABI（rcx/rdx/r8/r9 + 32 字节 shadow）与
+   Windows ARM64 ABI（x0..x3 + 第 5 参在 `[sp]`）分别处理；PE 链接命令加
+   `ws2_32`（clang `-lws2_32`、lld-link `ws2_32.lib`）；19 个符号经
+   `clang --target=x86_64/aarch64-pc-windows-msvc` 汇编验证、16 个 Winsock
+   extern 引用正确，本机无 Windows 无法运行验证。**裸机（ARM/RISC-V）没有
+   操作系统与网络栈，套接字无法实现**——运行时未引用任何套接字符号，裸机
+   程序若引用 `zr_socket` 会正确得到链接错误（未定义符号），这已是预期失败
+   模式，不提供桩函数。  **Linux 运行时是纯 syscall 设计（不依赖 libc），
   `getaddrinfo` / `inet_ntop` / `inet_pton` 不是 syscall、无法原样实现**——要
   么给 Linux 运行时接 libc，要么这 3 个在 Linux 上返回错误；未做。
   `tests/cases/104_socket_runtime.zr`（钉住）。

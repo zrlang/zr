@@ -719,12 +719,15 @@ fn linker_commands(
             }
         }
         ObjectFormat::PeCoff => {
-            // clang 驱动：自动附加 kernel32.lib 等系统导入库
+            // clang 驱动：自动附加 kernel32.lib 等系统导入库。套接字走
+            // Winsock2（ws2_32.dll），显式 `-lws2_32`（macOS 上无该导入库，
+            // 只有交叉链接 Windows 时才需要）。
             let mut c = std::process::Command::new("clang");
             c.arg(format!("--target={}", target.triple()))
                 .arg("-o")
                 .arg(output.as_os_str())
-                .arg(obj.as_os_str());
+                .arg(obj.as_os_str())
+                .arg("-lws2_32");
             if let Some(lib) = runtime_lib {
                 c.arg(lib);
             }
@@ -739,20 +742,22 @@ fn linker_commands(
             c.arg("-nostdlib")
                 .arg("-o")
                 .arg(output.as_os_str())
-                .arg(obj.as_os_str());
+                .arg(obj.as_os_str())
+                .arg("-lws2_32");
             if let Some(lib) = runtime_lib {
                 c.arg(lib);
             }
             commands.push(c);
 
-            // lld-link：显式指定入口与系统库
+            // lld-link：显式指定入口与系统库（含 Winsock2）。
             let mut c = std::process::Command::new("lld-link");
             c.arg(format!("/out:{}", output.display()))
                 .arg(format!("/entry:{}", target.entry_symbol()))
                 .arg("/subsystem:console")
                 .arg("/nodefaultlib")
                 .arg(obj.as_os_str())
-                .arg("kernel32.lib");
+                .arg("kernel32.lib")
+                .arg("ws2_32.lib");
             if let Some(lib) = runtime_lib {
                 c.arg(lib);
             }

@@ -427,3 +427,174 @@ zr_time_ns:
 zr_time_unix_ns:
     mov     x0, #-1
     ret
+
+#==============================================================================
+# BSD 套接字封装（Winsock2 / ws2_32.dll）
+#
+# 与 x86-64 版一一对应（见 rt_windows_x86_64.s 的注释）。Windows ARM64 ABI：
+# 前 4 参数 x0..x3，第 5 个起在栈上（[sp]），无 shadow space，sp 在公开
+# 接口边界保持 16 字节对齐；x9/x10 是 caller-saved 临时寄存器（x18 平台
+# 保留，x19..x28 是 callee-saved）。x64 的调用参数本来就在 x0..x3，故
+# ≤4 参的封装直接 `bl <func>; ret`（不动 sp，arg5 留在 [sp] 原处）。
+#==============================================================================
+
+    .section .bss
+    .align 8
+zr_wsa_ready:
+    .zero 8
+zr_wsadata:
+    .zero 512
+
+    .text
+
+# 惰性 WSAStartup：flag 已置就返回，否则调 WSAStartup(MAKEWORD(2,2), &wsadata)。
+zr_wsa_init:
+    adrp   x9, zr_wsa_ready
+    ldrb   w9, [x9, :lo12:zr_wsa_ready]
+    cbnz   w9, 1f
+    mov    w0, #0x0202
+    adrp   x1, zr_wsadata
+    add    x1, x1, :lo12:zr_wsadata
+    sub    sp, sp, #0x20
+    bl     WSAStartup
+    add    sp, sp, #0x20
+    adrp   x9, zr_wsa_ready
+    mov    w10, #1
+    strb   w10, [x9, :lo12:zr_wsa_ready]
+1:
+    ret
+
+# zr_socket(domain, type, protocol) -> fd
+    .globl zr_socket
+zr_socket:
+    bl     zr_wsa_init
+    bl     socket
+    ret
+
+# zr_bind(fd, addr, addrlen) -> i32
+    .globl zr_bind
+zr_bind:
+    bl     zr_wsa_init
+    bl     bind
+    ret
+
+# zr_connect(fd, addr, addrlen) -> i32
+    .globl zr_connect
+zr_connect:
+    bl     zr_wsa_init
+    bl     connect
+    ret
+
+# zr_listen(fd, backlog) -> i32
+    .globl zr_listen
+zr_listen:
+    bl     zr_wsa_init
+    bl     listen
+    ret
+
+# zr_accept(fd, addr, addrlen) -> fd
+    .globl zr_accept
+zr_accept:
+    bl     zr_wsa_init
+    bl     accept
+    ret
+
+# zr_recv(fd, buf, len, flags) -> isize
+    .globl zr_recv
+zr_recv:
+    bl     zr_wsa_init
+    bl     recv
+    ret
+
+# zr_send(fd, buf, len, flags) -> isize
+    .globl zr_send
+zr_send:
+    bl     zr_wsa_init
+    bl     send
+    ret
+
+# zr_setsockopt(fd, level, optname, optval, optlen) -> i32
+    .globl zr_setsockopt
+zr_setsockopt:
+    bl     zr_wsa_init
+    bl     setsockopt
+    ret
+
+# zr_getsockopt(fd, level, optname, optval, optlen) -> i32
+    .globl zr_getsockopt
+zr_getsockopt:
+    bl     zr_wsa_init
+    bl     getsockopt
+    ret
+
+# zr_getaddrinfo(node, service, hints, res) -> i32
+    .globl zr_getaddrinfo
+zr_getaddrinfo:
+    bl     zr_wsa_init
+    bl     getaddrinfo
+    ret
+
+# zr_freeaddrinfo(res)
+    .globl zr_freeaddrinfo
+zr_freeaddrinfo:
+    bl     zr_wsa_init
+    bl     freeaddrinfo
+    ret
+
+# zr_inet_ntop(af, src, dst, size) -> ptr
+    .globl zr_inet_ntop
+zr_inet_ntop:
+    bl     zr_wsa_init
+    bl     InetNtopA
+    ret
+
+# zr_inet_pton(af, src, dst) -> i32
+    .globl zr_inet_pton
+zr_inet_pton:
+    bl     zr_wsa_init
+    bl     InetPtonA
+    ret
+
+# zr_htons(hostshort) -> u16（Winsock2 不导出，运行时自实现）
+    .globl zr_htons
+zr_htons:
+    rev16  w0, w0
+    ret
+
+# zr_ntohs(netshort) -> u16
+    .globl zr_ntohs
+zr_ntohs:
+    rev16  w0, w0
+    ret
+
+# zr_htonl(hostlong) -> u32
+    .globl zr_htonl
+zr_htonl:
+    rev    w0, w0
+    ret
+
+# zr_ntohl(netlong) -> u32
+    .globl zr_ntohl
+zr_ntohl:
+    rev    w0, w0
+    ret
+
+# zr_set_nonblocking(fd, nonblocking) -> i32
+#   ioctlsocket(x0=fd, x1=FIONBIO=0x8004667E, x2=&arg)，arg = nonblocking ? 1 : 0。
+    .globl zr_set_nonblocking
+zr_set_nonblocking:
+    bl     zr_wsa_init
+    sub    sp, sp, #0x20
+    str    x1, [sp]
+    mov    x2, sp
+    mov    w1, #0x667E          // FIONBIO = 0x8004667E（拆成 mov/movk）
+    movk   w1, #0x8004, lsl #16
+    bl     ioctlsocket
+    add    sp, sp, #0x20
+    ret
+
+# zr_errno() -> i32
+    .globl zr_errno
+zr_errno:
+    bl     WSAGetLastError
+    ret
