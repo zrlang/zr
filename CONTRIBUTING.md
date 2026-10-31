@@ -18,7 +18,7 @@
 
 > 提交信息用**中文**、Conventional Commits，风格是**详细段落**：先讲"早先
 > 怎么错"，再讲"为什么这么改"，最后 `Co-Authored-By: Claude Code
-> <noreply@anthropic.com>`（项目内惯例，见 `CLAUDE.md` §9）。
+> <noreply@anthropic.com>`（项目内惯例，见 `AGENTS.md` §9）。
 
 ## 测试约定
 

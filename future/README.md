@@ -9,7 +9,7 @@ subsystem. Each file uses the following status legend:
 - ✅ **Done** — shipped in the current release.
 
 > ⚠️ **2026-10-29 核对**：这张表**严重失真**——几乎所有条目都标 ✅ Done，
-> 但源码里对应特性大多没接线或只是空壳。状态按 `AGENTS.md` / `CLAUDE.md`
+> 但源码里对应特性大多没接线或只是空壳。状态按 `AGENTS.md` / `AGENTS.md`
 > 与 `grep` 源码的实际结论重排：只有确实实现/接线的才留 ✅，其余降为
 > 🔧（有骨架没算法）或 ⬜（连骨架都没有）。
 

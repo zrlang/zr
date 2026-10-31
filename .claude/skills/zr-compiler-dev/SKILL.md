@@ -6,7 +6,7 @@ description: 在 zr 编译器代码库里工作的操作手册——构建、测
 # zr 编译器开发
 
 zr 是一门系统编程语言（Rust/Zig 混合取向），编译器用 Rust 写、零第三方依赖。
-根目录 `CLAUDE.md` 和 `AGENTS.md` 有完整项目背景，本 skill 是可执行的操作流程。
+根目录 `AGENTS.md` 和 `AGENTS.md` 有完整项目背景，本 skill 是可执行的操作流程。
 
 ## 1. 先建基线
 
@@ -121,7 +121,7 @@ lexer(token) → parser → typeck → mir → ssa → codegen → std/ → test
 | 文档 | 可信度 |
 |---|---|
 | 源码注释 | ✅ 最高——常记录"早先怎么错、为什么这么改" |
-| `CLAUDE.md` / `AGENTS.md` | ✅ 已核对源码 |
+| `AGENTS.md` / `AGENTS.md` | ✅ 已核对源码 |
 | `README.md` 语法与用例 | ✅ 高 |
 | `README.md` 安全模型（"指针与 unsafe"节） | ⚠️ 愿景，非现状 |
 | `CONTRIBUTING.md` | ⚠️ 步骤对，但漏了负向测试缺失和架构红线 |

@@ -69,7 +69,7 @@ Hello, zr!
 > 后读 `a` 报 use-after-move，`87_move_check.zr`）和**编译期常量越界检查**（
 > `86_bounds_check.zr`）是真的。`unsafe` 块可解析并通过类型检查但不改变语义。
 > 下面的代码示例是愿景，写进真实程序会静默得到未定义行为。权威现状见
-> `CLAUDE.md` §3.5 / `AGENTS.md` §4。
+> `AGENTS.md` §3.5 / `AGENTS.md` §4。
 
 zr 采用**所有权（Ownership）+ 借用（Borrowing）+ 生命周期（Lifetimes）**三重机制，
 在编译期保证内存安全，无运行时开销：
