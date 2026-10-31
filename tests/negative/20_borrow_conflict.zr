@@ -1,6 +1,9 @@
 // 负向用例：借用检查——同一位置的可变借用不能与已有借用重叠。
-// `let r1 = &mut x; let r2 = &mut x;` 里 r1 的 `&mut x` 存活到作用域结束
-// （绑定到 let），r2 的 `&mut x` 与它重叠，必须报错（Rust 的 E0499）。
+// `let r1 = &mut x; let r2 = &mut x;` 里 r1 的 `&mut x` 在 r1 的**最后使用**
+// 之前存活（NLL：r1 在 `*r1 = 1` 处还用，借用未死），r2 的 `&mut x` 与它重叠，
+// 必须报错（Rust 的 E0499）。若 r1 在 r2 之后不再用（`let r1 = &mut x;
+// let r2 = &mut x;`），r1 的借用已死，`let r2 = &mut x` 合法（NLL）——
+// 所以用 `*r1 = 1` 让 r1 保持存活。
 // 早先 `infer.rs::check_borrows` 是空壳，这种代码能编译，`r2` 静默拿到
 // 与 r1 指向同一位置的另一个可变引用，改一处等于改两处。
 //
@@ -9,5 +12,6 @@ fn main() -> i32 {
     let mut x = 0;
     let r1 = &mut x;
     let r2 = &mut x;
+    *r1 = 1;
     return 0;
 }

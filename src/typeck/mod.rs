@@ -117,6 +117,26 @@ struct BorrowRecord {
     /// 构造器的 `check_ctor_args` 第二遍）时按 `(place, span)` 去重，避免
     /// 把同一次借用记成两次而误报冲突。
     span: ast::Span,
+    /// 借用绑定的局部变量（`let r = &mut x` 的 `r`）。为 `Some` 时借用存活到
+    /// `r` 的最后使用（NLL 近似）；为 `None`（多绑定 / 未关联）时按词法作用域
+    /// 存活到作用域结束。只对 `let_bound` 借用有意义。
+    binding: Option<LocalId>,
+}
+
+/// 一个待确认的"借用冲突"候选（冲突一方的借用绑定到 `Some` 局部）。读到 /
+/// 写到 / 另借 `place` 时若存在 `&mut`（读 / 写）或 `&`（只写）借用且绑定到
+/// `r`，先记候选；整个函数体检查完、`r` 的最后使用已知后，由
+/// `finish_borrow_accesses` 决定报不报（NLL：`r` 已死则借用已死，不报）。
+#[derive(Debug, Clone)]
+struct AccessCandidate {
+    /// 预生成的完整错误信息（借用的可变性、读写区分都编码在文案里）。
+    message: String,
+    /// 访问 / 借用位置的字节偏移。
+    pos: usize,
+    /// 报错用的源码位置。
+    span: ast::Span,
+    /// 冲突借用绑定的局部（`let r = &mut x` 的 `r`）。
+    local: LocalId,
 }
 
 /// 类型检查器。
@@ -238,6 +258,16 @@ struct BorrowRecord {
     /// 用 `x`）会被误报——这是本最小版的已知限制，后续用活跃分析（last
     /// use）收紧。这里先做无假阴性（不漏报真冲突）、接受可能假阳性。
     live_borrows: Vec<BorrowRecord>,
+    /// 每个局部变量的**最后使用**字节偏移（NLL 近似）。`let r = &mut x` 的
+    /// 借用绑定到 `r`，读取被借用位置时若 `r` 的最后使用早于该读取，说明
+    /// 借用已死（`let r = &mut x; *r = 5; if x != 5` 里读 `x` 时 `r` 已死），
+    /// 不报冲突——否则会把合法的 NLL 代码误报。
+    binding_last_use: HashMap<LocalId, usize>,
+    /// 待确认的"读写被借用位置"候选（绑定到 `Some` 的借用）。读到 / 写到
+    /// `x` 时若存在 `&mut`（读 / 写）或 `&`（只写）借用且绑定到 `r`，先记候选；
+    /// 整个函数体检查完、最后使用已知后再决定报不报。临时借用
+    /// （`binding: None`）在访问点直接报。
+    access_candidates: Vec<AccessCandidate>,
     /// 是否正在检查 `let` 的初始化表达式。为真时创建的借用标记为
     /// `let_bound`（绑定到变量，存活到作用域结束）；为假时是**临时借用**
     /// （调用实参 / 临时结构体字段），在语句结束时释放——这正是
@@ -249,6 +279,12 @@ struct BorrowRecord {
     /// 释放，而不是 `let_bound`。`let r = Res { log: &mut log }` 的字段是
     /// 值位置（结构体就是绑定值），`&mut log` 仍应 `let_bound`。
     in_temp_context: bool,
+    /// 是否正在检查赋值表达式的 lhs（`x = ...` 里的 `x` 是**写**不是读，
+    /// `check_place_read` 不应对它报"读被借用"）。
+    in_lhs: bool,
+    /// 是否正在检查 `&x` / `&mut x` 的操作数（取地址不是普通读，`&mut x` 的
+    /// 借用检查由 `AddrOf` 分支自己负责，不应对操作数报"读被借用"）。
+    in_addr_of: bool,
     /// 词法作用域栈：每层是"名字 → DefId"的绑定表。
     ///
     /// 与 `scope_stack` 同步 push/pop，用于把源码里的标识符解析到
@@ -400,8 +436,12 @@ impl Default for TypeChecker {
             next_bb: 0,
             scope_depth: 0,
             live_borrows: Vec::new(),
+            binding_last_use: HashMap::new(),
+            access_candidates: Vec::new(),
             in_let_init: false,
             in_temp_context: false,
+            in_lhs: false,
+            in_addr_of: false,
             scope_stack: Vec::new(),
             local_scopes: Vec::new(),
             locals_by_def: HashMap::new(),
@@ -1904,6 +1944,8 @@ impl TypeChecker {
             self.current_is_async = f.is_async;
             self.scope_stack.clear();
             self.live_borrows.clear();
+            self.binding_last_use.clear();
+            self.access_candidates.clear();
             self.push_scope();
 
             // 函数体按 async fn 的真实输出类型检查；对外签名仍是 Future。
@@ -1943,7 +1985,12 @@ impl TypeChecker {
 
             // 检查函数体
             let body = if let Some(b) = &f.body {
-                Some(self.check_block(b, &ret_ty)?)
+                let b = self.check_block(b, &ret_ty)?;
+                // 借用检查：整个函数体已检查完，所有局部变量的最后使用已知。
+                // 对每个"读写被借用位置"候选按 NLL（借用绑定的最后使用）判定
+                // 是否真冲突，避免 `let r = &mut x; *r = 5; if x != 5` 误报。
+                self.finish_borrow_accesses()?;
+                Some(b)
             } else {
                 None
             };
@@ -2061,6 +2108,10 @@ impl TypeChecker {
                     )
                     .with_span(*span));
                 };
+                // 借用检查：`let r = &mut x` 的借用要关联到绑定局部 r（NLL 最后
+                // 使用），在初始化检查前记下借用栈长度，便于下方只处理本初始化
+                // 创建的借用。
+                let borrow_start = self.live_borrows.len();
                 let init_hir = if let Some(e) = init {
                     // 移动检查：`let b = a` 对非 `Copy`（含 drop glue）的 `a`
                     // 是移动不是复制。把 `a` 放进 `moving_now`，使检查 `a`
@@ -2120,6 +2171,16 @@ impl TypeChecker {
                 // 非绑定模式（通配 / 字面量 / 元组）没有单个可引用的名字，
                 // 用一个匿名局部占位，保证 `HirStmt::Let` 的形状不变。
                 let local = first_binding(&hir_pat).unwrap_or_else(|| self.alloc_local());
+                // 借用检查：把本 `let` 初始化里创建的 `let_bound` 借用关联到
+                // 绑定局部。关联后借用按该局部的**最后使用**释放（NLL），而非
+                // 作用域结束——`let r = &mut x; *r = 5; if x != 5` 里读 `x` 时
+                // `r` 已死，不报冲突。
+                for b in self.live_borrows[borrow_start..].iter_mut() {
+                    if b.let_bound && b.binding.is_none() {
+                        b.binding = Some(local);
+                        self.binding_last_use.entry(local).or_insert(span.start);
+                    }
+                }
                 Ok(HirStmt::Let {
                     local,
                     init: init_hir,
@@ -2276,8 +2337,30 @@ impl TypeChecker {
                 return Ok(HirExpr { kind, ty, span });
             }
             Expression::Variable(name, _) => {
+                // 借用检查：读被借用位置。`x` 出现在任何读上下文（`if x != 5`、
+                // `foo(x)`、`let y = x`）都是读 `x`；`x = 5` 的 lhs 是写（走
+                // `Assign` 分支的写检查）、`&mut x` 的操作数是取地址（走
+                // `AddrOf` 分支的借用检查），都不算普通读。
+                if !self.in_lhs && !self.in_addr_of {
+                    if let Some(place) = borrow_place_of(&Expression::Variable(name.clone(), span))
+                    {
+                        self.check_place_access(false, &place, span)?;
+                    }
+                }
                 let id = match self.resolve_name(name, span) {
-                    Ok(id) => id,
+                    Ok(id) => {
+                        // NLL：记录该局部变量的最后一次使用位置。`let r =
+                        // &mut x` 的借用绑定到 `r`，读取被借用位置时靠它判断
+                        // `r` 是否还活着（`finish_borrow_reads`）。
+                        if let Some(local) = self.as_local(id) {
+                            let cur = span.start;
+                            let e = self.binding_last_use.entry(local).or_insert(cur);
+                            if cur > *e {
+                                *e = cur;
+                            }
+                        }
+                        id
+                    }
                     // 裸无载荷枚举变体（`use core::Option::None` 导入的 `None`
                     // 当值用）：不是名字，是"0 实参的变体构造"。
                     Err(_) => {
@@ -2468,20 +2551,16 @@ impl TypeChecker {
                 // `&mut` 借用期间不能写原位置，`&` 借用期间更不能写（共享
                 // 借用只读）。`*r = 5` 走 `Unary(Deref)` 不在此列（那正是通过
                 // 引用写的合法途径）。字段级不相交（`&mut x.a` 后写 `x.b`）
-                // 由 `place_conflicts` 判为不相干。
+                // 由 `place_conflicts` 判为不相干。`let r = &mut x` 的借用绑定
+                // 到 `r`，写发生在 `r` 的最后使用之后（`let r = &mut x; *r = 5;
+                // x = 7`）是合法的 NLL，由 `finish_borrow_accesses` 判定。
                 if let Some(wplace) = borrow_place_of(lhs) {
-                    for b in &self.live_borrows {
-                        if place_conflicts(&b.place, &wplace) {
-                            return Err(CompileError::new(format!(
-                                "cannot assign to `{}` while it is {} borrowed",
-                                wplace,
-                                if b.mutable { "mutably" } else { "immutably" },
-                            ))
-                            .with_span(lhs.span()));
-                        }
-                    }
+                    self.check_place_access(true, &wplace, lhs.span())?;
                 }
+                let saved_lhs = self.in_lhs;
+                self.in_lhs = true;
                 let l = self.check_expr(lhs, &Ty::Infer(InferId(0)))?;
+                self.in_lhs = saved_lhs;
                 let r = self.check_expr(rhs, &l.ty)?;
                 self.check_partial_move(&r, rhs.span())?;
                 self.check_assignable(&l)?;
@@ -2559,6 +2638,15 @@ impl TypeChecker {
                 return self.check_index_scalar(recv, index, span);
             }
             Expression::Field(receiver, name, _) => {
+                // 借用检查：读被借用位置（字段访问）。`&mut x` 存活期间不能读
+                // `x.field`（要用 `*r` 再取字段）；`&mut x.field` 只挡 `x.field`
+                // 的直接读，`x.other` 由 `place_conflicts` 判为不相干。
+                if !self.in_lhs && !self.in_addr_of {
+                    if let Some(base) = borrow_place_of(receiver) {
+                        let place = format!("{base}.{name}");
+                        self.check_place_access(false, &place, span)?;
+                    }
+                }
                 let recv = self.check_expr(receiver, &Ty::Infer(InferId(0)))?;
                 let (ty, _idx) = self.check_field_access(&recv.ty, name, span)?;
                 return Ok(HirExpr {
@@ -2589,13 +2677,24 @@ impl TypeChecker {
                         if !already {
                             for b in &self.live_borrows {
                                 if b.place == place && (b.mutable || mutable) {
-                                    return Err(CompileError::new(format!(
+                                    let msg = format!(
                                         "cannot borrow `{}` as {} while already borrowed as {}",
                                         place,
                                         if mutable { "mutable" } else { "immutable" },
                                         if b.mutable { "mutable" } else { "immutable" },
-                                    ))
-                                    .with_span(span));
+                                    );
+                                    if b.let_bound {
+                                        if let Some(local) = b.binding {
+                                            self.access_candidates.push(AccessCandidate {
+                                                message: msg,
+                                                pos: span.start,
+                                                span,
+                                                local,
+                                            });
+                                            continue;
+                                        }
+                                    }
+                                    return Err(CompileError::new(msg).with_span(span));
                                 }
                             }
                             self.live_borrows.push(BorrowRecord {
@@ -2604,11 +2703,15 @@ impl TypeChecker {
                                 depth: self.scope_depth,
                                 let_bound: self.in_let_init && !self.in_temp_context,
                                 span,
+                                binding: None,
                             });
                         }
                     }
                 }
+                let saved_addr = self.in_addr_of;
+                self.in_addr_of = true;
                 let inner = self.check_expr(e, &Ty::Infer(InferId(0)))?;
+                self.in_addr_of = saved_addr;
                 reject_float_address(&self.infer, &inner.ty, span)?;
                 let ty = Ty::Pointer(Box::new(inner.ty.clone()), *m);
                 return Ok(HirExpr {
@@ -8583,6 +8686,81 @@ impl TypeChecker {
         let r = f(self);
         self.in_temp_context = saved;
         r
+    }
+
+    /// 借用检查：读写被借用位置。`&mut x` 存活期间不能读或写 `x`（要用 `*r`），
+    /// `&x` 共享借用只允许读、不允许写。字段级不相交由 `place_conflicts` 判据
+    /// 处理。
+    ///
+    /// **NLL 近似**：`let r = &mut x` 的借用绑定到 `r`。访问 `x` 时若 `r` 的
+    /// 最后使用早于该访问，借用已死（`let r = &mut x; *r = 5; if x != 5` 里读
+    /// `x` 时 `r` 已死），不报冲突——否则会把合法的 NLL 代码误报。因此绑定到
+    /// `Some` 的借用**先记候选**（`access_candidates`），整个函数体检查完、最后
+    /// 使用已知后由 `finish_borrow_accesses` 决定报不报；临时借用
+    /// （`let_bound: false`）语句内有效、绑定未关联的借用按词法作用域，都在
+    /// 访问点直接报。
+    fn check_place_access(&mut self, is_write: bool, place: &str, span: ast::Span) -> Result<()> {
+        let mut lexical_conflict: Option<bool> = None;
+        for b in &self.live_borrows {
+            if !place_conflicts(&b.place, place) {
+                continue;
+            }
+            // 读只对 `&mut` 冲突；`&` 共享允许读。写对两者都冲突。
+            if !is_write && !b.mutable {
+                continue;
+            }
+            if b.let_bound {
+                if let Some(local) = b.binding {
+                    let msg = if is_write {
+                        format!(
+                            "cannot assign to `{place}` while it is {} borrowed",
+                            if b.mutable { "mutably" } else { "immutably" },
+                        )
+                    } else {
+                        format!("cannot read `{place}` while it is mutably borrowed")
+                    };
+                    self.access_candidates.push(AccessCandidate {
+                        message: msg,
+                        pos: span.start,
+                        span,
+                        local,
+                    });
+                    continue;
+                }
+            }
+            lexical_conflict.get_or_insert(b.mutable);
+        }
+        if let Some(mutable) = lexical_conflict {
+            if is_write {
+                return Err(CompileError::new(format!(
+                    "cannot assign to `{place}` while it is {} borrowed",
+                    if mutable { "mutably" } else { "immutably" },
+                ))
+                .with_span(span));
+            }
+            return Err(CompileError::new(format!(
+                "cannot read `{place}` while it is mutably borrowed"
+            ))
+            .with_span(span));
+        }
+        Ok(())
+    }
+
+    /// 整个函数体检查完后调用：对每个"借用冲突"候选，若借用的绑定局部
+    /// 的最后使用不早于该访问 / 借用，说明借用在该点仍存活，报冲突；否则
+    /// 借用已死（NLL），不报。绑定局部从未被使用（`binding_last_use` 无该
+    /// id）时按创建位置本身视为存活（保守）。
+    fn finish_borrow_accesses(&mut self) -> Result<()> {
+        for c in std::mem::take(&mut self.access_candidates) {
+            let live = self
+                .binding_last_use
+                .get(&c.local)
+                .map_or(true, |&last| last >= c.pos);
+            if live {
+                return Err(CompileError::new(c.message).with_span(c.span));
+            }
+        }
+        Ok(())
     }
 
     fn pop_scope(&mut self) {

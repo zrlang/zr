@@ -49,8 +49,8 @@ target/debug/zr prog.zr -O1 -o /tmp/prog   # 编译单个程序
   `ld` 直接断言崩溃（`atomShouldReplaceExisting`）。先 `nm` 看目标文件有没有
   重复符号，再下结论。已修复（提交 `1ef4a02`：MIR 按最终符号名去重，保留首个
   用户定义）。
-- 测试：`tests/zr_language.rs` 把 104 个 `tests/cases/*.zr` 各在
-  `-O0/-O1/-O2/-O3/-Oz` 跑一遍（460 次编译+运行）。退出码 0 = 过，非 0 = 失败（编号指向失败的断言）。
+- 测试：`tests/zr_language.rs` 把 105 个 `tests/cases/*.zr` 各在
+  `-O0/-O1/-O2/-O3/-Oz` 跑一遍（525 次编译+运行）。退出码 0 = 过，非 0 = 失败（编号指向失败的断言）。
   宿主端另有 `io_print_matches_rust` 等 Rust 对照用例。
 - **没有负向测试机制。** `tests/cases/` 下每个 `.zr` 都必须编译通过并返回 0。
   想验证"某错误真被拦住了"，单独写 `/tmp/x.zr` 手工编译确认。
@@ -149,14 +149,20 @@ README 里"指针与 unsafe"一节目前是**愿景**：
 - **切片/数组索引不做越界检查**：`check_index_scalar` 不检查边界。
 - **借用检查是最小切片**：同位置的借用与已有借用重叠（`&mut` 独占、`&` 可共享，
   至少一个可变）报 `cannot borrow ... while already borrowed`；**写被借用位置**
-  （`x = 5` 而 `&x` / `&mut x` 存活）报 `cannot assign to ... while it is borrowed`
-  （字段级不相交 `&mut x.a` 后写 `x.b` 合法，由 `place_conflicts` 前缀判据处理）。
-  **词法作用域近似**：`let r = &mut x` 的借用存活到作用域结束，临时借用
-  （`foo(&mut x)`）在语句结束释放；`&mut x` 强转裸指针（字段类型 `*mut` 或
-  `as *mut T`）立即释放；`let` 初始化里的**调用实参**（`let v = early(&mut x)`）
+  （`x = 5` 而 `&x` / `&mut x` 存活）报 `cannot assign to ... while it is borrowed`；
+  **读被借用位置**（`use x` 而 `&mut x` 存活）报 `cannot read ... while it is
+  mutably borrowed`（字段级不相交 `&mut x.a` 后读/写 `x.b` 合法，由
+  `place_conflicts` 前缀判据处理）。
+  **NLL 近似（last-use）**：`let r = &mut x` 的借用绑定到 `r`，存活到 `r` 的
+  **最后使用**（不是作用域结束）——`let r = &mut x; *r = 5; if x != 5`（读 `x`
+  时 `r` 已死）、`let r = &mut x; *r = 5; let s = &mut x;`（再借 `x` 时 `r` 已
+  死）都合法；读/写/再借在 `r` 的最后使用**之后**不报冲突。整个函数体检查完、
+  最后使用已知后由 `finish_borrow_accesses` 统一判定。**词法作用域近似**：临时
+  借用（`foo(&mut x)`）在语句结束释放，`&mut x` 强转裸指针（字段类型 `*mut` 或
+  `as *mut T`）立即释放，`let` 初始化里的**调用实参**（`let v = early(&mut x)`）
   是临时量不是绑定值（`with_value_pos`），语句结束释放。
-  已知局限：let 绑定借用按作用域结束（不是最后使用），`let r = &mut x; use r; use x;`
-  会误报；**读**被借用位置（read-while-borrowed）尚不检查。
+  已知局限：多绑定 / 未关联的借用（`let (a, b) = (&mut x, &mut y)`）仍按作用域
+  结束；`binding_last_use` 按局部 id 记最后使用，跨作用域重名（遮蔽）可能混淆。
 - **移动语义不检查**：`let s2 = s1;` 之后再用 `s1` 不报错。
 - **`str` 是 `{ptr, len}` 结构体**，切片写成 `[]const T`（元素在后），不是 Rust 的 `&[T]`。
 - **`println` 是函数不是宏**：`println(s: str)`；格式化走 `println_fmt(fmt, &[FormatArg], n)`，
@@ -208,12 +214,12 @@ README 里"指针与 unsafe"一节目前是**愿景**：
 ### `cargo test` 当前基线（2026-10-29，全绿）
 
 - `cargo test --bin zr`：265 项。
-- `cargo test --test zr_language`：104 个用例 × 5 个优化等级 = 520 项，另有 3 个宿主端
+- `cargo test --test zr_language`：105 个用例 × 5 个优化等级 = 525 项，另有 3 个宿主端
   对照用例（`io_print_matches_rust`——逐字符对比 Rust 的格式化输出，含 `{:e}` / `{:E}`
   与大浮点 Display（`|v| ≥ 2⁶⁴` 不带 `.0`）的回归；`extern_c_write_prints_string_literal`；
   `toolchain_subcommands_emit`——`zr fmt` / `zr fmt --check` / `zr pkg init` / `zr lsp`
   与 `--emit-llvm` / `--wat` 的发射验证）。
-- `cargo test --test zr_negative`：19 个负向用例（含新加的越界、use-after-move 与枚举缺臂 `17_match_missing_variant.zr`、`19_debug_float.zr`）。
+- `cargo test --test zr_negative`：22 个负向用例（含新加的越界、use-after-move 与枚举缺臂 `17_match_missing_variant.zr`、`19_debug_float.zr`）。
 
 ### 最近修掉的静默 bug（都在 `tests/` 里留了钉子）
 
@@ -246,12 +252,13 @@ README 里"指针与 unsafe"一节目前是**愿景**：
 - **`dyn` 关键字**：✅ 词法+解析+类型检查骨架已实现；vtable 分派仍在未实现状态。
 - **借用检查**：🟡 最小切片已实现——同位置借用重叠（`&mut`+`&mut` / `&`+`&mut`）
   报 `cannot borrow ... while already borrowed`；**写被借用位置**（`x = 5` 而
-  `&x`/`&mut x` 存活）报 `cannot assign to ... while it is borrowed`；词法作用域
-  近似（`let r = &mut x` 存活到作用域结束、临时借用语句结束释放、裸指针强转
-  立即释放、`let` 初始化里的调用实参是临时量非绑定值）；
-  `tests/negative/20_borrow_conflict.zr`、`21_borrow_write.zr`。已知局限：let
-  绑定借用按作用域结束（`let r = &mut x; use r; use x;` 会误报）、读被借用位置
-  尚不检查。完整 NLL（最后使用、读被借用位置）后续再做。
+  `&x`/`&mut x` 存活）报 `cannot assign to ... while it is borrowed`；**读被借用
+  位置**（`use x` 而 `&mut x` 存活）报 `cannot read ... while it is mutably
+  borrowed`；**NLL 近似**（`let r = &mut x` 的借用绑定到 `r`、存活到 `r` 的
+  最后使用，`finish_borrow_accesses` 在函数体检查完后统一判定）；
+  `tests/negative/20_borrow_conflict.zr`、`21_borrow_write.zr`、`22_borrow_read.zr`、
+  `tests/cases/105_borrow_nll.zr`。已知局限：多绑定 / 未关联借用按作用域结束、
+  跨作用域重名可能混淆 last-use。
 - **移动检查**：✅ 最小版已实现（`let b = a` 对含 drop glue 的类型是移动，读被移动的源报错）。
 - **元数据**（权限、时间戳）与 `tempfile`：✅ 已补齐（`db0b01f`）——`std/fs`
   新增 `temp_file()`/`temp_file_raw()`（`/tmp/zr_tmp_<纳秒>`）、`file_mtime(path)`、

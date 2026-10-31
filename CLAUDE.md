@@ -9,7 +9,7 @@ zr 是一门系统编程语言，设计取向介于 Rust 与 Zig 之间：所有
 - 给 AI agent 的操作约定、架构红线、在途工作：见 `AGENTS.md`
 - 与 Rust 的逐条对照：见 `docs/rust-parity.md`（**部分结论已被在途改动超越**）
 
-> 最近更新：2026-10-29。`feat/lang-features` 上已完成：`unsafe`/`dyn`/最小移动检查/常量越界检查；`52_if_let` 回归与 `71_derive` 失败均已修复；**又修掉了 `55_tuple_pattern` / `74_generic_alias` / `60_process` / `64_fs_path` / `io_print_matches_rust`（用户定义遮蔽标准库同名函数，见提交 `1ef4a02`）**；**支持 `use foo::*` glob 导入（见提交 `40b5b45`）**；**`#[derive(Debug)]` 生成真实 `.debug()` 方法体（Rust `{:?}` 风格，`01ae31d`），并修掉 `EnumField` 对聚合载荷单字加载的 bug（嵌套结构体/元组枚举载荷段错误）；全绿（104 用例 × 5 等级 + 宿主端对照用例）**。
+> 最近更新：2026-10-29。`feat/lang-features` 上已完成：`unsafe`/`dyn`/最小移动检查/常量越界检查；`52_if_let` 回归与 `71_derive` 失败均已修复；**又修掉了 `55_tuple_pattern` / `74_generic_alias` / `60_process` / `64_fs_path` / `io_print_matches_rust`（用户定义遮蔽标准库同名函数，见提交 `1ef4a02`）**；**支持 `use foo::*` glob 导入（见提交 `40b5b45`）**；**`#[derive(Debug)]` 生成真实 `.debug()` 方法体（Rust `{:?}` 风格，`01ae31d`），并修掉 `EnumField` 对聚合载荷单字加载的 bug（嵌套结构体/元组枚举载荷段错误）；全绿（105 用例 × 5 等级 + 宿主端对照用例）**。
 
 ---
 
@@ -17,11 +17,11 @@ zr 是一门系统编程语言，设计取向介于 Rust 与 Zig 之间：所有
 
 ```sh
 cargo build                                    # 编译编译器 + 运行时汇编
-cargo test --test zr_language                  # 全量回归：104 用例 × 5 优化等级，约 3 分钟
+cargo test --test zr_language                  # 全量回归：105 用例 × 5 优化等级，约 3 分钟
 target/debug/zr prog.zr -O1 -o /tmp/prog && /tmp/prog
 ```
 
-当前基线：**104 用例 × 5 等级 + 宿主端对照用例 全绿**。
+当前基线：**105 用例 × 5 等级 + 宿主端对照用例 全绿**。
 
 诊断：`--dump-tokens|ast|hir|mir|ssa|ssa-after|asm`、`--wat`、`--emit-llvm`、
 `--no-incremental`、`--target <triple>`、`-g`；`ZR_TIME=1` 看各阶段耗时。
@@ -162,7 +162,7 @@ target/debug/zr prog.zr -O1 -o /tmp/prog && /tmp/prog
 | `*const T` / `*mut T` 裸指针，`&x` / `&mut x` | ✅（语法层面） |
 | 裸指针解引用 / 写入 | ✅ |
 | **移动语义（use-after-move 检查）** | ✅ 最小版已实现（`let b = a` 后读 `a` 报 use-after-move；字段级/按值传参移动暂不覆盖） |
-| **借用检查（`&mut` 独占、别名）** | 🟡 最小切片已实现：同位置借用重叠（`&mut`+`&mut` / `&`+`&mut`）报 `cannot borrow ... while already borrowed`；**写被借用位置**（`x = 5` 而 `&x`/`&mut x` 存活）报 `cannot assign to ... while it is borrowed`；词法作用域近似（`let r = &mut x` 存活到作用域结束、临时借用 `foo(&mut x)` 语句结束释放、`&mut x` 强转裸指针立即释放、`let` 初始化里的调用实参是临时量非绑定值）；`tests/negative/20_borrow_conflict.zr`、`21_borrow_write.zr`。已知局限：let 绑定借用按作用域结束（`let r = &mut x; use r; use x;` 会误报）、读被借用位置尚不检查 |
+| **借用检查（`&mut` 独占、别名）** | 🟡 最小切片已实现：同位置借用重叠（`&mut`+`&mut` / `&`+`&mut`）报 `cannot borrow ... while already borrowed`；**写被借用位置**（`x = 5` 而 `&x`/`&mut x` 存活）报 `cannot assign to ... while it is borrowed`；**读被借用位置**（`use x` 而 `&mut x` 存活）报 `cannot read ... while it is mutably borrowed`；**NLL 近似**（`let r = &mut x` 的借用绑定到 `r`、存活到 `r` 的最后使用，`finish_borrow_accesses` 在函数体检查完后统一判定——`let r = &mut x; *r = 5; if x != 5`、`let r = &mut x; *r = 5; let s = &mut x;` 都合法）；`tests/negative/20_borrow_conflict.zr`、`21_borrow_write.zr`、`22_borrow_read.zr`、`tests/cases/105_borrow_nll.zr`。已知局限：多绑定 / 未关联借用按作用域结束、跨作用域重名可能混淆 last-use |
 | 切片越界检查 | 🟡 编译期常量下标越界已报 `index out of bounds`（变量下标暂不检查） |
 | **`unsafe` 关键字** | ✅ 已实现（`unsafe { ... }` 块可解析和通过类型检查；当前按块表达式透传） |
 | `Drop` trait 与析构 | ✅（`drop_impls`；数组/嵌套临时值析构有序） |
@@ -258,7 +258,7 @@ target/debug/zr prog.zr -O1 -o /tmp/prog && /tmp/prog
 
 ## 4. 已实现但未测试覆盖
 
-`tests/cases/` 共 104 个用例，全部通过时 `cargo test` 绿。以下**已实现但无用例**，
+`tests/cases/` 共 105 个用例，全部通过时 `cargo test` 绿。以下**已实现但无用例**，
 属于回归盲区，加功能时容易破坏而无人发现：
 
 - 多边界泛型 `T: Clone + Ord`（✅ 已补 `91_multi_bound_generics.zr`：`P` 同时 impl 两个边界，`pick<P>` 两处边界都求解，形参按值移动两次）
@@ -320,7 +320,7 @@ target/debug/zr prog.zr -O1 -o /tmp/prog && /tmp/prog
 
 | 项 | 现状 |
 |---|---|
-| 借用检查 | 🟡 最小切片已实现：同位置借用重叠（`&mut`+`&mut` / `&`+`&mut`）报 `cannot borrow ... while already borrowed`；**写被借用位置**（`x = 5` 而 `&x`/`&mut x` 存活）报 `cannot assign to ... while it is borrowed`；词法作用域近似（`let r = &mut x` 存活到作用域结束、临时借用 `foo(&mut x)` 语句结束释放、`&mut x` 强转裸指针立即释放、`let` 初始化里的调用实参是临时量非绑定值）；`tests/negative/20_borrow_conflict.zr`、`21_borrow_write.zr`。已知局限：let 绑定借用按作用域结束（`let r = &mut x; use r; use x;` 会误报）、读被借用位置尚不检查 |
+| 借用检查 | 🟡 最小切片已实现：同位置借用重叠（`&mut`+`&mut` / `&`+`&mut`）报 `cannot borrow ... while already borrowed`；**写被借用位置**（`x = 5` 而 `&x`/`&mut x` 存活）报 `cannot assign to ... while it is borrowed`；**读被借用位置**（`use x` 而 `&mut x` 存活）报 `cannot read ... while it is mutably borrowed`；**NLL 近似**（`let r = &mut x` 的借用绑定到 `r`、存活到 `r` 的最后使用，`finish_borrow_accesses` 在函数体检查完后统一判定——`let r = &mut x; *r = 5; if x != 5`、`let r = &mut x; *r = 5; let s = &mut x;` 都合法）；`tests/negative/20_borrow_conflict.zr`、`21_borrow_write.zr`、`22_borrow_read.zr`、`tests/cases/105_borrow_nll.zr`。已知局限：多绑定 / 未关联借用按作用域结束、跨作用域重名可能混淆 last-use |
 | 无 `unsafe` 关键字 | ✅ 已实现（`unsafe { ... }` 块可解析和通过类型检查） |
 | 无 `dyn` 关键字 | ✅ 解析+类型检查骨架已实现（vtable 分派仍在未实现状态） |
 | 切片/数组索引不检查越界 | ✅ 编译期常量下标越界已报 `index out of bounds`（变量下标暂不检查） |

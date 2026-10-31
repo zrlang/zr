@@ -1,0 +1,36 @@
+// 借用检查 NLL：`let r = &mut x` 的借用绑定到 `r`，存活到 `r` 的最后使用。
+// 1) `let r = &mut x; *r = 5; if x != 5` —— 读 `x` 时 `r` 已死（最后一次使用是
+//    `*r = 5`），合法。
+// 2) `let r = &mut x; *r = 5; x = 7;` —— 写 `x` 时 `r` 已死，合法。
+// 3) 临时借用 `foo(&mut x)` 语句结束释放，之后读/写 `x` 合法。
+// 早先词法作用域近似把借用存活到作用域结束，这些都会被误报为 E0502/E0506。
+// 负向对应：tests/negative/22_borrow_read.zr（`r` 后面还用，读 `x` 报错）。
+fn early(r: &mut i32) -> i32 {
+    return *r;
+}
+
+fn main() -> i32 {
+    let mut x = 1;
+    let r = &mut x;
+    *r = 5;
+    if x != 5 {
+        return 1;
+    }
+
+    x = 7; // r 已死，写 x 合法（NLL）
+    let s = &mut x;
+    *s = 9;
+    if x != 9 {
+        return 2;
+    }
+
+    // 临时借用语句结束释放
+    let v = early(&mut x);
+    if v != 9 {
+        return 3;
+    }
+    if x != 9 {
+        return 4;
+    }
+    return 0;
+}

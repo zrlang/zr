@@ -1,0 +1,14 @@
+// 负向用例：借用检查——读被借用位置。`let r = &mut x; use x;` 里 `r` 的可变
+// 借用存活（`r` 在后面还会用到），直接读 `x` 是 E0502（要用 `*r`）。
+// 早先借用检查是空壳，这种代码能编译，读到的 `x` 是"绕过借用"的旧值。
+//
+// expect: cannot read `x` while it is mutably borrowed
+fn main() -> i32 {
+    let mut x = 1;
+    let r = &mut x;
+    if x != 1 {
+        return 1;
+    }
+    *r = 5;
+    return 0;
+}
