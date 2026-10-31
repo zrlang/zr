@@ -190,7 +190,12 @@ impl Parser {
                 // 于是 `extern "C" { fn zr_write(...); }` 之后调用 `zr_write`
                 // 会报"未定义名称"。解析出的 `Function` 的 `body` 为 `None`
                 // （以 `;` 结尾）。
-                functions.push(self.parse_function(Visibility::Private, vec![], false, false)?);
+                //
+                // 可见性设为 `pub`：`extern "C"` 声明是跨模块共享的 C 符号，
+                // 同一个 `zr_write` 可能在多个模块的 extern 块里重复声明
+                // （如 `io` 与 `process`），扁平符号表只留先收集者——若按
+                // 私有处理，后收集的模块调用它会因"私有条目不可见"被误拒。
+                functions.push(self.parse_function(Visibility::Public, vec![], false, false)?);
             } else if self.match_kind(&TokenKind::KwType) {
                 let _name = self.consume_ident("expected type name")?;
                 self.consume(&TokenKind::Semicolon, "expected ';'")?;
@@ -208,12 +213,12 @@ impl Parser {
 
     pub fn parse_function(
         &mut self,
-        _visibility: Visibility,
+        visibility: Visibility,
         attrs: Vec<Attribute>,
         is_async: bool,
         _is_default: bool,
     ) -> Result<Function, CompileError> {
-        self.parse_function_ext(_visibility, attrs, is_async, _is_default, false)
+        self.parse_function_ext(visibility, attrs, is_async, _is_default, false)
     }
 
     /// `parse_function` 的完整版本，多带一个 `comptime` 标志。
@@ -222,7 +227,7 @@ impl Parser {
     /// 一样，两个修饰符共用一条解析路径），所以标志得由调用方传进来。
     pub fn parse_function_ext(
         &mut self,
-        _visibility: Visibility,
+        visibility: Visibility,
         attrs: Vec<Attribute>,
         is_async: bool,
         _is_default: bool,
@@ -303,6 +308,12 @@ impl Parser {
 
         Ok(Function {
             name,
+            // 可见性解析后保留（早先 `_visibility` 直接丢弃，`pub(crate)` /
+            // `pub(super)` 被当成 `pub`），供类型检查的可见性检查用。
+            visibility,
+            // 顶层条目（crate root）模块路径为空串；模块加载器扁平化内联 /
+            // 文件模块时覆盖成模块路径。
+            module: String::new(),
             generics,
             // 属性之前被直接丢掉（`_attrs`），于是 `#[inline]`、`#[test]`
             // 之类只能解析、完全没有语义。必须原样带到 AST 上去。
@@ -407,7 +418,7 @@ impl Parser {
 
     pub fn parse_const(
         &mut self,
-        _visibility: Visibility,
+        visibility: Visibility,
         _attrs: Vec<Attribute>,
     ) -> Result<ConstDecl, CompileError> {
         let _span = self.previous().span;
@@ -417,12 +428,18 @@ impl Parser {
         self.consume(&TokenKind::Eq, "expected '='")?;
         let value = self.parse_expression()?;
         self.consume(&TokenKind::Semicolon, "expected ';'")?;
-        Ok(ConstDecl { name, ty, value })
+        Ok(ConstDecl {
+            name,
+            visibility,
+            module: String::new(),
+            ty,
+            value,
+        })
     }
 
     pub fn parse_static(
         &mut self,
-        _visibility: Visibility,
+        visibility: Visibility,
         _attrs: Vec<Attribute>,
     ) -> Result<StaticDecl, CompileError> {
         let _span = self.previous().span;
@@ -435,6 +452,8 @@ impl Parser {
         self.consume(&TokenKind::Semicolon, "expected ';'")?;
         Ok(StaticDecl {
             name,
+            visibility,
+            module: String::new(),
             is_mut,
             ty,
             init,
@@ -447,7 +466,7 @@ impl Parser {
 
     pub fn parse_struct_def(
         &mut self,
-        _visibility: Visibility,
+        visibility: Visibility,
         attrs: Vec<Attribute>,
     ) -> Result<TypeDef, CompileError> {
         let span = self.previous().span;
@@ -486,6 +505,8 @@ impl Parser {
             self.consume(&TokenKind::Semicolon, "expected ';' after tuple struct")?;
             return Ok(TypeDef::Struct(StructDef {
                 name,
+                visibility,
+                module: String::new(),
                 generics,
                 attrs,
                 fields,
@@ -497,6 +518,8 @@ impl Parser {
         if self.match_kind(&TokenKind::Semicolon) {
             return Ok(TypeDef::Struct(StructDef {
                 name,
+                visibility,
+                module: String::new(),
                 generics,
                 attrs,
                 fields: Vec::new(),
@@ -529,6 +552,8 @@ impl Parser {
         self.consume(&TokenKind::RBrace, "expected '}' to close struct")?;
         Ok(TypeDef::Struct(StructDef {
             name,
+            visibility,
+            module: String::new(),
             generics,
             attrs,
             fields,
@@ -542,7 +567,7 @@ impl Parser {
 
     pub fn parse_enum_def(
         &mut self,
-        _visibility: Visibility,
+        visibility: Visibility,
         attrs: Vec<Attribute>,
     ) -> Result<TypeDef, CompileError> {
         let span = self.previous().span;
@@ -572,6 +597,8 @@ impl Parser {
         self.consume(&TokenKind::RBrace, "expected '}' to close enum")?;
         Ok(TypeDef::Enum(EnumDef {
             name,
+            visibility,
+            module: String::new(),
             attrs,
             generics,
             repr,
@@ -640,7 +667,7 @@ impl Parser {
 
     pub fn parse_union_def(
         &mut self,
-        _visibility: Visibility,
+        visibility: Visibility,
         _attrs: Vec<Attribute>,
     ) -> Result<TypeDef, CompileError> {
         let _span = self.previous().span;
@@ -669,7 +696,12 @@ impl Parser {
             }
         }
         self.consume(&TokenKind::RBrace, "expected '}'")?;
-        Ok(TypeDef::Union(UnionDef { name, fields }))
+        Ok(TypeDef::Union(UnionDef {
+            name,
+            fields,
+            visibility,
+            module: String::new(),
+        }))
     }
 
     // ==================================================================
@@ -678,7 +710,7 @@ impl Parser {
 
     pub fn parse_type_alias(
         &mut self,
-        _visibility: Visibility,
+        visibility: Visibility,
         _attrs: Vec<Attribute>,
     ) -> Result<TypeDef, CompileError> {
         let _span = self.previous().span;
@@ -693,6 +725,8 @@ impl Parser {
         self.consume(&TokenKind::Semicolon, "expected ';' in type alias")?;
         Ok(TypeDef::Alias {
             name,
+            visibility,
+            module: String::new(),
             target,
             generics,
         })
@@ -704,7 +738,7 @@ impl Parser {
 
     pub fn parse_trait_def(
         &mut self,
-        _visibility: Visibility,
+        visibility: Visibility,
         attrs: Vec<Attribute>,
     ) -> Result<TraitDef, CompileError> {
         let _span = self.previous().span;
@@ -740,6 +774,8 @@ impl Parser {
         self.consume(&TokenKind::RBrace, "expected '}'")?;
         Ok(TraitDef {
             name,
+            visibility,
+            module: String::new(),
             super_traits,
             assoc_types,
             methods,
@@ -817,6 +853,9 @@ impl Parser {
             trait_type,
             methods,
             where_clause,
+            // 顶层条目（crate root）模块路径为空串；模块加载器扁平化内联 /
+            // 文件模块时覆盖成模块路径（impl 方法按 impl 块所在模块判可见性）。
+            module: String::new(),
             span,
         })
     }

@@ -16,7 +16,7 @@
 
 use std::path::{Path, PathBuf};
 
-use crate::parser::ast::{ModuleDecl, ModuleItem, Program};
+use crate::parser::ast::{self, ModuleDecl, ModuleItem, Program};
 use crate::parser::Parser;
 
 /// 本次编译读到的文件（按读取顺序）与各���内容指纹。
@@ -120,7 +120,7 @@ pub fn load(prog: &mut Program, base_dir: &Path) -> Loaded {
         match decl {
             ModuleDecl::Inline(name, items) => {
                 loader.flattened.insert(name.clone());
-                loader.absorb_items(prog, items, base_dir);
+                loader.absorb_items(prog, items, base_dir, &name);
             }
             ModuleDecl::Load(name) => {
                 if let Err(e) = loader.load_mod_file(prog, &name, base_dir, 0) {
@@ -203,7 +203,7 @@ impl Loader<'_> {
                 }
             }
             let dir = path.parent().unwrap_or(_base).to_path_buf();
-            self.absorb(prog, module, &dir, depth);
+            self.absorb(prog, module, &dir, depth, &name);
         }
         Ok(())
     }
@@ -229,7 +229,7 @@ impl Loader<'_> {
         self.module_exports
             .insert(name.to_string(), module_item_names(&module));
         let dir = path.parent().unwrap_or(base).to_path_buf();
-        self.absorb(prog, module, &dir, depth);
+        self.absorb(prog, module, &dir, depth, name);
         Ok(())
     }
 
@@ -250,7 +250,14 @@ impl Loader<'_> {
     }
 
     /// 把一个模块的条目并进主程序，并递归处理它自己的依赖。
-    fn absorb(&mut self, prog: &mut Program, module: Program, dir: &Path, depth: usize) {
+    fn absorb(
+        &mut self,
+        prog: &mut Program,
+        module: Program,
+        dir: &Path,
+        depth: usize,
+        module_name: &str,
+    ) {
         // 先取出来，避免借用冲突
         let mut items: Vec<ModuleItem> = Vec::new();        let Program {
             attrs,
@@ -277,30 +284,57 @@ impl Loader<'_> {
         items.extend(modules.into_iter().map(ModuleItem::Module));
         prog.attrs.extend(attrs);
         prog.imports.extend(imports);
-        self.absorb_items(prog, items, dir);
+        self.absorb_items(prog, items, dir, module_name);
         // 模块自己的 `use` 也要拉进来
         let _ = depth;
     }
 
     /// 把一批条目并进主程序（内联模块与文件模块共用）。
-    fn absorb_items(&mut self, prog: &mut Program, items: Vec<ModuleItem>, dir: &Path) {
+    ///
+    /// `module_path` 是当前模块的路径（`mod a { mod b { .. } }` 里的条目是
+    /// `a::b`；顶层条目为空串）。扁平化时给每个条目打上模块路径，供类型检查
+    /// 的可见性检查判断"该条目对引用它的模块是否可见"。
+    fn absorb_items(&mut self, prog: &mut Program, items: Vec<ModuleItem>, dir: &Path, module_path: &str) {
         let mut nested_uses = Vec::new();
         for item in items {
             match item {
-                ModuleItem::Function(f) => prog.functions.push(f),
-                ModuleItem::TypeDef(t) => prog.type_defs.push(t),
-                ModuleItem::Trait(t) => prog.traits.push(t),
-                ModuleItem::Impl(i) => prog.impls.push(i),
-                ModuleItem::Const(c) => prog.consts.push(c),
-                ModuleItem::Static(s) => prog.statics.push(s),
+                ModuleItem::Function(mut f) => {
+                    f.module = module_path.to_string();
+                    prog.functions.push(f);
+                }
+                ModuleItem::TypeDef(mut t) => {
+                    set_type_module(&mut t, module_path);
+                    prog.type_defs.push(t);
+                }
+                ModuleItem::Trait(mut t) => {
+                    t.module = module_path.to_string();
+                    prog.traits.push(t);
+                }
+                ModuleItem::Impl(mut i) => {
+                    i.module = module_path.to_string();
+                    prog.impls.push(i);
+                }
+                ModuleItem::Const(mut c) => {
+                    c.module = module_path.to_string();
+                    prog.consts.push(c);
+                }
+                ModuleItem::Static(mut s) => {
+                    s.module = module_path.to_string();
+                    prog.statics.push(s);
+                }
                 ModuleItem::Use(u) => nested_uses.push(u),
                 ModuleItem::Module(ModuleDecl::Inline(name, inner)) => {
                     // 登记为内联（扁平）模块：`mod af { pub const INET }` 的
                     // `INET` 被合并进顶层，`af::INET` 靠 `flattened` 里的名字
                     // 把叶子段拿到顶层解析。不能进 `modules`（`known_modules`）
                     // ——那是**加载**模块，`core::Option::Some` 得走既有路径。
-                    self.flattened.insert(name);
-                    self.absorb_items(prog, inner, dir)
+                    self.flattened.insert(name.clone());
+                    let nested = if module_path.is_empty() {
+                        name.clone()
+                    } else {
+                        format!("{module_path}::{name}")
+                    };
+                    self.absorb_items(prog, inner, dir, &nested);
                 }
                 ModuleItem::Module(ModuleDecl::Load(name)) => {
                     if let Err(e) = self.load_mod_file(prog, &name, dir, 0) {
@@ -316,6 +350,16 @@ impl Loader<'_> {
         if !nested_uses.is_empty() {
             let _ = self.load_uses(prog, dir, 0);
         }
+    }
+}
+
+/// 给 `TypeDef` 的每个变体（struct / enum / alias）打上模块路径。
+fn set_type_module(t: &mut ast::TypeDef, module_path: &str) {
+    match t {
+        ast::TypeDef::Struct(s) => s.module = module_path.to_string(),
+        ast::TypeDef::Enum(e) => e.module = module_path.to_string(),
+        ast::TypeDef::Union(u) => u.module = module_path.to_string(),
+        ast::TypeDef::Alias { module, .. } => *module = module_path.to_string(),
     }
 }
 

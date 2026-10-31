@@ -49,7 +49,7 @@ target/debug/zr prog.zr -O1 -o /tmp/prog   # 编译单个程序
   `ld` 直接断言崩溃（`atomShouldReplaceExisting`）。先 `nm` 看目标文件有没有
   重复符号，再下结论。已修复（提交 `1ef4a02`：MIR 按最终符号名去重，保留首个
   用户定义）。
-- 测试：`tests/zr_language.rs` 把 105 个 `tests/cases/*.zr` 各在
+- 测试：`tests/zr_language.rs` 把 106 个 `tests/cases/*.zr` 各在
   `-O0/-O1/-O2/-O3/-Oz` 跑一遍（525 次编译+运行）。退出码 0 = 过，非 0 = 失败（编号指向失败的断言）。
   宿主端另有 `io_print_matches_rust` 等 Rust 对照用例。
 - **没有负向测试机制。** `tests/cases/` 下每个 `.zr` 都必须编译通过并返回 0。
@@ -164,6 +164,16 @@ README 里"指针与 unsafe"一节目前是**愿景**：
   已知局限：多绑定 / 未关联的借用（`let (a, b) = (&mut x, &mut y)`）仍按作用域
   结束；`binding_last_use` 按局部 id 记最后使用，跨作用域重名（遮蔽）可能混淆。
 - **移动语义不检查**：`let s2 = s1;` 之后再用 `s1` 不报错。
+- **可见性检查**：解析阶段保留 `pub` / `pub(crate)` / `pub(super)`（早先
+  `_visibility` 直接丢弃，`pub(crate)` / `pub(super)` 被当成 `pub`，私有条目
+  跨模块访问不设防）。模块加载器给每个条目打上声明模块路径，类型检查在
+  `resolve_name` / `resolve_path` 里按"条目可见性 × 引用方模块"判定：`pub` /
+  `pub(crate)` 单 crate 内处处可见（单 crate 编译，两者等价）；`pub(super)`
+  对父模块及其后代可见（顶层模块的父模块 = crate root）；私有 / `pub(self)`
+  对声明模块及其后代可见。`extern "C"` 声明按 `pub` 处理（同一 `zr_write`
+  可能在多个模块的 extern 块里重复声明，扁平符号表只留先收集者）。
+  已知局限：`use m::item` 导入私有条目的检查在 `use` 点未做（内联模块的
+  `use` 本就不支持），`resolve_name` 的 `use_aliases` 分支绕过可见性检查。
 - **`str` 是 `{ptr, len}` 结构体**，切片写成 `[]const T`（元素在后），不是 Rust 的 `&[T]`。
 - **`println` 是函数不是宏**：`println(s: str)`；格式化走 `println_fmt(fmt, &[FormatArg], n)`，
   支持 `{}` `{:?}` `{:x}` `{:X}` `{:b}` `{:o}` `{:e}` `{:E}`、位置参数、填充/对齐/`+`/`#`/`0`/宽度/精度、
@@ -214,12 +224,12 @@ README 里"指针与 unsafe"一节目前是**愿景**：
 ### `cargo test` 当前基线（2026-10-29，全绿）
 
 - `cargo test --bin zr`：265 项。
-- `cargo test --test zr_language`：105 个用例 × 5 个优化等级 = 525 项，另有 3 个宿主端
+- `cargo test --test zr_language`：106 个用例 × 5 个优化等级 = 530 项，另有 3 个宿主端
   对照用例（`io_print_matches_rust`——逐字符对比 Rust 的格式化输出，含 `{:e}` / `{:E}`
   与大浮点 Display（`|v| ≥ 2⁶⁴` 不带 `.0`）的回归；`extern_c_write_prints_string_literal`；
   `toolchain_subcommands_emit`——`zr fmt` / `zr fmt --check` / `zr pkg init` / `zr lsp`
   与 `--emit-llvm` / `--wat` 的发射验证）。
-- `cargo test --test zr_negative`：22 个负向用例（含新加的越界、use-after-move 与枚举缺臂 `17_match_missing_variant.zr`、`19_debug_float.zr`）。
+- `cargo test --test zr_negative`：24 个负向用例（含新加的越界、use-after-move 与枚举缺臂 `17_match_missing_variant.zr`、`19_debug_float.zr`）。
 
 ### 最近修掉的静默 bug（都在 `tests/` 里留了钉子）
 

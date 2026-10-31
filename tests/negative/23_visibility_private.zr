@@ -1,0 +1,9 @@
+// 负向用例：模块条目可见性——私有条目跨模块访问。
+//
+// `mod m { fn helper() {} }` 里的 `helper` 是私有的，`m::helper()` 从 crate
+// root 访问应被拒绝。早先可见性在解析阶段就被丢弃（`_visibility`），私有
+// 条目扁平化进顶层后处处可调（P2-7 缺口），`m::helper()` 静默通过。
+//
+// expect: private item `helper` is not accessible from the crate root
+mod m { fn helper() {} }
+fn main() { m::helper(); }

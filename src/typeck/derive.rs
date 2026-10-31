@@ -843,6 +843,9 @@ fn make_fn(
 ) -> Function {
     Function {
         name: format!("{type_name}__{method}"),
+        // derive 生成的关联方法对调用方始终可见（按 `Type::method` 走）。
+        visibility: crate::parser::ast::Visibility::Public,
+        module: String::new(),
         generics: Vec::new(),
         attrs: Vec::new(),
         is_async: false,

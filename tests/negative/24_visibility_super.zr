@@ -1,0 +1,9 @@
+// 负向用例：模块条目可见性——`pub(super)` 跨模块访问。
+//
+// `pub(super) fn h()` 在 `a::b` 里声明，只对父模块 `a` 及其后代可见。
+// `a::b::h()` 从 crate root 访问不在可见范围内，应被拒绝。早先 `pub(super)`
+// 被当成 `pub`，跨模块访问静默通过。
+//
+// expect: `pub(super)` item `h` is not accessible from the crate root
+mod a { mod b { pub(super) fn h() {} } }
+fn main() { a::b::h(); }

@@ -329,6 +329,17 @@ struct AccessCandidate {
     flattened_modules: HashSet<String>,
     /// 每个模块导出的条目名（`use foo::*` 按它把模块的全部顶层名字导入）。
     module_exports: std::collections::HashMap<String, Vec<String>>,
+    /// 每个 DefId 的可见性（`pub` / `pub(crate)` / `pub(super)`，默认私有）。
+    ///
+    /// 早先可见性在解析阶段就被丢弃（`_visibility`），`pub(crate)` /
+    /// `pub(super)` 被当成 `pub`，私有条目对跨模块访问也不设防。
+    def_vis: HashMap<DefId, ast::Visibility>,
+    /// 每个 DefId 声明所在的模块路径（`mod a { mod b { .. } }` 里是 `a::b`，
+    /// 顶层条目为空串）。模块加载器扁平化时打上，见 `modules::absorb_items`。
+    def_module: HashMap<DefId, String>,
+    /// 当前正在检查的条目所在的模块路径。函数体检查时按函数自身的模块设置，
+    /// 供可见性检查判断"引用方是否在条目所在模块内"。默认空串（crate root）。
+    current_module: String,
     /// 警告集合（deprecated 使用等）。
     warnings: Vec<CompileError>,
     /// cfg 求值用的目标平台信息。
@@ -454,6 +465,9 @@ impl Default for TypeChecker {
             known_modules: HashSet::new(),
             flattened_modules: HashSet::new(),
             module_exports: std::collections::HashMap::new(),
+            def_vis: HashMap::new(),
+            def_module: HashMap::new(),
+            current_module: String::new(),
             warnings: Vec::new(),
             cfg_target: attributes::CfgTarget::host(),
             ast_fns: HashMap::new(),
@@ -575,6 +589,11 @@ impl TypeChecker {
                 }
                 let mut m = method.clone();
                 m.name = format!("{target_name}__{}", method.name);
+                // 方法体按 impl 块所在模块判可见性（`size_of_str` 是
+                // process.zr 的私有函数，`Command::new` 里调用它必须算"在
+                // process 模块内"——早先方法模块路径为空串，被当成 crate
+                // root，跨模块私有调用被误拒）。
+                m.module = ib.module.clone();
                 self.impl_targets.insert(m.name.clone(), ib.target.clone());
                 self.impl_generics.insert(m.name.clone(), ib.generics.clone());
                 expanded.functions.push(m);
@@ -979,6 +998,10 @@ impl TypeChecker {
             // 阶段 6/7 必须用这里的逐条 DefId 而不是按名查找。
             self.function_def_ids.push(id);
             self.ast_fns.insert(item.name.clone(), item.clone());
+            // 可见性 + 声明模块：`pub(crate)` / `pub(super)` / 私有条目的跨模块
+            // 访问检查（见 `check_visibility`）。
+            self.def_vis.insert(id, item.visibility);
+            self.def_module.insert(id, item.module.clone());
             // 参数类型这里不解析，`check_function_signatures`（阶段 6）只解析
             // 返回类型；参数要等阶段 7 `check_function_bodies` 逐个函数补上。
             // 占位的空参数列表 + `Infer` 返回类型是故意的。
@@ -1029,6 +1052,25 @@ impl TypeChecker {
                 ast::TypeDef::Union(u) => u.name.clone(),
                 ast::TypeDef::Alias { name, .. } => name.clone(),
             });
+            // 可见性 + 声明模块（struct / enum / alias；union 没有可见性字段）。
+            match td {
+                ast::TypeDef::Struct(s) => {
+                    self.def_vis.insert(id, s.visibility);
+                    self.def_module.insert(id, s.module.clone());
+                }
+                ast::TypeDef::Enum(e) => {
+                    self.def_vis.insert(id, e.visibility);
+                    self.def_module.insert(id, e.module.clone());
+                }
+                ast::TypeDef::Alias { visibility, module, .. } => {
+                    self.def_vis.insert(id, *visibility);
+                    self.def_module.insert(id, module.clone());
+                }
+                ast::TypeDef::Union(u) => {
+                    self.def_vis.insert(id, u.visibility);
+                    self.def_module.insert(id, u.module.clone());
+                }
+            }
             match td {
                 ast::TypeDef::Struct(s) => {
                     self.type_defs.insert(
@@ -1088,6 +1130,9 @@ impl TypeChecker {
         for t in &prog.traits {
             let id = self.alloc_def_top(t.name.clone());
             let (is_marker, _) = classify_trait(t);
+            // 可见性 + 声明模块。
+            self.def_vis.insert(id, t.visibility);
+            self.def_module.insert(id, t.module.clone());
             self.trait_defs.insert(
                 id,
                 hir::HirTrait {
@@ -1115,6 +1160,8 @@ impl TypeChecker {
         }
         for c in &prog.consts {
             let id = self.alloc_def_top(c.name.clone());
+            self.def_vis.insert(id, c.visibility);
+            self.def_module.insert(id, c.module.clone());
             self.consts.insert(
                 id,
                 hir::HirConst {
@@ -1125,6 +1172,8 @@ impl TypeChecker {
         }
         for s in &prog.statics {
             let id = self.alloc_def_top(s.name.clone());
+            self.def_vis.insert(id, s.visibility);
+            self.def_module.insert(id, s.module.clone());
             self.statics.insert(
                 id,
                 hir::HirStatic {
@@ -1423,6 +1472,18 @@ impl TypeChecker {
     }
 
     fn check_struct_def(&mut self, s: &AstStruct) -> Result<()> {
+        // 字段类型按声明模块判可见性：`Thread { slot: *mut ThreadHandle }`
+        // 里 `ThreadHandle` 是 thread.zr 的私有结构体，字段解析必须算"在
+        // thread 模块内"——早先 `current_module` 是 crate root，私有字段类型
+        // 被误拒。
+        let prev_module = self.current_module.clone();
+        self.current_module = s.module.clone();
+        let result = self.check_struct_def_inner(s);
+        self.current_module = prev_module;
+        result
+    }
+
+    fn check_struct_def_inner(&mut self, s: &AstStruct) -> Result<()> {
         // 泛型参数先绑上：字段里的 `T` 是类型变量。
         let scope = self.push_type_params(&s.generics, ast::Span::unknown());
         let def_id = self.find_def(&s.name)?;
@@ -1461,6 +1522,15 @@ impl TypeChecker {
     }
 
     fn check_enum_def(&mut self, e: &ast::EnumDef) -> Result<()> {
+        // 变体载荷类型按声明模块判可见性（见 check_struct_def）。
+        let prev_module = self.current_module.clone();
+        self.current_module = e.module.clone();
+        let result = self.check_enum_def_inner(e);
+        self.current_module = prev_module;
+        result
+    }
+
+    fn check_enum_def_inner(&mut self, e: &ast::EnumDef) -> Result<()> {
         // 泛型参数先绑上：变体载荷里的 `T` 是类型变量。
         let scope = self.push_type_params(&e.generics, ast::Span::unknown());
         let def_id = self.find_def(&e.name)?;
@@ -1576,6 +1646,15 @@ impl TypeChecker {
     }
 
     fn check_union_def(&mut self, u: &ast::UnionDef) -> Result<()> {
+        // 字段类型按声明模块判可见性（见 check_struct_def）。
+        let prev_module = self.current_module.clone();
+        self.current_module = u.module.clone();
+        let result = self.check_union_def_inner(u);
+        self.current_module = prev_module;
+        result
+    }
+
+    fn check_union_def_inner(&mut self, u: &ast::UnionDef) -> Result<()> {
         let def_id = self.find_def(&u.name)?;
         let mut max_size = 0usize;
         let mut max_align = 1usize;
@@ -1799,6 +1878,7 @@ impl TypeChecker {
             // `impl<T>` 的类型参数不在方法自己身上（方法被展开成普通函数后
             // `f.generics` 是空的），必须从 impl 块补上，否则 `Vec<T>` 里的
             // `T` 解析不到。
+            self.current_module = f.module.clone();
             let impl_gens = self
                 .impl_generics
                 .get(&f.name)
@@ -1942,6 +2022,8 @@ impl TypeChecker {
             }
             self.current_function = Some(id);
             self.current_is_async = f.is_async;
+            // 可见性检查的引用方模块：函数体按函数自身声明模块判定。
+            self.current_module = f.module.clone();
             self.scope_stack.clear();
             self.live_borrows.clear();
             self.binding_last_use.clear();
@@ -2363,7 +2445,13 @@ impl TypeChecker {
                     }
                     // 裸无载荷枚举变体（`use core::Option::None` 导入的 `None`
                     // 当值用）：不是名字，是"0 实参的变体构造"。
-                    Err(_) => {
+                    Err(e) => {
+                        // 可见性错误（私有 / `pub(super)` 条目跨模块访问）要
+                        // 原样传播——早先 `Err(_)` 把它吞掉、统一报成
+                        // "cannot find value"，掩盖了真正的原因。
+                        if e.message.contains("is not accessible") {
+                            return Err(e);
+                        }
                         if let Some(enum_id) = self.variant_aliases.get(name).copied() {
                             let Some(hir::HirTypeDef::Enum(he)) =
                                 self.type_defs.get(&enum_id)
@@ -6912,6 +7000,7 @@ impl TypeChecker {
 
         self.current_function = Some(inst.id);
         self.current_is_async = ast_fn.is_async;
+        self.current_module = ast_fn.module.clone();
         self.push_scope();
         self.push_type_scope(&inst.subst);
         if let Some(target) = self.impl_targets.get(&ast_fn.name).cloned() {
@@ -7707,6 +7796,59 @@ impl TypeChecker {
             .ok_or_else(|| CompileError::name_error(format!("undefined name `{}`", name)))
     }
 
+    /// 判断声明在 `item_module`、可见性 `vis` 的条目对引用方模块 `from` 是否可见。
+    ///
+    /// 模块路径用 `a::b` 形式（顶层为空串）。规则（单 crate 编译）：
+    /// - `pub` / `pub(crate)`：单 crate 内处处可见（`pub(crate)` 等于 `pub`）。
+    /// - `pub(super)`：父模块及其全部后代可见（父模块为 crate root 时 = 全 crate）。
+    /// - 私有 / `pub(self)`：声明模块及其后代可见（顶层私有条目 = 全 crate 可见，
+    ///   因为 crate root 的后代覆盖一切模块）。
+    fn visibility_allows(vis: ast::Visibility, item_module: &str, from: &str) -> bool {
+        match vis {
+            ast::Visibility::Public | ast::Visibility::Crate => true,
+            ast::Visibility::Private | ast::Visibility::SelfOnly => {
+                item_module.is_empty()
+                    || from == item_module
+                    || from.starts_with(&format!("{item_module}::"))
+            }
+            ast::Visibility::Super => {
+                let parent = parent_module_path(item_module);
+                parent.is_empty()
+                    || from == parent
+                    || from.starts_with(&format!("{parent}::"))
+            }
+        }
+    }
+
+    /// `a::b::c` → `a::b`；`a` → `""`（crate root）。
+    fn check_visibility(&self, def: DefId, name: &str, span: ast::Span) -> Result<()> {
+        let vis = self
+            .def_vis
+            .get(&def)
+            .copied()
+            .unwrap_or(ast::Visibility::Private);
+        let item_module = self.def_module.get(&def).map(|s| s.as_str()).unwrap_or("");
+        if Self::visibility_allows(vis, item_module, &self.current_module) {
+            return Ok(());
+        }
+        let from_desc = if self.current_module.is_empty() {
+            "the crate root".to_string()
+        } else {
+            format!("module `{}`", self.current_module)
+        };
+        let kind = match vis {
+            ast::Visibility::Private => "private",
+            ast::Visibility::SelfOnly => "`pub(self)`",
+            ast::Visibility::Super => "`pub(super)`",
+            ast::Visibility::Crate => "`pub(crate)`",
+            ast::Visibility::Public => "`pub`",
+        };
+        Err(CompileError::name_error(format!(
+            "{kind} item `{name}` is not accessible from {from_desc}"
+        ))
+        .with_span(span))
+    }
+
     fn resolve_name(&self, name: &str, span: ast::Span) -> Result<DefId> {
         // 先查局部变量（词法作用域，内层优先），再查导入与全局符号
         if let Some(id) = self.resolve_local(name) {
@@ -7715,10 +7857,12 @@ impl TypeChecker {
         if let Some(id) = self.use_aliases.get(name).copied() {
             return Ok(id);
         }
-        self.symbols.get(name).copied().ok_or_else(|| {
-            CompileError::name_error(format!("cannot find value `{}` in this scope", name))
-                .with_span(span)
-        })
+        if let Some(id) = self.symbols.get(name).copied() {
+            self.check_visibility(id, name, span)?;
+            return Ok(id);
+        }
+        Err(CompileError::name_error(format!("cannot find value `{}` in this scope", name))
+            .with_span(span))
     }
 
     fn resolve_path(&self, path: &[String], span: ast::Span) -> Result<DefId> {
@@ -7729,6 +7873,7 @@ impl TypeChecker {
         if path.len() > 1 {
             let mangled = path.join("__");
             if let Some(id) = self.symbols.get(&mangled).copied() {
+                self.check_visibility(id, &mangled, span)?;
                 return Ok(id);
             }
         }
@@ -7741,6 +7886,7 @@ impl TypeChecker {
         if path.len() > 1 && self.flattened_modules.contains(&first) {
             let leaf = &path[path.len() - 1];
             if let Some(id) = self.symbols.get(leaf).copied() {
+                self.check_visibility(id, leaf, span)?;
                 return Ok(id);
             }
         }
@@ -8965,6 +9111,14 @@ impl OffsetTracker {
 
 fn align_up(addr: usize, align: usize) -> usize {
     (addr + align - 1) & !(align - 1)
+}
+
+/// `a::b::c` → `a::b`；`a` → `""`（crate root）。
+fn parent_module_path(path: &str) -> &str {
+    match path.rfind("::") {
+        Some(i) => &path[..i],
+        None => "",
+    }
 }
 
 fn parse_int_type(name: &str) -> Option<u16> {

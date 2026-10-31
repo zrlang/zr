@@ -604,6 +604,14 @@ pub struct Arm {
 #[derive(Debug, Clone)]
 pub struct Function {
     pub name: String,
+    /// 可见性（`pub` / `pub(crate)` / `pub(super)`，默认私有）。
+    ///
+    /// 解析阶段保留（早先被丢弃），供类型检查的可见性检查用。
+    pub visibility: Visibility,
+    /// 声明所在的模块路径（`mod a { mod b { .. } }` 里的函数是 `a::b`）。
+    ///
+    /// 由模块加载器在扁平化时打上；顶层条目为空串（crate root）。
+    pub module: String,
     /// 泛型参数（`fn swap<T>(..)` 里的 `T`）。
     pub generics: Vec<GenericParam>,
     /// 函数上的属性（`#[inline]` / `#[test]` / `#[no_mangle]` …）。
@@ -669,6 +677,10 @@ pub enum TypeDef {
     /// `type` 别名。
     Alias {
         name: String,
+        /// 可见性（默认私有）。
+        visibility: Visibility,
+        /// 声明所在的模块路径（模块加载器扁平化时打上；顶层为空串）。
+        module: String,
         target: Type,
         /// 泛型参数（`type MyBox<T> = Option<T>` 里的 `<T>`）。
         ///
@@ -692,6 +704,10 @@ pub struct Field {
 #[derive(Debug, Clone)]
 pub struct StructDef {
     pub name: String,
+    /// 可见性（默认私有）。
+    pub visibility: Visibility,
+    /// 声明所在的模块路径（模块加载器扁平化时打上；顶层为空串）。
+    pub module: String,
     /// 泛型参数（`struct Pair<T> { .. }` 里的 `T`）。
     pub generics: Vec<GenericParam>,
     pub attrs: Vec<Attribute>,
@@ -734,6 +750,10 @@ pub enum VariantPayload {
 #[derive(Debug, Clone)]
 pub struct EnumDef {
     pub name: String,
+    /// 可见性（默认私有）。
+    pub visibility: Visibility,
+    /// 声明所在的模块路径（模块加载器扁平化时打上；顶层为空串）。
+    pub module: String,
     /// 属性（`#[derive(..)]` 等）。
     pub attrs: Vec<Attribute>,
     /// 泛型参数（`enum Option<T> { .. }` 里的 `T`）。
@@ -751,6 +771,10 @@ pub struct EnumDef {
 pub struct UnionDef {
     pub name: String,
     pub fields: Vec<Field>,
+    /// 条目可见性（`pub` / `pub(crate)` / `pub(super)` / 私有）。
+    pub visibility: Visibility,
+    /// 声明所在的模块路径（模块加载器扁平化时打上；顶层为空串）。
+    pub module: String,
 }
 
 // ======================================================================
@@ -761,6 +785,10 @@ pub struct UnionDef {
 #[derive(Debug, Clone)]
 pub struct ConstDecl {
     pub name: String,
+    /// 可见性（默认私有）。
+    pub visibility: Visibility,
+    /// 声明所在的模块路径（模块加载器扁平化时打上；顶层为空串）。
+    pub module: String,
     pub ty: Type,
     pub value: Expression,
 }
@@ -769,6 +797,10 @@ pub struct ConstDecl {
 #[derive(Debug, Clone)]
 pub struct StaticDecl {
     pub name: String,
+    /// 可见性（默认私有）。
+    pub visibility: Visibility,
+    /// 声明所在的模块路径（模块加载器扁平化时打上；顶层为空串）。
+    pub module: String,
     /// 是否 `static mut`。
     pub is_mut: bool,
     pub ty: Type,
@@ -783,6 +815,10 @@ pub struct StaticDecl {
 #[derive(Debug, Clone)]
 pub struct TraitDef {
     pub name: String,
+    /// 可见性（默认私有）。
+    pub visibility: Visibility,
+    /// 声明所在的模块路径（模块加载器扁平化时打上；顶层为空串）。
+    pub module: String,
     pub super_traits: Vec<Type>,
     pub assoc_types: Vec<AssocType>,
     pub methods: Vec<Function>,
@@ -802,6 +838,8 @@ pub struct ImplBlock {
     pub trait_type: Option<Type>, // `impl Trait for T` 中的 Trait
     pub methods: Vec<Function>,   // impl 中定义的方法
     pub where_clause: Vec<WherePred>,
+    /// 声明所在的模块路径（模块加载器扁平化时打上；顶层为空串）。
+    pub module: String,
     pub span: Span,
 }
 

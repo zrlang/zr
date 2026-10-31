@@ -1,0 +1,59 @@
+// 覆盖：模块条目可见性（`pub` / `pub(crate)` / `pub(super)` / 私有）。
+//
+// 早先可见性在解析阶段就被丢弃（`_visibility`），`pub(crate)` / `pub(super)`
+// 被当成 `pub`，私有条目对跨模块访问也不设防——`mod m { fn helper() {} }`
+// 里的 `helper` 会被扁平化进顶层，`m::helper()` 从 crate root 也能调。
+// 现在解析阶段保留可见性、模块加载器给每个条目打上声明模块路径，类型检查
+// 在 `resolve_name` / `resolve_path` 里按"条目可见性 × 引用方模块"判定：
+//   - `pub` / `pub(crate)`：单 crate 内处处可见。
+//   - `pub(super)`：父模块及其后代可见（顶层模块的父模块 = crate root）。
+//   - 私有：声明模块及其后代可见。
+// 本用例全部走合法路径（跨模块访问只碰 `pub` / `pub(crate)` / `pub(super)`；
+// 私有条目只在自己的模块内用），编译通过并运行返回 0。
+
+use io::*;
+
+mod utils {
+    pub const FACTOR: i32 = 2;
+    pub(crate) fn crate_helper(x: i32) -> i32 { x * FACTOR }
+    pub(super) fn super_helper(x: i32) -> i32 { x + FACTOR }
+    fn private_helper(x: i32) -> i32 { x - FACTOR }
+    pub fn entry(x: i32) -> i32 {
+        // 模块内：私有 / pub(super) / pub(crate) 都可见。
+        private_helper(super_helper(crate_helper(x)))
+    }
+}
+
+mod outer {
+    mod inner {
+        pub(super) fn helper(x: i32) -> i32 { x + 1 }
+    }
+    pub fn call(x: i32) -> i32 {
+        // `inner::helper` 是 `pub(super)`（父模块 = `outer`），`call` 在
+        // `outer` 里，可见。
+        inner::helper(x)
+    }
+}
+
+mod shapes {
+    pub struct Point { pub x: i32, pub y: i32 }
+    pub fn mk(x: i32) -> Point {
+        Point { x, y: 0 }
+    }
+}
+
+fn main() {
+    // crate root 看 utils 的 pub / pub(crate) / pub(super)（父模块 = crate root）。
+    if utils::FACTOR != 2 { return 1; }
+    if utils::crate_helper(5) != 10 { return 2; }
+    if utils::super_helper(5) != 7 { return 3; }
+    if utils::entry(10) != 20 { return 4; }
+    // 嵌套模块的 pub(super)：从父模块访问。
+    if outer::call(41) != 42 { return 5; }
+    // pub 结构体 + 私有结构体（私有只在模块内构造）。
+    let p = shapes::mk(7);
+    if p.x != 7 { return 6; }
+    // 运行到这就是全部可见性路径合法。
+    println("visibility ok");
+    return 0;
+}
