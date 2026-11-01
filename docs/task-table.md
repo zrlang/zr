@@ -217,13 +217,19 @@ zr 的做法是让被调方是**泛型**函数（`fn apply<F>(f: F, ..)`）：`F
 
 ### P2-1 可见性检查
 
-现状：`Visibility`（`ast.rs:84`：`Public/Private/Crate/SelfOnly/Super`）解析后**全部丢弃**，
-`typeck/mod.rs` 不读任何 `.vis`；`pub(crate)`/`pub(super)` 无检查。
+现状：✅ 已实现（`e0c5541`）。解析阶段保留 `pub` / `pub(crate)` / `pub(super)`
+（早先 `_visibility` 直接丢弃），模块加载器给每个条目打上声明模块路径；类型检查
+在 `resolve_name` / `resolve_path` 里按"条目可见性 × 引用方模块"判定
+（`check_visibility` / `visibility_allows`）：`pub` / `pub(crate)` 单 crate 内处处
+可见；`pub(super)` 对父模块及其后代可见；私有 / `pub(self)` 对声明模块及其后代
+可见。负向用例 `23_visibility_private.zr`、`24_visibility_super.zr`。
+已知局限：`use m::item` 导入私有条目的检查在 `use` 点未做；`resolve_name` 的
+`use_aliases` 分支绕过可见性检查。
 
 | 子任务 | 内容 | 状态 |
 |---|---|---|
-| P2-1a | 每个 def 记录其 `Visibility` + 所属模块（需要从 `modules.rs` 的 `absorb` 把模块信息带到 typeck） | ⬜ |
-| P2-1b | 路径解析时：非 `pub` 项被**不同模块**引用 → `cannot find` / `private item` 报错 | ⬜ |
+| P2-1a | 每个 def 记录其 `Visibility` + 所属模块（需要从 `modules.rs` 的 `absorb` 把模块信息带到 typeck） | ✅ `e0c5541` |
+| P2-1b | 路径解析时：非 `pub` 项被**不同模块**引用 → `cannot find` / `private item` 报错 | ✅ `e0c5541` |
 
 ### P2-2 LTO / PGO 接线
 

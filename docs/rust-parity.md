@@ -45,7 +45,7 @@
 | Rust 的写法 | zr 的现状 | 状态 | 说明 |
 |------|------|------|------|
 | `[T; N]` 定长数组 | 可用 | ✅ | 字面量、`[v; N]` 重复、索引读写、传参、逐元素算术、数组按值拷贝语义均正常 |
-| `&[T]` / `&mut [T]` 切片 | `[]const T` / `[]mut T` | ✅ | 元素类型写在括号**后面**（zr 独有写法）。可变切片可写回原数组；**没有借用检查**，任何数组都能隐式转成 `[]mut T` |
+| `&[T]` / `&mut [T]` 切片 | `[]const T` / `[]mut T` | ✅ | 元素类型写在括号**后面**（zr 独有写法）。可变切片可写回原数组；任何数组都能隐式转成 `[]mut T`（借用检查只有最小切片，见 §2.4） |
 | 数组 → 切片 强转 | 自动强转 | ✅ | `let s: []const i32 = arr;`、`f(arr)`（形参 `[]T`）都自动补 `(ptr, len)`；`arr[1..3]` / `arr[1..]` / `arr[..3]` / `arr[..]` / `arr[1..=3]` 均产生切片 |
 | `(T, U)` 元组 | 可用 | 🟡 | 直接写元组类型可用；但**经类型别名后取 `.0` 失败**：``zr: no field `0` on type `type#75` `` |
 | `struct` | 可用 | ✅ | 具名字段、元组结构体、嵌套字段、`impl` 方法、`impl Drop`、字段按值拷贝均正常 |
@@ -60,7 +60,7 @@
 | 关联类型 | 可用 | ✅ | `type Output;` + `type Output = i32;` 正常，`Self::Output` 能取到 |
 | `impl` 块 | 可用 | ✅ | 关联函数、`self` / `&self` / `&mut self` 三种接收者、`Self` 类型均可 |
 | `type` 别名 | 可用（含泛型） | ✅ | 在**使用点展开**：`let x: MyInt`、结构体字段、数组 / 指针、`Vec<MyInt>`、别名套别名、前向引用都正常；**泛型别名 `type V<T> = Vec<T>` 已支持**（`74_generic_alias.zr`，提交 `8d6c475`：保留参数并登记占位符，展平按实参替换） |
-| 生命周期标注 `'a` | 解析后丢弃 | 🟡 | `&'a T`、`struct S<'a>` 能写，但类型检查阶段直接丢掉标注（`src/parser/ty.rs`），**没有任何借用/存活检查** |
+| 生命周期标注 `'a` | 解析后丢弃 | 🟡 | `&'a T`、`struct S<'a>` 能写，但类型检查阶段直接丢掉标注（`src/parser/ty.rs`），**没有生命周期 / 存活检查**（借用检查只是 §2.4 的最小切片） |
 | `dyn Trait` / trait 对象 | 骨架可用 | 🔧 | 词法+解析+类型检查三层已实现（`88_dyn_keyword.zr`：参数/局部注解里出现 `&dyn Error` 不再报错）；**完整 vtable 分派与 trait-object 转换仍在未实现状态**，调用 trait 方法不在此用例范围 |
 | auto trait | 不支持 | ❌ | 无 auto trait 机制、无 blanket impl 语法 |
 | `PhantomData<T>` | 不存在 | ❌ | `std::core` 里没有 `PhantomData`，也没有等价物 |
@@ -103,7 +103,7 @@
 | 元组模式 `(1, v)` | 可用 | ✅ | |
 | 枚举变体模式 `Shape::Circle(r)` | 可用 | ✅ | 判别式比较正确（`Shape::Empty` 能被正确排除） |
 | 守卫 `n if n > 100` | 可用 | ✅ | |
-| 穷尽性检查 | 可用 | 🟡 | 枚举全覆盖时**可以**不写 `_`（与 Rust 一致）；但缺臂时报错信息有误导性：``zr: match must have a trailing `_` arm `` |
+| 穷尽性检查 | 可用 | ✅ | 枚举全覆盖时可以**不写 `_`**（与 Rust 一致）；缺臂时报错**列出缺失的变体名**（``match is not exhaustive: `Color` variant not covered: Blue``，`17_match_missing_variant.zr`）；整型 / 标量仍保留尾 `_` 臂措辞 |
 | 切片模式 `[a, b, c]` | 不支持 | ❌ | `zr: match on slice patterns is not implemented yet` |
 | 引用模式 `&v` | 不支持 | ❌ | 解析期就失败：`zr: expected pattern, found Amp`（类型检查器里还有一条 `zr: match on reference patterns is not implemented yet` 但到不了） |
 
@@ -113,7 +113,7 @@
 |------|------|------|------|
 | 块表达式 | 可用 | ✅ | `let v = { let a = 1; a + 1 };` |
 | 函数指针 `fn(T) -> R` | 可用 | ✅ | 取址、传参、返回值、存进结构体字段都行（x86-64 专属，其它后端明确报错） |
-| 闭包 `\|x\| x * factor` | 不支持 | ❌ | `zr: closures are not implemented yet (captures are not lowered)`（README 已记录） |
+| 闭包 `\|x\| x * factor` | 基本可用 | 🟡 | 无捕获闭包可存变量 / 当实参 / 返回；带捕获闭包也可存变量 / 嵌套 / 多次调用、按值传给**泛型**形参 / 从泛型返回值透传（`84_closure_capture_value.zr`、`109_closure_env_cross_fn.zr`、`110_closure_env_generic_passthrough.zr`）。**带捕获闭包传给裸 `fn(..)` 形参 / 作为 `fn(..)` 返回值仍明确报错**（负向 `07_closure_capture.zr` / `25_closure_return.zr`） |
 | `impl Trait` 参数 | 不支持 | ❌ | `fn f(op: impl Fn(T) -> T)` → `zr: expected ')': expected LParen`；`impl Fn(T) -> T` 这种 trait 路径参数写不了 |
 | `?` 运算符 | 可用 | ✅ | 对 `Result<T, E>` / `Option<T>` 生效：成功取载荷，失败从当前函数 `return Err(e)` / `return None`。返回类型必须是同一种枚举，错误类型必须一致（没有 `From` 转换） |
 | `try` / `catch` | 明确报错 | ❌ | 语法能解析，类型检查报 `` `try` / `catch` is not implemented yet; use the postfix `?` operator ... `` |
@@ -121,14 +121,14 @@
 | `defer` | 明确报错 | ❌ | 类型检查报 `` `defer` is not implemented yet (the block would never run) ... `` |
 | `async fn` / `.await` | 可用 | ✅ | Rust 风格受限降级：future 帧在堆上，`.await` 轮询；`async fn main` 入口执行器可用（实测 `count(5).await` → 10，`double(10).await` → 20） |
 | `comptime` | 可用 | ✅ | `let v = comptime 1 + 2;` → 3 |
-| `unsafe { }` | 不支持 | ❌ | **词法器里没有 `unsafe` 关键字**；README「指针与 unsafe」一节写的写法目前无法编译（`zr: expected ';' after binding: expected Semicolon, found LBrace`） |
+| `unsafe { }` | 骨架可用 | 🟡 | `unsafe { ... }` 块可解析、可通过类型检查（`85_unsafe.zr`）；但**当前不改变语义**（按块表达式透传），并非 Rust 的 unsafe 保障 |
 
 ### 2.4 所有权 / 借用
 
 | Rust 的写法 | zr 的现状 | 状态 | 说明 |
 |------|------|------|------|
-| 移动语义（use after move 报错） | 不检查 | ❌ | `let s2 = s1;` 之后再用 `s1` 不报错（README「所有权系统」一节与实际不符） |
-| 借用检查（`&mut` 独占） | 不检查 | ❌ | 同一变量可以同时取两个 `&mut`，不报 E0499 类错误 |
+| 移动语义（use after move 报错） | 最小版已实现 | 🟡 | `let b = a` 对含 drop glue 的类型是移动，之后读 `a` 报 use-after-move（`87_move_check.zr`、负向 `09_use_after_move.zr`）；**字段级 / 按值传参的移动不覆盖** |
+| 借用检查（`&mut` 独占） | 最小切片已实现 | 🟡 | 同位置借用重叠（`&mut` 与任意、`&` 与 `&mut`）报 `cannot borrow ... while already borrowed`；写被借用位置报 `cannot assign ... while it is borrowed`；读被可变借用位置报 `cannot read ... while it is mutably borrowed`；NLL 按 last-use 近似（`105_borrow_nll.zr` + 负向 20/21/22）。**多绑定 / 未关联借用、跨函数流动不检查** |
 | `let` 默认不可变 | 一致 | ✅ | `let x = 1; x = 2;` → ``zr: cannot assign to immutable binding (declare it with `let mut`) `` |
 | `var` | 已移除 | ✅ | `var x = 1;` → 解析错误（zr 用 `let` / `let mut`） |
 
@@ -136,11 +136,11 @@
 
 | Rust 的写法 | zr 的现状 | 状态 | 说明 |
 |------|------|------|------|
-| `mod` / `use` / `use ... as ...` | 部分可用 | 🟡 | `mod`、`use`、`use a::{b, c}` 分组导入可用；**`use x as y` 重命名无效**：``zr: cannot find value `hf` in this scope `` |
-| `use foo::*` | 不支持 | ❌ | ``zr: glob imports (`use foo::*`) require module system support (not yet implemented) `` |
+| `mod` / `use` / `use ... as ...` | 可用 | ✅ | `mod`、`use`、`use a::{b, c}` 分组导入、`use x as y` 重命名（`75_use_alias.zr`）均可 |
+| `use foo::*` | 支持 | ✅ | glob 导入按模块的导出名登记别名（`40b5b45`，`90_glob_import.zr`） |
 | `use std::core::Option` | 路径不带 `std::` | 🟡 | zr 的标准库模块直接叫 `core` / `io` / `string` / `collections`：`use core::Option;`。写 `std::core::Option` → ``zr: unknown module `std` `` |
-| `pub` / `pub(crate)` / `pub(super)` | 仅 `pub` | 🟡 | 没有 `pub(crate)` / `pub(super)` 的可见性检查 |
-| `#[derive(Clone, PartialEq, Eq, Hash, Default, Debug, ...)]` | 生成真实方法体 | 🟡 | `src/typeck/derive.rs` 在 AST 层生成 `Type__clone` / `__eq` / `__lt` / `__hash` / `__default` / `__debug`，与手写 `impl` 方法同形。结构体支持 `Clone/Copy/PartialEq/Eq/PartialOrd/Ord/Hash/Default/Debug`（含元组结构体、嵌套结构体、**`str` 字段后的嵌套结构体字段**）；枚举支持 `Clone/PartialEq/Eq/Hash/Debug`（含**结构体变体载荷里的 `str` 字段**，`EnumField` 聚合特判修好后已对齐 Rust）。`==`/`<` 等聚合比较改写成方法调用，**没 derive 就报错**。`Debug` 生成 `.debug() -> String`（Rust `{:?}` 风格；浮点/指针/数组/元组/`String` 字段显式报错）。仍缺：泛型类型 derive 报错、枚举 `Default`/`Ord` 报错。 |
+| `pub` / `pub(crate)` / `pub(super)` | 可用 | ✅ | 解析阶段保留可见性，类型检查按「条目可见性 × 引用方模块」判定（`e0c5541`）：`pub` / `pub(crate)` 单 crate 内处处可见，`pub(super)` 对父模块及后代可见，私有 / `pub(self)` 对声明模块及后代可见（负向 `23_visibility_private.zr` / `24_visibility_super.zr`）。局限：`use` 点导入私有条目未检查 |
+| `#[derive(Clone, PartialEq, Eq, Hash, Default, Debug, ...)]` | 生成真实方法体 | 🟡 | `src/typeck/derive.rs` 在 AST 层生成 `Type__clone` / `__eq` / `__lt` / `__hash` / `__default` / `__debug`，与手写 `impl` 方法同形。结构体支持 `Clone/Copy/PartialEq/Eq/PartialOrd/Ord/Hash/Default/Debug`（含元组结构体、嵌套结构体、**`str` 字段后的嵌套结构体字段**）；枚举支持 `Clone/PartialEq/Eq/Hash/Debug`（含**结构体变体载荷里的 `str` 字段**，`EnumField` 聚合特判修好后已对齐 Rust）。`==`/`<` 等聚合比较改写成方法调用，**没 derive 就报错**。`Debug` 生成 `.debug() -> String`（Rust `{:?}` 风格）与多行 `.debug_pretty()`（Rust `{:#?}` 风格，`13acff2`；浮点/指针/数组/元组/`String` 字段显式报错）。仍缺：泛型类型 derive 报错、枚举 `Default`/`Ord` 报错；**格式引擎 `{:#?}` 尚未接自定义类型**。 |
 | `#[repr(C)]` / `#[repr(u8)]` | 可用 | ✅ | |
 | `#[inline(...)]` / `#[link(...)]` / `#[test]` | 可用 | ✅ | `#[test]` 的函数会被编进产物并在 `main` 前调用 |
 | `static` / `static mut` | 标量可用 | ✅ | 初值能折成字面量的**标量**静态量会写进 `.data`：读、写、复合赋值、`&STATIC` / `&mut STATIC` 都正常。聚合静态量（结构体 / 数组 / 枚举）暂不生成数据，读取时明确报错；`static mut` 赋值不需要 `let mut`，非 `mut` 静态量赋值报错 |
@@ -176,12 +176,12 @@
 | `write` / `write_all` | `write(bytes)` / `write_all(bytes)` | ✅ | |
 | `seek` | `seek(offset, whence)` | 🟡 | `SEEK_SET` / `SEEK_CUR` / `SEEK_END`，返回新位置 |
 | `close` | `close() -> bool` | 🟡 | **显式关闭**，`File` 不实现 `Drop`，不会自动关闭 |
-| `metadata().len()` | `size() -> i64` | 🟡 | 只有大小，**没有权限 / 时间戳 / inode 等元数据** |
+| `metadata().len()` | `fs::file_size` / `file_mode` / `file_mtime` / `file_ctime` | 🟡 | 路径版元数据已补（大小 / mode / mtime / ctime）；**没有 `File` 上的 `metadata()`，也没有 inode** |
 | `is_terminal` | `is_terminal()` | ✅ | |
 | 目录操作（`create_dir` / `read_dir` / `remove_dir`） | `fs::create_dir` / `read_dir_count` + `read_dir_name` / `remove_dir` | ✅ | 目录遍历跳过 `.` 与 `..`；`read_dir_name` 写进调用方缓冲区 |
 | 路径操作（`Path` / `join` / `exists`） | `path::join` / `normalize` / `basename` / `extname` / `substr` / `fs::exists` | 🟡 | 没有 `Path` 类型，直接在 `str` 上算；`substr` / `basename` / `extname` 直接返回 `str` 切片 |
 | `Instant` / `SystemTime` / `sleep` | `zr_time_ns` / `zr_time_unix_ns` / `zr_sleep_ms`（`thread::sleep_ms`） | 🟡 | 只有纳秒整数，没有类型化的时间差 / 格式化 |
-| 临时文件（`tempfile`） | 无 | ❌ | 同上 |
+| 临时文件（`tempfile`） | `fs::temp_file()` / `temp_file_raw()` | 🟡 | `/tmp/zr_tmp_<纳秒>`；没有 `NamedTempFile` / 自动删除（`File` 不实现 `Drop`） |
 
 ---
 
@@ -197,16 +197,18 @@
    `let x = 1; x = 2;` 编译期报 ``cannot assign to immutable binding (declare it with `let mut`)``。
    这与 Rust 一致，但 Rust 的 `let mut` 之外还有 `mut` 引用绑定等更细的规则，zr 只有「绑定可不可变」这一层。
 
-3. **`&T` 是只读指针，`&mut T` 是可写指针，但没有借用检查。**
+3. **`&T` 是只读指针，`&mut T` 是可写指针；借用检查只有最小切片。**
    zr 把引用降级成裸指针语义：`&T` 上赋值会被拦（`cannot assign through an immutable pointer`），
-   但**借用规则本身不检查**——多个 `&mut`、移动后继续使用都不会报错。
-   也就是说：Rust 的借用检查器在 zr 里还没有，类型系统只挡得住「给不可变引用写值」这一种。
+   借用规则也做了最小检查（同位置重叠借用、写 / 读被借用位置，NLL 按 last-use
+   近似，见 §2.4），移动也只检查整值。但它**远不是完整的借用检查器**——多绑定 /
+   未关联借用、跨函数流动都不检查；`let r: &i32 = &x;` 还会把注解解析成
+   `*const i32`。
 
 4. **`str` 是 `{ptr, len}` 结构体，切片是 `[]const T`。**
    Rust 的 `&str` 是胖指针、`&[T]` 是 `&` + 长度；zr 把 `str` 做成了有两个字段的结构体，
    切片类型写成 `[]const T`（元素在后），而不是 Rust 的 `&[T]`。
    `[]mut T` 可用；数组 → 切片是隐式强转（Rust 里 `&arr` 也要显式配合）。
-   切片没有越界检查，也没有借用检查。
+   切片没有越界检查（借用检查见 §2.4 的最小切片）。
 
 5. **`print` / `println` 是函数，不是宏；格式化另走 `println_fmt`。**
    Rust 的 `println!("{} {}", a, b)` 在 zr 里要写成
@@ -259,24 +261,34 @@
    当前不改变语义，按块表达式透传）；**`dyn` 只是骨架**（词法+解析+类型检查
    已实现，`88_dyn_keyword.zr`；vtable 分派未完工，trait-object 转换受限，
    `std::error` 因此仍难导入）。
-3. **没有借用检查 / 移动检查**（README「所有权系统」「借用检查」两节与实际不符）。
-4. **没有元数据 / 临时文件 API**：目录、路径、时间已可用（`std/fs.zr`、
-    `std/path.zr`），但权限、时间戳、`tempfile` 仍缺。
-5. **格式规格只剩两处没做**：命名参数 `{name}` 与多行 Debug `{:#?}`
-   （`#` 对 `{:?}` 目前被忽略，输出的是一行）。其余（`{}` `{:?}` `{:x}`
-   `{:X}` `{:b}` `{:o}` `{:e}` `{:E}`、位置参数、填充 / 对齐 / `+` / `#` /
-   `0` / 宽度 / 精度、动态宽度 `{:1$}`、动态精度 `{:.*}` / `{:.1$}`）
-   已与 Rust 逐字符对齐。
-6. **闭包只支持"定义处立即调用"**：`(|x| x + 1)(5)` 会在调用点内联展开，
-   捕获变量复用外层 local。把闭包存进变量 / 当实参 / 返回会报
-   `closures can only be invoked immediately where they are defined`。
-7. **`i128` / `u128` 只在 64 位目标上可用**（拆成两个连续 8 字节栈槽，加减
+3. **借用检查 / 移动检查已是最小切片**（不是没有）。同位置借用重叠（`&mut` 与
+   任意、`&` 与 `&mut`）报 `cannot borrow ... while already borrowed`；写被借用
+   位置报 `cannot assign to ... while it is borrowed`；读被可变借用位置报
+   `cannot read ... while it is mutably borrowed`（NLL 按 last-use 近似，
+   `105_borrow_nll.zr` + 负向 20/21/22）；`let b = a` 对含 drop glue 的类型是
+   移动、读被移动的源报 use-after-move（`87_move_check.zr`）。**已知局限**：
+   多绑定 / 未关联借用仍按作用域结束；移动只覆盖整值，字段级 / 按值传参不覆盖。
+4. **格式引擎的 `{:#?}` 还没接到自定义类型**：命名参数 `{name}` 已实现
+   （`println_fmt_named`）；`#[derive(Debug)]` 也已生成 `.debug()` /
+   `.debug_pretty()`。但 `FormatArg` 只带标量 / 字符串种类，`println_fmt` 里的
+   自定义类型还接不进去——`{:#?}` 对自定义类型目前只能直接调生成的
+   `.debug_pretty()`。其余（`{}` `{:?}` `{:x}` `{:X}` `{:b}` `{:o}` `{:e}`
+   `{:E}`、位置参数、填充 / 对齐 / `+` / `#` / `0` / 宽度 / 精度、动态宽度
+   `{:1$}`、动态精度 `{:.*}` / `{:.1$}`）已与 Rust 逐字符对齐。
+5. **闭包：`fn(..)` 形参 / 返回值两条路径明确报错**。无捕获闭包可存变量 / 当实参 /
+   返回；带捕获闭包也可存变量 / 嵌套 / 多次调用，并能按值传给**泛型**形参、从
+   泛型返回值透传（`109_closure_env_cross_fn.zr`、
+   `110_closure_env_generic_passthrough.zr`）。但带捕获闭包传给裸 `fn(..)` 形参
+   报 `captured closure cannot be passed as a plain `fn` value`、作为 `fn(..)`
+   返回值报 `captured closure cannot be returned as a plain `fn` value`——要支持
+   需 `Fn` 边界 / 胖指针，属独立大工程。
+6. **`i128` / `u128` 只在 64 位目标上可用**（拆成两个连续 8 字节栈槽，加减
    走 `adc`/`sbb`、移位走 `shld`/`shrd`、比较按高位优先定序、传参 / 返回用
    `rdx:rax`；源码见 `src/codegen/encoder.rs`）。**乘 / 除 / 取模显式报错**
    （`target backend does not implement binary op 'Mul'` 等，需拆四段 / 软件
    长除，未做）；**32 位目标仍禁用**（类型检查阶段报错）。回归
    `tests/cases/111_i128.zr`。
-8. **泛型推断的边界**：类型参数只从实参和期望返回类型推断，不看作法体
+7. **泛型推断的边界**：类型参数只从实参和期望返回类型推断，不看作法体
    （`let v = Vec::new(); v.push(1)` 推不出 `T`，需要 `let v: Vec<i32>` 注解）。
    `T: Trait` / `where` 约束现在会在**单态化时**校验（`check_trait_bounds`，
    含超类型的双向展开）。
