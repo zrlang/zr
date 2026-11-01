@@ -80,18 +80,20 @@ i64 读，运行期越界 SIGSEGV（`/tmp/sl_bug.zr`）。`let a: []const i64 = 
 
 ### P0-1 借用检查（NLL）——拆 4 个子任务
 
-现状：`src/typeck/infer.rs::check_borrows` 返回空 `errors`（`borrow_intervals`
-是 `Vec<BorrowInterval>`，`BorrowInterval` 是空结构体，`record_borrow()` 不传
-任何参数）。这是"静默接受悬垂引用 / 重叠可变借用"的根源。
+现状：**已实现最小切片**（`src/typeck/mod.rs`——注意 `src/typeck/infer.rs::check_borrows`
+仍是未接线的空壳残留，真正的检查不在那里）。同位置借用重叠报
+`cannot borrow ... while already borrowed`；写被借用位置报
+`cannot assign to ... while it is borrowed`；读被可变借用位置报
+`cannot read ... while it is mutably borrowed`；NLL 按 last-use 近似
+（`finish_borrow_accesses` 在函数体检查完后统一判定）。已知局限：多绑定 /
+未关联借用按作用域结束、跨作用域重名可能混淆 last-use。
 
 | 子任务 | 内容 | 状态 |
 |---|---|---|
-| P0-1a | `BorrowInterval` 填充字段：`local`（DefId）、`is_mut`（bool）、`span`、`start`/`end` 程序点；`record_borrow` 改为接收这些参数，所有调用点传入真实借用信息 | ⬜ |
-| P0-1b | 借用区间收集：扫 MIR 基本块 + 支配树（`src/ssa/domtree.rs` 已有支配树），算每个借用的活跃区间 | ⬜ |
-| P0-1c | 冲突检测：`&mut T` × 任意重叠 → `E0499 cannot borrow as mutable more than once`；`&T` × `&mut T` 重叠 → `E0502 cannot borrow as immutable while mutable` | ⬜ |
-| P0-1d | 回归：`tests/negative/` 加借用冲突负向用例 + `tests/cases/` 加合法借用用例 | ⬜ |
-
-**验收**：`/tmp/borrow_*.zr` 手工确认冲突报错、合法借用不报；负向用例进套件。
+| P0-1a | 借用记录：位置（DefId）、可变性、span、起止程序点 | ✅ `ff5ff77` |
+| P0-1b | 借用区间 + last-use 近似（写/读被借用位置检测） | ✅ `14154ba` `a53a750` |
+| P0-1c | 冲突检测：`&mut` × 任意重叠、`&` × `&mut` 重叠 | ✅ `ff5ff77` |
+| P0-1d | 回归：`tests/negative/20_borrow_conflict.zr`、`21_borrow_write.zr`、`22_borrow_read.zr` + `tests/cases/105_borrow_nll.zr` | ✅ |
 
 ---
 
@@ -142,12 +144,14 @@ i64 读，运行期越界 SIGSEGV（`/tmp/sl_bug.zr`）。`let a: []const i64 = 
 ### P1-5 格式串 `{name}` 与 `{:#?}` 聚合
 
 现状：`std/io.zr` 格式引擎支持 `{}` `{:?}` `{:x}` …、位置参数、动态宽度/精度；
-缺**命名参数 `{name}`** 与 **`{:#?}` 多行聚合 Debug**（聚合 Debug 未实现，受阻）。
+**命名参数 `{name}` 已实现**（`io::println_fmt_named(fmt, &[NamedArg], n)`，
+`0d40ab1`）；**`{:#?}` 多行聚合 Debug 未实现**（`#` 对 `{:?}` 被忽略，只输出
+一行）。
 
 | 子任务 | 内容 | 状态 |
 |---|---|---|
-| P1-5a | 命名参数 `{name}`：格式引擎支持按名字查值（需要调用方传名字表，或编译期改写） | ⬜ |
-| P1-5b | `{:#?}` 聚合多行：递归 pretty-print（需要聚合 Debug 先落地，受阻于 P1-1c） | ⬜ |
+| P1-5a | 命名参数 `{name}`：格式引擎按名字查值（`NamedArg { name, value }`，名字与值同结构体） | ✅ `0d40ab1` |
+| P1-5b | `{:#?}` 聚合多行：递归 pretty-print。**不再受阻**——聚合 Debug（P1-1c）已落地，此前认定的"编译器阻塞"实为 `String::push_bytes` 扩容算错（见下 P1-7，已修），代码生成器无缺陷 | ⬜ |
 
 ### P1-6 元数据 / tempfile API
 
@@ -164,6 +168,23 @@ i64 读，运行期越界 SIGSEGV（`/tmp/sl_bug.zr`）。`let a: []const i64 = 
 |---|---|---|
 | P1-6a | `fs::metadata` → `{ len, mode, mtime, ctime }`（`stat` syscall） | 🔧 部分（mtime/mode 已出，len 走 `file_size_raw`，ctime 未出） |
 | P1-6b | `tempfile::temp_dir()` / `temp_dir_file()` | ✅ `temp_file()`/`temp_file_raw()` |
+
+### P1-7 `String::push_bytes` 扩容算错导致越界写堆
+
+现状：✅ 已修。`push_bytes` 需要扩容时传的是 `reserve(new_len - capacity)`
+（`new_len = len + bytes.len`），而 `reserve(additional)` 只保证
+`capacity >= len + additional`——因此只有当 `len == capacity` 时才够，其余
+情况一律少 reserve，紧接着的拷贝循环越界写堆。症状：循环里 `push_byte`
+反复 realloc 后 `push_bytes` 多字节字面量，越界写覆写相邻对象（字面量 `str`
+的 `ptr` 被写成 `s.ptr`），拷贝出 `ABCD`+NUL，最坏 `SIGABRT`/`SIGSEGV`。
+**早先被误判为代码生成器缺陷**（寄存器定错 / 局部槽别名）——实为标准库
+`reserve` 算错，代码生成器无缺陷；这也是 P1-5b `{:#?}` 被"阻塞"的真因。
+
+| 子任务 | 内容 | 状态 |
+|---|---|---|
+| P1-7a | 复现：循环 realloc + 之后 `push_bytes` 多字节字面量（`/tmp/hand17.zr`，未修版 exit 134/139） | ✅ |
+| P1-7b | 修复：改传 `reserve(bytes.len)` | ✅ |
+| P1-7c | 回归：`tests/cases/107_string_push_bytes_reserve.zr` 五档全绿（未修版全红） | ✅ |
 
 ---
 

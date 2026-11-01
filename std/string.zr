@@ -75,7 +75,11 @@ impl String {
     pub fn push_bytes(self: &mut String, bytes: []const u8) {
         let new_len = self.len + bytes.len;
         if new_len > self.capacity {
-            self.reserve(new_len - self.capacity);
+            // `reserve(additional)` 保证 `capacity >= len + additional`，
+            // 所以要保证 `capacity >= new_len` 必须传 `bytes.len`，而不是
+            // `new_len - capacity`（后者只在 `len == capacity` 时够用，
+            // 否则会少 reserve，拷贝循环越界写堆）。
+            self.reserve(bytes.len);
         }
         let mut i = 0;
         while i < bytes.len {

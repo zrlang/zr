@@ -117,6 +117,7 @@ cargo test --test zr_language
 | `95_str_slice_layout.zr` | `str`/切片字段布局与数组字面量元素传播：`S { name: str, x: i64 }` 的 `name.len` 读对（早先 `type_size_align` 把 str/切片当 8 字节，`len` 被下个字段盖住）、切片字段用 i32 字面量数组初始化按期望 i64 收窄 |
 | `96_str_slice_hash.zr` | `str`/切片按内容 Hash：`"abc"`=96354、`""`=0、相等⇒同哈希、不同⇒不同、数组字面量切片元素类型传播（早先 `str`/切片按 `0` 计入，碰撞严重；且首版用 `loop` 当块尾得 0） |
 | `97_loop_value.zr` | `loop` 表达式带值 `break`：`let x = loop { break 7; }` = 7、累加器 = 0+1+2+3、嵌套 break 值只外层生效、`while`/`for` break 作语句、发散循环（早先 `Break` 只记标签丢弃值、`Loop` 恒 `Never`，全静默得 0）。**聚合 break 值在 `-O3`/`-Oz` 有已知 codegen 缺陷** |
+| `107_string_push_bytes_reserve.zr` | `String::push_bytes` 扩容算错：早先传 `reserve(new_len - capacity)`（只在 `len == capacity` 时够），其余情况少 reserve、拷贝循环越界写堆，可能覆写相邻对象/`SIGABRT`；本用例在循环里 `push_byte` 触发 realloc 后再 `push_bytes` 多字节字面量，断言字节完整、无 NUL |
 
 ## 尚未覆盖（编译器还不支持）
 
@@ -130,7 +131,7 @@ Rust Book 的其余章节目前一个都测不了，因为对应特性尚未实�
 
 | Rust Book 章节 | 现状 |
 |----------------|------|
-| 所有权 / 借用 / 引用 / 切片 | 🟡 部分：最小移动检查已实现（`87_move_check.zr`：`let b = a` 后读 `a` 报 use-after-move；字段级/按值传参移动暂不覆盖）；**借用检查仍是空壳**（`infer.rs::check_borrows` 只记录不检查）；切片已覆盖（`65_slices.zr`） |
+| 所有权 / 借用 / 引用 / 切片 | 🟡 部分：最小移动检查已实现（`87_move_check.zr`：`let b = a` 后读 `a` 报 use-after-move；字段级/按值传参移动暂不覆盖）；**借用检查最小切片已实现**（`src/typeck/mod.rs`：同位置重叠借用报 `cannot borrow ... while already borrowed`、写被借用位置报 `cannot assign ... while it is borrowed`、读被可变借用位置报 `cannot read ... while it is mutably borrowed`；NLL 按 last-use 近似，`105_borrow_nll.zr` + 负向 20/21/22。`infer.rs::check_borrows` 只是未接线的空壳残留）；切片已覆盖（`65_slices.zr`） |
 | 枚举 | ✅ `57_enum.zr`：变体构造 / 判别式 / 变体模式 / 穷尽性 / 拷贝语义；`80_match_value.zr` 钉 match 返回值 |
 | 浮点（仅 ARM32 / Thumb / RISC-V / wasm） | x86-64 与 aarch64 已支持；其余后端遇到浮点字面量会**明确报错**（不再静默发射 0） |
 | 字符串字面量（仅 ARM32 / Thumb / RISC-V / wasm） | x86-64 与 aarch64 已落 `.rodata`（可取址、按地址比较），并可通过 `extern "C"` 调用运行时的 `zr_write` 输出；其余后端遇到字符串字面量会**明确报错**。尚无解引用 / 索引（需要 SSA 内存模型） |

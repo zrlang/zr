@@ -1,0 +1,65 @@
+//=============================================================================
+// tests/cases/107_string_push_bytes_reserve.zr — `String::push_bytes` 扩容算错
+//
+// 早先 `push_bytes` 需要扩容时传的是 `reserve(new_len - capacity)`
+// （`new_len = len + bytes.len`），而 `reserve(additional)` 只保证
+// `capacity >= len + additional`——因此只有当 `len >= capacity` 时才够，
+// 其余情况一律少 reserve，紧接着的拷贝循环
+// `self.ptr[self.len + i] = bytes.ptr[i]`（`i < bytes.len`）越界写堆。
+//
+// 触发场景（`/tmp/hand17.zr` 的最小复现）：循环里 `push_byte` 让 String
+// 反复 realloc，之后把多字节字面量传进 `push_bytes`——越界写会覆写相邻
+// 对象的 `ptr`（早先探针观察到字面量 `str` 的 `ptr` 被写成 `s.ptr`），
+// 最终拷贝出 `ABCD`+NUL，最坏直接 SIGABRT（未修版实测 exit 134）。
+//
+// 本用例断言：循环 realloc 之后 `push_bytes` 的多字节字面量必须完整落位，
+// 且结果中不出现任何 NUL。
+//=============================================================================
+
+/// 循环里反复 `push_byte`（触发 realloc），之后追加一个 6 字节字面量。
+fn build(n: i64) -> String {
+    let mut s = String::new();
+    let mut i: i64 = 0;
+    while i < n {
+        s.push_byte(32);        // ' ' —— 触发容量增长
+        s.push_bytes("tag: ");  // 5 字节，紧跟着多字节拷贝
+        i = i + 1;
+    }
+    let lit = "ABCDEF";
+    s.push_bytes("Outer {");
+    s.push_bytes(lit);
+    s.push_bytes("}");
+    return s;
+}
+
+fn main() -> i32 {
+    let s = build(4);
+
+    // " tag: " × 4 = 24 字节；"Outer {ABCDEF}" = 14 字节；合计 38。
+    if s.len != 38 { return 1; }
+
+    let p = s.ptr;
+    // 尾部布局：24='O' 25='u' 26='t' 27='e' 28='r' 29=' ' 30='{'
+    //           31='A' 32='B' 33='C' 34='D' 35='E' 36='F' 37='}'
+    if p[30] != b'{' { return 2; }
+    if p[31] != b'A' { return 3; }
+    // 越界写坏时这里会读到 NUL（早先只拷到 `ABCD`）。
+    if p[36] != b'F' { return 4; }
+    if p[37] != b'}' { return 5; }
+
+    // 结果里不允许出现 NUL（越界/覆盖的症状）。
+    let mut k: usize = 0;
+    while k < s.len {
+        if p[k] == 0 { return 6; }
+        k = k + 1;
+    }
+
+    // 循环多跑几轮，覆盖不同的 realloc 时序。
+    // 每轮 " tag: " = 6 字节（1 + 5），故 build(n) 长度为 6*n + 14。
+    let t = build(9);
+    if t.len != 6 * 9 + 14 { return 7; }
+    if t.ptr[t.len - 1] != b'}' { return 8; }
+    if t.ptr[t.len - 2] != b'F' { return 9; }
+
+    return 0;
+}

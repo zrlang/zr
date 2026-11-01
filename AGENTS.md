@@ -287,47 +287,22 @@ README 里"指针与 unsafe"一节目前是**愿景**：
   取 `symbols["max"]`（先收集者），不是 core 模块里的那个；根治需按模块限定。
 - **格式串**：命名参数 `{name}` 已实现（`println_fmt_named`，见下）；多行 Debug
   `{:#?}` 没做（`#` 对 `{:?}` 被忽略，只输出一行）。
-  **聚合多行 Debug 的运行时缩进被一个既有编译器 bug 挡住**：在"带结构体形参
-  的函数里出现用户级 `while` 循环"会让**字符串字面量的尾字节错读成 NUL**
-  （最小复现 `/tmp/hand7.zr`：`fn f(self: Outer, indent: usize)` 里 `while`
-  循环调用 `s.push_byte(32)` + `s.push_bytes("tag: ")`，`.rodata` 里
-  `"tag: "` 正确（`74 61 67 3a 20`）但 `push_bytes` 读回 `tag:\0`（尾空格变
-  NUL）；`push_bytes`/`push_byte` 单独用没事（`/tmp/hand5.zr` 无循环则正常）。
-  **精确触发**：循环里的 `push_byte` 触发 realloc（缓冲搬移），**之后**的
-  `push_bytes` 只拷 **4 字节**（不是 `len-1`——6 字节字面量 `"ABCDEF"` 也拷 4 字节
-  `ABCD`，`/tmp/hand14.zr`；循环改 2 次则拷满 6 字节，`/tmp/hand15.zr`）。
-  `lit.len` 在 `println_fmt` 读 **6 正确**，但传给 `push_bytes` 的切片 `len` 被
-  读成 **4（调用方循环次数）**——即 `str` 局部变量的槽位/寄存器被循环的
-  realloc 或值传播弄脏，`len` 错成循环计数。
-  `/tmp/hand10.zr`（良性循环 `i += 1` 无方法调用）正常；
-  `/tmp/hand11.zr`（`push_bytes("tag: ")` 在循环**前**）正常；
-  `/tmp/hand12.zr`（循环前 `s.reserve(64)` 避免 realloc）正常；
-  `/tmp/hand16.zr`（无循环、结构体形参 + 调用）正常——
-  证明是"**循环里 realloc + 之后把 `str` 局部传进方法**"的组合触发。
-  **SSA 与 asm 设置都对**（`--dump-ssa` 的 `z_String__push_bytes` 拷贝循环
-  `%28 = load (%4+8)` 正确；`leaq 0x1785b3(%rip)` 字面量地址 0x178cd8 与
-  `.rodata` 字节一致；`reserve` 的 epilogue 确实 pop r12/r13/r14 恢复调用者
-  的 r13=&slice）——错在**读回**（`bytes.len` 运行期被读成 4），疑似后端
-  寄存器/`while` 条件跨 `realloc` 调用的既有缺陷，非 derive 引入。
-  `.debug_pretty()` 若按"运行时缩进 + 循环"实现必踩此坑；修复需先定位
-  `z_String__push_bytes` 拷贝循环在"调用前有 realloc 的调用者"下 `bytes.len`
-  被读错一字节的确切环节（`%4`=&slice 在 r13 存活跨 reserve，reserve 也恢复
-  r13，仍错——疑似更深层的指令选择/线性扫描缺陷）。
-  **SSA 级定位（hand14 `--dump-ssa`）**：`bb3` 里 `let lit = "ABCDEF"` 存
-  `{ptr,6}` 到 `slot1073741828`，拷到切片临时 `slot1073741829`（`{ptr,6}`），
-  `println_fmt` 读 `slot1073741829+8` 得 6（`lit.len=6` 正确），但 `println_fmt`
-  **调用之后** `slot1073741829+8` 被覆写成 **4（调用方循环次数）**，再拷给
-  `push_bytes` 的 `slot1073741834` 就只拷 4 字节。MIR/SSA/帧布局（`FRAME_SLOTS`
-  覆盖全部局部槽，locals 在 `[alloc.spilled+float_slots, call_slot)` 内不越界）
-  都对——错在**运行期**。**运行时插桩定根因**：给 `z_String__push_bytes` 加
-  panic 探针，`bytes.len` 在 **push_bytes 入口**就是错误的小值（≠4、≠6、
-  <100），尽管调用方 `lit.len` 读 6（l1/l2 都打印 6）。调用方 asm 的切片构造
-  （hand17 `0xc02`）是 `leaq 0x190(%rsp),%rsi; movq (%r13),%rdi; ...;
-  movq 0x8(%r13),%rdi; ...`——它把 **r13 当 `&slot1829`（lit 切片临时）用**，
-  但 r13 在构造点并非 `&lit`（是循环/字符串遗留值），于是 `bytes.len=[r13+8]`
-  读到垃圾。而 SSA 里该读取是 `%145=load %57`（`%57=&slot1829`）——所以
-  **寄存器分配/指令选择把 `%57` 的基址寄存器定成了 r13，但 r13 在切片构造点
-  没装 `&slot1829`**（codegen 的 live-range/基址寄存器缺陷）。
+  **2026-11-01 定根因（此前"代码生成器寄存器/局部槽别名缺陷"的结论全部作废）**：
+  该 bug 与代码生成无关，真凶在 `std/string.zr::push_bytes` 自己的 `reserve`
+  算错。`push_bytes` 追加 `bytes` 后要保证 `capacity >= len + bytes.len`，却把
+  增量传成了 `reserve(new_len - capacity)`（`new_len = len + bytes.len`）；
+  而 `reserve(additional)` 只保证 `capacity >= len + additional`，于是只有当
+  `len >= capacity`（通常 `len == capacity`）时才够、其余情况一律**少 reserve**，
+  紧接着的拷贝循环 `self.ptr[self.len + i] = bytes.ptr[i]`（`i < bytes.len`）
+  越界写堆。症状分两层：字面量对象恰好紧邻一块刚 `realloc` 过的 String 缓冲
+  时，越界写把栈上 `str` 局部（`lit`）的 `ptr` 覆写成 `s.ptr`——`push_bytes`
+  于是从 String 缓冲拷 `ABCD`+NUL（早先探针看到 `[r13] = s.ptr` 正是这个，
+  并非寄存器定错）；最坏情况直接 `SIGABRT`（`/tmp/hand17.zr` 退回未修版实测
+  exit 134，修复后五档全输出 `Outer {ABCDEF}`）。
+  **修复**：改传 `reserve(bytes.len)`（`self.capacity` 比较仍用 `new_len > capacity`）。
+  **回归**：`tests/cases/107_string_push_bytes_reserve.zr`（循环里 realloc +
+  之后 `push_bytes` 多字节字面量）。**代码生成器无缺陷**——`{:#?}` 多行 Debug
+  不再被"编译器 bug"阻塞，只是单纯尚未实现。
 - **格式串命名参数 `{name}`**：✅ 已实现——`println_fmt` 是函数不是宏，`{name}`
   需要按名查参。新增 `io::println_fmt_named(fmt, &[NamedArg], n)`（`NamedArg { name: str, value: FormatArg }`），
   名字与值放同一个结构体（zr 里 `&["x","y"]` 无法强转成 `*const str`，分开两个
