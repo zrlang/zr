@@ -1,0 +1,71 @@
+// 覆盖：带捕获闭包的**值传递**在泛型机制下穿过函数边界与结构体字段。
+//
+// 环境结构体 `__env_N` 就是一个普通的值（字段 = 捕获 local 的值拷贝）。
+// 只要承载它的类型是**泛型**（`fn idf<F>(f: F) -> F`、`struct Holder<F> { f: F }`），
+// 单态化就会把 `F` 定到 `__env_N`，之后对它的调用（`f(x)` / `h.f(x)`）都按
+// 环境 DefId 查 `closures_by_env` 内联展开。因此"返回闭包""存字段"这两种
+// 形态在泛型路径下本就可用——真正做不到的是把环境值**转成裸 `fn(..)` 指针**
+// （需要 Fn 边界 / 胖指针，见 `tests/negative/07_closure_capture.zr`、
+// `25_closure_return.zr`）。
+//
+// 值语义：捕获是**值拷贝**（捕获时点），之后再改外层局部不影响闭包看到的值。
+struct Holder<F> {
+    f: F,
+}
+
+// 泛型透传：把环境值原样返回（`F` 由实参单态化到 `__env_N`）。
+fn idf<F>(f: F) -> F {
+    return f;
+}
+
+// 把持有闭包的结构体传给泛型函数，在那边调用它的字段。
+fn call_field<F>(h: F, x: i32) -> i32 {
+    return h.f(x);
+}
+
+fn apply<F>(f: F, x: i32) -> i32 {
+    return f(x);
+}
+
+fn main() -> i32 {
+    let n: i32 = 5;
+
+    // 1. 泛型透传返回后再调用。
+    let g = |x: i32| x + n;
+    let h = idf(g);
+    if h(1) != 6 {
+        return 1;
+    }
+
+    // 2. 存进泛型结构体字段，直接调用 `h.f(x)`。
+    let holder = Holder { f: g };
+    if holder.f(2) != 7 {
+        return 2;
+    }
+
+    // 3. 把持闭包的结构体传给泛型函数，在那边 `h.f(x)`。
+    if call_field(holder, 3) != 8 {
+        return 3;
+    }
+
+    // 4. 数组捕获穿过结构体字段 + 泛型函数，变量下标（基址替换必须正确）。
+    let arr = [100, 200, 300];
+    let get = |i: i32| arr[i];
+    let holder2 = Holder { f: get };
+    if call_field(holder2, 0) != 100 {
+        return 4;
+    }
+    if call_field(holder2, 2) != 300 {
+        return 5;
+    }
+
+    // 5. 值拷贝语义：捕获时点的值，之后改外层不影响闭包。
+    let mut m: i32 = 10;
+    let cap = |x: i32| x + m;
+    m = 999;
+    if apply(cap, 1) != 11 {
+        return 6;
+    }
+
+    return 0;
+}
