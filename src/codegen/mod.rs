@@ -22,6 +22,7 @@
 //! 各平台的启动约定不同：Linux 自带 syscall 启动桩；macOS / Windows
 //! 复用运行时的 `zr_exit` 退出进程（无需 libc 启动代码）。
 
+pub mod c_backend;
 pub mod encoder;
 pub mod encoder_aarch64;
 pub mod encoder_arm;

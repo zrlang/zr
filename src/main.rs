@@ -329,6 +329,8 @@ struct Cli {
     dump_ssa_after: bool,
     dump_asm: bool,
     emit_llvm: bool,
+    /// 发射 C 源码（`--emit-c`）而不是机器码——自举路径 HIR → C。
+    emit_c: bool,
     no_link: bool,
     target: String,
     /// 输出 WebAssembly 文本（WAT）而不是二进制模块。
@@ -388,6 +390,7 @@ impl Cli {
                 "--dump-ssa-after" => cli.dump_ssa_after = true,
                 "--dump-asm" => cli.dump_asm = true,
                 "--emit-llvm" => cli.emit_llvm = true,
+                "--emit-c" => cli.emit_c = true,
                 "--wat" => cli.wat = true,
                 "--no-incremental" => cli.incremental = false,
                 "-v" | "--verbose" => cli.verbose = true,
@@ -504,6 +507,7 @@ fn print_usage(prog: &str) {
     println!("    --dump-ssa-after    Dump SSA after optimization");
     println!("    --dump-asm          Dump assembly");
     println!("    --emit-llvm         Emit LLVM IR (future)");
+    println!("    --emit-c            Emit C source (bootstrap backend)");
     println!("    -h, --help          Show this help");
     println!("    -V, --version       Print version");
 }
@@ -534,13 +538,14 @@ thread_local! {
 /// 那比不缓存糟糕得多。
 fn build_salt(cmd: &Cli, target: &Target, input: &str) -> String {
     format!(
-        "v{}|{}|{:?}|{}|{}|{}|{}|{}",
+        "v{}|{}|{:?}|{}|{}|{}|{}|{}|{}",
         env!("CARGO_PKG_VERSION"),
         target.triple(),
         cmd.opt_level,
         cmd.debug_info,
         if cmd.no_link { "c" } else { "link" },
         if cmd.wat { "wat" } else { "bin" },
+        if cmd.emit_c { "c-src" } else { "native" },
         input,
         compiler_identity()
     )
@@ -754,6 +759,17 @@ fn compile(input: &str, cmd: &Cli) -> Result<std::path::PathBuf, String> {
         println!("{:#?}", hir);
     }
 
+    // 3.5 发射 C 源码（`--emit-c`）：C 后端直接从 HIR 翻译，是自举路径
+    // （见 `future/bootstrap/c_backend.md`）。产物是**一个 C 翻译单元**，
+    // 交给系统 C 编译器即可得到原生可执行文件。
+    if cmd.emit_c {
+        let c = codegen::c_backend::CBackend::translate(&hir);
+        let out = c_source_output_path(Path::new(&cmd.output));
+        std::fs::write(&out, c)
+            .map_err(|e| format!("cannot write C source to '{}': {e}", out.display()))?;
+        return Ok(out);
+    }
+
     // 4.5 提取属性（链接指令、repr 布局）到编译单元
     let mut unit = codegen::CompilationUnit::new();
     codegen::extract_attributes(&mut unit, &hir, &ast);
@@ -893,6 +909,23 @@ fn object_output_path(path: &Path, target: &Target) -> std::path::PathBuf {
             name.push(".o");
             std::path::PathBuf::from(name)
         }
+    }
+}
+
+/// `--emit-c` 的目标文件名。
+///
+/// 默认输出名来自输入文件（`prog.zr` → 输出 `prog.zr`），如果直接写回就会
+/// **覆盖源文件**；因此把 `.zr` 后缀换成 `.c`，无扩展名时补 `.c`。用户显式
+/// 指定的其它扩展名（`-o foo.c`）原样保留。
+fn c_source_output_path(path: &Path) -> std::path::PathBuf {
+    match path.extension().and_then(|e| e.to_str()) {
+        Some("zr") => path.with_extension("c"),
+        None => {
+            let mut name = path.as_os_str().to_os_string();
+            name.push(".c");
+            std::path::PathBuf::from(name)
+        }
+        Some(_) => path.to_path_buf(),
     }
 }
 
