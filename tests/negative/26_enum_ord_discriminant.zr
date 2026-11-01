@@ -1,0 +1,14 @@
+// 带显式判别式的枚举不能 derive `Ord`/`PartialOrd`。
+//
+// 无显式判别式时声明下标就是判别式，按声明顺序比是对的（见
+// tests/cases/114_enum_ord_derive.zr）。但 `A = 5, B = 1` 的判别式顺序与
+// 声明顺序相反，Rust 的 `Ord` 比的是**判别式的值**；derive 不求值常量
+// 表达式，按声明顺序生成 `__lt` 会给出错的顺序——所以这里必须继续报错，
+// 而不是悄悄生成一个顺序错误的实现。
+// expect: cannot derive `Ord`/`PartialOrd` for enum `E` with explicit discriminants yet
+#[derive(PartialEq, Eq, PartialOrd, Ord)]
+enum E { A = 5, B = 1 }
+
+fn main() -> i32 {
+    return 0;
+}

@@ -19,7 +19,7 @@
 //! | `Clone` | `fn Type__clone(self) -> Self` |
 //! | `Default` | `fn Type__default() -> Self`（仅结构体） |
 //! | `PartialEq` / `Eq` | `fn Type__eq(self, other: Self) -> bool` |
-//! | `PartialOrd` / `Ord` | `lt` / `le` / `gt` / `ge`（仅结构体） |
+//! | `PartialOrd` / `Ord` | `lt` / `le` / `gt` / `ge` |
 //! | `Hash` | `fn Type__hash(self) -> u64` |
 //! | `Debug` | `fn Type__debug(self) -> String`（Rust `{:?}` 风格；浮点/指针/数组/元组字段暂不支持，显式报错） |
 //!
@@ -30,8 +30,10 @@
 //! - 泛型类型上的 derive 不生成方法（方法体里的字段类型要靠单态化才知道），
 //!   报错让调用方知道；
 //! - 枚举不支持 `Default`（Rust 要求用 `#[default]` 标出变体，zr 没有这个
-//!   属性）与 `PartialOrd` / `Ord`（要按判别式排序，判别式可以是显式且非
-//!   单调的表达式）；
+//!   属性）；枚举的 `PartialOrd` / `Ord` **支持**（无显式判别式时先比变体
+//!   声明顺序、同一变体内再比载荷的字典序），但**带显式判别式**（`A = 5`）
+//!   的枚举仍然显式报错——Rust 的 `Ord` 比的是判别式的值，derive 不求值
+//!   任意常量表达式，硬按声明顺序生成会给出错的顺序；
 //! - 结构体更新语法之外，`Hash` 对 `str` / 切片 / 数组 / 元组 / 指针字段一律
 //!   按 `0` 计入：只保证"相等 ⇒ 同哈希"，不保证分布。这几类字段在 zr 里还
 //!   没有按内容比较的语义，硬编一个哈希反而会在 eq/hash 之间制造不一致。
@@ -135,12 +137,18 @@ pub fn derive_methods(type_name: &str, type_def: &ast::TypeDef, traits: &[String
         out.push(default_fn(type_name, &self_ty, fields)?);
     }
     if want_ord {
-        if variants.is_some() {
-            return Err(CompileError::type_error(format!(
-                "cannot derive `Ord`/`PartialOrd` for enum `{type_name}` yet: \
-                 ordering needs discriminant comparison, which derive does not implement"
-            ))
-            .with_span(span));
+        if let Some(vs) = &variants {
+            // 显式判别式（`A = 5`）会让声明顺序与判别式顺序分家，而 Rust 的
+            // `Ord` 比的是**判别式**。要支持得先把判别式表达式当常量求值，
+            // derive 不做这件事——继续显式报错，别生成一个顺序错的 `lt`。
+            if vs.iter().any(|v| v.discriminant.is_some()) {
+                return Err(CompileError::type_error(format!(
+                    "cannot derive `Ord`/`PartialOrd` for enum `{type_name}` with explicit \
+                     discriminants yet: ordering compares discriminant values, which derive \
+                     does not evaluate"
+                ))
+                .with_span(span));
+            }
         }
     }
     if want_clone {
@@ -150,8 +158,18 @@ pub fn derive_methods(type_name: &str, type_def: &ast::TypeDef, traits: &[String
         out.push(eq_fn(type_name, &self_ty, fields.as_deref(), variants.as_deref(), span)?);
     }
     if want_ord {
-        let fields = fields.as_deref().unwrap_or(&[]);
-        out.push(lt_fn(type_name, &self_ty, fields, span));
+        match (fields.as_deref(), variants.as_deref()) {
+            // 结构体：字段按字典序比较。
+            (Some(fields), _) => {
+                out.push(lt_fn(type_name, &self_ty, fields, span));
+            }
+            // 枚举：先比变体（声明顺序；显式判别式已在上面拒绝），
+            // 同一变体内再按载荷字段的字典序。
+            (None, Some(vs)) => {
+                out.push(lt_enum_fn(type_name, &self_ty, vs, span));
+            }
+            (None, None) => {}
+        }
         out.push(le_fn(type_name, &self_ty, span));
         out.push(gt_fn(type_name, &self_ty, span));
         out.push(ge_fn(type_name, &self_ty, span));
@@ -398,6 +416,99 @@ fn lt_fn(type_name: &str, self_ty: &Type, fields: &[FieldInfo], span: Span) -> F
         Type::Bool,
         body,
     )
+}
+
+/// `fn Type__lt(self, other: Type) -> bool`（枚举）。
+///
+/// 两层 `match`：外层按 `self` 的变体分派，内层再按 `other` 的变体分派。
+/// 不同变体直接按**声明顺序**定序（Rust 对无显式判别式的枚举，判别式就是
+/// 声明下标）；同一变体内对载荷字段做字典序比较（与结构体 `lt_fn` 同一
+/// 规则，只是字段换成了模式绑定的名字）。
+///
+/// ```text
+/// match self {
+///     E::A => match other {
+///         E::A => <载荷字典序>,       // 同变体
+///         E::B => true,              // B 声明在 A 之后 ⇒ A < B
+///         E::C => true,
+///     },
+///     E::B => match other {
+///         E::A => false,
+///         E::B => <载荷字典序>,
+///         E::C => true,
+///     },
+///     ...
+/// }
+/// ```
+fn lt_enum_fn(
+    type_name: &str,
+    self_ty: &Type,
+    variants: &[ast::Variant],
+    span: Span,
+) -> Function {
+    let body = variant_match(type_name, variants, |v, sbinds| {
+        let i = variants
+            .iter()
+            .position(|w| w.name == v.name)
+            .unwrap_or_default();
+        let arms = variants
+            .iter()
+            .enumerate()
+            .map(|(j, w)| {
+                let body = if j < i {
+                    Expression::Literal(Literal::Bool(false), span)
+                } else if j > i {
+                    Expression::Literal(Literal::Bool(true), span)
+                } else {
+                    payload_lt(sbinds, w, span)
+                };
+                ast::Arm {
+                    pattern: variant_pattern(type_name, w, "o"),
+                    guard: None,
+                    body: Box::new(body),
+                }
+            })
+            .collect();
+        // other 的变体全覆盖，不需要 `_` 臂（穷尽性检查认这个）。
+        Expression::Match(Box::new(var("other")), arms, SPAN)
+    });
+    make_fn(
+        type_name,
+        "lt",
+        Some(receiver(self_ty)),
+        vec![param("other", self_ty)],
+        Type::Bool,
+        body,
+    )
+}
+
+/// 同一变体内载荷的字典序比较：
+/// `s0 < o0 || (s0 == o0 && (s1 < o1 || (s1 == o1 && ...)))`。
+///
+/// 无载荷变体返回 `false`（`E::A < E::A` 恒假）。字段 span 让"某载荷字段
+/// 缺 Ord"的报错指向那个字段。
+fn payload_lt(sbinds: &[String], v: &ast::Variant, span: Span) -> Expression {
+    let obinds = payload_binds(v, "o");
+    let ospans = payload_bind_spans(v, "o");
+    let n = obinds.len();
+    let mut acc: Option<Expression> = None;
+    for k in (0..n).rev() {
+        let fspan = ospans
+            .get(k)
+            .map(|(_, s)| *s)
+            .filter(|s| *s != SPAN)
+            .unwrap_or(span);
+        let lt = bin(var(&sbinds[k]), BinaryOp::Lt, var(&obinds[k]), fspan);
+        acc = Some(if k + 1 == n {
+            // 最后一个字段：没有"后面"要比较了，不必再拼 `==`。
+            lt
+        } else {
+            let eq = bin(var(&sbinds[k]), BinaryOp::Eq, var(&obinds[k]), fspan);
+            let tail = acc.expect("非末字段一定有后续比较");
+            bin(lt, BinaryOp::Or, bin(eq, BinaryOp::And, tail, span), span)
+        });
+    }
+    acc.unwrap_or_else(|| Expression::Literal(Literal::Bool(false), span))
 }
 
 /// `fn Type__le(self, other) -> bool { self.lt(other) || self.eq(other) }`
