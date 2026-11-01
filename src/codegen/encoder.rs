@@ -135,6 +135,16 @@ fn emit_phi_copies(unit: &mut CompilationUnit, func: &SsaFunction, succ: usize, 
             emit_store_float(unit, 0, rs, w);
             continue;
         }
+        // 宽值 φ（i128/u128）住在两个连续栈槽里：lo、hi 各搬一次。
+        // 源若不是宽值（合法 SSA 里不该出现，防御性处理）按符号扩展补高字。
+        if is_wide(*result) {
+            let d = wide_slot(*result);
+            wide_load_word(unit, *src, 0, SCRATCH_AX);
+            emit_store_slot(unit, SCRATCH_AX, d);
+            wide_load_word(unit, *src, 1, SCRATCH_AX);
+            emit_store_slot(unit, SCRATCH_AX, d + 1);
+            continue;
+        }
         if let Location::Stack(slot) = location_of(*result) {
             emit_mov_src(unit, SCRATCH_AX, src_of(*src));
             emit_store_slot(unit, SCRATCH_AX, slot);
@@ -230,6 +240,459 @@ thread_local! {
     /// 寻址方式完全一样。`&x` 就是这块槽的地址。
     static LOCAL_SLOTS: std::cell::RefCell<HashMap<u32, usize>> =
         std::cell::RefCell::new(HashMap::new());
+    /// 宽值（宽于机器字长，x86-64 上是 i128/u128）的 SSA 值 id 集合。
+    ///
+    /// 这些值不占寄存器池，住在**两个连续的 8 字节栈槽**里：`lo` 在槽 `s`、
+    /// `hi` 在槽 `s+1`。运算用 `adc`/`sbb`/`shld`/`shrd` 把两个字拼起来。
+    static WIDE_VALUES: std::cell::RefCell<HashSet<u32>> =
+        std::cell::RefCell::new(HashSet::new());
+}
+
+/// `v` 是否是宽值（i128/u128）。
+fn is_wide(v: SsaValue) -> bool {
+    WIDE_VALUES.with(|w| w.borrow().contains(&v.id()))
+}
+
+/// 宽值的 lo 栈槽号。宽值必然被分配在栈上（见 `regalloc::allocate_registers`）。
+fn wide_slot(v: SsaValue) -> usize {
+    match location_of(v) {
+        Location::Stack(s) => s,
+        Location::Reg(_) => unreachable!("宽值必须住在栈槽里"),
+    }
+}
+
+// ==================================================================
+// 128 位（i128/u128）运算
+//
+// 机器字长是 64 位，宽于它的整数在栈上占**两个连续槽**：`lo` 在槽 `s`、
+// `hi` 在槽 `s+1`。加减用 `adc`/`sbb` 把进位接上，移位用 `shld`/`shrd`，
+// 比较按"先比高位、高位相等再比低位"来定序。
+//
+// 本后端只有 `rax`/`rcx`/`rdx` 三个不参与分配的暂存寄存器，所以右操作数
+// 一次只装一个字进 `rcx`；两个 `mov`/装载都不动标志位，`adc`/`sbb` 才能
+// 正确读到低字留下的 CF。
+// ==================================================================
+
+/// 读出一个"当作 128 位用"的操作数的第 `word` 个字（0=lo、1=hi）。
+///
+/// 宽值住在两个连续栈槽里。**非宽值**（指针、宽类型之前的 64 位中间值等）
+/// 只有一个字：装进 `dst` 后按**符号**扩展出高字——宽运算的两侧未必都真被
+/// 标成宽值。取高字要发 `sar`，它会**改写标志位**，所以调用方必须保证这个
+/// 高字是在任何依赖 CF 的 `adc`/`sbb` **之前**读出来的。本后端里宽二元运算
+/// 的两个操作数都被 `assign_int_widths` 标成宽值，实际只会走"从栈槽 mov"。
+fn wide_load_word(unit: &mut CompilationUnit, v: SsaValue, word: usize, dst: Gpr) {
+    if is_wide(v) {
+        emit_load_slot(unit, dst, wide_slot(v) + word);
+        return;
+    }
+    reg_into(unit, v, dst);
+    if word == 1 {
+        emit_sar_imm(unit, dst, 63);
+    }
+}
+
+/// 把宽值（或按符号扩展成 128 位的窄值）的 lo / hi 两字装进 `lo` / `hi`。
+fn wide_load2(unit: &mut CompilationUnit, v: SsaValue, lo: Gpr, hi: Gpr) {
+    wide_load_word(unit, v, 0, lo);
+    wide_load_word(unit, v, 1, hi);
+}
+
+/// 把一个 128 位结果写回宽值 `v` 的两个栈槽。
+fn wide_store(unit: &mut CompilationUnit, v: SsaValue, lo: Gpr, hi: Gpr) {
+    let slot = wide_slot(v);
+    emit_store_slot(unit, lo, slot);
+    emit_store_slot(unit, hi, slot + 1);
+}
+
+/// `sar dst, imm8`（REX.W + 0xC1 /7 ib）：算术右移，符号位填充。
+fn emit_sar_imm(unit: &mut CompilationUnit, dst: Gpr, amount: u8) {
+    emit1(unit, 0x48 | if dst.rex_bit() { 0x01 } else { 0 });
+    emit1(unit, 0xc1);
+    modrm(unit, 3, 7, dst.bits());
+    emit1(unit, amount);
+}
+
+/// `cmp r/m64, imm8`（REX.W + 0x83 /7 ib）。
+fn emit_cmp_imm8(unit: &mut CompilationUnit, dst: Gpr, imm: i8) {
+    emit1(unit, 0x48 | if dst.rex_bit() { 0x01 } else { 0 });
+    emit1(unit, 0x83);
+    modrm(unit, 3, 7, dst.bits());
+    emit1(unit, imm as u8);
+}
+
+/// `shld dst, src, cl`（0F A5 /r）：`dst = (dst << cl) | (src >> (64-cl))`。
+///
+/// ModRM 的 reg 字段是提供"补位"的源、r/m 字段是被移的目的，REX.R 属于 reg
+/// （src）、REX.B 属于 r/m（dst）——写反会读到错误的寄存器。
+fn emit_shld_cl(unit: &mut CompilationUnit, dst: Gpr, src: Gpr) {
+    let mut rex = 0x48u8;
+    if src.rex_bit() {
+        rex |= 0x04;
+    }
+    if dst.rex_bit() {
+        rex |= 0x01;
+    }
+    emit1(unit, rex);
+    emit2(unit, 0x0f, 0xa5);
+    modrm(unit, 3, src.bits(), dst.bits());
+}
+
+/// `shrd dst, src, cl`（0F AD /r）：`dst = (dst >> cl) | (src << (64-cl))`。
+fn emit_shrd_cl(unit: &mut CompilationUnit, dst: Gpr, src: Gpr) {
+    let mut rex = 0x48u8;
+    if src.rex_bit() {
+        rex |= 0x04;
+    }
+    if dst.rex_bit() {
+        rex |= 0x01;
+    }
+    emit1(unit, rex);
+    emit2(unit, 0x0f, 0xad);
+    modrm(unit, 3, src.bits(), dst.bits());
+}
+
+/// `shl`（4）/`shr`（5，逻辑）/`sar`（7，算术）`dst, cl`（REX.W + 0xD3 /ext）。
+fn emit_shift_cl(unit: &mut CompilationUnit, ext: u8, dst: Gpr) {
+    emit1(unit, 0x48 | if dst.rex_bit() { 0x01 } else { 0 });
+    emit1(unit, 0xd3);
+    modrm(unit, 3, ext, dst.bits());
+}
+
+/// `mov dst, [base + disp32]`（64 位）。
+fn emit_load_mem_off(unit: &mut CompilationUnit, dst: Gpr, base: Gpr, disp: i32) {
+    let rex = 0x48 | if dst.rex_bit() { 0x04 } else { 0 } | if base.rex_bit() { 0x01 } else { 0 };
+    emit1(unit, rex);
+    emit1(unit, 0x8b);
+    // mod=10 (disp32), reg=dst, rm=100 (SIB)；SIB base=base、无 index。
+    emit1(unit, 0b10_000_100 | dst.bits() << 3);
+    emit1(unit, 0b00_100_000 | base.bits());
+    emit4(unit, disp as u32);
+}
+
+/// `mov [base + disp32], src`（64 位）。
+fn emit_store_mem_off(unit: &mut CompilationUnit, base: Gpr, src: Gpr, disp: i32) {
+    let rex = 0x48 | if src.rex_bit() { 0x04 } else { 0 } | if base.rex_bit() { 0x01 } else { 0 };
+    emit1(unit, rex);
+    emit1(unit, 0x89);
+    emit1(unit, 0b10_000_100 | src.bits() << 3);
+    emit1(unit, 0b00_100_000 | base.bits());
+    emit4(unit, disp as u32);
+}
+
+/// `i128` 常量：拆成 lo/hi 两个字，各写一个栈槽。
+fn emit_const_wide(unit: &mut CompilationUnit, result: SsaValue, i: i128) {
+    let slot = wide_slot(result);
+    emit_mov_imm64(unit, SCRATCH_AX, i as u64 as i64);
+    emit_store_slot(unit, SCRATCH_AX, slot);
+    emit_mov_imm64(unit, SCRATCH_AX, (i >> 64) as u64 as i64);
+    emit_store_slot(unit, SCRATCH_AX, slot + 1);
+}
+
+/// `*ptr` 读 16 字节到宽值 `result`（小端：`[ptr]` 是 lo、`[ptr+8]` 是 hi）。
+fn emit_load_wide(unit: &mut CompilationUnit, result: SsaValue, ptr: SsaValue, _ty: NumTy) {
+    // 地址要落在一个稳定寄存器：`rax` 随后被用来装数据，`ptr` 溢出时正好
+    // 装载到 `rax`，先经 `rcx` 中转避开。
+    let p = use_reg(unit, ptr);
+    let base = if p == SCRATCH_AX {
+        emit_mov_rr(unit, SCRATCH_CX, SCRATCH_AX);
+        SCRATCH_CX
+    } else {
+        p
+    };
+    let slot = wide_slot(result);
+    emit_load_mem_off(unit, SCRATCH_AX, base, 0);
+    emit_store_slot(unit, SCRATCH_AX, slot);
+    emit_load_mem_off(unit, SCRATCH_AX, base, 8);
+    emit_store_slot(unit, SCRATCH_AX, slot + 1);
+}
+
+/// `*ptr = value` 把宽值写 16 字节到内存。
+fn emit_store_wide(unit: &mut CompilationUnit, ptr: SsaValue, value: SsaValue, _ty: NumTy) {
+    let p = use_reg(unit, ptr);
+    let base = if p == SCRATCH_AX {
+        emit_mov_rr(unit, SCRATCH_CX, SCRATCH_AX);
+        SCRATCH_CX
+    } else {
+        p
+    };
+    let slot = wide_slot(value);
+    emit_load_slot(unit, SCRATCH_AX, slot);
+    emit_store_mem_off(unit, base, SCRATCH_AX, 0);
+    emit_load_slot(unit, SCRATCH_AX, slot + 1);
+    emit_store_mem_off(unit, base, SCRATCH_AX, 8);
+}
+
+/// 128 位加/减：低字 `add`/`sub` 置进位，高字用 `adc`/`sbb` 接上。
+///
+/// `Add`/`Sub` 的 `ty` 若是宽整数，两个操作数都会被 `assign_int_widths`
+/// 标成宽值——所以右操作数每次从栈槽 `mov` 一个字进 `rcx`，不会碰标志位，
+/// 低字留下的 CF 能原样传给 `adc`/`sbb`。
+fn emit_addsub_wide(
+    unit: &mut CompilationUnit,
+    result: SsaValue,
+    op: SsaBinaryOp,
+    lhs: SsaValue,
+    rhs: SsaValue,
+) {
+    let add = op == SsaBinaryOp::Add;
+    wide_load2(unit, lhs, SCRATCH_AX, SCRATCH_DX);
+    wide_load_word(unit, rhs, 0, SCRATCH_CX);
+    emit_full_alu(
+        unit,
+        if add { 0 } else { 5 }, // add / sub
+        SCRATCH_AX,
+        SCRATCH_CX,
+    );
+    wide_load_word(unit, rhs, 1, SCRATCH_CX);
+    emit_full_alu(
+        unit,
+        if add { 2 } else { 3 }, // adc / sbb
+        SCRATCH_DX,
+        SCRATCH_CX,
+    );
+    wide_store(unit, result, SCRATCH_AX, SCRATCH_DX);
+}
+
+/// 128 位按位运算：lo / hi 两个字各做一遍同样的运算（进位与高低字无关）。
+fn emit_bitop_wide(
+    unit: &mut CompilationUnit,
+    result: SsaValue,
+    code: u8,
+    lhs: SsaValue,
+    rhs: SsaValue,
+) {
+    wide_load2(unit, lhs, SCRATCH_AX, SCRATCH_DX);
+    wide_load_word(unit, rhs, 0, SCRATCH_CX);
+    emit_full_alu(unit, code, SCRATCH_AX, SCRATCH_CX);
+    wide_load_word(unit, rhs, 1, SCRATCH_CX);
+    emit_full_alu(unit, code, SCRATCH_DX, SCRATCH_CX);
+    wide_store(unit, result, SCRATCH_AX, SCRATCH_DX);
+}
+
+/// 128 位比较，结果是一个 bool（窄值）。
+///
+/// 等值：两个字都为零才算相等——把两个字异或后或起来再 `test`。
+/// 大小：算 128 位差 `lhs - rhs`（低字 `sub`、高字 `sbb`）。`sbb` 之后
+/// **无符号**看 CF（借位即 `lhs < rhs`）、**有符号**看 SF≠OF（128 位结果
+/// 的符号位与溢出位）——两者正好对应 `setb` / `setl` 系列。
+fn emit_compare_wide(
+    unit: &mut CompilationUnit,
+    result: SsaValue,
+    op: SsaBinaryOp,
+    lhs: SsaValue,
+    rhs: SsaValue,
+    ty: NumTy,
+) {
+    use SsaBinaryOp::*;
+    let unsigned = matches!(ty, NumTy::Uint(_));
+    wide_load_word(unit, lhs, 0, SCRATCH_AX);
+    wide_load_word(unit, lhs, 1, SCRATCH_DX);
+    // 结果先算进 `acc` 的低字节，最后统一零扩展搬进结果位置。
+    let acc;
+    match op {
+        Eq | Ne => {
+            // (lhs ^ rhs) 的两个字都为 0 才算相等。两个字 `or` 起来后 ZF
+            // 反映的正是"整体是否为零"（不像 `sbb` 只有高字），所以
+            // `sete`/`setne` 可以直接用。
+            wide_load_word(unit, rhs, 0, SCRATCH_CX);
+            emit_full_alu(unit, 6, SCRATCH_AX, SCRATCH_CX); // xor lo
+            wide_load_word(unit, rhs, 1, SCRATCH_CX);
+            emit_full_alu(unit, 6, SCRATCH_DX, SCRATCH_CX); // xor hi
+            emit_full_alu(unit, 1, SCRATCH_AX, SCRATCH_DX); // or lo, hi
+            emit_test_rr(unit, SCRATCH_AX, SCRATCH_AX);
+            emit_setcc(unit, condition_code(op, unsigned), SCRATCH_AX);
+            acc = SCRATCH_AX;
+        }
+        Lt | Ge => {
+            // 算 128 位差 `lhs - rhs`（低字 `sub`、高字 `sbb`）。之后
+            // **无符号**看 CF、**有符号**看 SF≠OF，两者正好对应 `setb` /
+            // `setl` 系列；`setae` / `setge` 只看 CF==0 / SF==OF，**都不依赖
+            // ZF**，所以可以直接用。
+            wide_load_word(unit, rhs, 0, SCRATCH_CX);
+            emit_full_alu(unit, 5, SCRATCH_AX, SCRATCH_CX); // sub lo（置 CF）
+            wide_load_word(unit, rhs, 1, SCRATCH_CX);
+            emit_full_alu(unit, 3, SCRATCH_DX, SCRATCH_CX); // sbb hi（带借位）
+            emit_setcc(unit, condition_code(op, unsigned), SCRATCH_AX);
+            acc = SCRATCH_AX;
+        }
+        Le | Gt => {
+            // `setle` / `setg` 要用 ZF，而 `sbb` 之后的 ZF 只反映**高字**
+            // 为不为零——`2^64 <= 1` 的差是 `hi=0:lo=0xFFFF...FFFF`，高字
+            // 为零，ZF 被置起，`setle` 于是错误地给出真。这里自己把两个差值
+            // 字 `or` 起来造出正确的"整体为零"，再与严格小于合成：
+            //   le = (严格小于) | (相等)，gt = le ^ 1。
+            wide_load_word(unit, rhs, 0, SCRATCH_CX);
+            emit_full_alu(unit, 5, SCRATCH_AX, SCRATCH_CX); // sub lo（置 CF）
+            wide_load_word(unit, rhs, 1, SCRATCH_CX);
+            emit_full_alu(unit, 3, SCRATCH_DX, SCRATCH_CX); // sbb hi（带借位）
+            emit_setcc(unit, condition_code(Lt, unsigned), SCRATCH_CX); // CL = 严格小于
+            emit_full_alu(unit, 1, SCRATCH_AX, SCRATCH_DX); // AX = lo|hi，ZF = 整体为零
+            emit_setcc(unit, 0x94, SCRATCH_DX); // DL = 相等（sete）
+            emit_movzx(unit, SCRATCH_CX, SCRATCH_CX);
+            emit_movzx(unit, SCRATCH_DX, SCRATCH_DX);
+            emit_full_alu(unit, 1, SCRATCH_CX, SCRATCH_DX); // CX = 小于 | 相等
+            if op == Gt {
+                emit_alu_imm(unit, 6, SCRATCH_CX, 1, false); // CX ^= 1
+            }
+            acc = SCRATCH_CX;
+        }
+        _ => crate::codegen::unsupported_binary_op(op),
+    }
+    let spilled = matches!(location_of(result), Location::Stack(_));
+    let dst = if spilled {
+        SCRATCH_AX
+    } else {
+        alloc_reg(result)
+    };
+    emit_movzx(unit, dst, acc);
+    if spilled {
+        if let Location::Stack(slot) = location_of(result) {
+            emit_store_slot(unit, dst, slot);
+        }
+    }
+}
+
+/// 128 位移位。计数取右操作数的低字（放 `cl`），按 `n < 64` / `n >= 64`
+/// 分两段：小计数用 `shld`/`shrd` 把另一字补进来，大计数整字搬再补符号。
+fn emit_shift_wide(
+    unit: &mut CompilationUnit,
+    result: SsaValue,
+    op: SsaBinaryOp,
+    lhs: SsaValue,
+    rhs: SsaValue,
+    ty: NumTy,
+) {
+    let unsigned = matches!(ty, NumTy::Uint(_));
+    let base = unit.code.len();
+    let big = format!(".wshift_big_{base}");
+    let done = format!(".wshift_done_{base}");
+
+    wide_load2(unit, lhs, SCRATCH_AX, SCRATCH_DX);
+    wide_load_word(unit, rhs, 0, SCRATCH_CX);
+
+    // cl == 0 时什么都不用做
+    emit_test_rr(unit, SCRATCH_CX, SCRATCH_CX);
+    emit_jcc_rel32(unit, 0x04, &done); // jz
+    emit_cmp_imm8(unit, SCRATCH_CX, 64);
+    emit_jcc_rel32(unit, 0x03, &big); // jae
+
+    // 小计数（1..63）：另一字补进移出的位
+    match op {
+        SsaBinaryOp::Shl => {
+            emit_shld_cl(unit, SCRATCH_DX, SCRATCH_AX); // hi = (hi << n) | (lo >> (64-n))
+            emit_shift_cl(unit, 4, SCRATCH_AX); // lo <<= n
+        }
+        SsaBinaryOp::Shr if unsigned => {
+            emit_shrd_cl(unit, SCRATCH_AX, SCRATCH_DX);
+            emit_shift_cl(unit, 5, SCRATCH_DX); // hi >>= n（逻辑）
+        }
+        _ => {
+            // sar 与逻辑右移的低字部分相同（低字补进来的位来自高字低位）
+            emit_shrd_cl(unit, SCRATCH_AX, SCRATCH_DX);
+            emit_shift_cl(unit, 7, SCRATCH_DX); // hi >>= n（算术）
+        }
+    }
+    emit_jmp(unit, &done);
+
+    // 大计数（64..127）：整字挪，另一边清零 / 补符号
+    let big_start = unit.code.len();
+    bind_local_label(unit, &big, big_start);
+    match op {
+        SsaBinaryOp::Shl => {
+            // 新的 hi = lo << (n & 63)（x86 的 64 位移位把计数掩到 6 位）
+            emit_shift_cl(unit, 4, SCRATCH_AX);
+            emit_mov_rr(unit, SCRATCH_DX, SCRATCH_AX);
+            emit_const_int(unit, SCRATCH_AX, 0);
+        }
+        SsaBinaryOp::Shr if unsigned => {
+            emit_shift_cl(unit, 5, SCRATCH_DX); // hi >>= (n & 63)
+            emit_mov_rr(unit, SCRATCH_AX, SCRATCH_DX);
+            emit_const_int(unit, SCRATCH_DX, 0);
+        }
+        _ => {
+            emit_shift_cl(unit, 7, SCRATCH_DX); // hi >>= (n & 63)
+            emit_mov_rr(unit, SCRATCH_AX, SCRATCH_DX);
+            emit_sar_imm(unit, SCRATCH_DX, 63); // hi = 符号填充
+        }
+    }
+
+    let done_start = unit.code.len();
+    bind_local_label(unit, &done, done_start);
+    wide_store(unit, result, SCRATCH_AX, SCRATCH_DX);
+}
+
+/// 128 位与更窄/更宽整数之间的转换。
+///
+/// - 宽 → 宽：两个槽整块搬。
+/// - 宽 → 窄：取低字再按目标宽度截断（复用 `emit_cast`）。
+/// - 窄 → 宽：低字照搬；高字按**源**的有无符号补零或补符号位（`u64 as i128`
+///   必须是零扩展，不能按目标的有无符号判）。
+fn emit_cast_wide(
+    unit: &mut CompilationUnit,
+    result: SsaValue,
+    src: SsaValue,
+    from: NumTy,
+    to: NumTy,
+) {
+    let to_is_wide = matches!(to, NumTy::Int(w) | NumTy::Uint(w) if w > 64);
+    if is_wide(src) && to_is_wide {
+        wide_load2(unit, src, SCRATCH_AX, SCRATCH_DX);
+        wide_store(unit, result, SCRATCH_AX, SCRATCH_DX);
+        return;
+    }
+    if is_wide(src) {
+        // 宽 → 窄：取低字，再按 `to` 的宽度截断 / 扩展
+        wide_load_word(unit, src, 0, SCRATCH_AX);
+        let spilled = matches!(location_of(result), Location::Stack(_));
+        let d = if spilled {
+            SCRATCH_AX
+        } else {
+            alloc_reg(result)
+        };
+        emit_cast(unit, d, SCRATCH_AX, from, to);
+        if spilled {
+            if let Location::Stack(slot) = location_of(result) {
+                emit_store_slot(unit, d, slot);
+            }
+        }
+        return;
+    }
+    // 窄 → 宽：低字照搬，高字按**源**的符号扩展
+    let from_signed = matches!(from, NumTy::Int(_) | NumTy::Bool);
+    let slot = wide_slot(result);
+    reg_into(unit, src, SCRATCH_AX);
+    emit_store_slot(unit, SCRATCH_AX, slot);
+    if from_signed {
+        emit_sar_imm(unit, SCRATCH_AX, 63);
+    } else {
+        emit_const_int(unit, SCRATCH_AX, 0);
+    }
+    emit_store_slot(unit, SCRATCH_AX, slot + 1);
+}
+
+/// 128 位一元运算（取负 / 按位取反）。
+fn emit_unary_wide(
+    unit: &mut CompilationUnit,
+    result: SsaValue,
+    op: crate::ssa::SsaUnaryOp,
+    operand: SsaValue,
+) {
+    use crate::ssa::SsaUnaryOp::*;
+    wide_load2(unit, operand, SCRATCH_AX, SCRATCH_DX);
+    match op {
+        Neg => {
+            // 128 位取负：lo = -lo（CF = lo != 0），hi = -(hi + CF)
+            emit_group3(unit, 0xf7, 3, SCRATCH_AX); // neg lo
+            emit_alu_imm(unit, 2, SCRATCH_DX, 0, false); // adc hi, 0
+            emit_group3(unit, 0xf7, 3, SCRATCH_DX); // neg hi
+        }
+        BitNot => {
+            emit_group3(unit, 0xf7, 2, SCRATCH_AX); // not lo
+            emit_group3(unit, 0xf7, 2, SCRATCH_DX); // not hi
+        }
+        Not => crate::codegen::unsupported_const("宽值上的逻辑非"),
+    }
+    wide_store(unit, result, SCRATCH_AX, SCRATCH_DX);
 }
 
 /// `v` 的浮点位宽（32 或 64）。整数返回 0。
@@ -721,17 +1184,6 @@ fn emit_load_float_rbp(unit: &mut CompilationUnit, xmm: u8, disp: u32, width: u8
     emit4(unit, disp);
 }
 
-/// `mov [rsp], src`——往栈上传参区的当前格（也就是 `sub rsp, 8` 之后的
-/// 那个 8 字节）写一个整数实参。
-fn emit_store_rsp0(unit: &mut CompilationUnit, src: Gpr) {
-    emit1(unit, 0x48 | if src.rex_bit() { 0x04 } else { 0 });
-    emit1(unit, 0x89);
-    // mod=00 (无 disp), reg=src, r/m=100 (SIB)
-    emit1(unit, 0b00_000_100 | src.bits() << 3);
-    // SIB: scale=00, index=100 (无索引), base=100 (rsp)
-    emit1(unit, 0b00_100_100);
-}
-
 /// `sub rsp, imm32` / `add rsp, imm32`：给栈上传参区让位 / 收回来。
 fn emit_sub_rsp(unit: &mut CompilationUnit, bytes: u32) {
     emit1(unit, 0x48);
@@ -859,6 +1311,11 @@ fn reg_into(unit: &mut CompilationUnit, v: SsaValue, dst: Gpr) {
 
 /// `result = *ptr`。
 fn emit_load(unit: &mut CompilationUnit, result: SsaValue, ptr: SsaValue, ty: NumTy) {
+    // 宽值（i128/u128）一次读 16 字节到两个栈槽。
+    if is_wide(result) {
+        emit_load_wide(unit, result, ptr, ty);
+        return;
+    }
     let p = use_reg(unit, ptr);
     if let NumTy::Float(width) = ty {
         let Some(slot) = float_slot(result) else {
@@ -884,6 +1341,11 @@ fn emit_load(unit: &mut CompilationUnit, result: SsaValue, ptr: SsaValue, ty: Nu
 
 /// `*ptr = value`。
 fn emit_store(unit: &mut CompilationUnit, ptr: SsaValue, value: SsaValue, ty: NumTy) {
+    // 宽值（i128/u128）一次写 16 字节。
+    if is_wide(value) {
+        emit_store_wide(unit, ptr, value, ty);
+        return;
+    }
     // 先把地址放进一个稳定寄存器：溢出值或 rax 会经 `rcx` 中转（rcx 不参与
     // 分配，任何时刻都是空的）。否则直接用它的寄存器。
     let p = match location_of(ptr) {
@@ -948,13 +1410,20 @@ pub fn emit_function(target: &Target, unit: &mut CompilationUnit, func: &SsaFunc
         "x86-64 后端只能用于 x86_64 目标"
     );
     // 先做活跃区间分析 + 线性扫描，确定每个值落在哪个寄存器
+    //
+    // x86-64 的机器字长是 64 位，宽于它的（i128/u128）走"双 8 字节栈槽"路径：
+    // 每个宽值占**两个**连续槽（`wide_slots = 2`），后端用 `adc`/`sbb` 等把
+    // 两个字拼起来。
+    let wide = crate::codegen::regalloc::assign_int_widths(func, 64);
     let alloc = crate::codegen::regalloc::allocate_registers(
         func,
         ALLOCATABLE.len(),
         &X86_64_CALLEE_SAVE,
         0,
-        &HashSet::new(),
+        &wide,
+        2,
     );
+    WIDE_VALUES.with(|w| *w.borrow_mut() = wide);
     // callee-save 集合要在发射尾声时再用，所以这里留一份
     let callee_saved = callee_saved_regs(&alloc.map);
     // 整数溢出的槽之后接着排浮点槽，最后是被取地址的局部变量的槽：
@@ -1034,6 +1503,9 @@ pub fn emit_function(target: &Target, unit: &mut CompilationUnit, func: &SsaFunc
                     // 浮点返回值按 ABI 走 xmm0，不是 rax
                     if let Some(slot) = float_slot(*v) {
                         emit_load_float(unit, 0, slot, float_width(*v));
+                    } else if is_wide(*v) {
+                        // i128/u128 返回值按 SysV 走 rdx:rax（lo → rax，hi → rdx）
+                        wide_load2(unit, *v, SCRATCH_AX, SCRATCH_DX);
                     } else {
                         let r = use_reg(unit, *v);
                         emit_mov_rr(unit, SCRATCH_AX, r);
@@ -1115,7 +1587,14 @@ pub fn emit_function(target: &Target, unit: &mut CompilationUnit, func: &SsaFunc
 /// 发射一条 SSA 指令。
 fn emit_instr(unit: &mut CompilationUnit, instr: &SsaInstr) {
     match instr {
-        SsaInstr::Const { result, value } => emit_const(unit, *result, value.clone()),
+        SsaInstr::Const { result, value } => {
+            // i128/u128 常量：拆成 lo/hi 两个字各写一个栈槽。
+            if let (true, SsaConst::Int(i)) = (is_wide(*result), value) {
+                emit_const_wide(unit, *result, *i);
+            } else {
+                emit_const(unit, *result, value.clone());
+            }
+        }
         SsaInstr::Binary {
             result,
             op,
@@ -1128,9 +1607,14 @@ fn emit_instr(unit: &mut CompilationUnit, instr: &SsaInstr) {
             op,
             operand,
         } => {
-            // 一元运算的结果类型与操作数一致；用它核对浮点位宽
-            let operand_w = float_width(*operand);
-            emit_unary(unit, *result, *op, *operand, operand_w);
+            // 宽值（i128/u128）取负 / 按位取反走两个字。
+            if is_wide(*result) || is_wide(*operand) {
+                emit_unary_wide(unit, *result, *op, *operand);
+            } else {
+                // 一元运算的结果类型与操作数一致；用它核对浮点位宽
+                let operand_w = float_width(*operand);
+                emit_unary(unit, *result, *op, *operand, operand_w);
+            }
         }
         SsaInstr::Call {
             result,
@@ -1148,6 +1632,11 @@ fn emit_instr(unit: &mut CompilationUnit, instr: &SsaInstr) {
             // 浮点返回值按 ABI 在 xmm0，不是 rax
             if let Some(slot) = float_slot(*result) {
                 emit_store_float(unit, 0, slot, float_width(*result));
+            } else if is_wide(*result) {
+                // i128/u128 返回值按 SysV 走 rdx:rax（lo → rax，hi → rdx）
+                let slot = wide_slot(*result);
+                emit_store_slot(unit, SCRATCH_AX, slot);
+                emit_store_slot(unit, SCRATCH_DX, slot + 1);
             } else {
                 match location_of(*result) {
                     Location::Reg(i) => {
@@ -1168,6 +1657,12 @@ fn emit_instr(unit: &mut CompilationUnit, instr: &SsaInstr) {
                 let w = float_width(*result).max(float_width(*src));
                 emit_load_float(unit, 0, ss, w);
                 emit_store_float(unit, 0, rs, w);
+                return;
+            }
+            // 宽值（i128/u128）拷贝：两个栈槽各搬一个字。
+            if is_wide(*result) {
+                wide_load2(unit, *src, SCRATCH_AX, SCRATCH_DX);
+                wide_store(unit, *result, SCRATCH_AX, SCRATCH_DX);
                 return;
             }
             let spilled = matches!(location_of(*result), Location::Stack(_));
@@ -1200,6 +1695,11 @@ fn emit_instr(unit: &mut CompilationUnit, instr: &SsaInstr) {
             // 任一侧是浮点就走 XMM 路径
             if from.is_float() || to.is_float() || float_slot(*src).is_some() {
                 emit_cast_float(unit, *result, *src, *from, *to);
+                return;
+            }
+            // 任一侧是宽整数（i128/u128）就走宽值转换路径。
+            if is_wide(*result) || is_wide(*src) {
+                emit_cast_wide(unit, *result, *src, *from, *to);
                 return;
             }
             let spilled = matches!(location_of(*result), Location::Stack(_));
@@ -1275,6 +1775,10 @@ fn emit_instr(unit: &mut CompilationUnit, instr: &SsaInstr) {
             }
             if let Some(slot) = float_slot(*result) {
                 emit_store_float(unit, 0, slot, float_width(*result));
+            } else if is_wide(*result) {
+                let slot = wide_slot(*result);
+                emit_store_slot(unit, SCRATCH_AX, slot);
+                emit_store_slot(unit, SCRATCH_DX, slot + 1);
             } else {
                 match location_of(*result) {
                     Location::Reg(i) => {
@@ -1531,6 +2035,31 @@ fn emit_const_bool(unit: &mut CompilationUnit, dst: Gpr, value: bool) {
     emit_const_int(unit, dst, u64::from(value));
 }
 
+/// 128 位（i128/u128）二元运算的分派。
+///
+/// 覆盖加 / 减 / 位运算 / 移位 / 比较；乘、除、取模在 64 位目标上需要
+/// 更长的算法（乘要 `mulx` 拆四段、除要走软件长除法），暂不支持——直接
+/// 报错，绝不静默给错值。
+fn emit_binary_wide(
+    unit: &mut CompilationUnit,
+    result: SsaValue,
+    op: SsaBinaryOp,
+    lhs: SsaValue,
+    rhs: SsaValue,
+    ty: NumTy,
+) {
+    use SsaBinaryOp::*;
+    match op {
+        Add | Sub => emit_addsub_wide(unit, result, op, lhs, rhs),
+        BitAnd | And => emit_bitop_wide(unit, result, 4, lhs, rhs),
+        BitOr | Or => emit_bitop_wide(unit, result, 1, lhs, rhs),
+        BitXor => emit_bitop_wide(unit, result, 6, lhs, rhs),
+        Shl | Shr => emit_shift_wide(unit, result, op, lhs, rhs, ty),
+        Eq | Ne | Lt | Gt | Le | Ge => emit_compare_wide(unit, result, op, lhs, rhs, ty),
+        Mul | Div | Rem => crate::codegen::unsupported_binary_op(op),
+    }
+}
+
 /// 发射二元运算。
 fn emit_binary(
     unit: &mut CompilationUnit,
@@ -1551,6 +2080,12 @@ fn emit_binary(
     let rhs_is_f = float_slot(rhs).is_some();
     if lhs_is_f || rhs_is_f {
         emit_binary_float(unit, result, op, lhs, rhs, ty);
+        return;
+    }
+
+    // 任一侧是宽整数（i128/u128）就走"双 64 位字"路径。
+    if is_wide(lhs) || is_wide(rhs) {
+        emit_binary_wide(unit, result, op, lhs, rhs, ty);
         return;
     }
 
@@ -2148,6 +2683,18 @@ fn emit_call_args(unit: &mut CompilationUnit, args: &[SsaValue]) -> usize {
                 stack_args.push(*a);
             }
             xi += 1;
+        } else if is_wide(*a) {
+            // i128/u128 占**两个连续**整数实参寄存器（lo、hi）；不够两个
+            // 就整块走栈（SysV 对 `__int128` 要求 16 字节对齐）。
+            if gi + 2 <= ARG_REGS.len() {
+                let lo = wide_slot(*a);
+                moves.push((ARG_REGS[gi], Src::Mem(lo)));
+                moves.push((ARG_REGS[gi + 1], Src::Mem(lo + 1)));
+                gi += 2;
+            } else {
+                stack_args.push(*a);
+                gi = ARG_REGS.len(); // 余下的整数实参一律走栈
+            }
         } else if gi < ARG_REGS.len() {
             let src = src_of(*a);
             if !matches!(src, Src::Reg(r) if r == ARG_REGS[gi]) {
@@ -2161,38 +2708,57 @@ fn emit_call_args(unit: &mut CompilationUnit, args: &[SsaValue]) -> usize {
 
     // 栈实参必须在寄存器搬运**之前**写好：搬运会把实参寄存器覆盖掉，而
     // 栈实参的源完全可能就是那些寄存器。
+    //
+    // 布局按"相对最终 rsp 的偏移"显式排定：第一个上栈的实参落在 `[rsp]`，
+    // 依次向上。宽值占 16 字节、且必须 16 字节对齐（SysV 对 `__int128` 的
+    // 要求），其余各占 8 字节；整块补齐到 16 的倍数，保证 `call` 那一刻 rsp
+    // 仍 16 字节对齐。被调用方按同一套规则读 `[rbp+16+off]`——两边必须逐字
+    // 一致，否则宽实参会读到错位的垃圾。
     let mut released = 0usize;
     if !stack_args.is_empty() {
-        // SysV 要求 `call` 那一刻 rsp 16 字节对齐。序言已经保证"没有任何栈
-        // 实参"时是对齐的，所以这里只需补奇偶：奇数个 8 字节实参先垫一格，
-        // 垫在**最后一个实参之上**（即先 sub 再压）。
-        let pad_slots = stack_args.len() % 2;
-        if pad_slots == 1 {
-            emit_sub_rsp(unit, 8);
+        let mut items: Vec<(SsaValue, usize, bool)> = Vec::new(); // (值, 偏移, 是否宽值)
+        let mut off = 0usize;
+        for v in &stack_args {
+            if is_wide(*v) {
+                off = (off + 15) & !15;
+                items.push((*v, off, true));
+                off += 16;
+            } else {
+                items.push((*v, off, false));
+                off += 8;
+            }
         }
-        // 倒着压：最后声明的实参落在最高地址，第一个上栈的实参落在 [rsp]。
-        for (i, v) in stack_args.iter().rev().enumerate() {
-            // 栈槽是 rsp 相对的：每压下一格，同一个帧内栈槽的偏移就要 +1。
-            let shift = pad_slots + i + 1;
-            emit_sub_rsp(unit, 8);
-            if let Some(fslot) = float_slot(*v) {
+        let stack_size = (off + 15) & !15;
+        emit_sub_rsp(unit, stack_size as u32);
+        // 帧内栈槽是 rsp 相对的：整个区域下移了 stack_size 字节，源的偏移
+        // 要整体加 `stack_size/8` 个槽。
+        let shift = stack_size / 8;
+        for (v, o, wide) in &items {
+            // 偏移都是 8 的倍数，直接复用 `emit_store_slot`（disp = slot*8）。
+            if *wide {
+                let lo = wide_slot(*v);
+                emit_load_slot(unit, SCRATCH_AX, lo + shift);
+                emit_store_slot(unit, SCRATCH_AX, o / 8);
+                emit_load_slot(unit, SCRATCH_AX, lo + 1 + shift);
+                emit_store_slot(unit, SCRATCH_AX, o / 8 + 1);
+            } else if let Some(fslot) = float_slot(*v) {
                 // 浮点值一律住在 8 字节的浮点栈槽里，按位整块复制即可。
                 // **不能**用 xmm0 中转：`xmm0..7` 在 `call` 那一刻还装着
                 // 前 8 个浮点实参，拿 xmm0 搬第 9 个及之后的实参会把第 1 个
                 // 实参写坏（`eleven(1.5, 2.5, ...)` 实测 539 → 547）。
                 emit_load_slot(unit, SCRATCH_AX, fslot + shift);
-                emit_store_rsp0(unit, SCRATCH_AX);
+                emit_store_slot(unit, SCRATCH_AX, o / 8);
             } else {
                 match location_of(*v) {
-                    Location::Reg(i) => emit_store_rsp0(unit, ALLOCATABLE[i]),
+                    Location::Reg(i) => emit_store_slot(unit, ALLOCATABLE[i], o / 8),
                     Location::Stack(slot) => {
                         emit_load_slot(unit, SCRATCH_AX, slot + shift);
-                        emit_store_rsp0(unit, SCRATCH_AX);
+                        emit_store_slot(unit, SCRATCH_AX, o / 8);
                     }
                 }
             }
         }
-        released = (pad_slots + stack_args.len()) * 8;
+        released = stack_size;
     }
 
     // 栈实参已经把 rsp 压低了 `released` 字节，而 `Src::Mem(slot)` 是
@@ -2280,30 +2846,49 @@ fn emit_param_moves(unit: &mut CompilationUnit, func: &SsaFunction) {
     // 浮点形参走 xmm0..、整数形参走 rdi..，两类各自计数（SysV ABI）。
     let mut gi = 0usize;
     let mut xi = 0usize;
-    // 第几个"走栈"的形参（按声明顺序，整数与浮点共用一条队列）。
-    let mut stack_idx = 0usize;
+    // 相对 `[rbp+16]` 的栈上传参偏移（整数与浮点溢出共用一条队列，按声明
+    // 顺序排定，且宽值必须 16 字节对齐——与调用方 `emit_call_args` 的布局
+    // 规则逐字一致）。
+    let mut stack_off = 0usize;
     let mut moves: Vec<(Gpr, Src)> = Vec::new();
-    // 走栈的整数形参要等寄存器搬运做完再装载：它的落点可能就是某个还没搬
+    // 走栈的形参要等寄存器搬运做完再装载：它的落点可能就是某个还没搬
     // 走的 ABI 实参寄存器（例如第 5 个形参还在 r8 里等着搬，而第 7 个形参
     // 分配到的落点正好也是 r8），先装就把它踩掉了。
-    let mut stack_loads: Vec<(SsaValue, u32)> = Vec::new();
+    // 条目为 `(形参, rbp 偏移, 是否宽值)`。
+    let mut stack_loads: Vec<(SsaValue, u32, bool)> = Vec::new();
     for p in &func.params {
         if let Some(sl) = float_slot(*p) {
             if xi < 8 {
                 emit_store_float(unit, xi as u8, sl, float_width(*p));
             } else {
-                let disp = 16 + 8 * stack_idx;
-                stack_idx += 1;
+                let disp = 16 + stack_off;
+                stack_off += 8;
                 emit_load_float_rbp(unit, 0, disp as u32, float_width(*p));
                 emit_store_float(unit, 0, sl, float_width(*p));
             }
             xi += 1;
             continue;
         }
+        if is_wide(*p) {
+            // i128/u128 形参占两个连续整数寄存器（lo、hi）；不够两个就整块
+            // 走栈（16 字节对齐）。落点是两个连续栈槽。
+            if gi + 2 <= ARG_REGS.len() {
+                let slot = wide_slot(*p);
+                emit_store_slot(unit, ARG_REGS[gi], slot);
+                emit_store_slot(unit, ARG_REGS[gi + 1], slot + 1);
+                gi += 2;
+            } else {
+                stack_off = (stack_off + 15) & !15;
+                stack_loads.push((*p, (16 + stack_off) as u32, true));
+                stack_off += 16;
+                gi = ARG_REGS.len(); // 余下的整数形参一律走栈
+            }
+            continue;
+        }
         if gi >= ARG_REGS.len() {
             // 第 7 个及之后的整数形参在调用者的栈上：[rbp+16] 起。
-            stack_loads.push((*p, 16 + 8 * stack_idx as u32));
-            stack_idx += 1;
+            stack_loads.push((*p, (16 + stack_off) as u32, false));
+            stack_off += 8;
             continue;
         }
         match location_of(*p) {
@@ -2321,7 +2906,16 @@ fn emit_param_moves(unit: &mut CompilationUnit, func: &SsaFunction) {
     // 5、6 个形参在 r8/r9，而中间某步的落点正好也是 r8/r9）。顺序搬运会
     // 踩掉尚未读取的源。
     emit_parallel_moves(unit, &moves);
-    for (p, disp) in stack_loads {
+    for (p, disp, wide) in stack_loads {
+        if wide {
+            // 宽形参：从栈上读两个字写进两个连续栈槽。
+            let slot = wide_slot(p);
+            emit_load_rbp(unit, SCRATCH_AX, disp);
+            emit_store_slot(unit, SCRATCH_AX, slot);
+            emit_load_rbp(unit, SCRATCH_AX, disp + 8);
+            emit_store_slot(unit, SCRATCH_AX, slot + 1);
+            continue;
+        }
         match location_of(p) {
             Location::Stack(slot) => {
                 emit_load_rbp(unit, SCRATCH_AX, disp);
@@ -2486,10 +3080,12 @@ fn emit_mul(unit: &mut CompilationUnit, dst: Gpr, l: Gpr, r: Gpr) {
 
 /// ALU 编码的完整分发：op dst, src（dst OP= src）。
 fn emit_full_alu(unit: &mut CompilationUnit, op: u8, dst: Gpr, src: Gpr) {
-    // op: 0=add, 1=or, 4=and, 5=sub, 6=xor
+    // op: 0=add, 1=or, 2=adc, 3=sbb, 4=and, 5=sub, 6=xor
     let opcode = match op {
         0 => 0x01, // add r/m64, r64
         1 => 0x09, // or  r/m64, r64
+        2 => 0x11, // adc r/m64, r64（带进位加，宽值加法的高字用）
+        3 => 0x19, // sbb r/m64, r64（带借位减，宽值减法的高字用）
         4 => 0x21, // and r/m64, r64
         5 => 0x29, // sub r/m64, r64
         6 => 0x31, // xor r/m64, r64

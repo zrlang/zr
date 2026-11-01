@@ -1652,6 +1652,7 @@ fn check_register_pressure(func: &SsaFunction) {
         &CALLEE_SAVE,
         ARG_REGS.len(),
         &std::collections::HashSet::new(),
+        2,
     );
     if alloc.spilled > 0 {
         // 池子装不下的值溢出到栈槽；槽数记进 `SPILL_SLOTS`，槽区高度由

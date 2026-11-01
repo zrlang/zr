@@ -1873,13 +1873,14 @@ pub fn emit_function(
     LOCAL_LABEL_PREFIX.with(|p| *p.borrow_mut() = func.name.clone());
     LOCAL_LABEL.with(|c| c.set(0));
 
-    let wide = crate::codegen::regalloc::assign_int_widths(func);
+    let wide = crate::codegen::regalloc::assign_int_widths(func, 32);
     let alloc = crate::codegen::regalloc::allocate_registers(
         func,
         ALLOCATABLE.len(),
         &CALLEE_SAVE,
         ARG_REGS.len(),
         &wide,
+        1,
     );
     WIDE_VALUES.with(|w| {
         w.borrow_mut().clear();

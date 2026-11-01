@@ -2348,13 +2348,14 @@ pub fn emit_start_wrapper(target: &Target, unit: &mut CompilationUnit) {
 fn check_register_pressure(func: &SsaFunction) {
     // 跨调用存活的值只放被调用者保存的 r4-r8，否则 `bl` 会破坏它。
     // 多字长（i64）值走栈槽，不占寄存器池。
-    let wide = crate::codegen::regalloc::assign_int_widths(func);
+    let wide = crate::codegen::regalloc::assign_int_widths(func, 32);
     let alloc = crate::codegen::regalloc::allocate_registers(
         func,
         ALLOCATABLE.len(),
         &CALLEE_SAVE,
         ARG_REGS.len(),
         &wide,
+        1,
     );
     WIDE_VALUES.with(|w| {
         w.borrow_mut().clear();
@@ -2428,6 +2429,7 @@ mod tests {
             name: "pick".to_string(),
             params: vec![],
             param_types: vec![],
+            ret_ty: crate::mir::NumTy::Int(64),
             blocks: vec![
                 SsaBasicBlock {
                     id: 0,

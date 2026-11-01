@@ -97,6 +97,7 @@ pub fn build_harness(test_names: &[String]) -> MirFunction {
         inline_always: false,
         aggregate_ret: None,
         returns_future: false,
+        ret_ty: crate::mir::NumTy::Int(64),
     }
 }
 

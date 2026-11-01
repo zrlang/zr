@@ -734,9 +734,16 @@ fn compile(input: &str, cmd: &Cli) -> Result<std::path::PathBuf, String> {
     checker.set_flattened_modules(loaded.flattened.iter().cloned().collect());
     // 每个模块导出的条目名：`use core::*` 要按它导入全部顶层名字。
     checker.set_module_exports(loaded.module_exports);
-    // 32 位目标支持多字长（i64）运算：值走 8 字节栈槽，用两条 32 位指令
-    // 计算。未实现的运算（如 i64 乘法/除法）在后端报错，不会静默截断。
-    checker.set_max_int_bits(64);
+    // 宽整数（超机器字长）走"寄存器对拆分"：32 位目标上的 i64、x86-64 上的
+    // i128 都靠它实现。上限按**后端已经实现的能力**设，不能按"寄存器有多宽"
+    // 想当然——aarch64 / riscv64 也是 64 位寄存器，但后端还没做 i128 拆分，
+    // 在这里放行会让它们静默截断。
+    //
+    // - x86-64：i64 天然是机器字长，i128 走 2×8 字节栈槽 → 上限 128。
+    // - 其余 64 位目标：上限 64（i128 在类型检查阶段就报错）。
+    // - 32 位目标：i64 走双 32 位栈槽 → 上限 64（i128 报错）。
+    let max_int_bits: u16 = if target.arch() == Arch::X86_64 { 128 } else { 64 };
+    checker.set_max_int_bits(max_int_bits);
     checker.set_pointer_bits(target.pointer_size() as u16 * 8);
     // cfg 条件按编译目标求值（交叉编译到 Linux 时 `target_os = "linux"` 成立）。
     checker.set_cfg_target(cfg_target);

@@ -213,6 +213,7 @@ fn dynamic_drop_helper() -> MirFunction {
         inline_always: false,
         aggregate_ret: None,
         returns_future: false,
+        ret_ty: NumTy::Uint(64),
     }
 }
 
@@ -1118,6 +1119,7 @@ fn lower_function(
         inline_always: false,
         aggregate_ret: None,
         returns_future: false,
+        ret_ty: NumTy::Uint(64),
     };
 
     // Rust 风格：`f(args)` 只创建 future（堆帧），不执行函数体；
@@ -1183,6 +1185,7 @@ fn lower_function(
         inline_always: false,
         aggregate_ret: None,
         returns_future: false,
+        ret_ty: NumTy::Uint(64),
     };
 
     let drop = make_async_drop(
@@ -1352,6 +1355,7 @@ fn make_async_drop(
         inline_always: false,
         aggregate_ret: None,
         returns_future: false,
+        ret_ty: NumTy::Uint(64),
     }
 }
 
@@ -1423,6 +1427,7 @@ fn make_async_main(future: &str, poll: &str) -> MirFunction {
         inline_always: false,
         aggregate_ret: None,
         returns_future: false,
+        ret_ty: NumTy::Uint(64),
     }
 }
 
@@ -1877,6 +1882,7 @@ mod tests {
             inline_always: false,
             aggregate_ret: None,
             returns_future: false,
+            ret_ty: NumTy::Uint(64),
         };
         let wrap = MirFunction {
             name: "wrap".to_string(),
@@ -1897,6 +1903,7 @@ mod tests {
             inline_always: false,
             aggregate_ret: None,
             returns_future: false,
+            ret_ty: NumTy::Uint(64),
         };
         let f = MirFunction {
             name: "f".to_string(),
@@ -1908,6 +1915,7 @@ mod tests {
             inline_always: false,
             aggregate_ret: None,
             returns_future: false,
+            ret_ty: NumTy::Uint(64),
         };
         let lowerable = HashSet::from(["f".to_string()]);
         let producers = compute_future_producers(&[f, make, wrap], &lowerable);

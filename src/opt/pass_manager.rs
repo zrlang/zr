@@ -135,9 +135,9 @@ pub fn fold_constants(module: SsaModule) -> SsaModule {
             for block in &mut func.blocks {
                 for instr in &mut block.instrs {
                     let folded = match instr {
-                        SsaInstr::Binary { op, lhs, rhs, .. } => {
+                        SsaInstr::Binary { op, lhs, rhs, ty, .. } => {
                             match (const_of(&defs, *lhs), const_of(&defs, *rhs)) {
-                                (Some(a), Some(b)) => eval_binary(*op, &a, &b),
+                                (Some(a), Some(b)) => eval_binary(*op, &a, &b, *ty),
                                 _ => None,
                             }
                         }
@@ -164,13 +164,69 @@ pub fn fold_constants(module: SsaModule) -> SsaModule {
 }
 
 /// 常量求值：二元运算。
-fn eval_binary(op: SsaBinaryOp, a: &SsaConst, b: &SsaConst) -> Option<SsaConst> {
+///
+/// `ty` 是运算的类型，决定比较 / 右移 / 除法按有符号还是无符号算。
+fn eval_binary(op: SsaBinaryOp, a: &SsaConst, b: &SsaConst, ty: crate::mir::NumTy) -> Option<SsaConst> {
     use SsaBinaryOp::*;
     // 浮点先走这一支：位运算与取模对浮点没有意义，其余按 IEEE 直接算。
     if let (SsaConst::Float(x, wx), SsaConst::Float(y, wy)) = (a, b) {
         return float_binary(op, *x, *y, (*wx).max(*wy));
     }
     let (x, y) = (a.as_int()?, b.as_int()?);
+    // 在 SSA 里整数常量一律按 i128 的**位模式**存：`u128` 的 2^128-1 就是
+    // i128 的 -1。所以凡是"有符号 / 无符号语义不同"的运算——比较、逻辑右移、
+    // 除法、取模——都必须按无符号重算。否则 `2^128-1 < 2^64` 会在编译期被
+    // 折成 true（运行期是 false），优化等级越高越错。
+    //
+    // 窄于等于 64 位的无符号值在 i128 里必定非负，有符号语义与无符号一致，
+    // 走下面的有符号分支也正确（且保留原有的移位范围守卫：窄整数运行期
+    // 把移位计数掩到宽度以下，编译期不能按 128 位去折）。
+    let wide = matches!(ty, crate::mir::NumTy::Int(w) | crate::mir::NumTy::Uint(w) if w > 64);
+    if wide && matches!(ty, crate::mir::NumTy::Uint(_)) {
+        let (ux, uy) = (x as u128, y as u128);
+        let r = match op {
+            Add => ux.checked_add(uy)?,
+            Sub => ux.checked_sub(uy)?,
+            Mul => ux.checked_mul(uy)?,
+            Div => {
+                if uy == 0 {
+                    return None;
+                }
+                ux.checked_div(uy)?
+            }
+            Rem => {
+                if uy == 0 {
+                    return None;
+                }
+                ux.checked_rem(uy)?
+            }
+            BitAnd => ux & uy,
+            BitOr => ux | uy,
+            BitXor => ux ^ uy,
+            Shl => {
+                if !(0..128).contains(&uy) {
+                    return None;
+                }
+                ux.checked_shl(uy as u32)?
+            }
+            Shr => {
+                if !(0..128).contains(&uy) {
+                    return None;
+                }
+                ux.checked_shr(uy as u32)?
+            }
+            // 比较运算恒为 0/1
+            Eq => return Some(SsaConst::Int(i128::from(ux == uy))),
+            Ne => return Some(SsaConst::Int(i128::from(ux != uy))),
+            Lt => return Some(SsaConst::Int(i128::from(ux < uy))),
+            Gt => return Some(SsaConst::Int(i128::from(ux > uy))),
+            Le => return Some(SsaConst::Int(i128::from(ux <= uy))),
+            Ge => return Some(SsaConst::Int(i128::from(ux >= uy))),
+            And => return Some(SsaConst::Int(i128::from(ux != 0 && uy != 0))),
+            Or => return Some(SsaConst::Int(i128::from(ux != 0 || uy != 0))),
+        };
+        return Some(SsaConst::Int(r as i128));
+    }
     let r = match op {
         Add => x.checked_add(y)?,
         Sub => x.checked_sub(y)?,
@@ -772,12 +828,13 @@ fn propagate_constants(func: &mut SsaFunction) {
                         op,
                         lhs,
                         rhs,
+                        ty,
                         ..
                     } => {
                         let (l, r) = (lookup(&lattice, *lhs), lookup(&lattice, *rhs));
                         let new = match (l, r) {
                             (Lattice::Const(a), Lattice::Const(b)) => {
-                                match eval_binary(*op, &a, &b) {
+                                match eval_binary(*op, &a, &b, *ty) {
                                     Some(v) => Lattice::Const(v),
                                     None => Lattice::Top,
                                 }
@@ -1555,10 +1612,10 @@ fn hoist_invariants(func: &mut crate::ssa::SsaFunction, header: usize, members: 
 #[cfg(test)]
 mod cast_trunc_tests {
     use super::*;
+    use crate::mir::NumTy;
 
     #[test]
     fn narrowing_cast_truncates_and_sign_extends() {
-        use crate::mir::NumTy;
         // 200 作为 i8 是 -56。
         let got = eval_cast(&SsaConst::Int(200), NumTy::Int(32), NumTy::Int(8));
         assert_eq!(got, Some(SsaConst::Int(-56)));
@@ -1578,8 +1635,35 @@ mod cast_trunc_tests {
     fn comparison_of_truncated_value_folds_correctly() {
         // -56 >= 0 必须是假 —— 这条断言守着"窄化后再比较"的折叠顺序。
         assert_eq!(
-            eval_binary(SsaBinaryOp::Ge, &SsaConst::Int(-56), &SsaConst::Int(0)),
+            eval_binary(SsaBinaryOp::Ge, &SsaConst::Int(-56), &SsaConst::Int(0), NumTy::Int(64)),
             Some(SsaConst::Int(0))
+        );
+    }
+
+    #[test]
+    fn wide_unsigned_comparison_folds_as_unsigned() {
+        // `u128` 的常量按 i128 位模式存：2^128-1 是 i128 的 -1，
+        // 2^64 是 i128 的 2^64。按 i128 有符号折会得到 `-1 < 2^64` 为真，
+        // 而运行期无符号语义是假。Uint(128) 必须走无符号路径。
+        let all_ones = SsaConst::Int(-1); // u128 最大值
+        let two_pow_64 = SsaConst::Int(1i128 << 64);
+        assert_eq!(
+            eval_binary(SsaBinaryOp::Lt, &all_ones, &two_pow_64, NumTy::Uint(128)),
+            Some(SsaConst::Int(0))
+        );
+        assert_eq!(
+            eval_binary(SsaBinaryOp::Gt, &all_ones, &two_pow_64, NumTy::Uint(128)),
+            Some(SsaConst::Int(1))
+        );
+        // 逻辑右移：全 1 右移 64 位应得 2^64-1（有符号会补成 -1）。
+        assert_eq!(
+            eval_binary(
+                SsaBinaryOp::Shr,
+                &all_ones,
+                &SsaConst::Int(64),
+                NumTy::Uint(128)
+            ),
+            Some(SsaConst::Int((1i128 << 64) - 1))
         );
     }
 }

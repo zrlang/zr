@@ -532,6 +532,11 @@ pub(super) fn f32_to_narrow_fn(bits: u8) -> MirFunction {
         name: format!("__zr_f32_to_f{bits}"),
         is_async: false,
         param_types: vec![NumTy::Float(32)],
+        ret_ty: if bits == 8 {
+            NumTy::Uint(8)
+        } else {
+            NumTy::Uint(16)
+        },
         // 转换有上百条指令，内联回调用点会把调用方的栈帧撑爆。
         inline_never: true,
         inline_always: false,
@@ -559,6 +564,7 @@ pub(super) fn narrow_to_f32_fn(bits: u8) -> MirFunction {
         } else {
             NumTy::Uint(16)
         }],
+        ret_ty: NumTy::Float(32),
         inline_never: true,
         inline_always: false,
         aggregate_ret: None,

@@ -929,7 +929,9 @@ pub fn emit_function(target: &Target, unit: &mut CompilationUnit, func: &SsaFunc
         "RISC-V 后端只能用于 riscv 目标"
     );
     check_register_pressure(func);
-    let wide = crate::codegen::regalloc::assign_int_widths(func);
+    // RISC-V 后端把 i64 一律按"多字长"处理（RV64 也一样，只是溢出槽
+    // load/store 的宽度不同），所以这里固定按机器字长 32 判宽值。
+    let wide = crate::codegen::regalloc::assign_int_widths(func, 32);
     WIDE_VALUES.with(|w| {
         w.borrow_mut().clear();
         w.borrow_mut().extend(wide.iter().copied());
@@ -1818,13 +1820,14 @@ pub fn emit_start_wrapper(target: &Target, unit: &mut CompilationUnit) {
 fn check_register_pressure(func: &SsaFunction) {
     // 跨调用存活的值只放被调用者保存的 s0-s11，否则 `jal` 返回后内容就没了。
     // 多字长（i64）值走栈槽，不占寄存器池。
-    let wide = crate::codegen::regalloc::assign_int_widths(func);
+    let wide = crate::codegen::regalloc::assign_int_widths(func, 32);
     let alloc = crate::codegen::regalloc::allocate_registers(
         func,
         ALLOCATABLE.len(),
         &CALLEE_SAVE,
         ARG_REGS.len(),
         &wide,
+        1,
     );
     REG_MAP.with(|m| {
         let mut map = m.borrow_mut();
@@ -1879,6 +1882,7 @@ mod tests {
             name: "pick".to_string(),
             params: vec![],
             param_types: vec![],
+            ret_ty: crate::mir::NumTy::Int(64),
             blocks: vec![
                 SsaBasicBlock {
                     id: 0,

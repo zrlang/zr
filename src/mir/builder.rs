@@ -165,6 +165,7 @@ pub fn lower_function(
         },
         inline_never: func.attr("inline").is_some_and(|a| a.has_arg("never")),
         inline_always: func.attr("inline").is_some_and(|a| a.has_arg("always")),
+        ret_ty: reg_ty_of(actual_ret),
         aggregate_ret: b.async_ret_bytes,
         returns_future: !func.is_async && matches!(func.return_type, hir::Ty::Opaque(_)),
         params: b.param_names.iter().map(|_| MirParam).collect(),

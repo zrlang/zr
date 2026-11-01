@@ -37,6 +37,11 @@ pub struct SsaFunction {
     /// 整数走 rdi 而调用方按 xmm0 传，读到的位模式当指针用会直接 SIGSEGV。
     /// 所以形参必须用声明类型显式播种。
     pub param_types: Vec<mir::NumTy>,
+    /// 返回值的数值类型（由 MIR 的 `ret_ty` 抄过来）。
+    ///
+    /// 后端判断返回值是不是宽值（i128 → rdx:rax）时用它：`return 5` 这种
+    /// 常量本身不带宽度，只从返回值反推会把 i128 当成 64 位。
+    pub ret_ty: mir::NumTy,
     /// `#[inline(never)]`：内联 pass 必须跳过它。
     pub inline_never: bool,
     /// `#[inline(always)]`：内联 pass 必须内联它（即使多块）。
@@ -324,6 +329,7 @@ fn convert_function(func: &mir::MirFunction) -> SsaFunction {
             params,
             blocks: Vec::new(),
             param_types: func.param_types.clone(),
+            ret_ty: func.ret_ty,
             inline_never: func.inline_never,
             inline_always: func.inline_always,
         };
@@ -800,6 +806,7 @@ fn convert_function(func: &mir::MirFunction) -> SsaFunction {
         params,
         blocks: out_blocks,
         param_types: func.param_types.clone(),
+        ret_ty: func.ret_ty,
         inline_never: func.inline_never,
         inline_always: func.inline_always,
     }
@@ -923,6 +930,7 @@ pub fn split_critical_edges(func: &SsaFunction) -> SsaFunction {
         params: func.params.clone(),
         blocks,
         param_types: func.param_types.clone(),
+        ret_ty: func.ret_ty,
         inline_never: func.inline_never,
         inline_always: func.inline_always,
     }

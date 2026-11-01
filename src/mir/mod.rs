@@ -59,6 +59,12 @@ pub struct MirFunction {
     pub is_async: bool,
     /// 形参的数值类型（下标与 `params` 一致）。
     pub param_types: Vec<NumTy>,
+    /// 返回值的数值类型。
+    ///
+    /// 与 `param_types` 一样必须显式带上：后端的宽值（i128）判定靠"类型
+    /// 宽于机器字长"，而 `return 5` 这种字面量常量本身不携带宽度信息——
+    /// 只从返回**值**反推会把 i128 的返回值当成 64 位，只写 rax 不写 rdx。
+    pub ret_ty: NumTy,
     /// `#[inline(never)]`：优化器不许把这个函数自动内联进调用点。
     pub inline_never: bool,
     /// `#[inline(always)]`：优化器必须把这个函数内联进调用点。
@@ -163,7 +169,10 @@ pub enum MirInstr {
 /// 数值类型（只保留后端真正需要的部分）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum NumTy {
-    /// 有符号整数，位宽 8 / 16 / 32 / 64。
+    /// 有符号整数，位宽 8 / 16 / 32 / 64 / 128。
+    ///
+    /// 宽于机器字长的（32 位目标上的 64、x86-64 上的 128）由后端拆成
+    /// 机器字对处理，落在连续的栈槽里——见 `codegen::regalloc::assign_int_widths`。
     Int(u8),
     /// 无符号整数，位宽同上。
     Uint(u8),

@@ -53,20 +53,43 @@ pub const X86_64_CALLEE_SAVE: [usize; 4] = [6, 7, 8, 9];
 /// 之后它的内容就没了，生成的程序会安静地算错。这里宁可溢出，也不产出
 /// 错代码：调用方负责在溢出发生时报错（见 `emit_function`）。
 ///
-/// 扫出函数里所有多字长（i64）值的 id 集合。
+/// 扫出函数里所有多字长（宽于机器字长）值的 id 集合。
 ///
-/// zr 的 SSA 把整数统一建模为 i64，但 32 位目标上一次只能运算 32 位——
-/// 宽度不够的值必须走"双 32 位"路径（栈槽 + 两条指令）。识别哪些值
-/// 真的是 64 位：常量超 i32 范围的、64 位类型的运算/转换结果、以及经
-/// `Copy`/`Phi` 传播过去的。
+/// zr 的 SSA 把整数统一建模为 i64/i128，但**机器字长**才是分水岭：
+/// 32 位目标一次只能运算 32 位（i64 要"双 32 位"拆分），x86-64 一次
+/// 64 位（i128 要"2×8 字节栈槽"拆分）。两者结构相同——宽值都落进连续的
+/// 栈槽、由后端用两条机器字指令拼出来，所以共用这一套判据，只是
+/// `word_bits` 不同。
+///
+/// 识别哪些值真的是宽整数：类型宽于机器字的、常量超出机器字范围的
+/// 运算/转换结果，以及经 `Copy`/`Phi` 传播过去的。
 ///
 /// 传播到不动点：`Unary`/`Copy` 的宽度要等对端确定，`Phi` 取各 incoming
 /// 的最大宽度。
-pub fn assign_int_widths(func: &SsaFunction) -> HashSet<u32> {
+pub fn assign_int_widths(func: &SsaFunction, word_bits: u16) -> HashSet<u32> {
     let mut wide: HashSet<u32> = HashSet::new();
     let is_wide_ty = |ty: &crate::mir::NumTy| -> bool {
-        matches!(ty, crate::mir::NumTy::Int(64) | crate::mir::NumTy::Uint(64))
+        match ty {
+            crate::mir::NumTy::Int(w) | crate::mir::NumTy::Uint(w) => (*w as u16) > word_bits,
+            _ => false,
+        }
     };
+    // 形参不在任何指令里，光靠传播会漏掉"只在 `==`/`!=` 里出现"的形参
+    // （比较的 `ty` 是 Bool，不带操作数宽度）。按声明类型直接播种。
+    for (p, ty) in func.params.iter().zip(func.param_types.iter()) {
+        if is_wide_ty(ty) {
+            wide.insert(p.id());
+        }
+    }
+    // 返回值同理：`return 5` 的常量本身不带宽度，只有函数声明的返回类型
+    // 才知道它是不是 i128。按 `ret_ty` 给返回点的值播种。
+    if is_wide_ty(&func.ret_ty) {
+        for block in &func.blocks {
+            if let SsaTerminator::Return(Some(v)) = &block.term {
+                wide.insert(v.id());
+            }
+        }
+    }
     loop {
         let mut changed = false;
         let mark = |v: &SsaValue, set: &mut HashSet<u32>| -> bool { set.insert(v.id()) };
@@ -77,10 +100,22 @@ pub fn assign_int_widths(func: &SsaFunction) -> HashSet<u32> {
                         result,
                         value: crate::ssa::SsaConst::Int(i),
                     } => {
-                        // 常量超 i32 范围 → i64
-                        if (*i < i32::MIN as i128 || *i > i32::MAX as i128)
-                            && mark(result, &mut wide)
-                        {
+                        // 常量**自身**超出机器字长（一个机器字装不下）→ 才必须
+                        // 按宽值走栈槽。
+                        //
+                        // 判据要同时容纳无符号的机器字上界：SSA 里的整数常量
+                        // 一律按 i128 位模式存，`u64` 的 2^63 是**正**的 i128，
+                        // 却完全装得下一个 64 位寄存器。若只用 i64 范围判，它
+                        // 会被误判成 i128（`u64 >> n` 于是走 128 位移位路径，
+                        // 结果错、甚至栈槽断言崩溃）。装得下机器字的常量如果
+                        // 真的参与了 128 位运算，会被那条 `Binary` 的 `ty` 标
+                        // 宽（两侧操作数一起标），不依赖这里的值域启发。
+                        let (lo, hi) = if word_bits >= 64 {
+                            (i64::MIN as i128, u64::MAX as i128)
+                        } else {
+                            (i32::MIN as i128, u32::MAX as i128)
+                        };
+                        if (*i < lo || *i > hi) && mark(result, &mut wide) {
                             changed = true;
                         }
                     }
@@ -91,16 +126,11 @@ pub fn assign_int_widths(func: &SsaFunction) -> HashSet<u32> {
                         rhs,
                         op,
                     } => {
-                        if is_wide_ty(ty) {
-                            for v in [result, lhs, rhs] {
-                                if mark(v, &mut wide) {
-                                    changed = true;
-                                }
-                            }
-                        }
-                        // 比较运算（Eq/Ne/Lt/Gt/Le/Ge）结果是 Bool，但若任一操作数是
-                        // i64，另一侧也必须是 i64——比较要求两侧位宽一致。
-                        if matches!(
+                        // 比较运算（Eq/Ne/Lt/Gt/Le/Ge）的结果是 Bool，不能跟着
+                        // 操作数一起标成宽值——否则一个布尔要占两个栈槽。但它
+                        // 的 `ty` 可能带着**无符号操作数**的宽度（见
+                        // `binary_result_ty`），所以两侧操作数仍然要标。
+                        let is_cmp = matches!(
                             op,
                             SsaBinaryOp::Eq
                                 | SsaBinaryOp::Ne
@@ -108,7 +138,19 @@ pub fn assign_int_widths(func: &SsaFunction) -> HashSet<u32> {
                                 | SsaBinaryOp::Gt
                                 | SsaBinaryOp::Le
                                 | SsaBinaryOp::Ge
-                        ) {
+                        );
+                        if is_wide_ty(ty) {
+                            if !is_cmp && mark(result, &mut wide) {
+                                changed = true;
+                            }
+                            for v in [lhs, rhs] {
+                                if mark(v, &mut wide) {
+                                    changed = true;
+                                }
+                            }
+                        }
+                        if is_cmp {
+                            // 比较要求两侧位宽一致：一侧是宽值，另一侧也得是。
                             let lhs_wide = wide.contains(&lhs.id());
                             let rhs_wide = wide.contains(&rhs.id());
                             if lhs_wide && mark(rhs, &mut wide) {
@@ -191,15 +233,20 @@ pub fn assign_int_widths(func: &SsaFunction) -> HashSet<u32> {
 /// 个数，且要求目标后端的池下标与实参寄存器一一对应——x86-64 的池以
 /// rsi/rdi 开头、顺序与实参寄存器不一致，传 0 走老路径；thumb 同理）。
 ///
-/// `wide` 是多字长（i64）值的 id 集合（32 位目标）：这些值不占寄存器池，
-/// 直接走 8 字节栈槽，后端用两条 32 位指令实现 i64 运算。64 位目标传
-/// 空集（i64 就是机器字长）。
+/// `wide` 是多字长（宽于机器字长）值的 id 集合：这些值不占寄存器池，
+/// 直接走**连续的栈槽**（每个槽 8 字节），后端用两条机器字指令实现运算。
+/// 64 位目标的 i64 传空集（i64 就是机器字长）。
+///
+/// `wide_slots` 是**一个宽值占几个 8 字节槽**：32 位目标的 i64 = 1 个槽
+/// （后端把两个字拼进同一个槽读），x86-64 的 i128 = 2 个槽（lo/hi 各占
+/// 一个）。取值必须与后端 `wide_load`/`wide_store` 的写法一致。
 pub fn allocate_registers(
     func: &SsaFunction,
     pool_size: usize,
     callee_save: &[usize],
     pin_params: usize,
     wide: &HashSet<u32>,
+    wide_slots: usize,
 ) -> Allocation {
     let (intervals, calls) = live_intervals(func);
     let mut out = Allocation::default();
@@ -272,11 +319,12 @@ pub fn allocate_registers(
         if pinned.contains(&val) {
             continue;
         }
-        // 多字长（i64）值：不占寄存器池，直接走 8 字节栈槽。
-        // 后端 emit 时从栈槽装载低/高两个 32 位半做运算。
+        // 多字长（宽于机器字长）值：不占寄存器池，直接走连续的栈槽。
+        // 后端 emit 时把两个机器字各自独立存取（32 位目标的 i64 占 1 个
+        // 8 字节槽；x86-64 的 i128 占 2 个 8 字节槽）。
         if wide.contains(&val) {
             out.map.insert(val, Location::Stack(out.spilled));
-            out.spilled += 1;
+            out.spilled += wide_slots.max(1);
             continue;
         }
         // 回收所有已经结束的区间
