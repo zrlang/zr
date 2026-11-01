@@ -299,12 +299,15 @@ pub fn compile(
 
     // 1. 指令选择 + 寄存器分配 + 代码发射（按目标架构分派后端）
     let arch = target.arch();
+    // 全模块的形参类型表：调用点的宽整数实参只能靠被调方的声明判定宽度
+    // （`SsaInstr::Call` 本身不带实参类型，见 `regalloc::CalleeParams`）。
+    let callees = callee_params(module);
     let workers = codegen_workers(module.functions.len());
     if workers > 1 {
-        emit_functions_parallel(target, arch, module, &mut unit, workers);
+        emit_functions_parallel(target, arch, module, &callees, &mut unit, workers);
     } else {
         for func in &module.functions {
-            emit_one(target, arch, &mut unit, func);
+            emit_one(target, arch, &mut unit, func, &callees);
         }
     }
 
@@ -350,19 +353,34 @@ pub fn compile(
     Ok(unit)
 }
 
+/// 收集全模块的形参类型表（函数符号名 -> 形参类型，按声明顺序）。
+fn callee_params(module: &SsaModule) -> regalloc::CalleeParams {
+    module
+        .functions
+        .iter()
+        .map(|f| (f.name.clone(), f.param_types.clone()))
+        .collect()
+}
+
 /// 一个函数分派给对应架构的后端发射。
-fn emit_one(target: &Target, arch: Arch, unit: &mut CompilationUnit, func: &SsaFunction) {
+fn emit_one(
+    target: &Target,
+    arch: Arch,
+    unit: &mut CompilationUnit,
+    func: &SsaFunction,
+    callees: &regalloc::CalleeParams,
+) {
     match arch {
-        Arch::X86_64 => encoder::emit_function(target, unit, func),
-        Arch::AArch64 => encoder_aarch64::emit_function(target, unit, func),
+        Arch::X86_64 => encoder::emit_function(target, unit, func, callees),
+        Arch::AArch64 => encoder_aarch64::emit_function(target, unit, func, callees),
         Arch::Arm32 | Arch::Arm32Thumb => {
             if target.is_arm32_thumb() {
-                encoder_thumb::emit_function(target, unit, func)
+                encoder_thumb::emit_function(target, unit, func, callees)
             } else {
-                encoder_arm::emit_function(target, unit, func)
+                encoder_arm::emit_function(target, unit, func, callees)
             }
         }
-        Arch::RiscV32 | Arch::RiscV64 => encoder_riscv::emit_function(target, unit, func),
+        Arch::RiscV32 | Arch::RiscV64 => encoder_riscv::emit_function(target, unit, func, callees),
         Arch::Wasm32 | Arch::Wasm64 => {
             unreachable!("wasm 由 `wasm::WasmModule` 处理，不走原生后端")
         }
@@ -412,6 +430,7 @@ fn emit_functions_parallel(
     target: &Target,
     arch: Arch,
     module: &SsaModule,
+    callees: &regalloc::CalleeParams,
     unit: &mut CompilationUnit,
     workers: usize,
 ) {
@@ -447,7 +466,7 @@ fn emit_functions_parallel(
                 part.is_thumb = is_thumb;
                 part.string_pool = pool;
                 for func in &funcs[lo..hi] {
-                    emit_one(target, arch, &mut part, func);
+                    emit_one(target, arch, &mut part, func, callees);
                 }
                 part
             }));

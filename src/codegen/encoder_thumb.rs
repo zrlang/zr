@@ -1866,6 +1866,7 @@ pub fn emit_function(
     target: &crate::codegen::target::Target,
     unit: &mut CompilationUnit,
     func: &SsaFunction,
+    callees: &crate::codegen::regalloc::CalleeParams,
 ) {
     debug_assert!(target.is_arm32_thumb(), "Thumb-2 后端只用于 thumb 目标");
 
@@ -1873,7 +1874,7 @@ pub fn emit_function(
     LOCAL_LABEL_PREFIX.with(|p| *p.borrow_mut() = func.name.clone());
     LOCAL_LABEL.with(|c| c.set(0));
 
-    let wide = crate::codegen::regalloc::assign_int_widths(func, 32);
+    let wide = crate::codegen::regalloc::assign_int_widths(func, 32, callees);
     let alloc = crate::codegen::regalloc::allocate_registers(
         func,
         ALLOCATABLE.len(),

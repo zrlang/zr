@@ -16,8 +16,20 @@
 
 use std::collections::{HashMap, HashSet};
 
+use crate::mir::NumTy;
 use crate::ssa::{SsaBinaryOp, SsaFunction, SsaInstr, SsaTerminator, SsaValue};
 use Location as L;
+
+/// 全模块的形参类型表：函数符号名 -> 形参类型（按声明顺序）。
+///
+/// 调用点的**实参**宽度只能靠它判定：SSA 里 `Call` 只记录返回值类型，
+/// 实参本身不带类型。`fn f(x: i128)` 的实参若是 `-100` 这种"常量取负"，
+/// 任何按值反推宽度的启发都看不出来——SSA 里就是 `Neg(const 100)`，
+/// 位宽信息在 MIR 就丢了。早先没这张表时，实参被当成 64 位塞进 rdi，
+/// 被调方却按 128 位读 rdi:rsi，第二个字读到的是**下一个实参**，结果全错
+/// （`div128(-100, 7)` 在 O0 返回 0）。形参一侧已有 `SsaFunction::param_types`
+/// 播种，实参一侧必须用这张表对齐。
+pub type CalleeParams = HashMap<String, Vec<NumTy>>;
 
 /// 一个值的存放位置。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -66,7 +78,11 @@ pub const X86_64_CALLEE_SAVE: [usize; 4] = [6, 7, 8, 9];
 ///
 /// 传播到不动点：`Unary`/`Copy` 的宽度要等对端确定，`Phi` 取各 incoming
 /// 的最大宽度。
-pub fn assign_int_widths(func: &SsaFunction, word_bits: u16) -> HashSet<u32> {
+pub fn assign_int_widths(
+    func: &SsaFunction,
+    word_bits: u16,
+    callees: &CalleeParams,
+) -> HashSet<u32> {
     let mut wide: HashSet<u32> = HashSet::new();
     let is_wide_ty = |ty: &crate::mir::NumTy| -> bool {
         match ty {
@@ -172,8 +188,24 @@ pub fn assign_int_widths(func: &SsaFunction, word_bits: u16) -> HashSet<u32> {
                             changed = true;
                         }
                     }
-                    SsaInstr::Call { result, ty, .. }
-                    | SsaInstr::CallIndirect { result, ty, .. } => {
+                    SsaInstr::Call { result, callee, args, ty } => {
+                        if is_wide_ty(ty) && mark(result, &mut wide) {
+                            changed = true;
+                        }
+                        // 实参的宽度只有被调函数的声明知道（见 `CalleeParams`）。
+                        // 只按下标对齐；调用点实参数与被调方形参数不一致时
+                        // （编译器内部造出的调用，如 `zr_spawn`）不标记。
+                        if let Some(pts) = callees.get(callee) {
+                            for (a, pt) in args.iter().zip(pts.iter()) {
+                                if is_wide_ty(pt) && mark(a, &mut wide) {
+                                    changed = true;
+                                }
+                            }
+                        }
+                    }
+                    SsaInstr::CallIndirect { result, ty, .. } => {
+                        // 间接调用的被调方是运行期指针，没有声明可查——实参
+                        // 宽度无从得知，只能维持现状（不标记）。
                         if is_wide_ty(ty) && mark(result, &mut wide) {
                             changed = true;
                         }

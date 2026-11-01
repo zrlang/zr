@@ -1639,10 +1639,15 @@ fn assign_float_slots(func: &SsaFunction) -> usize {
 }
 
 /// 发射一个函数的机器码。
-pub fn emit_function(target: &Target, unit: &mut CompilationUnit, func: &SsaFunction) {
+pub fn emit_function(
+    target: &Target,
+    unit: &mut CompilationUnit,
+    func: &SsaFunction,
+    callees: &crate::codegen::regalloc::CalleeParams,
+) {
     debug_assert_eq!(target.arch(), Arch::Arm32, "ARM 后端只能用于 arm32 目标");
 
-    check_register_pressure(func);
+    check_register_pressure(func, callees);
     let start = unit.code.len();
     let sym_base = unit.symbols.len();
 
@@ -2345,10 +2350,10 @@ pub fn emit_start_wrapper(target: &Target, unit: &mut CompilationUnit) {
 /// 编出一个算错的程序（取模分配会让同余的值抢同一个寄存器）。
 ///
 /// x86-64 后端自己实现了溢出，见 `encoder.rs`。
-fn check_register_pressure(func: &SsaFunction) {
+fn check_register_pressure(func: &SsaFunction, callees: &crate::codegen::regalloc::CalleeParams) {
     // 跨调用存活的值只放被调用者保存的 r4-r8，否则 `bl` 会破坏它。
     // 多字长（i64）值走栈槽，不占寄存器池。
-    let wide = crate::codegen::regalloc::assign_int_widths(func, 32);
+    let wide = crate::codegen::regalloc::assign_int_widths(func, 32, callees);
     let alloc = crate::codegen::regalloc::allocate_registers(
         func,
         ALLOCATABLE.len(),
@@ -2461,7 +2466,12 @@ mod tests {
             inline_always: false,
         };
         let mut unit = empty_unit();
-        emit_function(&Target::parse("arm-none-eabi").unwrap(), &mut unit, &func);
+        emit_function(
+            &Target::parse("arm-none-eabi").unwrap(),
+            &mut unit,
+            &func,
+            &crate::codegen::regalloc::CalleeParams::new(),
+        );
         crate::codegen::objfile::apply_relocations(&mut unit, 0, 0, 0);
 
         let word_at = |off: usize| u32::from_le_bytes(unit.code[off..off + 4].try_into().unwrap());

@@ -916,7 +916,16 @@ fn block_label(func: &str, id: usize) -> String {
 // ==================================================================
 
 /// 发射一个函数的机器码。
-pub fn emit_function(target: &Target, unit: &mut CompilationUnit, func: &SsaFunction) {
+///
+/// `callees` 是全模块的形参类型表（见 `regalloc::CalleeParams`）。AArch64
+/// 上 128 位整数在类型检查阶段就被拒绝了，所以这里用不到；参数留给统一
+/// 的分派签名。
+pub fn emit_function(
+    target: &Target,
+    unit: &mut CompilationUnit,
+    func: &SsaFunction,
+    _callees: &crate::codegen::regalloc::CalleeParams,
+) {
     debug_assert_eq!(
         target.arch(),
         Arch::AArch64,

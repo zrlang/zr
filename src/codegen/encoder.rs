@@ -246,6 +246,21 @@ thread_local! {
     /// `hi` 在槽 `s+1`。运算用 `adc`/`sbb`/`shld`/`shrd` 把两个字拼起来。
     static WIDE_VALUES: std::cell::RefCell<HashSet<u32>> =
         std::cell::RefCell::new(HashSet::new());
+    /// 宽整数乘 / 除 / 取模的临时栈槽基址。
+    ///
+    /// 这三个运算的中间状态（操作数副本、余数、计数器）比 `rax/rcx/rdx`
+    /// 三个暂存器能装的多，又不能在指令流里 `push`（那会把所有
+    /// `[rsp+disp]` 栈槽访问整体错位）。所以在帧尾按需预留 8 个槽；
+    /// 函数里没有宽 mul/div/rem 时基址无意义、也不占空间。
+    static WIDE_TEMP_BASE: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// 宽整数乘 / 除 / 取模需要的临时栈槽数（见 `WIDE_TEMP_BASE`）。
+const WIDE_TEMP_SLOTS: usize = 8;
+
+/// 宽运算临时槽 `n` 的绝对槽号。
+fn wide_temp(n: usize) -> usize {
+    WIDE_TEMP_BASE.with(|c| c.get()) + n
 }
 
 /// `v` 是否是宽值（i128/u128）。
@@ -356,6 +371,81 @@ fn emit_shift_cl(unit: &mut CompilationUnit, ext: u8, dst: Gpr) {
     emit1(unit, 0x48 | if dst.rex_bit() { 0x01 } else { 0 });
     emit1(unit, 0xd3);
     modrm(unit, 3, ext, dst.bits());
+}
+
+/// `shl`（4）/`shr`（5，逻辑）/`sar`（7，算术）`dst, imm8`（REX.W + 0xC1 /ext ib）。
+///
+/// 与 `emit_shift_cl` 是同一个 opcode 组的两种计数来源；128 位乘法 / 除法里
+/// 计数都是编译期常量（1 或 63），用 imm8 形式省掉先装载 `cl`。
+fn emit_shift_imm(unit: &mut CompilationUnit, ext: u8, dst: Gpr, imm: u8) {
+    emit1(unit, 0x48 | if dst.rex_bit() { 0x01 } else { 0 });
+    emit1(unit, 0xc1);
+    modrm(unit, 3, ext, dst.bits());
+    emit1(unit, imm);
+}
+
+/// `shld dst, src, imm8`（REX.W + 0F A4 /r ib）。
+///
+/// 与 `emit_shld_cl` 同一条指令的立即数计数形式，REX 归属也一样
+/// （REX.R = src、REX.B = dst）。
+fn emit_shld_imm(unit: &mut CompilationUnit, dst: Gpr, src: Gpr, imm: u8) {
+    let mut rex = 0x48u8;
+    if src.rex_bit() {
+        rex |= 0x04;
+    }
+    if dst.rex_bit() {
+        rex |= 0x01;
+    }
+    emit1(unit, rex);
+    emit2(unit, 0x0f, 0xa4);
+    modrm(unit, 3, src.bits(), dst.bits());
+    emit1(unit, imm);
+}
+
+/// `mul r/m64`（REX.W + F7 /4）：`rdx:rax = rax * r/m64`。
+///
+/// 有符号 / 无符号共用：结果的**低 128 位**与有无符号无关（模 2^128 的乘法
+/// 对二补数封闭），只有高 128 位才分 `mul` / `imul`，这里用不到。
+fn emit_mul_u64(unit: &mut CompilationUnit, r: Gpr) {
+    emit1(unit, 0x48 | if r.rex_bit() { 0x01 } else { 0 });
+    emit1(unit, 0xf7);
+    modrm(unit, 3, 4, r.bits());
+}
+
+/// `not r64`（REX.W + F7 /2）。
+fn emit_not_r64(unit: &mut CompilationUnit, dst: Gpr) {
+    emit1(unit, 0x48 | if dst.rex_bit() { 0x01 } else { 0 });
+    emit1(unit, 0xf7);
+    modrm(unit, 3, 2, dst.bits());
+}
+
+/// `add dst, imm8`（REX.W + 83 /0 ib）。
+fn emit_add_imm8(unit: &mut CompilationUnit, dst: Gpr, imm: u8) {
+    emit1(unit, 0x48 | if dst.rex_bit() { 0x01 } else { 0 });
+    emit1(unit, 0x83);
+    modrm(unit, 3, 0, dst.bits());
+    emit1(unit, imm);
+}
+
+/// `adc dst, imm8`（REX.W + 83 /2 ib）。依赖上一条指令留下的 CF。
+fn emit_adc_imm8(unit: &mut CompilationUnit, dst: Gpr, imm: u8) {
+    emit1(unit, 0x48 | if dst.rex_bit() { 0x01 } else { 0 });
+    emit1(unit, 0x83);
+    modrm(unit, 3, 2, dst.bits());
+    emit1(unit, imm);
+}
+
+/// `sub qword ptr [rsp + 8*slot], imm8`（REX.W + 83 /5 ib）。
+///
+/// 宽除法循环计数器放在栈槽里，减一不能经寄存器（三个暂存器都在用）。
+fn emit_sub_slot_imm8(unit: &mut CompilationUnit, slot: usize, imm: u8) {
+    emit1(unit, 0x48);
+    emit1(unit, 0x83);
+    // mod=10 (disp32)、reg=/5、r/m=100 (SIB)
+    emit1(unit, 0b10_000_100 | 5u8 << 3);
+    emit1(unit, 0b00_100_100);
+    emit4(unit, (slot * 8) as u32);
+    emit1(unit, imm);
 }
 
 /// `mov dst, [base + disp32]`（64 位）。
@@ -619,6 +709,278 @@ fn emit_shift_wide(
     let done_start = unit.code.len();
     bind_local_label(unit, &done, done_start);
     wide_store(unit, result, SCRATCH_AX, SCRATCH_DX);
+}
+
+/// 把一个宽操作数按**机器字**复制到临时槽（低字在前）。
+///
+/// 窄操作数（`wide` 判定只看结果，混宽运算时另一侧可能不是宽值）经
+/// `wide_load_word` 按符号扩展补高字，与 SSA 语义一致。
+fn copy_wide_to_temp(unit: &mut CompilationUnit, v: SsaValue, temp: usize) {
+    wide_load_word(unit, v, 0, SCRATCH_AX);
+    emit_store_slot(unit, SCRATCH_AX, wide_temp(temp));
+    wide_load_word(unit, v, 1, SCRATCH_AX);
+    emit_store_slot(unit, SCRATCH_AX, wide_temp(temp + 1));
+}
+
+/// `[lo, hi] = -[lo, hi]`（128 位二补数取负：两个字取反再 `adc` 加一）。
+fn negate_wide_slots(unit: &mut CompilationUnit, lo: usize, hi: usize) {
+    emit_load_slot(unit, SCRATCH_AX, lo);
+    emit_not_r64(unit, SCRATCH_AX);
+    emit_load_slot(unit, SCRATCH_DX, hi);
+    emit_not_r64(unit, SCRATCH_DX);
+    emit_add_imm8(unit, SCRATCH_AX, 1); // 置 CF
+    emit_adc_imm8(unit, SCRATCH_DX, 0); // 把进位带上高字
+    emit_store_slot(unit, SCRATCH_AX, lo);
+    emit_store_slot(unit, SCRATCH_DX, hi);
+}
+
+/// 128 位乘法：`lo = low(a0*b0)`，`hi = high(a0*b0) + low(a0*b1) + low(a1*b0)`。
+///
+/// 两个操作数先复制到临时槽：`mul` 隐式占用 `rax`/`rdx`，且结果槽与操作数
+/// 槽可能**同一个值**（内联等场景），边算边写会读到自己刚写掉的字。
+/// 低 128 位对有无符号是同一组位（模 2^128 的乘法对二补数封闭），所以
+/// 有符号与无符号共用这一条路径。
+fn emit_mul_wide(unit: &mut CompilationUnit, result: SsaValue, lhs: SsaValue, rhs: SsaValue) {
+    copy_wide_to_temp(unit, lhs, 0); // a0 / a1
+    copy_wide_to_temp(unit, rhs, 2); // b0 / b1
+
+    // lo = a0 * b0（结果写进目标低字，高半留到临时槽 t4）
+    emit_load_slot(unit, SCRATCH_AX, wide_temp(0));
+    emit_load_slot(unit, SCRATCH_CX, wide_temp(2));
+    emit_mul_u64(unit, SCRATCH_CX);
+    emit_store_slot(unit, SCRATCH_AX, wide_slot(result));
+    emit_store_slot(unit, SCRATCH_DX, wide_temp(4));
+
+    // hi += low(a0 * b1)
+    emit_load_slot(unit, SCRATCH_AX, wide_temp(0));
+    emit_load_slot(unit, SCRATCH_CX, wide_temp(3));
+    emit_mul_u64(unit, SCRATCH_CX);
+    emit_load_slot(unit, SCRATCH_DX, wide_temp(4));
+    emit_full_alu(unit, 0, SCRATCH_DX, SCRATCH_AX); // add
+    emit_store_slot(unit, SCRATCH_DX, wide_temp(4));
+
+    // hi += low(a1 * b0)
+    emit_load_slot(unit, SCRATCH_AX, wide_temp(1));
+    emit_load_slot(unit, SCRATCH_CX, wide_temp(2));
+    emit_mul_u64(unit, SCRATCH_CX);
+    emit_load_slot(unit, SCRATCH_DX, wide_temp(4));
+    emit_full_alu(unit, 0, SCRATCH_DX, SCRATCH_AX); // add
+    emit_store_slot(unit, SCRATCH_DX, wide_slot(result) + 1);
+}
+
+/// 128 位除法 / 取模。
+///
+/// 64 位硬件 `div` 只能除 64 位被除数，128 位的商要按位长除：从最高位起
+/// 逐位把被除数移进余数，够减就减并置商位。这里发射一个 128 次的真实循环
+/// （比展开 128 段省代码），状态全放临时槽：
+///
+/// | 槽 | 含义 |
+/// |---|---|
+/// | t0 / t1 | 被除数 lo / hi（循环中逐位左移） |
+/// | t2 / t3 | 除数 lo / hi（只读副本） |
+/// | t4 / t5 | 余数 lo / hi |
+/// | t6 | 剩余迭代次数 |
+/// | t7 | 符号包（bit0 = 被除数负、bit1 = 除数负；无符号时不用） |
+///
+/// 商直接写在结果槽里（结果与操作数先复制到临时槽，不存在别名问题）。
+/// 有符号路径先把两个操作数取绝对值，算完再按符号补回：商负
+/// ⇔ 两个符号异或，余数负 ⇔ 被除数负（与 Rust/C 的截断除法语义一致）。
+fn emit_divrem_wide(
+    unit: &mut CompilationUnit,
+    result: SsaValue,
+    op: SsaBinaryOp,
+    lhs: SsaValue,
+    rhs: SsaValue,
+    ty: NumTy,
+) {
+    let unsigned = matches!(ty, NumTy::Uint(_));
+    let base = unit.code.len();
+    let nonzero = format!(".wide_div_nz_{base}");
+    let divzero = format!(".wide_div_zero_{base}");
+    let loop_label = format!(".wide_div_loop_{base}");
+    let no_sub = format!(".wide_div_skip_{base}");
+    let next = format!(".wide_div_next_{base}");
+    let done = format!(".wide_div_done_{base}");
+    let skip_a = format!(".wide_div_sa_{base}");
+    let skip_b = format!(".wide_div_sb_{base}");
+    let skip_r = format!(".wide_div_sr_{base}");
+    let skip_q = format!(".wide_div_sq_{base}");
+
+    copy_wide_to_temp(unit, lhs, 0);
+    copy_wide_to_temp(unit, rhs, 2);
+
+    // 除数为零：128 位的长除会静默给出"全 1"的假商，这里直接发 `ud2`
+    // 触发非法指令异常（与 64 位 `div` 除零同样在运行期硬失败，而不是
+    // 悄悄算错）。
+    emit_load_slot(unit, SCRATCH_AX, wide_temp(2));
+    emit_test_rr(unit, SCRATCH_AX, SCRATCH_AX);
+    emit_jcc_rel32(unit, 0x5, &nonzero); // jnz
+    emit_load_slot(unit, SCRATCH_AX, wide_temp(3));
+    emit_test_rr(unit, SCRATCH_AX, SCRATCH_AX);
+    emit_jcc_rel32(unit, 0x4, &divzero); // jz
+    let nz_start = unit.code.len();
+    bind_local_label(unit, &nonzero, nz_start);
+
+    if !unsigned {
+        // 符号包：bit0 = a1 的符号位，bit1 = b1 的符号位
+        emit_load_slot(unit, SCRATCH_AX, wide_temp(1));
+        emit_shift_imm(unit, 5, SCRATCH_AX, 63); // shr 63 → 0/1
+        emit_load_slot(unit, SCRATCH_CX, wide_temp(3));
+        emit_shift_imm(unit, 5, SCRATCH_CX, 63);
+        emit_shift_imm(unit, 4, SCRATCH_CX, 1);
+        emit_full_alu(unit, 1, SCRATCH_AX, SCRATCH_CX); // or → 符号包
+        emit_store_slot(unit, SCRATCH_AX, wide_temp(7));
+
+        // 取绝对值必须**逐位**看各自的符号：`test 符号包, 符号包` 只判"非零"，
+        // 被除数为负、除数为正时它会连除数一起取负（负数除正数于是变成
+        // "负数除负数"，商的正负整个反掉）。
+        //
+        // 被除数取绝对值（符号包 bit0）
+        emit_load_slot(unit, SCRATCH_CX, wide_temp(7));
+        emit_mov_rr(unit, SCRATCH_AX, SCRATCH_CX);
+        emit_alu_imm(unit, 4, SCRATCH_AX, 1, false); // and 1
+        emit_test_rr(unit, SCRATCH_AX, SCRATCH_AX);
+        emit_jcc_rel32(unit, 0x4, &skip_a); // jz：非负，不取负
+        negate_wide_slots(unit, wide_temp(0), wide_temp(1));
+        let sa_start = unit.code.len();
+        bind_local_label(unit, &skip_a, sa_start);
+
+        // 除数取绝对值（符号包 bit1，右移一位落到 bit0）
+        emit_load_slot(unit, SCRATCH_CX, wide_temp(7));
+        emit_mov_rr(unit, SCRATCH_AX, SCRATCH_CX);
+        emit_shift_imm(unit, 5, SCRATCH_AX, 1);
+        emit_test_rr(unit, SCRATCH_AX, SCRATCH_AX);
+        emit_jcc_rel32(unit, 0x4, &skip_b); // jz：非负，不取负
+        negate_wide_slots(unit, wide_temp(2), wide_temp(3));
+        let sb_start = unit.code.len();
+        bind_local_label(unit, &skip_b, sb_start);
+    }
+
+    // 余数 = 0，商 = 0，计数器 = 128
+    emit_const_int(unit, SCRATCH_AX, 0);
+    emit_store_slot(unit, SCRATCH_AX, wide_temp(4));
+    emit_store_slot(unit, SCRATCH_AX, wide_temp(5));
+    emit_store_slot(unit, SCRATCH_AX, wide_slot(result));
+    emit_store_slot(unit, SCRATCH_AX, wide_slot(result) + 1);
+    emit_mov_imm64(unit, SCRATCH_AX, 128);
+    emit_store_slot(unit, SCRATCH_AX, wide_temp(6));
+
+    let loop_start = unit.code.len();
+    bind_local_label(unit, &loop_label, loop_start);
+
+    // 商左移一位（每轮处理一位被除数，最早处理的位最后落在最高位）
+    emit_load_slot(unit, SCRATCH_AX, wide_slot(result));
+    emit_load_slot(unit, SCRATCH_DX, wide_slot(result) + 1);
+    emit_shld_imm(unit, SCRATCH_DX, SCRATCH_AX, 1);
+    emit_shift_imm(unit, 4, SCRATCH_AX, 1);
+    emit_store_slot(unit, SCRATCH_AX, wide_slot(result));
+    emit_store_slot(unit, SCRATCH_DX, wide_slot(result) + 1);
+
+    // carry = 被除数当前最高位（bit 127 = hi 的 bit 63）。
+    //
+    // 早先取的是 lo 的 bit 63——那等于先处理低 64 位、再处理高 64 位，长除
+    // 法的位序整个反了，商和余数都不对。128 位值的最高位在 **hi** 里。
+    emit_load_slot(unit, SCRATCH_AX, wide_temp(1));
+    emit_mov_rr(unit, SCRATCH_CX, SCRATCH_AX);
+    emit_shift_imm(unit, 5, SCRATCH_CX, 63);
+
+    // 被除数左移一位，把刚处理过的最高位移出去（lo 的 bit63 补进 hi）
+    emit_load_slot(unit, SCRATCH_AX, wide_temp(0));
+    emit_load_slot(unit, SCRATCH_DX, wide_temp(1));
+    emit_shld_imm(unit, SCRATCH_DX, SCRATCH_AX, 1);
+    emit_shift_imm(unit, 4, SCRATCH_AX, 1);
+    emit_store_slot(unit, SCRATCH_AX, wide_temp(0));
+    emit_store_slot(unit, SCRATCH_DX, wide_temp(1));
+
+    // 余数 = (余数 << 1) | carry
+    emit_load_slot(unit, SCRATCH_AX, wide_temp(4));
+    emit_load_slot(unit, SCRATCH_DX, wide_temp(5));
+    emit_shld_imm(unit, SCRATCH_DX, SCRATCH_AX, 1);
+    emit_shift_imm(unit, 4, SCRATCH_AX, 1);
+    emit_full_alu(unit, 1, SCRATCH_AX, SCRATCH_CX); // or carry
+    emit_store_slot(unit, SCRATCH_AX, wide_temp(4));
+    emit_store_slot(unit, SCRATCH_DX, wide_temp(5));
+
+    // 余数 -= 除数，借位（CF=1）说明不够减，把减掉的部分加回去
+    emit_load_slot(unit, SCRATCH_AX, wide_temp(4));
+    emit_load_slot(unit, SCRATCH_DX, wide_temp(5));
+    emit_load_slot(unit, SCRATCH_CX, wide_temp(2));
+    emit_full_alu(unit, 5, SCRATCH_AX, SCRATCH_CX); // sub lo
+    emit_load_slot(unit, SCRATCH_CX, wide_temp(3));
+    emit_full_alu(unit, 3, SCRATCH_DX, SCRATCH_CX); // sbb hi
+    emit_jcc_rel32(unit, 0x2, &no_sub); // jc：借位说明不够减
+
+    emit_store_slot(unit, SCRATCH_AX, wide_temp(4));
+    emit_store_slot(unit, SCRATCH_DX, wide_temp(5));
+    // 商当前位置一：商每轮都左移过，最低位是空的。**不能**把减差（余数）
+    // 的低位或进来——早先就是这么写的，商于是每轮多出一位，实测比真值大 8。
+    emit_load_slot(unit, SCRATCH_CX, wide_slot(result));
+    emit_alu_imm(unit, 1, SCRATCH_CX, 1, false); // or rcx, 1
+    emit_store_slot(unit, SCRATCH_CX, wide_slot(result));
+    emit_jmp(unit, &next);
+
+    let ns_start = unit.code.len();
+    bind_local_label(unit, &no_sub, ns_start);
+    // 借位置起时 `sub`/`sbb` 的差值正好是"余数 - 除数"，加回除数即可恢复
+    emit_load_slot(unit, SCRATCH_CX, wide_temp(2));
+    emit_full_alu(unit, 0, SCRATCH_AX, SCRATCH_CX); // add（CF 来自 add）
+    emit_load_slot(unit, SCRATCH_CX, wide_temp(3));
+    emit_full_alu(unit, 2, SCRATCH_DX, SCRATCH_CX); // adc hi
+    emit_store_slot(unit, SCRATCH_AX, wide_temp(4));
+    emit_store_slot(unit, SCRATCH_DX, wide_temp(5));
+
+    let next_start = unit.code.len();
+    bind_local_label(unit, &next, next_start);
+    emit_sub_slot_imm8(unit, wide_temp(6), 1);
+    emit_jcc_rel32(unit, 0x5, &loop_label); // jnz
+
+    let done_start = unit.code.len();
+    bind_local_label(unit, &done, done_start);
+
+    if !unsigned {
+        // 余数符号跟随被除数（符号包 bit0；test 整个包会看错除数那一位）
+        emit_load_slot(unit, SCRATCH_CX, wide_temp(7));
+        emit_mov_rr(unit, SCRATCH_AX, SCRATCH_CX);
+        emit_alu_imm(unit, 4, SCRATCH_AX, 1, false); // and 1
+        emit_test_rr(unit, SCRATCH_AX, SCRATCH_AX);
+        emit_jcc_rel32(unit, 0x4, &skip_r);
+        negate_wide_slots(unit, wide_temp(4), wide_temp(5));
+        let sr_start = unit.code.len();
+        bind_local_label(unit, &skip_r, sr_start);
+
+        // 商负 ⇔ 两个符号异或（pack ^ (pack >> 1) 的**最低位**）。
+        // 只 xor 不 `and 1` 会让两负（pack = 0b11）算出 0b10——非零，
+        // 被误判成"商为负"，-100 / -7 于是给出 -14 而不是 14。
+        emit_load_slot(unit, SCRATCH_CX, wide_temp(7));
+        emit_mov_rr(unit, SCRATCH_AX, SCRATCH_CX);
+        emit_shift_imm(unit, 5, SCRATCH_AX, 1);
+        emit_full_alu(unit, 6, SCRATCH_CX, SCRATCH_AX); // xor
+        emit_alu_imm(unit, 4, SCRATCH_CX, 1, false); // and 1
+        emit_test_rr(unit, SCRATCH_CX, SCRATCH_CX);
+        emit_jcc_rel32(unit, 0x4, &skip_q);
+        negate_wide_slots(unit, wide_slot(result), wide_slot(result) + 1);
+        let sq_start = unit.code.len();
+        bind_local_label(unit, &skip_q, sq_start);
+    }
+
+    if op == SsaBinaryOp::Rem {
+        emit_load_slot(unit, SCRATCH_AX, wide_temp(4));
+        emit_store_slot(unit, SCRATCH_AX, wide_slot(result));
+        emit_load_slot(unit, SCRATCH_AX, wide_temp(5));
+        emit_store_slot(unit, SCRATCH_AX, wide_slot(result) + 1);
+    }
+
+    // 主路径必须跳过下面的除零出口：`divzero` 绑定的位置正好落在主路径
+    // 的落点上，少了这条 jmp，每次除法算完都会踩到 `ud2`。
+    let end = format!(".wide_div_end_{base}");
+    emit_jmp(unit, &end);
+
+    // 除数为零的出口（主路径不落到这里）
+    let dz_start = unit.code.len();
+    bind_local_label(unit, &divzero, dz_start);
+    emit_ud2(unit);
+    let end_start = unit.code.len();
+    bind_local_label(unit, &end, end_start);
 }
 
 /// 128 位与更窄/更宽整数之间的转换。
@@ -1403,7 +1765,16 @@ fn assign_local_slots(func: &SsaFunction, base: usize) -> usize {
     slots
 }
 /// 发射一个函数的机器码。
-pub fn emit_function(target: &Target, unit: &mut CompilationUnit, func: &SsaFunction) {
+///
+/// `callees` 是全模块的形参类型表（见 `regalloc::CalleeParams`）：调用点的
+/// 实参宽度只能靠它判定——宽整数实参必须占两个实参寄存器，少送一个字
+/// 会让被调方读到下一个实参。
+pub fn emit_function(
+    target: &Target,
+    unit: &mut CompilationUnit,
+    func: &SsaFunction,
+    callees: &crate::codegen::regalloc::CalleeParams,
+) {
     debug_assert_eq!(
         target.arch(),
         Arch::X86_64,
@@ -1414,7 +1785,7 @@ pub fn emit_function(target: &Target, unit: &mut CompilationUnit, func: &SsaFunc
     // x86-64 的机器字长是 64 位，宽于它的（i128/u128）走"双 8 字节栈槽"路径：
     // 每个宽值占**两个**连续槽（`wide_slots = 2`），后端用 `adc`/`sbb` 等把
     // 两个字拼起来。
-    let wide = crate::codegen::regalloc::assign_int_widths(func, 64);
+    let wide = crate::codegen::regalloc::assign_int_widths(func, 64, callees);
     let alloc = crate::codegen::regalloc::allocate_registers(
         func,
         ALLOCATABLE.len(),
@@ -1424,6 +1795,21 @@ pub fn emit_function(target: &Target, unit: &mut CompilationUnit, func: &SsaFunc
         2,
     );
     WIDE_VALUES.with(|w| *w.borrow_mut() = wide);
+    // 宽整数乘 / 除 / 取模的临时槽（见 `WIDE_TEMP_BASE`）只在函数里真有这三
+    // 个宽运算时才在帧尾预留；别的函数白加 64 字节没有意义。
+    let has_wide_muldiv = func
+        .blocks
+        .iter()
+        .flat_map(|b| &b.instrs)
+        .any(|instr| match instr {
+            SsaInstr::Binary { result, op, .. } => {
+                matches!(
+                    op,
+                    SsaBinaryOp::Mul | SsaBinaryOp::Div | SsaBinaryOp::Rem
+                ) && WIDE_VALUES.with(|w| w.borrow().contains(&result.id()))
+            }
+            _ => false,
+        });
     // callee-save 集合要在发射尾声时再用，所以这里留一份
     let callee_saved = callee_saved_regs(&alloc.map);
     // 整数溢出的槽之后接着排浮点槽，最后是被取地址的局部变量的槽：
@@ -1432,7 +1818,9 @@ pub fn emit_function(target: &Target, unit: &mut CompilationUnit, func: &SsaFunc
     let local_slots = assign_local_slots(func, alloc.spilled + float_slots);
     let call_slot = alloc.spilled + float_slots + local_slots;
     CALL_SLOT.with(|c| c.set(call_slot));
-    FRAME_SLOTS.with(|c| c.set(call_slot + 1));
+    let wide_temp_slots = if has_wide_muldiv { WIDE_TEMP_SLOTS } else { 0 };
+    WIDE_TEMP_BASE.with(|c| c.set(call_slot + 1));
+    FRAME_SLOTS.with(|c| c.set(call_slot + 1 + wide_temp_slots));
     REG_MAP.with(|m| {
         *m.borrow_mut() = alloc;
     });
@@ -2056,7 +2444,8 @@ fn emit_binary_wide(
         BitXor => emit_bitop_wide(unit, result, 6, lhs, rhs),
         Shl | Shr => emit_shift_wide(unit, result, op, lhs, rhs, ty),
         Eq | Ne | Lt | Gt | Le | Ge => emit_compare_wide(unit, result, op, lhs, rhs, ty),
-        Mul | Div | Rem => crate::codegen::unsupported_binary_op(op),
+        Mul => emit_mul_wide(unit, result, lhs, rhs),
+        Div | Rem => emit_divrem_wide(unit, result, op, lhs, rhs, ty),
     }
 }
 

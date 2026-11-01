@@ -1,0 +1,108 @@
+//=============================================================================
+// tests/cases/113_i128_muldiv.zr — 128 位整数（i128/u128）的乘 / 除 / 取模
+//
+// 本用例钉住两件事：
+//
+// 1. **128 位乘除本身**。乘要拆四段 64 位部分积（`(alo*blo)` + 两个跨字
+//    项的高半加到 `hi`），除走 128 轮软件长除（商每轮左移、余数左移进被
+//    除数位、`sub/sbb` 比较、借位则恢复）。两个方向都容易"编译通过、结果
+//    差一点"：早先商每轮把余数的低位或进了商，实测比真值大 8；商符号判定
+//    只 `xor` 不 `and 1`，两个负数相除被误判成商为负（-100 / -7 给出 -14）。
+//
+// 2. **调用点的宽整数实参宽度**。`SsaInstr::Call` 不带实参类型，后端只能
+//    靠 `regalloc::CalleeParams`（全模块 `param_types`）判定某个实参是不是
+//    128 位——是就占两个实参寄存器。早先只按返回值标宽，`div128(neg100,
+//    seven)` 只送 2 个字而 `_z_div128` 读 4 个，-O2/-Oz 下直接 SIGILL。
+//    故这里**每个宽运算都同时走"就地算"与"函数调用"两条路径**。
+//
+// 所有断言都在 `main` 里用 `return <非零>` 自证数值——`tests/zr_language.rs`
+// 只断言退出码。
+//=============================================================================
+
+/// 两个 i128 相乘（覆盖跨函数传递两个 128 位实参）。
+fn mul128(x: i128, y: i128) -> i128 {
+    return x * y;
+}
+
+/// 两个 i128 相除（商向零截断）。
+fn div128(x: i128, y: i128) -> i128 {
+    return x / y;
+}
+
+/// 两个 i128 取模（余数符号跟随被除数）。
+fn rem128(x: i128, y: i128) -> i128 {
+    return x % y;
+}
+
+fn main() -> i32 {
+    let a: i128 = 18446744073709551616; // 2^64
+    let three: i128 = 3;
+    let two: i128 = 2;
+
+    // --- 乘法：跨 64 位边界的部分积 ---
+    let p = a * three;
+    if p != 55340232221128654848 { return 1; } // 3 * 2^64
+    if mul128(a, three) != p { return 2; }
+    let aa: u128 = 18446744073709551617; // 2^64 + 1
+    let bb: u128 = 18446744073709551615; // 2^64 - 1
+    let uzero: u128 = 0;
+    let uall = ~uzero; // 2^128 - 1
+    if aa * bb != uall { return 3; } // (2^64+1)(2^64-1) = 2^128 - 1
+    if a * a != uzero { return 4; } // 2^128 截断为 0
+    let n1: i128 = -1;
+    if n1 * n1 != 1 { return 5; }
+    let min: i128 = -9223372036854775808; // -2^63
+    if min * two != -18446744073709551616 { return 6; } // -2^64
+
+    // --- 除法 / 取模：无符号 ---
+    if p / three != a { return 7; }
+    if p % three != 0 { return 8; }
+    let a5 = a + 5; // 2^64 + 5
+    if a5 / three != 6148914691236517207 { return 9; }
+    if a5 % three != 0 { return 10; }
+    if (a + 1) / a != 1 { return 11; }
+    if (a + 1) % a != 1 { return 12; }
+    if a / a != 1 { return 13; }
+
+    // --- 有符号：商向零截断，余数符号跟随被除数 ---
+    let five: i128 = 5;
+    let seven: i128 = 7;
+    let neg100: i128 = -100;
+    if five / seven != 0 { return 14; }
+    if five % seven != 5 { return 15; }
+    if neg100 / seven != -14 { return 16; }
+    if neg100 % seven != -2 { return 17; }
+    let hundred: i128 = 100;
+    let nseven: i128 = -7;
+    if hundred / nseven != -14 { return 18; }
+    if hundred % nseven != 2 { return 19; }
+    // 两个负数相除商为正：符号判定必须取异或的**最低位**（见文件头第 1 条）
+    if neg100 / nseven != 14 { return 20; }
+    if neg100 % nseven != -2 { return 21; }
+
+    // --- 跨函数：宽实参必须各占两个寄存器（文件头第 2 条）---
+    if div128(neg100, seven) != -14 { return 22; }
+    if rem128(neg100, seven) != -2 { return 23; }
+    if div128(neg100, nseven) != 14 { return 24; }
+    if rem128(neg100, nseven) != -2 { return 25; }
+    // 被除数大于 2^64 时实参的高字也必须送到
+    if div128(a5, three) != 6148914691236517207 { return 26; }
+
+    // --- u128：大于 2^64 的除数 / 被除数（无符号长除不许走有符号路径）---
+    if uall / a != 18446744073709551615 { return 27; } // 2^64 - 1
+    if uall % a != 18446744073709551615 { return 28; }
+    if aa / bb != 1 { return 29; }
+    if aa % bb != 2 { return 30; }
+
+    // --- 循环里反复做宽乘除（钉帧尾临时槽不被别的函数踩）---
+    let mut sum: i128 = 0;
+    let mut i: i128 = 1;
+    while i <= three {
+        sum = sum + (i * a);
+        i = i + 1;
+    }
+    if sum != 110680464442257309696 { return 31; } // 6 * 2^64
+    if sum / a != 6 { return 32; }
+
+    return 0;
+}
