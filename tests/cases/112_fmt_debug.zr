@@ -1,0 +1,73 @@
+//=============================================================================
+// tests/cases/112_fmt_debug.zr —— 格式引擎接自定义类型的 Debug（P1-5c）
+//
+// `println_fmt` 的 `{:?}` / `{:#?}` 早先只能吃标量/字符串（`FormatArg` 的
+// `kind` 是结构体里的整数，枚举载荷那条路没走通）。这里给 `FormatArg` 加了
+// 一条"类型化值通道"：`kind = 7` 时由 `debug_fn`（derive 生成的
+// `Type__debug_fmt`）把值渲染进调用方缓冲。
+//
+// 覆盖：
+//   - `fmt_debug` 产出的 `FormatArg`：`kind == 7`、`debug_fn`/`obj_ptr` 可用；
+//   - 同一渲染函数按 `pretty` 参数给出单行（`{:?}`）与多行（`{:#?}`）两态；
+//   - 渲染结果与 Rust 的 `{:?}` / `{:#?}` 逐字符一致；
+//   - 缓冲区超容量时按容量截断、且返回**所需**总长度；
+//   - 嵌套结构体递归渲染；
+//   - 经 `println_fmt` 的端到端冒烟（崩溃会被退出码捕获）。
+//=============================================================================
+
+use io::{fmt_debug, println_fmt, FormatArg};
+
+#[derive(Debug)]
+struct Pt { x: i32, y: i32 }
+
+#[derive(Debug)]
+struct Wrap { inner: Pt, name: str }
+
+/// 逐字符比对缓冲内容与期望字面量。
+fn eq_bytes(buf: []const u8, want: str) -> bool {
+    if buf.len < want.len { return false; }
+    let mut i: usize = 0;
+    while i < want.len {
+        if buf[i] != want.ptr[i] { return false; }
+        i = i + 1;
+    }
+    return true;
+}
+
+fn main() -> i32 {
+    let p = Pt { x: 3, y: 4 };
+    let a = fmt_debug(&p as *const void, Pt__debug_fmt);
+    if a.kind != 7 { return 1; }
+
+    // --- 单行（`{:?}`）：`Pt { x: 3, y: 4 }` ---
+    let mut buf: [u8; 64] = [0; 64];
+    let n = (a.debug_fn)(a.obj_ptr, false, &mut buf[0] as *mut u8, 64);
+    if n != 17 { return 2; }
+    if !eq_bytes(&buf[0..n], "Pt { x: 3, y: 4 }") { return 3; }
+
+    // --- 多行（`{:#?}`）：同一渲染函数、`pretty = true` ---
+    let n2 = (a.debug_fn)(a.obj_ptr, true, &mut buf[0] as *mut u8, 64);
+    if n2 != 26 { return 4; }
+    if !eq_bytes(&buf[0..n2], "Pt {\n    x: 3,\n    y: 4,\n}") { return 5; }
+
+    // --- 超容量截断：返回所需总长度，但只写 `cap` 个字节 ---
+    let mut small: [u8; 32] = [0; 32];
+    let n3 = (a.debug_fn)(a.obj_ptr, false, &mut small[0] as *mut u8, 8);
+    if n3 != 17 { return 6; }
+    if small[3] != b'{' { return 7; }
+    if small[8] != 0 { return 8; }   // 容量之外不写
+
+    // --- 嵌套结构体递归渲染：`Wrap { inner: Pt { x: 3, y: 4 }, name: "hi" }` ---
+    let w = Wrap { inner: Pt { x: 3, y: 4 }, name: "hi" };
+    let b = fmt_debug(&w as *const void, Wrap__debug_fmt);
+    let n4 = (b.debug_fn)(b.obj_ptr, false, &mut buf[0] as *mut u8, 64);
+    let want_w = "Wrap { inner: Pt { x: 3, y: 4 }, name: \"hi\" }";
+    if n4 != want_w.len { return 9; }
+    if !eq_bytes(&buf[0..n4], want_w) { return 10; }
+
+    // --- 端到端冒烟：经 `println_fmt` 的格式串走一遍（崩溃 → 退出码非 0）---
+    let args = [fmt_debug(&p as *const void, Pt__debug_fmt), fmt_debug(&p as *const void, Pt__debug_fmt)];
+    println_fmt("smoke {:?} {:#?}", &args[0] as *const FormatArg, 2);
+
+    return 0;
+}

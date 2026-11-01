@@ -1028,8 +1028,14 @@ fn write_float_debug(fd: i32, v: f64) -> usize {
 /// 时 f64 字段要经过内存与浮点寄存器之间的搬运，编译器在这条路径上
 /// 有 bug（数组里的 f64 字段会被读成 0.0，`-O3` 下甚至直接崩）；
 /// 整数位模式只走普通整数寄存器与内存，不会被弄丢。
+///
+/// 标量 / 字符串种类走 `int_value` / `float_bits` / `str_ptr` / `str_len`；
+/// **自定义类型**（`kind` 为 7）走 `obj_ptr` + `debug_fn` 这条"类型化值通道"：
+/// 值的指针由调用方（`fmt_debug`）填进来，渲染函数由 `#[derive(Debug)]`
+/// 在**编译期**生成。渲染函数是普通函数指针，结构体按值拷贝时和其它整数
+/// 一样搬运，不碰浮点寄存器。
 pub struct FormatArg {
-    /// 种类：0=int 1=uint 2=float 3=bool 4=str 5=char 6=hex
+    /// 种类：0=int 1=uint 2=float 3=bool 4=str 5=char 6=hex 7=custom(debug)
     pub kind: i32,
     /// 整数 / 字符的值。
     pub int_value: i64,
@@ -1039,6 +1045,22 @@ pub struct FormatArg {
     pub str_ptr: *const u8,
     /// 字符串的长度。
     pub str_len: usize,
+    /// 自定义类型的渲染函数（`kind` 为 7 时有效）。
+    ///
+    /// 签名：`(值的指针, 是否多行 {:#?}, 缓冲区, 容量) -> 所需总长度`。
+    /// 把渲染结果写进缓冲区（不超过容量），返回**实际需要的**总长度——
+    /// 调用方据此判断是否被截断。
+    pub debug_fn: fn(*const void, bool, *mut u8, usize) -> usize,
+    /// 自定义类型的值指针（`kind` 为 7 时有效）。
+    pub obj_ptr: *const void,
+}
+
+/// 非自定义类型参数的 `debug_fn` 占位：`kind != 7` 时不会被调用。
+///
+/// 需要一个真函数是因为 zr 不允许把整数 `0` 强转成函数指针
+/// （``cannot cast `i32` to `fn(..)``）。
+fn no_debug(__p: *const void, __pretty: bool, __buf: *mut u8, __cap: usize) -> usize {
+    return 0;
 }
 
 /// 带名字的格式化参数：`{name}` 占位符按 `name` 在参数表里查值。
@@ -1056,12 +1078,12 @@ pub struct NamedArg {
 
 /// 一个整数参数。
 pub fn fmt_int(n: i64) -> FormatArg {
-    return FormatArg { kind: 0, int_value: n, float_bits: 0, str_ptr: 0 as *const u8, str_len: 0 };
+    return FormatArg { kind: 0, int_value: n, float_bits: 0, str_ptr: 0 as *const u8, str_len: 0, debug_fn: no_debug, obj_ptr: 0 as *const void };
 }
 
 /// 一个无符号整数参数。
 pub fn fmt_uint(n: u64) -> FormatArg {
-    return FormatArg { kind: 1, int_value: n as i64, float_bits: 0, str_ptr: 0 as *const u8, str_len: 0 };
+    return FormatArg { kind: 1, int_value: n as i64, float_bits: 0, str_ptr: 0 as *const u8, str_len: 0, debug_fn: no_debug, obj_ptr: 0 as *const void };
 }
 
 /// 一个浮点参数。
@@ -1073,29 +1095,48 @@ pub fn fmt_float(n: f64) -> FormatArg {
     let v = n * 1.0;
     // NaN 单独处理（位模式是固定的）。
     if v != v {
-        return FormatArg { kind: 2, int_value: 0, float_bits: F64_NAN_BITS, str_ptr: 0 as *const u8, str_len: 0 };
+        return FormatArg { kind: 2, int_value: 0, float_bits: F64_NAN_BITS, str_ptr: 0 as *const u8, str_len: 0, debug_fn: no_debug, obj_ptr: 0 as *const void };
     }
-    return FormatArg { kind: 2, int_value: 0, float_bits: f64_to_bits(v), str_ptr: 0 as *const u8, str_len: 0 };
+    return FormatArg { kind: 2, int_value: 0, float_bits: f64_to_bits(v), str_ptr: 0 as *const u8, str_len: 0, debug_fn: no_debug, obj_ptr: 0 as *const void };
 }
 
 /// 一个布尔参数。
 pub fn fmt_bool(b: bool) -> FormatArg {
-    return FormatArg { kind: 3, int_value: if b { 1 } else { 0 }, float_bits: 0, str_ptr: 0 as *const u8, str_len: 0 };
+    return FormatArg { kind: 3, int_value: if b { 1 } else { 0 }, float_bits: 0, str_ptr: 0 as *const u8, str_len: 0, debug_fn: no_debug, obj_ptr: 0 as *const void };
 }
 
 /// 一个字符串参数。
 pub fn fmt_str(s: str) -> FormatArg {
-    return FormatArg { kind: 4, int_value: 0, float_bits: 0, str_ptr: s.ptr, str_len: s.len };
+    return FormatArg { kind: 4, int_value: 0, float_bits: 0, str_ptr: s.ptr, str_len: s.len, debug_fn: no_debug, obj_ptr: 0 as *const void };
 }
 
 /// 一个字符参数。
 pub fn fmt_char(c: char) -> FormatArg {
-    return FormatArg { kind: 5, int_value: c as i64, float_bits: 0, str_ptr: 0 as *const u8, str_len: 0 };
+    return FormatArg { kind: 5, int_value: c as i64, float_bits: 0, str_ptr: 0 as *const u8, str_len: 0, debug_fn: no_debug, obj_ptr: 0 as *const void };
 }
 
 /// 一个十六进制参数。
 pub fn fmt_hex(n: u64) -> FormatArg {
-    return FormatArg { kind: 6, int_value: n as i64, float_bits: 0, str_ptr: 0 as *const u8, str_len: 0 };
+    return FormatArg { kind: 6, int_value: n as i64, float_bits: 0, str_ptr: 0 as *const u8, str_len: 0, debug_fn: no_debug, obj_ptr: 0 as *const void };
+}
+
+/// 一个**自定义类型**参数：把值的指针与它 `#[derive(Debug)]` 生成的渲染函数
+/// 绑成一个参数，让 `{:?}` / `{:#?}` 能直接打印结构体 / 枚举。
+///
+/// 用法：
+///
+/// ```zr
+/// #[derive(Debug)]
+/// struct Point { x: i64, y: i64 }
+///
+/// let p = Point { x: 1, y: 2 };
+/// // `Point__debug_fmt` 由 derive 生成；`&p as *const void` 是值的稳定地址。
+/// println_fmt("p = {:?}", &[fmt_debug(&p as *const void, Point__debug_fmt)], 1);
+/// // `{:#?}` 走多行：格式引擎按 `#` 标志把 `pretty` 置真再调渲染函数。
+/// println_fmt("p = {:#?}", &[fmt_debug(&p as *const void, Point__debug_fmt)], 1);
+/// ```
+pub fn fmt_debug(obj_ptr: *const void, debug_fn: fn(*const void, bool, *mut u8, usize) -> usize) -> FormatArg {
+    return FormatArg { kind: 7, int_value: 0, float_bits: 0, str_ptr: 0 as *const u8, str_len: 0, debug_fn, obj_ptr };
 }
 
 //=============================================================================
@@ -2101,6 +2142,22 @@ fn write_arg(fd: i32, arg: &FormatArg, flags0: u64, width: usize, prec: i32) {
             body[0] = c;
             emit_arg(fd, &body[0..1], 1, 0, 0, flags, width);
         }
+        return;
+    }
+    if arg.kind == 7 {
+        // 自定义类型：调 derive 生成的渲染函数，把值渲染进栈缓冲。
+        // `{:#?}`（`#` 标志）走多行 pretty，其余走单行。
+        //
+        // 渲染函数返回**所需**总长度：超过缓冲容量时按容量截断（与其它
+        // 种类用的 1024 字节栈缓冲一致），不越界写。
+        let n = (arg.debug_fn)(arg.obj_ptr, alt, &mut body[0] as *mut u8, 1024);
+        let mut blen = n;
+        if blen > 1024 {
+            blen = 1024;
+        }
+        // 自定义类型的 Debug 不吃 `0` 填充：这里没置 FLAG_NUMERIC，
+        // `emit_arg` 的 `use_zero = zero && numeric` 自然为假。
+        emit_arg(fd, &body[0..blen], blen, 0, 0, flags, width);
         return;
     }
     // 未知 kind：尽力按整数输出

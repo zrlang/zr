@@ -121,7 +121,10 @@ fn zr_language_cases() {
 #[test]
 fn io_print_matches_rust() {
     let zr = env!("CARGO_BIN_EXE_zr");
-    let source = r#"use io::{println_fmt, println_fmt_named, fmt_int, fmt_float, fmt_str, fmt_bool};
+    let source = r#"use io::{println_fmt, println_fmt_named, fmt_int, fmt_float, fmt_str, fmt_bool, fmt_debug};
+
+#[derive(Debug)]
+struct Pt { x: i32, y: i32 }
 
 fn main() -> i32 {
     let a1 = [fmt_int(42), fmt_float(2.675), fmt_str("hi"), fmt_bool(true)];
@@ -155,6 +158,13 @@ fn main() -> i32 {
     // 输出位置计数法——那是另一处差异，不在本回归钉住的范围内。
     let a13 = [fmt_float(1.0e30), fmt_float(1.2345e30), fmt_float(-1.5e30)];
     println_fmt("big={} {} {}", &a13[0] as *const FormatArg, 3);
+    // 自定义类型走 `fmt_debug`：`{:?}` 单行、`{:#?}` 多行（`#` 在运行期决定
+    // 走 `.debug()` 还是 `.debug_pretty()`；渲染函数由 derive 生成）。
+    let pt = Pt { x: 3, y: 4 };
+    let a14 = [fmt_debug(&pt as *const void, Pt__debug_fmt)];
+    println_fmt("dbg={:?}", &a14[0] as *const FormatArg, 1);
+    let a15 = [fmt_debug(&pt as *const void, Pt__debug_fmt)];
+    println_fmt("dbgp={:#?}", &a15[0] as *const FormatArg, 1);
     // 命名参数 `{name}`：`{x}` 按名字查 `NamedArg` 表。名字没匹配按字面
     // 输出；重复用同一个名字；规格（`:>5`、`:x`）与位置参数一致。
     let na = [NamedArg { name: "x", value: fmt_int(7) }, NamedArg { name: "y", value: fmt_int(9) }];
@@ -190,7 +200,7 @@ fn main() -> i32 {
         );
         assert_eq!(
             run.stdout,
-            b"int=42 float=2.675 str=hi bool=true\ndebug=1.0 hex=ff hexu=FF esc=a\tb\\c\nexp=1.2345e3 1e3 1.2345E3\nexpp=1.23e3 0.00e0 9.99e2\niexp=1.234e3 -1e3 1.30e3\ndyn=[         5]\ndync=[****5*****]\ndynp=[1.23]\ndynp2=[1.235]\nidynp=[1234]\nw=[0003.142]\nnoprec=[2.675][hello]\nbig=1000000000000000000000000000000 1234500000000000000000000000000 -1500000000000000000000000000000\nnamed 7+9=7\nnmiss={unknown} 7\nspec=[    7] 0x7\n",
+            b"int=42 float=2.675 str=hi bool=true\ndebug=1.0 hex=ff hexu=FF esc=a\tb\\c\nexp=1.2345e3 1e3 1.2345E3\nexpp=1.23e3 0.00e0 9.99e2\niexp=1.234e3 -1e3 1.30e3\ndyn=[         5]\ndync=[****5*****]\ndynp=[1.23]\ndynp2=[1.235]\nidynp=[1234]\nw=[0003.142]\nnoprec=[2.675][hello]\nbig=1000000000000000000000000000000 1234500000000000000000000000000 -1500000000000000000000000000000\ndbg=Pt { x: 3, y: 4 }\ndbgp=Pt {\n    x: 3,\n    y: 4,\n}\nnamed 7+9=7\nnmiss={unknown} 7\nspec=[    7] 0x7\n",
             "标准输出不符 ({opt})"
         );
         let _ = std::fs::remove_file(&out);

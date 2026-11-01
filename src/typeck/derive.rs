@@ -39,7 +39,7 @@
 use crate::error::{CompileError, Result};
 use crate::parser::ast::{
     self, Argument, ArrayLen, AssignOp, BinaryOp, Block, Expression, FieldPat, Function, Literal,
-    Mutability, Param, Pattern, Receiver, Span, Statement, Type, VariantPayload,
+    Mutability, Param, Pattern, Receiver, Span, Statement, Type, UnaryOp, VariantPayload,
 };
 
 /// 生成代码没有源码位置。所有派生方法的诊断都落在同一点上，但错误文案里
@@ -168,6 +168,10 @@ pub fn derive_methods(type_name: &str, type_def: &ast::TypeDef, traits: &[String
             variants.as_deref(),
             span,
         )?);
+        // 格式引擎入口：`fn Type__debug_fmt(*const void, bool, *mut u8, usize) -> usize`。
+        // 放在 `debug_fn` 之后：字段类型不支持时 `debug_fn` 已经先报错返回，
+        // 不会生成一个引用不存在 `Type__debug` 的函数体。
+        out.push(debug_fmt_fn(type_name, &self_ty, span));
     }
     Ok(out)
 }
@@ -1391,6 +1395,126 @@ fn debug_pretty_value(e: Expression, ty: &Type, ind: Expression, span: Span) -> 
         // 其余就是单行渲染那套（标量/字符串），不需要缩进。
         _ => debug_value(e, ty, span),
     }
+}
+
+// ----------------------------------------------------------------------
+// `#[derive(Debug)]`：`fn Type__debug_fmt(*const void, bool, *mut u8, usize) -> usize`
+// ----------------------------------------------------------------------
+
+/// 给**格式引擎**（`io::fmt_debug`）用的入口：把 `*const void` 还原成 `Type`
+/// 值，按 `__pretty` 走 `.debug()` / `.debug_pretty()`，把渲染结果拷进调用方
+/// 的缓冲区并返回**所需**总长度。
+///
+/// 为什么需要这层包装：
+/// - `Type__debug(self)` 是按值接收者，而格式引擎手里只有值的一个指针，
+///   所以要在这里解引用还原（`*(__p as *const Type)`）；
+/// - `{:?}` 还是 `{:#?}` 是**运行期**由格式串里的 `#` 决定的，因此必须把
+///   "走哪条"当参数传进来，不能在校验时写死；
+/// - 返回所需长度、由调用方提供缓冲区（而不是返回 `String`）：`std/io.zr`
+///   刻意保持"自足"（不依赖 `std/string.zr`），收发 `String` 会引入一条新依赖。
+fn debug_fmt_fn(type_name: &str, self_ty: &Type, span: Span) -> Function {
+    // `*(__p as *const Type)`：把传入的值指针还原成值。
+    let deref_value = || {
+        Expression::Unary(
+            UnaryOp::Deref,
+            Box::new(cast(
+                var("__p"),
+                Type::Pointer(Box::new(self_ty.clone()), Mutability::Immutable),
+            )),
+            span,
+        )
+    };
+    // `let __s = if __pretty { Type__debug_pretty(*(..)) } else { Type__debug(*(..)) };`
+    let s_init = Expression::If(
+        Box::new(var("__pretty")),
+        Block {
+            stmts: Vec::new(),
+            tail: Some(Box::new(call_path_at(
+                &[format!("{type_name}__debug_pretty")],
+                vec![deref_value()],
+                span,
+            ))),
+            span,
+        },
+        Some(Box::new(call_path_at(
+            &[format!("{type_name}__debug")],
+            vec![deref_value()],
+            span,
+        ))),
+        span,
+    );
+    // `while __i < __n && __i < __cap { __buf[__i] = __s.ptr[__i]; __i = __i + 1; }`
+    let cond = Expression::Binary(
+        Box::new(bin(var("__i"), BinaryOp::Lt, var("__n"), span)),
+        BinaryOp::And,
+        Box::new(bin(var("__i"), BinaryOp::Lt, var("__cap"), span)),
+        span,
+    );
+    let copy_one = Statement::Expr(
+        Expression::Assign(
+            Box::new(Expression::Index(
+                Box::new(var("__buf")),
+                Box::new(var("__i")),
+                span,
+            )),
+            AssignOp::Assign,
+            Box::new(Expression::Index(
+                Box::new(field(var("__s"), "ptr")),
+                Box::new(var("__i")),
+                span,
+            )),
+            span,
+        ),
+        span,
+    );
+    let bump = Statement::Expr(
+        Expression::Assign(
+            Box::new(var("__i")),
+            AssignOp::Assign,
+            Box::new(bin(var("__i"), BinaryOp::Add, int(1), span)),
+            span,
+        ),
+        span,
+    );
+    let loop_ = Expression::While(
+        Box::new(cond),
+        Block {
+            stmts: vec![copy_one, bump],
+            tail: None,
+            span,
+        },
+        None,
+        span,
+    );
+    let body = Block {
+        stmts: vec![
+            Statement::Let(binding("__s"), None, Some(s_init), span),
+            Statement::Let(binding("__n"), None, Some(field(var("__s"), "len")), span),
+            let_mut("__i", named("usize"), int(0)),
+            stmt_expr(loop_, span),
+        ],
+        tail: Some(Box::new(var("__n"))),
+        span,
+    };
+    make_fn(
+        type_name,
+        "debug_fmt",
+        None,
+        vec![
+            param(
+                "__p",
+                &Type::Pointer(Box::new(Type::Void), Mutability::Immutable),
+            ),
+            param("__pretty", &Type::Bool),
+            param(
+                "__buf",
+                &Type::Pointer(Box::new(Type::U(8)), Mutability::Mutable),
+            ),
+            param("__cap", &named("usize")),
+        ],
+        named("usize"),
+        Expression::Block(body, span),
+    )
 }
 
 // ----------------------------------------------------------------------

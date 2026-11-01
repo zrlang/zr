@@ -164,17 +164,18 @@ zr 的做法是让被调方是**泛型**函数（`fn apply<F>(f: F, ..)`）：`F
 
 现状：`std/io.zr` 格式引擎支持 `{}` `{:?}` `{:x}` …、位置参数、动态宽度/精度；
 **命名参数 `{name}` 已实现**（`io::println_fmt_named(fmt, &[NamedArg], n)`，
-`0d40ab1`）。**`{:#?}` 多行聚合 Debug 分两步**：derive 侧已落地——`#[derive(Debug)]`
-生成 `.debug_pretty()` / `.debug_pretty_at(e, ind)`，输出对齐 Rust `{:#?}`；
-但**格式引擎尚未把 `{:#?}` 接到自定义类型**（`FormatArg` 只带标量/字符串种类），
-所以现在只能直接调生成的 `.debug_pretty()` 方法，还不能写
-`println_fmt("… {:#?}", …)`。
+`0d40ab1`）。**`{:#?}` 多行聚合 Debug 已全线打通**：derive 侧 `#[derive(Debug)]`
+生成 `.debug_pretty()` / `.debug_pretty_at(e, ind)`（输出对齐 Rust `{:#?}`）；
+格式引擎侧新增**类型化值通道**——`FormatArg` 加 `kind = 7`（custom）+ `obj_ptr`
++ `debug_fn` 函数指针，调用方写 `fmt_debug(&v as *const void, Type__debug_fmt)`
+即可把自定义类型交给 `{:?}` / `{:#?}`（`#` 在运行期决定走 `.debug()` 还是
+`.debug_pretty()`）。
 
 | 子任务 | 内容 | 状态 |
 |---|---|---|
 | P1-5a | 命名参数 `{name}`：格式引擎按名字查值（`NamedArg { name, value }`，名字与值同结构体） | ✅ `0d40ab1` |
 | P1-5b | `{:#?}` 多行 derive 侧：`#[derive(Debug)]` 生成 `Type__debug_pretty`（入口）/ `Type__debug_pretty_at(e, ind)`（递归 worker；缩进是**运行期**参数，同一类型不同深度都对齐 Rust）；`String::push_indent` 做缩进。`108_debug_pretty.zr` 逐个对照 `rustc {:#?}` | ✅ `13acff2` |
-| P1-5c | 格式引擎接 `{:?}` / `{:#?}`：`println_fmt` 让自定义类型的 `Debug` 走格式串（需在 `FormatArg` 之外加类型化值通道） | ⬜ |
+| P1-5c | 格式引擎接 `{:?}` / `{:#?}`：`FormatArg` 加类型化值通道（`kind = 7` + `obj_ptr` + `debug_fn`），`derive` 生成 `Type__debug_fmt(*const void, bool, *mut u8, usize) -> usize`，`io::fmt_debug` 组装参数。`tests/cases/112_fmt_debug.zr` + `io_print_matches_rust` 逐字节对照 Rust | ✅ |
 
 ### P1-6 元数据 / tempfile API
 

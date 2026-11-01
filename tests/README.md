@@ -121,6 +121,8 @@ cargo test --test zr_language
 | `108_debug_pretty.zr` | `#[derive(Debug)]` 生成的多行 `.debug_pretty()`（Rust `{:#?}` 风格）：命名结构体/结构体变体每字段一行、元组结构体/元组变体逐元素一行、单元变体与空结构体只打名字；嵌套命名类型递归 `Inner__debug_pretty_at(e, ind)`，`__ind` 是**运行期**参数（同一类型出现在深度 0 与深度 2 都对齐 Rust）。期望串逐个对照 `rustc {:#?}` |
 | `109_closure_env_cross_fn.zr` | 带捕获闭包**跨函数**传递：把环境结构体 `__env_N` 按值当实参传给**泛型**形参（`fn apply<F>(f: F, ..)`，`F` 单态化到 `__env_N`），被调函数体的 `f(x)` 同样按环境 DefId 内联展开。覆盖单元/多捕获、同一闭包传给两个泛型函数、重复调用、**数组捕获 + 变量下标**（早先 `substitute_local` 的 `Index` 分支只替换下标不替换数组基址，跨函数内联读到别的栈帧、SIGSEGV）、元组捕获、闭包体内数组字面量（`Array` 子表达式含捕获）与 `return`。`fn(..)` 形参仍拒绝（见负向 `07_closure_capture.zr`） |
 | `110_closure_env_generic_passthrough.zr` | 带捕获闭包的**值传递**穿函数边界与结构体字段：泛型透传返回（`fn idf<F>(f: F) -> F`）、存进泛型结构体字段并调用 `h.f(x)`、把结构体传给泛型函数再调用字段、数组捕获穿过字段 + 泛型函数（变量下标）、捕获的值拷贝语义（捕获后改外层不影响闭包）。这些形态在泛型路径下本就可用；做不到的只是转裸 `fn(..)` 指针 |
+| `111_i128.zr` | x86-64 上的 `i128`/`u128`：拆成两个连续 8 字节栈槽（lo/hi），加减 `adc`/`sbb`、位运算逐字、移位 `shld`/`shrd`、比较按高位优先定序，传参/返回走 `rdx:rax`，字面量/拷贝/转换；**乘/除/取模显式报错**，32 位目标仍禁用 |
+| `112_fmt_debug.zr` | 格式引擎接自定义类型 Debug（P1-5c）：`FormatArg` 加 `kind = 7` 类型化值通道（`obj_ptr` + `debug_fn`），`#[derive(Debug)]` 生成 `Type__debug_fmt(*const void, bool, *mut u8, usize) -> usize`，`io::fmt_debug` 组装参数。断言单行/多行两态逐字符对齐 Rust、超容量按容量截断且返回所需总长度、嵌套结构体递归渲染，并经 `println_fmt` 端到端冒烟 |
 
 ## 尚未覆盖（编译器还不支持）
 

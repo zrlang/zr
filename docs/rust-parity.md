@@ -155,10 +155,10 @@
 | Rust 的写法 | zr 的现状 | 状态 | 说明 |
 |------|------|------|------|
 | `println!("...")` 宏 | `println(s: str)` 普通函数 | 🟡 | zr 的 `println` 是**函数不是宏**：`println!("{}", 1)` 解析失败（`zr: expected '}' to close block: expected RBrace, found Bang`）。参数类型现在会检查：`println(42)` 报 `type mismatch: expected `str`, found `i32`` |
-| `print!` / `println!` 格式化 `{}` | `println_fmt(fmt, &[FormatArg], n)` | 🟡 | 支持 `{}`、`{:?}`、`{:x}`、`{:X}`、`{:b}`、`{:o}`、`{:e}`、`{:E}`、位置参数 `{0}`、`{{`/`}}` 转义，以及填充 / 对齐（`<` `>` `^`）、`+`、`#`、`0`、宽度、精度（`{:08.2}`、`{:*^10.3}`）、动态宽度 `{:1$}`、动态精度 `{:.*}` / `{:.1$}`；与 Rust 逐字符对比一致。**没有**命名参数 `{name}`，`{:#?}` 也只会输出一行（`#` 对 `{:?}` 被忽略） |
+| `print!` / `println!` 格式化 `{}` | `println_fmt(fmt, &[FormatArg], n)` | 🟡 | 支持 `{}`、`{:?}`、`{:x}`、`{:X}`、`{:b}`、`{:o}`、`{:e}`、`{:E}`、位置参数 `{0}`、`{{`/`}}` 转义，以及填充 / 对齐（`<` `>` `^`）、`+`、`#`、`0`、宽度、精度（`{:08.2}`、`{:*^10.3}`）、动态宽度 `{:1$}`、动态精度 `{:.*}` / `{:.1$}`；与 Rust 逐字符对比一致。命名参数走 `println_fmt_named(fmt, &[NamedArg], n)`；自定义类型的 `{:?}` / `{:#?}` 走 `io::fmt_debug(&v as *const void, Type__debug_fmt)`（`FormatArg` 的 `kind = 7` 类型化值通道）。**标量**的 `{:#?}` 仍只输出一行（`#` 对标量被忽略） |
 | `Display` 浮点格式 | 最短可回读十进制 | ✅ | `1.0`→`1`、`3.5`→`3.5`、`1.0/3.0`→`0.3333333333333333`、`0.1+0.2`→`0.30000000000000004`、`-0.0`→`-0`、`1e30`→`1000000000000000000000000000000`，与 Rust 一致（早先 ≥2⁶⁴ 会打成 `.0`，已修） |
 | `eprintln!` / `eprint!` | `eprintln(s)` / `eprint(s)` | ✅ | 写到 STDERR |
-| `println!("{:?}", x)` 结构体调试 | 需手写 `fmt_*` | 🟡 | 只有 `fmt_int` / `fmt_uint` / `fmt_float` / `fmt_bool` / `fmt_str` / `fmt_char` / `fmt_hex` 几种预制参数，没有自动 `Debug` |
+| `println!("{:?}", x)` 结构体调试 | `fmt_debug(&v as *const void, Type__debug_fmt)` | 🟡 | `#[derive(Debug)]` 生成 `.debug()` / `.debug_pretty()` 与格式引擎入口 `Type__debug_fmt`；`println_fmt("… {:?} …", &[fmt_debug(..)], n)` 单行、`{:#?}` 多行，与 Rust 逐字符一致。**未覆盖**：泛型类型上的 derive、`{:#?}` 对浮点/指针/数组/元组字段（derive 侧显式报错） |
 
 ### 3.2 标准输入
 
@@ -268,13 +268,16 @@
    `105_borrow_nll.zr` + 负向 20/21/22）；`let b = a` 对含 drop glue 的类型是
    移动、读被移动的源报 use-after-move（`87_move_check.zr`）。**已知局限**：
    多绑定 / 未关联借用仍按作用域结束；移动只覆盖整值，字段级 / 按值传参不覆盖。
-4. **格式引擎的 `{:#?}` 还没接到自定义类型**：命名参数 `{name}` 已实现
-   （`println_fmt_named`）；`#[derive(Debug)]` 也已生成 `.debug()` /
-   `.debug_pretty()`。但 `FormatArg` 只带标量 / 字符串种类，`println_fmt` 里的
-   自定义类型还接不进去——`{:#?}` 对自定义类型目前只能直接调生成的
-   `.debug_pretty()`。其余（`{}` `{:?}` `{:x}` `{:X}` `{:b}` `{:o}` `{:e}`
+4. **格式引擎已接自定义类型的 `{:?}` / `{:#?}`**：命名参数 `{name}` 走
+   `println_fmt_named`；`#[derive(Debug)]` 生成 `.debug()` / `.debug_pretty()`
+   及格式引擎入口 `Type__debug_fmt(*const void, bool, *mut u8, usize) -> usize`，
+   调用方经 `io::fmt_debug(&v as *const void, Type__debug_fmt)` 把值交给
+   `println_fmt` 的格式串（`FormatArg` 的 `kind = 7` 类型化值通道，`#` 在运行期
+   决定单行 / 多行）。其余（`{}` `{:?}` `{:x}` `{:X}` `{:b}` `{:o}` `{:e}`
    `{:E}`、位置参数、填充 / 对齐 / `+` / `#` / `0` / 宽度 / 精度、动态宽度
-   `{:1$}`、动态精度 `{:.*}` / `{:.1$}`）已与 Rust 逐字符对齐。
+   `{:1$}`、动态精度 `{:.*}` / `{:.1$}`）已与 Rust 逐字符对齐。**未覆盖**：
+   泛型类型上的 derive；`{:#?}` 对浮点 / 指针 / 数组 / 元组字段（derive 侧显式报错）；
+   标量的 `{:#?}` 仍只输出一行。
 5. **闭包：`fn(..)` 形参 / 返回值两条路径明确报错**。无捕获闭包可存变量 / 当实参 /
    返回；带捕获闭包也可存变量 / 嵌套 / 多次调用，并能按值传给**泛型**形参、从
    泛型返回值透传（`109_closure_env_cross_fn.zr`、
