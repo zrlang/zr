@@ -94,6 +94,16 @@ impl String {
         self.push_bytes(Slice { ptr: s.ptr, len: s.len });
     }
 
+    /// 追加 `n` 个空格。`#[derive(Debug)]` 生成的多行 `.debug_pretty()` 用它
+    /// 做逐层缩进（每层 4 空格），见 `src/typeck/derive.rs`。
+    pub fn push_indent(self: &mut String, n: usize) {
+        let mut i = 0;
+        while i < n {
+            self.push_byte(32);
+            i = i + 1;
+        }
+    }
+
     /// 追加一个数字（十进制）。
     pub fn push_int(self: &mut String, n: i64) {
         if n == 0 {

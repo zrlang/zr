@@ -161,6 +161,13 @@ pub fn derive_methods(type_name: &str, type_def: &ast::TypeDef, traits: &[String
     }
     if want_debug {
         out.push(debug_fn(type_name, &self_ty, fields.as_deref(), variants.as_deref(), span)?);
+        out.extend(debug_pretty_fns(
+            type_name,
+            &self_ty,
+            fields.as_deref(),
+            variants.as_deref(),
+            span,
+        )?);
     }
     Ok(out)
 }
@@ -1185,6 +1192,208 @@ fn debug_value(e: Expression, ty: &Type, span: Span) -> Result<Expression> {
 }
 
 // ----------------------------------------------------------------------
+// `#[derive(Debug)]`：`fn Type__debug_pretty(self) -> String`（Rust `{:#?}`）
+// ----------------------------------------------------------------------
+
+/// `{:#?}` 多行 pretty Debug。为每个 derive 了 `Debug` 的类型生成**两个**函数：
+///
+/// - `fn Type__debug_pretty(self) -> String`：用户调用的入口
+///   （`.debug_pretty()`），以起始缩进 0 调用下面那个 worker；
+/// - `fn Type__debug_pretty_at(self, __ind: usize) -> String`：真正递归的 worker。
+///   `__ind` 是**本层起始缩进**（本层右花括号对齐到该列），字段缩进为
+///   `__ind + 4`；嵌套命名类型递归 `Inner__debug_pretty_at(e, __ind + 4)`，
+///   于是内层字符串自带的换行缩进是**绝对列**，能直接嵌在外层字段行中间。
+///
+/// 缩进宽度是**运行期**量（同一类型可能出现在不同嵌套深度，见
+/// `Option<Inner>` 与 `Inner` 并存的场景），所以 worker 必须收 `__ind`
+/// 参数、用 `String::push_indent` 逐字节补空格。
+///
+/// 输出与 Rust `{:#?}` 对齐：命名/结构体变体每个字段一行、行尾带 `,`；
+/// 元组结构体/元组变体每个元素一行；单元变体与空结构体只打名字（无换行）。
+fn debug_pretty_fns(
+    type_name: &str,
+    self_ty: &Type,
+    fields: Option<&[FieldInfo]>,
+    variants: Option<&[ast::Variant]>,
+    span: Span,
+) -> Result<Vec<Function>> {
+    let mut stmts = vec![let_mut(
+        "__s",
+        named("String"),
+        call_path(&["String".to_string(), "new".to_string()], Vec::new()),
+    )];
+    if let Some(fields) = fields {
+        // 结构体：空结构体只打名字；元组结构体每个元素一行；命名结构体
+        // 每个字段 `name: value` 一行。
+        if fields.is_empty() {
+            stmts.push(stmt_expr(push_bytes_lit(type_name), span));
+        } else if is_tuple_struct(fields) {
+            stmts.push(stmt_expr(push_bytes_lit(&format!("{type_name}(\n")), span));
+            for f in fields.iter() {
+                stmts.push(stmt_expr(push_indent_expr(ind_plus4(span)), span));
+                let v = debug_pretty_value(
+                    field_at(self_expr(), &f.name, f.span),
+                    &f.ty,
+                    ind_plus4(span),
+                    f.span,
+                )?;
+                stmts.push(stmt_expr(v, f.span));
+                stmts.push(stmt_expr(push_bytes_lit(",\n"), span));
+            }
+            stmts.push(stmt_expr(push_indent_expr(var("__ind")), span));
+            stmts.push(stmt_expr(push_bytes_lit(")"), span));
+        } else {
+            stmts.push(stmt_expr(push_bytes_lit(&format!("{type_name} {{\n")), span));
+            for f in fields.iter() {
+                stmts.push(stmt_expr(push_indent_expr(ind_plus4(span)), span));
+                stmts.push(stmt_expr(push_bytes_lit(&format!("{}: ", f.name)), f.span));
+                let v = debug_pretty_value(
+                    field_at(self_expr(), &f.name, f.span),
+                    &f.ty,
+                    ind_plus4(span),
+                    f.span,
+                )?;
+                stmts.push(stmt_expr(v, f.span));
+                stmts.push(stmt_expr(push_bytes_lit(",\n"), span));
+            }
+            stmts.push(stmt_expr(push_indent_expr(var("__ind")), span));
+            stmts.push(stmt_expr(push_bytes_lit("}"), span));
+        }
+    } else {
+        // 枚举：每个变体一条臂；载荷逐元素/逐字段一行。
+        let arms = variants
+            .unwrap_or(&[])
+            .iter()
+            .map(|v| -> Result<ast::Arm> {
+                let pts = payload_types(v);
+                let mut arm_stmts = Vec::new();
+                if pts.is_empty() {
+                    arm_stmts.push(stmt_expr(push_bytes_lit(&v.name), span));
+                } else {
+                    let is_struct = matches!(v.payload, VariantPayload::Struct(_));
+                    let head = if is_struct {
+                        format!("{} {{\n", v.name)
+                    } else {
+                        format!("{}(\n", v.name)
+                    };
+                    arm_stmts.push(stmt_expr(push_bytes_lit(&head), span));
+                    let binds = payload_binds(v, "s");
+                    let fnames = payload_field_names(v);
+                    for (k, ty) in pts.iter().enumerate() {
+                        arm_stmts.push(stmt_expr(push_indent_expr(ind_plus4(span)), span));
+                        if is_struct {
+                            arm_stmts.push(stmt_expr(
+                                push_bytes_lit(&format!("{}: ", fnames[k])),
+                                span,
+                            ));
+                        }
+                        let val = debug_pretty_value(var(&binds[k]), ty, ind_plus4(span), span)?;
+                        arm_stmts.push(stmt_expr(val, span));
+                        arm_stmts.push(stmt_expr(push_bytes_lit(",\n"), span));
+                    }
+                    arm_stmts.push(stmt_expr(push_indent_expr(var("__ind")), span));
+                    arm_stmts.push(stmt_expr(
+                        push_bytes_lit(if is_struct { "}" } else { ")" }),
+                        span,
+                    ));
+                }
+                Ok(ast::Arm {
+                    pattern: variant_pattern(type_name, v, "s"),
+                    guard: None,
+                    body: Box::new(Expression::Block(
+                        Block {
+                            stmts: arm_stmts,
+                            tail: None,
+                            span,
+                        },
+                        span,
+                    )),
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        stmts.push(Statement::Expr(
+            Expression::Match(Box::new(self_expr()), arms, span),
+            span,
+        ));
+    }
+    let worker = make_fn(
+        type_name,
+        "debug_pretty_at",
+        Some(receiver(self_ty)),
+        vec![param("__ind", &named("usize"))],
+        named("String"),
+        Expression::Block(
+            Block {
+                stmts,
+                tail: Some(Box::new(var("__s"))),
+                span,
+            },
+            span,
+        ),
+    );
+    // 入口：以起始缩进 0 调用 worker。用户拿到的 API 是 `.debug_pretty()`。
+    let entry = make_fn(
+        type_name,
+        "debug_pretty",
+        Some(receiver(self_ty)),
+        Vec::new(),
+        named("String"),
+        call_path_at(
+            &[format!("{type_name}__debug_pretty_at")],
+            vec![self_expr(), int(0)],
+            span,
+        ),
+    );
+    Ok(vec![entry, worker])
+}
+
+/// 把 `expr` 以 `{:#?}` 风格追加到 `__s`。
+///
+/// 叶子类型（整数 / `bool` / `char` / `str` / 切片）与单行 `debug_value`
+/// 完全一致（不带缩进）；命名类型递归 `{Last}__debug_pretty_at(e, ind)`，
+/// 其中 `ind` 是**该嵌套值自身的起始缩进**（调用方传 `__ind + 4`）。
+fn debug_pretty_value(e: Expression, ty: &Type, ind: Expression, span: Span) -> Result<Expression> {
+    match ty {
+        Type::Named { path, .. } if path.last().map(String::as_str) == Some("String") => {
+            return Err(CompileError::type_error(
+                "cannot derive `Debug`: `String` field needs explicit handling",
+            )
+            .with_span(span));
+        }
+        Type::Named { path, .. } => {
+            let last = path.last().cloned().unwrap_or_default();
+            let nested =
+                call_path_at(&[format!("{last}__debug_pretty_at")], vec![e, ind], span);
+            Ok(block_expr(
+                vec![
+                    Statement::Var(
+                        binding("__n"),
+                        Some(named("String")),
+                        Some(nested),
+                        span,
+                    ),
+                    stmt_expr(
+                        method_call(
+                            var("__s"),
+                            "push_str",
+                            vec![Expression::AddrOf(
+                                Box::new(var("__n")),
+                                Mutability::Immutable,
+                                span,
+                            )],
+                        ),
+                        span,
+                    ),
+                ],
+                span,
+            ))
+        }
+        // 其余就是单行渲染那套（标量/字符串），不需要缩进。
+        _ => debug_value(e, ty, span),
+    }
+}
+
+// ----------------------------------------------------------------------
 // Debug 专用的 AST 构造小工具
 // ----------------------------------------------------------------------
 
@@ -1215,6 +1424,16 @@ fn push_uint_expr(e: Expression) -> Expression {
 
 fn push_byte_expr(e: Expression) -> Expression {
     method_call(var("__s"), "push_byte", vec![e])
+}
+
+/// `__s.push_indent(n)`——追加 `n` 个空格（`{:#?}` 多行 Debug 缩进用）。
+fn push_indent_expr(n: Expression) -> Expression {
+    method_call(var("__s"), "push_indent", vec![n])
+}
+
+/// `__ind + 4`——本层字段相对本层起始缩进再进一层。
+fn ind_plus4(span: Span) -> Expression {
+    bin(var("__ind"), BinaryOp::Add, int(4), span)
 }
 
 /// `if cond { then } else { else }`（两个分支都是 `()` 表达式）。

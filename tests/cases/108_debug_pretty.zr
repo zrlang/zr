@@ -1,0 +1,109 @@
+// 108_debug_pretty.zr —— `#[derive(Debug)]` 生成的多行 `.debug_pretty()`
+// （Rust `{:#?}` 风格）。
+//
+// `debug_pretty()` 与单行 `debug()` 并存：每个字段/元素一行，命名结构体与
+// 结构体变体每行 `name: value,`，元组结构体与元组变体逐元素一行，单元变体
+// 与空结构体只打名字。嵌套命名类型递归 `Inner__debug_pretty_at(e, ind)`，
+// 内层字符串自带**绝对列**缩进（每层 4 空格），直接嵌在外层字段行中间。
+// 本用例的期望串逐个对照 `rustc` 的实际 `{:#?}` 输出（见提交信息）。
+//
+// 关键回归点：`A` 同时出现在**深度 0**（顶层）与**深度 2**（`C > B > A`），
+// `A__debug_pretty_at` 的 `__ind` 必须是运行期参数——写死 0 或写死固定缩进
+// 都会让其中一处与 Rust 不一致。
+#[derive(Debug)]
+struct Inner { v: i64 }
+#[derive(Debug)]
+struct Wrap { inner: Inner }
+#[derive(Debug)]
+struct Point { x: i64, y: i64, name: str, ok: bool, ch: char }
+#[derive(Debug)]
+struct Pair(i64, bool);
+#[derive(Debug)]
+enum Shape { Circle, Rect(i64, i64), Named { w: i64, h: i64 } }
+#[derive(Debug)]
+struct Outer { name: str, inner: Inner, tag: i64 }
+#[derive(Debug)]
+struct Empty {}
+#[derive(Debug)]
+struct A { v: i64 }
+#[derive(Debug)]
+struct B { a: A }
+#[derive(Debug)]
+struct C { b: B }
+
+// `expect`：逐字符比对，长度不符返回 1、字节不符返回 2。多行期望串用 `\n`
+// 与空格写成和 Rust 一致的绝对缩进。
+fn expect(s: String, want: str) -> i32 {
+    if s.len != want.len { return 1; }
+    let mut i: usize = 0;
+    while i < s.len {
+        if s.ptr[i] != want.ptr[i] { return 2; }
+        i += 1;
+    }
+    return 0;
+}
+
+fn main() -> i32 {
+    // 单元命名结构体：`Inner {\n    v: 7,\n}`。
+    let r = expect(Inner { v: 7 }.debug_pretty(), "Inner {\n    v: 7,\n}");
+    if r != 0 { return 10 + r; }
+
+    // 嵌套结构体：内层字段 8 空格、内层右花括号 4 空格（绝对列）。
+    let r = expect(
+        Wrap { inner: Inner { v: 7 } }.debug_pretty(),
+        "Wrap {\n    inner: Inner {\n        v: 7,\n    },\n}",
+    );
+    if r != 0 { return 20 + r; }
+
+    // 标量 + str + bool + char 命名结构体。
+    let p = Point { x: 10, y: -3, name: "bob", ok: true, ch: 'Z' };
+    let r = expect(
+        p.debug_pretty(),
+        "Point {\n    x: 10,\n    y: -3,\n    name: \"bob\",\n    ok: true,\n    ch: 'Z',\n}",
+    );
+    if r != 0 { return 30 + r; }
+
+    // 元组结构体：逐元素一行。
+    let r = expect(Pair(1, false).debug_pretty(), "Pair(\n    1,\n    false,\n)");
+    if r != 0 { return 40 + r; }
+
+    // 单元变体：只打名字，无换行。
+    let r = expect(Shape::Circle.debug_pretty(), "Circle");
+    if r != 0 { return 50 + r; }
+
+    // 元组变体：逐元素一行。
+    let r = expect(Shape::Rect(1, 2).debug_pretty(), "Rect(\n    1,\n    2,\n)");
+    if r != 0 { return 60 + r; }
+
+    // 结构体变体：逐字段一行。
+    let r = expect(
+        Shape::Named { w: 2, h: 9 }.debug_pretty(),
+        "Named {\n    w: 2,\n    h: 9,\n}",
+    );
+    if r != 0 { return 70 + r; }
+
+    // `str` 字段 + 嵌套结构体字段（`str` 在前）混排。
+    let o = Outer { name: "bob", inner: Inner { v: 7 }, tag: 9 };
+    let r = expect(
+        o.debug_pretty(),
+        "Outer {\n    name: \"bob\",\n    inner: Inner {\n        v: 7,\n    },\n    tag: 9,\n}",
+    );
+    if r != 0 { return 80 + r; }
+
+    // 空结构体：只打名字。
+    let r = expect(Empty {}.debug_pretty(), "Empty");
+    if r != 0 { return 90 + r; }
+
+    // 同一类型在不同深度：深度 0 的 `A { v: 1 }`。
+    let r = expect(A { v: 1 }.debug_pretty(), "A {\n    v: 1,\n}");
+    if r != 0 { return 100 + r; }
+
+    // 深度 2 的 `A`（`C > B > A`）：字段缩进 12、`A` 的右括号 8、`B` 的 4。
+    let r = expect(
+        C { b: B { a: A { v: 1 } } }.debug_pretty(),
+        "C {\n    b: B {\n        a: A {\n            v: 1,\n        },\n    },\n}",
+    );
+    if r != 0 { return 110 + r; }
+
+    return 0;
+}
