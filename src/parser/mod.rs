@@ -946,6 +946,25 @@ mod tests {
     }
 
     #[test]
+    fn parse_empty_struct_literal() {
+        // 回归：零字段结构体字面量 `Empty {}` 早先不认（`{` 后直接是 `}`），
+        // `Empty` 被当成变量、`{` 留给调用方，表达式位置报 `expected ')'`。
+        // 现在 `{` 后直接是 `}` 也按结构体字面量解析。
+        let p = parse_ok("fn main() { let e = Empty {}; }");
+        let body = p.functions[0].body.as_ref().expect("函数有体");
+        assert_eq!(body.stmts.len(), 1);
+        assert!(
+            matches!(
+                &body.stmts[0],
+                Statement::Let(_, _, Some(Expression::StructInit(_, fields, _, _)), _)
+                    if fields.is_empty()
+            ),
+            "应是零字段结构体字面量，实际是 {:?}",
+            body.stmts[0]
+        );
+    }
+
+    #[test]
     fn parse_enum_with_payload() {
         let p = parse_ok("enum Result<T, E> { Ok(T), Err(E), }");
         assert_eq!(p.type_defs.len(), 1);

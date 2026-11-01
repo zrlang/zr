@@ -934,10 +934,16 @@ impl Parser {
     /// 当前的 `{` 是不是结构体字面量的开头。
     ///
     /// `{` 后紧跟「标识符」且其后是 `:` 或 `,` / `}` 时才认定，避免和块
-    /// 语法冲突；`Type { ..base }` 没有字段名，`{` 后面直接是 `..`。
+    /// 语法冲突；`Type { ..base }` 没有字段名，`{` 后面直接是 `..`；
+    /// `Type {}`（空结构体字面量）`{` 后面直接是 `}`。
+    ///
+    /// 空花括号必须单独判：`Empty {}` 是零字段结构体字面量，若不认它，
+    /// `Path` 会被当成变量、`{` 留给调用方（`match` / `for` 的块体），
+    /// 表达式位置的 `Empty {}` 直接解析失败。块状构造（`if` / `while` /
+    /// `if let` 的条件）都已在 `no_struct_literal` 下禁用本判别，不受影响。
     fn looks_like_struct_literal(&self) -> bool {
         self.peek_n(1).is_some_and(|t| {
-            if matches!(t.kind, TokenKind::DotDot) {
+            if matches!(t.kind, TokenKind::RBrace | TokenKind::DotDot) {
                 return true;
             }
             matches!(t.kind, TokenKind::Ident(_))
