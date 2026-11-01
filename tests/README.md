@@ -119,6 +119,7 @@ cargo test --test zr_language
 | `97_loop_value.zr` | `loop` 表达式带值 `break`：`let x = loop { break 7; }` = 7、累加器 = 0+1+2+3、嵌套 break 值只外层生效、`while`/`for` break 作语句、发散循环（早先 `Break` 只记标签丢弃值、`Loop` 恒 `Never`，全静默得 0）。**聚合 break 值在 `-O3`/`-Oz` 有已知 codegen 缺陷** |
 | `107_string_push_bytes_reserve.zr` | `String::push_bytes` 扩容算错：早先传 `reserve(new_len - capacity)`（只在 `len == capacity` 时够），其余情况少 reserve、拷贝循环越界写堆，可能覆写相邻对象/`SIGABRT`；本用例在循环里 `push_byte` 触发 realloc 后再 `push_bytes` 多字节字面量，断言字节完整、无 NUL |
 | `108_debug_pretty.zr` | `#[derive(Debug)]` 生成的多行 `.debug_pretty()`（Rust `{:#?}` 风格）：命名结构体/结构体变体每字段一行、元组结构体/元组变体逐元素一行、单元变体与空结构体只打名字；嵌套命名类型递归 `Inner__debug_pretty_at(e, ind)`，`__ind` 是**运行期**参数（同一类型出现在深度 0 与深度 2 都对齐 Rust）。期望串逐个对照 `rustc {:#?}` |
+| `109_closure_env_cross_fn.zr` | 带捕获闭包**跨函数**传递：把环境结构体 `__env_N` 按值当实参传给**泛型**形参（`fn apply<F>(f: F, ..)`，`F` 单态化到 `__env_N`），被调函数体的 `f(x)` 同样按环境 DefId 内联展开。覆盖单元/多捕获、同一闭包传给两个泛型函数、重复调用、**数组捕获 + 变量下标**（早先 `substitute_local` 的 `Index` 分支只替换下标不替换数组基址，跨函数内联读到别的栈帧、SIGSEGV）、元组捕获、闭包体内数组字面量（`Array` 子表达式含捕获）与 `return`。`fn(..)` 形参仍拒绝（见负向 `07_closure_capture.zr`） |
 
 ## 尚未覆盖（编译器还不支持）
 

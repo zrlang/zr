@@ -9680,7 +9680,23 @@ fn substitute_local(e: &mut hir::HirExpr, target: LocalId, with: &hir::HirExpr) 
         }
         ExprKind::Loop(_, body) => walk_block(body, target, with),
         ExprKind::Block(b) => walk_block(b, target, with),
-        ExprKind::Index(_, v) => substitute_local(v, target, with),
+        // `receiver[index]`：**两个**操作数都要替换。早先写成 `Index(_, v)`
+        // 只下沉到下标，`arr[i]` 里的 `arr` 保持未替换——同函数内联时外层
+        // local 还活着，读到的恰好是对的（`84_closure_capture_value.zr` 第 3 组
+        // 就这么"碰巧"过了）；一旦闭包跨函数内联进被调方（`apply_capture_body`
+        // 把捕获 local 替换成 `env.__cN`），未替换的 `Local(arr)` 在别的函数帧
+        // 里指向垃圾，按数组基址索引直接 SIGSEGV。
+        ExprKind::Index(recv, idx) => {
+            substitute_local(recv, target, with);
+            substitute_local(idx, target, with);
+        }
+        // 数组 / 元组字面量同样持有子表达式：闭包体 `|k| (x, k)`、`|i| [x, i]`
+        // 里的捕获 `x` 必须替换，否则与 `Index` 同因（跨函数内联读到外层帧）。
+        ExprKind::Array(elems) | ExprKind::Tuple(elems) => {
+            for e in elems {
+                substitute_local(e, target, with);
+            }
+        }
         ExprKind::Struct(fields) => {
             for (_, f) in fields {
                 substitute_local(f, target, with);
@@ -9697,8 +9713,6 @@ fn substitute_local(e: &mut hir::HirExpr, target: LocalId, with: &hir::HirExpr) 
         | ExprKind::Defer(_)
         | ExprKind::Try { .. }
         | ExprKind::Throw(_)
-        | ExprKind::Array(..)
-        | ExprKind::Tuple(..)
         | ExprKind::Closure { .. }
         | ExprKind::Asm { .. }
         | ExprKind::Yield

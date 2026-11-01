@@ -322,7 +322,7 @@ README 里"指针与 unsafe"一节目前是**愿景**：
   支持规格（`{x:>5}`、`{x:x}`）与重复使用同一个名字（`{x}..{x}`）。
   `io_print_matches_rust` 已加 `{x}+{y}={x}` / `nmiss={unknown} {x}` / `spec=[{x:>5}] 0x{x:x}`
   三组钉住。
-- **闭包**：**无捕获**闭包已可存进变量/当实参/返回（提升成 `__closure_N` 顶层函数指针）；**带捕获**闭包已可存进变量/嵌套/多次调用（`tests/cases/84_closure_capture_value.zr`）；**跨函数传 env 未实现**，两条路径都明确报错——传给 `fn(..)` 形参报 `captured closure cannot be passed as a plain `fn` value`（负向 `07_closure_capture.zr`），作为 `fn(..)` 返回值报 `captured closure cannot be returned as a plain `fn` value`（负向 `25_closure_return.zr`；早先编译通过、运行 SIGSEGV）。返回路径的检查在 `check_expr` 的 `Expression::Return` 分支，与实参检查（`check_call`）对称。
+- **闭包**：**无捕获**闭包已可存进变量/当实参/返回（提升成 `__closure_N` 顶层函数指针）；**带捕获**闭包已可存进变量/嵌套/多次调用（`tests/cases/84_closure_capture_value.zr`）；**跨函数传 env 已支持**——把环境结构体按值当实参传给**泛型**形参（`fn apply<F>(f: F, ..)`，`F` 单态化到 `__env_N`，被调函数体的 `f(x)` 按环境 DefId 内联展开，`tests/cases/109_closure_env_cross_fn.zr`）。**`fn(..)` 形参/返回值两条路径仍明确报错**——传给 `fn(..)` 形参报 `captured closure cannot be passed as a plain `fn` value`（负向 `07_closure_capture.zr`），作为 `fn(..)` 返回值报 `captured closure cannot be returned as a plain `fn` value`（负向 `25_closure_return.zr`；早先编译通过、运行 SIGSEGV）；要支持需 `Fn` 边界 / 胖指针，属独立大工程。返回路径的检查在 `check_expr` 的 `Expression::Return` 分支，与实参检查（`check_call`）对称。跨函数内联靠 `substitute_local` 把捕获 local 替换成形参 `f.__cN`——**该函数必须递归进 `Index` 的基址、`Array`/`Tuple` 元素**，早先 `Index(_, v)` 只替换下标，数组捕获跨函数内联读到别的栈帧直接 SIGSEGV（同函数内联因外层 local 还在而"碰巧"对）。
 - **`i128`/`u128`** 在 64 位目标上不可用（需寄存器对拆分）。
 - **泛型推断**：✅ 已改进（`bab298c`）——`try_instantiate_call` 推不出类型参数时
   留推断变量、等用法体约束（`let v = Vec::new(); v.push(1)` 不再报

@@ -1,0 +1,89 @@
+// 覆盖：**带捕获**闭包跨函数传递（env 结构体按值传给泛型形参）。
+//
+// 背景：带捕获闭包的值模型是环境结构体 `__env_N`（字段 = 捕获 local 的值拷贝），
+// 调用点按环境 DefId 查 `closures_by_env` 内联展开。把这个环境值当**实参**传出去，
+// zr 的做法是让被调方是**泛型**函数（`fn apply<F>(f: F, ..)`）——`F` 单态化到
+// `__env_N`，被调函数体里的 `f(x)` 同样按环境 DefId 内联展开，捕获 local 被替换
+// 成形参 `f.__cN`（`apply_capture_body`）。这也正是"env 打包成结构体按值传给被调
+// 方"的形态；zr 没有 `Fn` 边界 / 胖指针，`fn(..)` 形参仍然拒绝（见
+// `tests/negative/07_closure_capture.zr`）。
+//
+// 早先这里有一个静默 bug：`substitute_local` 的 `Index` 分支写成 `Index(_, v)`，
+// 只替换下标、**不替换数组基址**。同函数内联时外层 local 还活着，`arr[i]` 读到
+// 的恰好是对的（`84_closure_capture_value.zr` 第 3 组因此"碰巧"通过）；一旦闭包
+// 跨函数内联进被调方，未替换的 `Local(arr)` 指向**另一个函数帧**的垃圾，按数组
+// 基址索引直接 SIGSEGV（`apply(get, 2)` 五档全 139）。`Array` / `Tuple` 字面量
+// 持有子表达式却列在 `substitute_local` 的空操作分支里，同因。
+fn apply<F>(f: F, x: i32) -> i32 {
+    return f(x);
+}
+
+fn apply2<G>(g: G, x: i32) -> i32 {
+    return g(x) + 1;
+}
+
+fn main() -> i32 {
+    // 1. 单元捕获 + 单次调用。
+    let n: i32 = 40;
+    let inc = |x: i32| x + n;
+    if apply(inc, 2) != 42 {
+        return 1;
+    }
+
+    // 2. 多捕获（两个外层局部）。
+    let a: i32 = 3;
+    let b: i32 = 4;
+    let add = |x: i32| x + a + b;
+    if apply(add, 1) != 8 {
+        return 2;
+    }
+    // 同一个闭包传给两个不同的泛型函数（各自单态化一个实例）。
+    if apply2(add, 1) != 9 {
+        return 3;
+    }
+
+    // 3. 重复调用同一闭包（同一个单态实例被多次调用）。
+    if apply(add, 10) != 17 {
+        return 4;
+    }
+    if apply(add, 11) != 18 {
+        return 5;
+    }
+
+    // 4. 捕获数组 + **变量下标**（就是早先 SIGSEGV 的形态：Index 的基址必须
+    //    替换成 `f.__cN`，否则读到调用方帧外的垃圾）。
+    let arr = [100, 200, 300];
+    let get = |i: i32| arr[i];
+    if apply(get, 0) != 100 {
+        return 6;
+    }
+    if apply(get, 2) != 300 {
+        return 7;
+    }
+
+    // 5. 捕获元组并访问字段。
+    let t = (7, 8);
+    let tup = |k: i32| t.0 * 10 + t.1 + k;
+    if apply(tup, 1) != 79 {
+        return 8;
+    }
+
+    // 6. 闭包体内构造数组字面量（`Array` 子表达式里含捕获 `n`）。
+    let mk = |i: i32| {
+        let built = [n, i, n];
+        return built[1] + built[0];
+    };
+    if apply(mk, 3) != 43 {
+        return 9;
+    }
+
+    // 7. 闭包体内 `return`（跨函数内联后归约成块尾值）。
+    let h = |x: i32| {
+        return x * 2 + n;
+    };
+    if apply(h, 3) != 46 {
+        return 10;
+    }
+
+    return 0;
+}
