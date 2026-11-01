@@ -1,0 +1,129 @@
+//=============================================================================
+// tests/cases/115_lifetime_args.zr — 生命周期参数 / 实参的解析与全链路
+//
+// 生命周期在 zr 里不进类型环境、不影响代码生成（`push_type_params` 只登记
+// 类型参数；README 的安全模型那节说明借用/生命周期仍是设计目标），但**必须
+// 能解析**，否则带生命周期的代码一行都写不了。本用例钉住三处缺口：
+//
+// 1. **泛型实参里的生命周期**：`Ctx<'a>` / `Pair<'_, i64>`。早先
+//    `parse_generic_args` 对每个实参都调 `parse_type()`，`'a` 被类型前缀吃掉
+//    后撞上 `>`，报 `expected type, found Gt`——`impl<'a> Ctx<'a>` 的头就
+//    解析不了（`std/async.zr` 整个模块因此加载失败）。现在生命周期实参
+//    跳过、不登记，其余实参照旧。
+//
+// 2. **`&'a mut T`**：生命周期夹在 `&` 与 `mut` 之间。早先 `&` 分支先看
+//    `mut`，`'a` 被当成"没有 mut"的不可变引用，接着 `mut` 撞上
+//    `expected type, found KwMut`。现在 `&` 后先吃掉生命周期。
+//
+// 3. **`&'static dyn Trait`**：类型前缀里跳生命周期的那段早先排在 `dyn`
+//    分支之后，`&'static dyn Error` 先吃掉 `'static`、再落到基础类型分派，
+//    `dyn` 不是基础类型——报 `expected type, found KwDyn`（`std/error.zr`
+//    因此解析失败）。现在生命周期跳过提到 `parse_type_prefix` 最前面。
+//
+// 还有一处**下游**缺口：`impl<'a> Ctx<'a>` 的方法体早先被当成"泛型 impl"
+// 整体跳过（`check_function_bodies` 看 `impl_gens.is_empty()`，只含生命周
+// 期的 impl 也被跳过），方法永远不发射，调用点留下未定义的 `Ctx__get`，
+// 链接期才炸。现在只把**类型 / const 参数**算作泛型，纯生命周期 impl 的
+// 方法体按具体类型检查并正常发射——所以这个用例真的会调用它们。
+//
+// 带 `dyn` 的参数只在签名里出现，不调用（zr 目前没有 vtable 分派，
+// `(&dyn T).method()` 仍报错，那是另一件事，见 `future/README.md`）。
+//
+// 所有断言都在 `main` 里用 `return <非零>` 自证——`tests/zr_language.rs`
+// 只断言退出码。
+//=============================================================================
+
+/// 只用来钉住 `&'static dyn Trait` 能解析（不调用，无 vtable 分派）。
+trait Err {
+    fn msg(self) -> u64;
+}
+
+fn takes_static_dyn(e: &'static dyn Err) -> u64 {
+    return 0;
+}
+
+/// 只用来钉住 `&'static T` 能解析（zr 的 `&x` 表达式产出的类型是裸指针，
+/// 值层面把字面量绑到 `&'static u8` 会报 `expected &u8, found i32`，
+/// 所以这里只放签名）。
+fn takes_static_ref(r: &'static u8) -> u64 {
+    return *r as u64;
+}
+
+/// 带生命周期参数的结构体（`*const` 字段由 `&x` 隐式转换而来）。
+struct Ctx<'a> {
+    pub value: i64,
+    pub tag: *const u8,
+}
+
+/// `impl<'a> Ctx<'a>`：早先连这个 header 都解析不了；修好解析后方法体又
+/// 被当成泛型跳过，调用点链接失败。现在两条路径都通了。
+impl<'a> Ctx<'a> {
+    pub fn get(self: &'a Ctx<'a>) -> i64 {
+        return self.value;
+    }
+
+    pub fn tag(self: &'a Ctx<'a>) -> *const u8 {
+        return self.tag;
+    }
+
+    /// `&'a mut T` 的解析（`self: &'a mut Ctx<'a>`）。
+    pub fn set(self: &'a mut Ctx<'a>, v: i64) {
+        self.value = v;
+    }
+}
+
+/// 生命周期 + 类型参数混用。
+struct Pair<'a, T> {
+    pub v: T,
+    pub r: *const u8,
+}
+
+impl<'a, T> Pair<'a, T> {
+    pub fn first(self: &'a Pair<'a, T>) -> T {
+        return self.v;
+    }
+
+    pub fn tag(self: &'a Pair<'a, T>) -> *const u8 {
+        return self.r;
+    }
+}
+
+fn main() -> i32 {
+    // 1. `Ctx<'a>` 构造 + 方法调用（含 `&'a mut` 的 setter）。
+    let flag1: u8 = 7;
+    let mut c: Ctx = Ctx { value: 42, tag: &flag1 };
+    if c.get() != 42 {
+        return 1;
+    }
+    if *c.tag() != 7 {
+        return 2;
+    }
+    c.set(100);
+    if c.get() != 100 {
+        return 3;
+    }
+    if c.value != 100 {
+        return 4;
+    }
+
+    // 2. `Pair<'a, T>`：生命周期与类型参数同时存在。
+    let flag2: u8 = 9;
+    let p: Pair<i64> = Pair { v: 11, r: &flag2 };
+    if p.first() != 11 {
+        return 5;
+    }
+    if *p.tag() != 9 {
+        return 6;
+    }
+
+    // 3. 显式写 `'_`（早先同样报 `expected type, found Gt`）。
+    let flag3: u8 = 4;
+    let p2: Pair<'_, i64> = Pair { v: 5, r: &flag3 };
+    if p2.first() != 5 {
+        return 7;
+    }
+
+    // 4. `&'static T` / `&'static dyn Trait` 的签名已在上面声明（解析层面
+    //    的钉子），值层面见注释：`&x` 产物是裸指针，不能直接绑给 `&u8`。
+    return 0;
+}

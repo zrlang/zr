@@ -85,6 +85,16 @@ impl Parser {
 
     /// 解析类型前缀（基础类型 + 一元类型）。
     fn parse_type_prefix(&mut self) -> Result<Type, crate::error::CompileError> {
+        // 生命周期标注：`&'a T` / `&'static dyn Error` 里的 `'a`。
+        // 类型检查阶段直接丢弃（生命周期不影响代码生成），但**必须**在
+        // `impl` / `dyn` 这些前缀之前吃掉：早先这行在基础类型分派前、
+        // `dyn` 分支之后，于是 `&'static dyn Error` 先跳过 `'static`、
+        // 再落到基础类型分派，`dyn` 不是基础类型——报 `expected type,
+        // found KwDyn`，整个 `std/error.zr` 解析不了。
+        if let TokenKind::Lifetime(_) = self.peek().kind {
+            self.advance();
+        }
+
         // `impl Trait` / `impl Trait1 + Trait2`
         if self.match_kind(&TokenKind::KwImpl) {
             let mut bounds = vec![self.parse_type_bp(10)?];
@@ -115,8 +125,14 @@ impl Parser {
             return Ok(Type::Pointer(Box::new(inner), mutability));
         }
 
-        // 引用：`&T` / `&mut T`
+        // 引用：`&T` / `&mut T` / `&'a T` / `&'a mut T`
         if self.match_kind(&TokenKind::Amp) {
+            // `&'a mut T`：生命周期夹在 `&` 与 `mut` 之间，必须先吃掉，
+            // 否则下面把 `'a` 当可变性（不可变）后 `mut` 就撞上"expected
+            // type, found KwMut"。
+            if let TokenKind::Lifetime(_) = self.peek().kind {
+                self.advance();
+            }
             let mutability = if self.match_kind(&TokenKind::KwMut) {
                 crate::parser::ast::Mutability::Mutable
             } else {
@@ -174,11 +190,6 @@ impl Parser {
         // 永不复返类型 `!`
         if self.match_kind(&TokenKind::Bang) {
             return Ok(Type::Never);
-        }
-
-        // 生命周期标注：`&'a T` 里的 `'a`（类型检查阶段直接丢弃）
-        if let TokenKind::Lifetime(_) = self.peek().kind {
-            self.advance();
         }
 
         // 基础类型
@@ -297,19 +308,38 @@ impl Parser {
         })
     }
 
-    /// 解析泛型实参 `<T, U, 42>`。
+    /// 解析泛型实参 `<T, U, 42>` / `<T, 'a>`。
+    ///
+    /// 生命周期实参（`Ctx<'a>`、`Ctx<'_>`）**跳过、不登记**：zr 的 `Type`
+    /// 没有生命周期变体，类型检查也把它们整体丢弃。早先这里直接调
+    /// `parse_type()`，`'a` 被前缀吃掉后撞上 `>`，报 `expected type, found
+    /// Gt`——于是 `struct Ctx<'a>` 的 `impl<'a> Ctx<'a>` 头、以及任何带
+    /// 生命周期的类型引用都解析不了（`std/async.zr` 因此整模块加载不了）。
     pub(crate) fn parse_generic_args(&mut self) -> Result<Vec<Type>, crate::error::CompileError> {
         let mut args = Vec::new();
         if !self.check(&TokenKind::Gt) {
-            args.push(self.parse_type()?);
+            self.parse_one_generic_arg(&mut args)?;
             while self.match_kind(&TokenKind::Comma) {
                 if self.check(&TokenKind::Gt) {
                     break;
                 }
-                args.push(self.parse_type()?);
+                self.parse_one_generic_arg(&mut args)?;
             }
         }
         self.consume(&TokenKind::Gt, "expected '>' to close generic arguments")?;
         Ok(args)
+    }
+
+    /// 解析一个泛型实参：生命周期参数跳过，其余按类型解析并登记。
+    fn parse_one_generic_arg(
+        &mut self,
+        args: &mut Vec<Type>,
+    ) -> Result<(), crate::error::CompileError> {
+        if let TokenKind::Lifetime(_) = self.peek().kind {
+            self.advance();
+            return Ok(());
+        }
+        args.push(self.parse_type()?);
+        Ok(())
     }
 }

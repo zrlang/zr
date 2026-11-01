@@ -2006,12 +2006,24 @@ impl TypeChecker {
             // 泛型函数的体跳过：类型参数是推断变量，按它检查只会报一堆
             // 假错。函数体留空，用到它时再按具体类型单态化检查。
             // `impl<T>` 里的方法同理（`impl_generics` 由展开阶段记录）。
+            //
+            // **只数类型 / const 参数**：生命周期参数（`impl<'a> Ctx<'a>`）
+            // 不进类型环境（`push_type_params` 只登记 Type），方法体完全可以
+            // 按具体类型检查。早先这里看 `impl_gens.is_empty()`，于是
+            // `impl<'a> Ctx<'a> { fn get(..) }` 的体被当成泛型跳过——函数
+            // 永远不发射，调用点留下一个未定义的 `Ctx__get`，链接期才炸
+            // （`100_debug_derive.zr` 那种纯生命周期 impl 也中招）。
             let impl_gens = self
                 .impl_generics
                 .get(&f.name)
                 .cloned()
                 .unwrap_or_default();
-            if !f.generics.is_empty() || !impl_gens.is_empty() {
+            let has_type_param = |gens: &[ast::GenericParam]| {
+                gens.iter().any(|g| {
+                    !matches!(g, ast::GenericParam::Lifetime(_))
+                })
+            };
+            if has_type_param(&f.generics) || has_type_param(&impl_gens) {
                 if self.generic_fn_span.is_none() {
                     self.generic_fn_span = Some(ast::Span::unknown());
                 }
@@ -2088,7 +2100,9 @@ impl TypeChecker {
             if self.impl_targets.contains_key(&f.name) {
                 self.type_params.pop();
             }
-            if !impl_gens.is_empty() {
+            // 与上面的 `has_type_param` 对称：纯生命周期 impl（`impl<'a>`）
+            // 只压过 `Self` 一个作用域（上一行已弹），这里不能再多弹一次。
+            if has_type_param(&impl_gens) {
                 self.type_params.pop();
             }
         }
