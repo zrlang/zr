@@ -1,0 +1,62 @@
+//=============================================================================
+// tests/cases/117_union.zr — `union` 类型的构造、字段读写、类型双关与按值传递
+//
+// 早先 `union U { i: i32 }` 能声明但无法使用：
+// - 构造 `U { i: 42 }` 报 `` `U` is not a struct ``（`check_struct_init` 只认
+//   `HirTypeDef::Struct`）；
+// - 字段访问 `u.i` 报 `no field i on type U`（`struct_field_tys` 只返回结构体
+//   字段，union 返回空）。
+// 现在三处都接上：
+// - `check_struct_init` 对 `HirTypeDef::Union` 要求恰好一个字段（Rust 语义），
+//   按该字段的声明类型检查实参；
+// - `struct_field_tys` 同时返回 union 字段，字段访问（读 / 写）走结构体同一套
+//   路径；
+// - MIR `struct_layout` / `type_size_align` 把 union 所有字段放在偏移 0，尺寸 /
+//   对齐取最大字段——类型双关（写 f32 读 bytes）天然成立。
+//
+// 覆盖：单字段构造、字段读、字段写、类型双关（IEEE 754 1.0 的字节）、
+// 按值传递给函数、大字段（f64 决定 union 尺寸）。
+//=============================================================================
+
+union U {
+    i: i32,
+    f: f32,
+    bytes: [u8; 4],
+}
+
+union Big {
+    small: u8,
+    wide: u64,
+}
+
+fn read_i(u: U) -> i32 {
+    u.i
+}
+
+fn main() -> i32 {
+    // 构造 + 读
+    let u = U { i: 42 };
+    if u.i != 42 { return 1; }
+
+    // 写字段
+    let mut u2 = U { i: 0 };
+    u2.i = 100;
+    if u2.i != 100 { return 2; }
+
+    // 类型双关：f32 1.0 的 IEEE 754 表示是 0x3F800000
+    // （小端：bytes[0]=0x00, bytes[3]=0x3F）
+    let u3 = U { f: 1.0 };
+    if u3.bytes[0] != 0x00 { return 3; }
+    if u3.bytes[3] != 0x3f { return 4; }
+
+    // 按值传递
+    let u4 = U { i: 77 };
+    if read_i(u4) != 77 { return 5; }
+
+    // 大字段决定 union 尺寸：写 u64 再读回
+    let mut b = Big { small: 0 };
+    b.wide = 0x0102030405060708;
+    if b.wide != 0x0102030405060708 { return 6; }
+
+    return 0;
+}

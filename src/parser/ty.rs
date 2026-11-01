@@ -95,6 +95,12 @@ impl Parser {
             self.advance();
         }
 
+        // 推断类型占位 `_`：`as *const _`、`let x: Vec<_>`。类型检查阶段
+        // 展开成新的推断变量，由上下文解析。
+        if self.match_kind(&TokenKind::Underscore) {
+            return Ok(Type::Infer);
+        }
+
         // `impl Trait` / `impl Trait1 + Trait2`
         if self.match_kind(&TokenKind::KwImpl) {
             let mut bounds = vec![self.parse_type_bp(10)?];
@@ -331,6 +337,12 @@ impl Parser {
     }
 
     /// 解析一个泛型实参：生命周期参数跳过，其余按类型解析并登记。
+    ///
+    /// 关联类型绑定 `Output = O1`（`Future<Output = O1>`）：解析 LHS 类型名、
+    /// 消费 `=` 与 RHS 类型，**整体丢弃**——zr 的 `Type::Named` 不记录关联
+    /// 类型绑定，且 where 子句本身也不强制。早先这里直接把 LHS 推进 args，
+    /// 遇到 `=` 报 `expected '>' to close generic arguments`，`std/async.zr`
+    /// 的 `F1: Future<Output = O1>` 解析不了。
     fn parse_one_generic_arg(
         &mut self,
         args: &mut Vec<Type>,
@@ -339,7 +351,13 @@ impl Parser {
             self.advance();
             return Ok(());
         }
-        args.push(self.parse_type()?);
+        let lhs = self.parse_type()?;
+        if self.match_kind(&TokenKind::Eq) {
+            // `Assoc = Type`：消费 RHS，不登记（关联类型绑定暂不支持）。
+            let _ = self.parse_type()?;
+            return Ok(());
+        }
+        args.push(lhs);
         Ok(())
     }
 }

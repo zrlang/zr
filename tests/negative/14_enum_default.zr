@@ -1,7 +1,7 @@
-// 负向用例：枚举不能 derive `Default`。
+// 负向用例：枚举 derive `Default` 必须用 `#[default]` 标出默认变体。
 //
-// Rust 靠 `#[default]` 标出"哪个变体是默认值"；zr 没有这个属性，只能猜第一个
-// 变体——那会在有载荷的变体上生成 `E::A(未初始化)`。明确报错，不猜。
+// 没有 `#[default]` 变体时显式报错——不猜第一个变体（有载荷的变体上
+// 硬猜会生成 `E::A(未初始化)`）。多个 `#[default]` 也报错。
 //
 // expect: cannot derive `Default` for enum
 

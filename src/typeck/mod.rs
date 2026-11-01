@@ -170,6 +170,10 @@ struct AccessCandidate {
     impl_targets: HashMap<String, AstType>,
     /// 目标类型 DefId → Drop 析构函数 DefId。
     drop_impls: HashMap<DefId, DefId>,
+    /// impl 块里定义的关联类型：目标类型 DefId → (关联类型名 → 具体类型)。
+    /// `Self::Output` 在 impl 方法签名里靠它解析——早先 impl 的
+    /// `type Output = i32` 被整个丢弃，`Self::Output` 报 `cannot find value Self`。
+    impl_assoc_types: HashMap<DefId, HashMap<String, Ty>>,
     /// 常量表。
     consts: HashMap<DefId, hir::HirConst>,
     /// 静态变量表。
@@ -427,6 +431,7 @@ impl Default for TypeChecker {
             impl_blocks: Vec::new(),
             impl_targets: HashMap::new(),
             drop_impls: HashMap::new(),
+            impl_assoc_types: HashMap::new(),
             consts: HashMap::new(),
             statics: HashMap::new(),
             locals: HashMap::new(),
@@ -1737,6 +1742,22 @@ impl TypeChecker {
     fn check_impl_block(&mut self, ib: &ast::ImplBlock) -> Result<()> {
         {
             let target = self.ast_to_hir_type(&ib.target)?;
+            // 登记 impl 块里的关联类型（`type Output = i32;`），供
+            // `Self::Output` 在 impl 方法签名里解析。只处理目标是命名类型
+            // 的情况（泛型 impl 的关联类型需要投影，暂不支持）。
+            if let Ty::Named(type_id, _) = &target {
+                let mut map = HashMap::new();
+                for at in &ib.assoc_types {
+                    if let Some(ty_ast) = &at.ty {
+                        if let Ok(ty) = self.ast_to_hir_type(ty_ast) {
+                            map.insert(at.name.clone(), ty);
+                        }
+                    }
+                }
+                if !map.is_empty() {
+                    self.impl_assoc_types.insert(*type_id, map);
+                }
+            }
             // `Drop` 是编译器内建 trait，不要求用户先声明它。
             let is_drop = ib
                 .trait_type
@@ -5578,6 +5599,40 @@ impl TypeChecker {
             }
         }
         let def_id = self.resolve_path(path, span)?;
+        // union 字面量：`U { i: 42 }`。必须恰好一个字段——union 同一时刻
+        // 只持有一个值，多字段初始化在语义上没有意义（Rust 同样要求恰好一个
+        // 字段）。该字段的值按 union 字段的声明类型检查，其它字段保持未初始化
+        // （与 Rust 的 `MaybeUninit` 语义一致；zr 目前不追踪初始化状态，读
+        // 未初始化字段是用户责任）。
+        if let Some(hir::HirTypeDef::Union(u)) = self.type_defs.get(&def_id) {
+            if fields.len() != 1 {
+                return Err(CompileError::type_error(format!(
+                    "union literal `{}` must have exactly one field, found {}",
+                    path.join("::"),
+                    fields.len()
+                ))
+                .with_span(span));
+            }
+            let (name, expr) = &fields[0];
+            let field = u.fields.iter().find(|f| &f.name == name);
+            let Some(field) = field else {
+                return Err(CompileError::name_error(format!(
+                    "no field `{}` on union `{}`",
+                    name,
+                    path.join("::")
+                ))
+                .with_span(span));
+            };
+            let fty = field.ty.clone();
+            let checked_expr = self.check_expr(expr, &fty)?;
+            self.check_partial_move(&checked_expr, expr.span())?;
+            let target_ty = Ty::Named(def_id, Vec::new());
+            return Ok(HirExpr {
+                kind: ExprKind::Struct(vec![(name.clone(), checked_expr)]),
+                ty: target_ty,
+                span,
+            });
+        }
         let raw_field_tys: Vec<(String, Ty)> = match self.type_defs.get(&def_id) {
             Some(hir::HirTypeDef::Struct(s)) => s
                 .fields
@@ -6594,13 +6649,22 @@ impl TypeChecker {
 
     /// 结构体的字段类型（按 `args` 替换泛型参数）。
     fn struct_field_tys(&self, def_id: DefId, args: &[Ty]) -> Vec<(String, Ty, usize)> {
-        let Some(hir::HirTypeDef::Struct(s)) = self.type_defs.get(&def_id) else {
-            return Vec::new();
-        };
-        s.fields
-            .iter()
-            .map(|f| (f.name.clone(), self.subst_def_ty(def_id, args, &f.ty), f.index))
-            .collect()
+        match self.type_defs.get(&def_id) {
+            Some(hir::HirTypeDef::Struct(s)) => s
+                .fields
+                .iter()
+                .map(|f| (f.name.clone(), self.subst_def_ty(def_id, args, &f.ty), f.index))
+                .collect(),
+            // union 的字段也走同一套查找（所有字段偏移都是 0，但类型不同，
+            // 字段访问要靠名字取对应类型）。
+            Some(hir::HirTypeDef::Union(u)) => u
+                .fields
+                .iter()
+                .enumerate()
+                .map(|(i, f)| (f.name.clone(), self.subst_def_ty(def_id, args, &f.ty), i))
+                .collect(),
+            _ => Vec::new(),
+        }
     }
 
     /// 类型在运行期是否以"指向存储的地址"表示。
@@ -6609,7 +6673,9 @@ impl TypeChecker {
             Ty::Tuple(_) | Ty::Array(..) | Ty::Slice(..) | Ty::Str => true,
             Ty::Named(id, _) => matches!(
                 self.type_defs.get(id),
-                Some(hir::HirTypeDef::Struct(_)) | Some(hir::HirTypeDef::Enum(_))
+                Some(hir::HirTypeDef::Struct(_))
+                    | Some(hir::HirTypeDef::Enum(_))
+                    | Some(hir::HirTypeDef::Union(_))
             ),
             _ => false,
         }
@@ -8007,6 +8073,21 @@ impl TypeChecker {
                         return Ok(ty);
                     }
                 }
+                // 关联类型投影（具体类型）：`Self::Output` / `IntFut::Output`。
+                // 只支持目标是 impl 块里登记过的命名类型（`impl ... for IntFut
+                // { type Output = i32; }`）。泛型参数的关联类型（`F::Output`
+                // 里 `F: Future`）需要真投影，属架构级特性，暂不支持。
+                if path.len() == 2 && generics.is_empty() {
+                    if let Some(base_ty) = self.lookup_type_param(&path[0]) {
+                        if let Ty::Named(base_id, _) = self.infer.resolve(&base_ty) {
+                            if let Some(map) = self.impl_assoc_types.get(&base_id) {
+                                if let Some(assoc_ty) = map.get(&path[1]) {
+                                    return Ok(assoc_ty.clone());
+                                }
+                            }
+                        }
+                    }
+                }
                 let id = self.resolve_type_path(path)?;
                 let ty = Ty::Named(
                     id,
@@ -8062,6 +8143,11 @@ impl TypeChecker {
                 Box::new(self.ast_to_hir_type(e)?),
             ),
             AstType::Anytype => Ty::Infer(InferId(0)),
+            // 类型位置的 `_`（`as *const _` / `Vec<_>`）：展开成一个新的推断
+            // 变量，由上下文（赋值目标、函数形参的 unify）解析；解析不了时
+            // 收尾报 `type annotations needed`。注意不能复用 `InferId(0)`——
+            // 那是活的推断变量（见架构红线 §3.2），大文件里会被绑定掉。
+            AstType::Infer => self.infer.fresh_infer(crate::parser::ast::Span::unknown()),
             AstType::ImplTrait(bounds) => {
                 // `impl Trait` 降级为不透明类型：
                 // - RPIT（返回位置）：隐藏类型由函数体推断，外部不可见

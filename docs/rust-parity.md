@@ -50,7 +50,7 @@
 | `(T, U)` 元组 | 可用 | 🟡 | 直接写元组类型可用；但**经类型别名后取 `.0` 失败**：``zr: no field `0` on type `type#75` `` |
 | `struct` | 可用 | ✅ | 具名字段、元组结构体、嵌套字段、`impl` 方法、`impl Drop`、字段按值拷贝均正常 |
 | `enum`（带载荷） | 可用 | ✅ | 判别式与载荷正常（含 `f64` 载荷、struct 载荷变体）；泛型枚举按实例单态化，`Option<T>` / `Result<T, E>` 的载荷也能正确读写 |
-| `union` | 只能声明 | ❌ | `union U { i: i32 }` 能声明，但构造报 ``zr: `U` is not a struct ``；字段读写也没有安全的入口 |
+| `union` | 可用 | ✅ | `union U { i: i32, f: f32 }` 可构造（`U { i: 42 }`，恰好一个字段）、字段读/写、类型双关（写 f32 读 bytes）、按值传参 / 返回均正常 |
 | `*const T` / `*mut T` | 可用 | ✅ | 裸指针可用；`*p = v` 走指针语义 |
 | `&T` / `&mut T` | 可用 | 🟡 | 语义上 `&T` 是只读指针（``zr: cannot assign through an immutable pointer (use `&mut` and a `*mut` type) ``），`&mut T` 可写；但**`let` 注解里的 `&T` 被解析成 `*const T`**：`let r: &i32 = &x;` → ``zr: type mismatch: expected `*const i32`, found `&i32` `` |
 | `Option<T>` / `Result<T, E>` | 可用 | ✅ | 在 `std::core` 里；`is_some()` / `is_none()` / `is_ok()` / `is_err()` / `unwrap()` / `unwrap_or()` / `map()`、模式匹配与后缀 `?` 均正常 |
@@ -140,7 +140,7 @@
 | `use foo::*` | 支持 | ✅ | glob 导入按模块的导出名登记别名（`40b5b45`，`90_glob_import.zr`） |
 | `use std::core::Option` | 路径不带 `std::` | 🟡 | zr 的标准库模块直接叫 `core` / `io` / `string` / `collections`：`use core::Option;`。写 `std::core::Option` → ``zr: unknown module `std` `` |
 | `pub` / `pub(crate)` / `pub(super)` | 可用 | ✅ | 解析阶段保留可见性，类型检查按「条目可见性 × 引用方模块」判定（`e0c5541`）：`pub` / `pub(crate)` 单 crate 内处处可见，`pub(super)` 对父模块及后代可见，私有 / `pub(self)` 对声明模块及后代可见（负向 `23_visibility_private.zr` / `24_visibility_super.zr`）。局限：`use` 点导入私有条目未检查 |
-| `#[derive(Clone, PartialEq, Eq, Hash, Default, Debug, ...)]` | 生成真实方法体 | 🟡 | `src/typeck/derive.rs` 在 AST 层生成 `Type__clone` / `__eq` / `__lt` / `__hash` / `__default` / `__debug`，与手写 `impl` 方法同形。结构体支持 `Clone/Copy/PartialEq/Eq/PartialOrd/Ord/Hash/Default/Debug`（含元组结构体、嵌套结构体、**`str` 字段后的嵌套结构体字段**）；枚举支持 `Clone/PartialEq/Eq/Hash/Debug`（含**结构体变体载荷里的 `str` 字段**，`EnumField` 聚合特判修好后已对齐 Rust）。`==`/`<` 等聚合比较改写成方法调用，**没 derive 就报错**。`Debug` 生成 `.debug() -> String`（Rust `{:?}` 风格）与多行 `.debug_pretty()`（Rust `{:#?}` 风格，`13acff2`；浮点/指针/数组/元组/`String` 字段显式报错）。仍缺：泛型类型 derive 报错、枚举 `Default`/`Ord` 报错；**格式引擎 `{:#?}` 尚未接自定义类型**。 |
+| `#[derive(Clone, PartialEq, Eq, Hash, Default, Debug, ...)]` | 生成真实方法体 | 🟡 | `src/typeck/derive.rs` 在 AST 层生成 `Type__clone` / `__eq` / `__lt` / `__hash` / `__default` / `__debug`，与手写 `impl` 方法同形。结构体支持 `Clone/Copy/PartialEq/Eq/PartialOrd/Ord/Hash/Default/Debug`（含元组结构体、嵌套结构体、**`str` 字段后的嵌套结构体字段**）；枚举支持 `Clone/PartialEq/Eq/Hash/Debug/PartialOrd/Ord/Default`（`Default` 需 `#[default]` 标出恰好一个变体，`Ord` 对无显式判别式枚举按声明顺序）。`==`/`<` 等聚合比较改写成方法调用，**没 derive 就报错**。`Debug` 生成 `.debug() -> String`（Rust `{:?}` 风格）与多行 `.debug_pretty()`（Rust `{:#?}` 风格，`13acff2`；浮点/指针/数组/元组/`String` 字段显式报错）。仍缺：泛型类型 derive 报错、带显式判别式的枚举 `Ord` 报错；**格式引擎 `{:#?}` 尚未接自定义类型**。 |
 | `#[repr(C)]` / `#[repr(u8)]` | 可用 | ✅ | |
 | `#[inline(...)]` / `#[link(...)]` / `#[test]` | 可用 | ✅ | `#[test]` 的函数会被编进产物并在 `main` 前调用 |
 | `static` / `static mut` | 标量可用 | ✅ | 初值能折成字面量的**标量**静态量会写进 `.data`：读、写、复合赋值、`&STATIC` / `&mut STATIC` 都正常。聚合静态量（结构体 / 数组 / 枚举）暂不生成数据，读取时明确报错；`static mut` 赋值不需要 `let mut`，非 `mut` 静态量赋值报错 |
@@ -252,8 +252,10 @@
    `Debug` 已生成 `.debug()` 方法体（`Type__debug(self) -> String`，Rust `{:?}`
    风格；浮点/指针/数组/元组/`String` 字段显式报错；**结构体变体载荷里的
    `str` 字段与 `str` 后嵌套字段两处组合错经 `EnumField` 聚合特判后也已对齐
-   Rust**）；泛型类型上的 derive 明确报错；枚举的 `Default` 明确报错
-   （zr 没有 `#[default]` 变体属性）；**枚举的 `PartialOrd` / `Ord` 已支持**
+   Rust**）；泛型类型上的 derive 明确报错；**枚举的 `Default` 已支持**
+   （用 `#[default]` 标出恰好一个变体，`116_enum_default.zr`；没有或多个
+   `#[default]` 都报错，负向 `14_enum_default.zr`）；**枚举的 `PartialOrd` /
+   `Ord` 已支持**
    （无显式判别式时按声明顺序比变体、同一变体内再比载荷字典序，
    `114_enum_ord_derive.zr`；带显式判别式的枚举仍报错，负向
    `26_enum_ord_discriminant.zr`）；字段类型缺少所需 trait 时

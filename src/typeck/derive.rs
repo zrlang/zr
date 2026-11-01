@@ -17,7 +17,7 @@
 //! | derive | 方法 |
 //! |---|---|
 //! | `Clone` | `fn Type__clone(self) -> Self` |
-//! | `Default` | `fn Type__default() -> Self`（仅结构体） |
+//! | `Default` | `fn Type__default() -> Self`（结构体 / 枚举） |
 //! | `PartialEq` / `Eq` | `fn Type__eq(self, other: Self) -> bool` |
 //! | `PartialOrd` / `Ord` | `lt` / `le` / `gt` / `ge` |
 //! | `Hash` | `fn Type__hash(self) -> u64` |
@@ -29,11 +29,12 @@
 //!
 //! - 泛型类型上的 derive 不生成方法（方法体里的字段类型要靠单态化才知道），
 //!   报错让调用方知道；
-//! - 枚举不支持 `Default`（Rust 要求用 `#[default]` 标出变体，zr 没有这个
-//!   属性）；枚举的 `PartialOrd` / `Ord` **支持**（无显式判别式时先比变体
-//!   声明顺序、同一变体内再比载荷的字典序），但**带显式判别式**（`A = 5`）
-//!   的枚举仍然显式报错——Rust 的 `Ord` 比的是判别式的值，derive 不求值
-//!   任意常量表达式，硬按声明顺序生成会给出错的顺序；
+//! - 枚举的 `Default` **支持**，但必须有且仅有一个 `#[default]` 变体（与 Rust
+//!   一致）；没有或多个都报错。默认变体的载荷字段按结构体同样的规则取零值 /
+//!   递归 `__default()`；枚举的 `PartialOrd` / `Ord` **支持**（无显式判别式时
+//!   先比变体声明顺序、同一变体内再比载荷的字典序），但**带显式判别式**
+//!   （`A = 5`）的枚举仍然显式报错——Rust 的 `Ord` 比的是判别式的值，derive
+//!   不求值任意常量表达式，硬按声明顺序生成会给出错的顺序；
 //! - 结构体更新语法之外，`Hash` 对 `str` / 切片 / 数组 / 元组 / 指针字段一律
 //!   按 `0` 计入：只保证"相等 ⇒ 同哈希"，不保证分布。这几类字段在 zr 里还
 //!   没有按内容比较的语义，硬编一个哈希反而会在 eq/hash 之间制造不一致。
@@ -128,13 +129,43 @@ pub fn derive_methods(type_name: &str, type_def: &ast::TypeDef, traits: &[String
     };
 
     if want_default {
-        let Some(fields) = &fields else {
-            return Err(CompileError::type_error(format!(
-                "cannot derive `Default` for enum `{type_name}`: zr has no `#[default]` variant attribute"
-            ))
-            .with_span(span));
-        };
-        out.push(default_fn(type_name, &self_ty, fields)?);
+        match (&fields, &variants) {
+            // 结构体：每个字段取零值 / 递归取 `__default()`。
+            (Some(fields), _) => {
+                out.push(default_fn(type_name, &self_ty, fields)?);
+            }
+            // 枚举：必须有且仅有一个 `#[default]` 变体。默认值就是该变体，
+            // 其载荷字段按结构体同样的规则取零值 / 递归 `__default()`。
+            // 没有 `#[default]` 或有多个都报错——与 Rust 一致（Rust 也要求
+            // 恰好一个 `#[default]` 变体，多个是编译错误）。
+            (None, Some(vs)) => {
+                let default_variants: Vec<&ast::Variant> = vs
+                    .iter()
+                    .filter(|v| v.attrs.iter().any(|a| a.name == "default"))
+                    .collect();
+                if default_variants.is_empty() {
+                    return Err(CompileError::type_error(format!(
+                        "cannot derive `Default` for enum `{type_name}`: \
+                         no variant is marked `#[default]`"
+                    ))
+                    .with_span(span));
+                }
+                if default_variants.len() > 1 {
+                    let names = default_variants
+                        .iter()
+                        .map(|v| v.name.as_str())
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    return Err(CompileError::type_error(format!(
+                        "cannot derive `Default` for enum `{type_name}`: \
+                         multiple `#[default]` variants ({names}); exactly one is required"
+                    ))
+                    .with_span(span));
+                }
+                out.push(default_enum_fn(type_name, &self_ty, default_variants[0])?);
+            }
+            (None, None) => {}
+        }
     }
     if want_ord {
         if let Some(vs) = &variants {
@@ -212,6 +243,53 @@ fn default_fn(type_name: &str, self_ty: &Type, fields: &[FieldInfo]) -> Result<F
         self_ty.clone(),
         construct(type_name, fields, args),
     ))
+}
+
+/// `fn Type__default() -> Type`（枚举）：构造 `#[default]` 标出的变体。
+///
+/// 与结构体 `default_fn` 同一套零值规则，只是把"字段表"换成"该变体的载荷"
+/// （Unit 变体无载荷，直接返回 `E::V`；元组/结构体载荷的每个字段取零值）。
+fn default_enum_fn(type_name: &str, self_ty: &Type, v: &ast::Variant) -> Result<Function> {
+    let fields = payload_field_infos(v);
+    let mut args = Vec::with_capacity(fields.len());
+    for f in &fields {
+        args.push(default_value(type_name, f)?);
+    }
+    Ok(make_fn(
+        type_name,
+        "default",
+        None,
+        Vec::new(),
+        self_ty.clone(),
+        variant_build(type_name, v, args),
+    ))
+}
+
+/// 把变体载荷转成与结构体字段同形的 `FieldInfo` 列表，复用 `default_value`。
+///
+/// 元组载荷用下标字符串作字段名（`"0"` / `"1"`，与元组结构体一致，`.0` 才
+/// 找得到）；结构体载荷用真实字段名。Unit 变体返回空列表。
+fn payload_field_infos(v: &ast::Variant) -> Vec<FieldInfo> {
+    match &v.payload {
+        VariantPayload::Unit => Vec::new(),
+        VariantPayload::Tuple(tys) => tys
+            .iter()
+            .enumerate()
+            .map(|(i, ty)| FieldInfo {
+                name: i.to_string(),
+                ty: ty.clone(),
+                span: SPAN,
+            })
+            .collect(),
+        VariantPayload::Struct(fields) => fields
+            .iter()
+            .map(|f| FieldInfo {
+                name: f.name.clone(),
+                ty: f.ty.clone(),
+                span: f.span,
+            })
+            .collect(),
+    }
 }
 
 /// 单个字段的默认值表达式。

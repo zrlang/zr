@@ -188,6 +188,10 @@ pub enum Type {
     /// `dyn Trait`：trait 对象（动态分发）。`Vec<Type>` 是 trait 边界列表
     /// （`dyn Error`、`dyn Error + Send`）。
     Dyn(Vec<Type>),
+    /// 推断类型占位 `_`：`as *const _`、`let x: Vec<_> = ..`。
+    /// 类型检查阶段展开成一个新的推断变量，由上下文（赋值目标、函数形参等）
+    /// 解析；若最终无法解析，收尾时报 `type annotations needed`。
+    Infer,
 }
 
 /// 数组长度（可以是编译期常量表达式）。
@@ -737,6 +741,9 @@ pub struct Variant {
     /// payload：无 / 元组 / 结构体。
     pub payload: VariantPayload,
     pub discriminant: Option<Expression>, // 显式赋值
+    /// 变体上的属性（`#[default]` 等）。早先解析完就丢，导致枚举
+    /// `#[derive(Default)]` 无法用 `#[default]` 标出默认变体。
+    pub attrs: Vec<Attribute>,
 }
 
 #[derive(Debug, Clone)]
@@ -825,9 +832,17 @@ pub struct TraitDef {
     pub attrs: Vec<Attribute>,
 }
 
-/// 关联类型：`type Item;` / `type Item: Iterator;`。
+/// 关联类型：`type Item;` / `type Item: Iterator;` / `type Output = i32;`。
+///
+/// `name` 是关联类型名；`ty` 是 impl 块里 `= T` 指定的具体类型
+/// （trait 定义里为 `None`）。早先这两个字段都被丢弃，于是 impl 里的
+/// `type Output = i32` 完全没记录，`Self::Output` 在 impl 方法签名里
+/// 解析不了（报 `cannot find value Self`）。
 #[derive(Debug, Clone)]
-pub struct AssocType;
+pub struct AssocType {
+    pub name: String,
+    pub ty: Option<Type>,
+}
 
 /// impl 块。
 #[derive(Debug, Clone)]
@@ -837,6 +852,9 @@ pub struct ImplBlock {
     pub target: Type,             // 实现的目标类型
     pub trait_type: Option<Type>, // `impl Trait for T` 中的 Trait
     pub methods: Vec<Function>,   // impl 中定义的方法
+    /// impl 块里的关联类型定义（`type Output = i32;`）。早先丢弃，
+    /// `Self::Output` 在 impl 方法签名里解析不了。
+    pub assoc_types: Vec<AssocType>,
     pub where_clause: Vec<WherePred>,
     /// 声明所在的模块路径（模块加载器扁平化时打上；顶层为空串）。
     pub module: String,

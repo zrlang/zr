@@ -477,6 +477,16 @@ impl Parser {
             vec![]
         };
 
+        // `where` 子句：`struct S<T> where T: Ord { .. }`。
+        // 与函数 / impl 上的 where 子句一致——**解析并消费，但暂不强制**
+        // （边界在泛型单态化时由 `check_trait_bounds` 校验）。早先这里没有
+        // where 分支，`pub struct Join2<..> where ..` 直接撞上 `{` 分派，
+        // 报 `expected '{' after struct name: found KwWhere`，`std/async.zr`
+        // 整模块加载不了。
+        if self.match_kind(&TokenKind::KwWhere) {
+            let _ = self.parse_where_clause()?;
+        }
+
         if self.match_kind(&TokenKind::LParen) {
             // 元组结构体 `struct Point(u32, u32)`
             let mut fields = Vec::new();
@@ -609,6 +619,7 @@ impl Parser {
 
     fn parse_variant(&mut self) -> Result<Variant, CompileError> {
         let _span = self.peek().span;
+        let attrs = self.parse_outer_attrs()?;
         let name = self.consume_ident("expected variant name")?;
         let payload = if self.match_kind(&TokenKind::LParen) {
             let mut types = Vec::new();
@@ -658,6 +669,7 @@ impl Parser {
             name,
             payload,
             discriminant,
+            attrs,
         })
     }
 
@@ -785,7 +797,7 @@ impl Parser {
 
     fn parse_assoc_type(&mut self) -> Result<AssocType, CompileError> {
         let _span = self.peek().span;
-        let _name = self.consume_ident("expected associated type name")?;
+        let name = self.consume_ident("expected associated type name")?;
         if self.match_kind(&TokenKind::Colon) {
             // 消费 trait bounds 但不存储
             let _ = self.parse_type()?;
@@ -793,13 +805,13 @@ impl Parser {
                 let _ = self.parse_type()?;
             }
         }
-        let _default = if self.match_kind(&TokenKind::Eq) {
+        let ty = if self.match_kind(&TokenKind::Eq) {
             Some(self.parse_type()?)
         } else {
             None
         };
         self.consume(&TokenKind::Semicolon, "expected ';'")?;
-        Ok(AssocType)
+        Ok(AssocType { name, ty })
     }
 
     // ==================================================================
@@ -831,10 +843,10 @@ impl Parser {
         };
         self.consume(&TokenKind::LBrace, "expected '{'")?;
         let mut methods = Vec::new();
-        let mut _assoc_types = Vec::new();
+        let mut assoc_types = Vec::new();
         while !self.check(&TokenKind::RBrace) && !self.is_at_end() {
             if self.match_kind(&TokenKind::KwType) {
-                _assoc_types.push(self.parse_assoc_type()?);
+                assoc_types.push(self.parse_assoc_type()?);
             } else {
                 let visibility = if self.match_kind(&TokenKind::KwPub) {
                     Visibility::Public
@@ -852,6 +864,7 @@ impl Parser {
             target,
             trait_type,
             methods,
+            assoc_types,
             where_clause,
             // 顶层条目（crate root）模块路径为空串；模块加载器扁平化内联 /
             // 文件模块时覆盖成模块路径（impl 方法按 impl 块所在模块判可见性）。

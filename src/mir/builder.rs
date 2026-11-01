@@ -2489,6 +2489,18 @@ fn type_size_align(b: &Builder, ty: &hir::Ty, depth: usize) -> Option<(i128, i12
             if let Some(el) = enum_layout(b, *id, args) {
                 return Some((el.size, el.align));
             }
+            // union：所有字段共享偏移 0，尺寸 / 对齐取最大字段。
+            if let Some(hir::HirTypeDef::Union(u)) = b.types.get(id) {
+                let mut max_size = 0i128;
+                let mut max_align = 1i128;
+                for f in &u.fields {
+                    let fty = subst_generic(b, *id, args, &f.ty);
+                    let (sz, al) = type_size_align(b, &fty, depth + 1)?;
+                    max_size = max_size.max(sz);
+                    max_align = max_align.max(al);
+                }
+                return Some((max_size, max_align));
+            }
             let hs = match b.types.get(id)? {
                 hir::HirTypeDef::Struct(hs) => hs,
                 _ => return None,
@@ -2536,6 +2548,26 @@ fn struct_layout(b: &Builder, ty: &hir::Ty) -> Option<StructLayout> {
     };
     let hs = match b.types.get(&id)? {
         hir::HirTypeDef::Struct(hs) => hs,
+        hir::HirTypeDef::Union(u) => {
+            // union：所有字段共享偏移 0。尺寸取最大字段，对齐取最大对齐。
+            let mut fields = Vec::with_capacity(u.fields.len());
+            let mut names = HashMap::new();
+            let mut max_size = 0i128;
+            let mut align = 1i128;
+            for (idx, f) in u.fields.iter().enumerate() {
+                let fty = subst_generic(b, id, &args, &f.ty);
+                let (sz, al) = type_size_align(b, &fty, 0)?;
+                fields.push((0, fty));
+                names.insert(f.name.clone(), idx);
+                max_size = max_size.max(sz);
+                align = align.max(al);
+            }
+            return Some(StructLayout {
+                size: max_size,
+                fields,
+                names,
+            });
+        }
         _ => return None,
     };
     let mut fields = Vec::with_capacity(hs.fields.len());

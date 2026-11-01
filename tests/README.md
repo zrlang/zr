@@ -16,7 +16,7 @@ cargo test --test zr_language
 属性、断言内建这些设施编译器目前还不支持（闭包已可用，见 `83_closure_fnptr.zr`
 与 `84_closure_capture_value.zr`；见下方"尚未覆盖"）。
 
-`tests/cases/` 现有 115 个用例，每个在 `-O0/-O1/-O2/-O3/-Oz` 各跑一遍。
+`tests/cases/` 现有 117 个用例，每个在 `-O0/-O1/-O2/-O3/-Oz` 各跑一遍。
 
 "该报错的还在报错"由另一半套件补上：`tests/negative/*.zr`（26 个）每个都必须
 **编译失败**，且报错文本要含文件里 `// expect: <子串>` 标注的期望子串
@@ -139,6 +139,8 @@ cargo test --test zr_negative
 | `113_i128_muldiv.zr` | `i128`/`u128` 的乘 / 除 / 取模：乘拆四段 64 位部分积（跨 64 位边界、`2^128` 截断为 0、负负得正），除 / 取模走 128 轮软件长除（有符号商向零截断、余数符号跟随被除数、两负数相除商为正）；**每个宽运算都同时走"就地算"与"函数调用"两条路径**——`SsaInstr::Call` 不带实参类型，宽实参的宽度靠 `regalloc::CalleeParams` 查被调方声明，早先漏标只送 2 个字，-O2/-Oz 直接 SIGILL |
 | `114_enum_ord_derive.zr` | `#[derive(PartialOrd, Ord)]` 生成枚举的 `__lt`：两级 match（外层 self 变体、内层 other 变体），不同变体按**声明顺序**定序、同一变体内按载荷字段字典序；覆盖无载荷枚举全序、带载荷枚举的跨变体与同变体、命名类型载荷递归进 `Key__lt`、方法与运算符一致性。带显式判别式的枚举仍报错（负向 `26`） |
 | `115_lifetime_args.zr` | 生命周期参数与实参：`Ctx<'a>` / `Pair<'a, T>` / `Pair<'_, i64>` 的解析、`impl<'a> Ctx<'a>` 的方法能真正发射并调用（早先方法体被当"泛型 impl"整体跳过，链接期才有未定义符号 `_Ctx__get`）、`&'a mut T`（`set(self: &'a mut Ctx<'a>)`）、`&'static dyn Trait` / `&'static T` 签名（只解析，无 vtable 分派） |
+| `116_enum_default.zr` | 枚举的 `#[derive(Default)]`：用 `#[default]` 标出恰好一个变体；覆盖无载荷 / 元组载荷 / 结构体载荷默认变体、默认变体不是第一个、命名类型载荷递归 `Inner__default()`。没有或多个 `#[default]` 报错（负向 `14`） |
+| `117_union.zr` | `union` 的构造（恰好一个字段）、字段读 / 写、类型双关（写 f32 1.0 读 bytes 验证 IEEE 754）、按值传参 / 返回、大字段决定 union 尺寸 |
 
 ## 尚未覆盖（编译器还不支持）
 

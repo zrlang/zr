@@ -318,8 +318,24 @@ README 里"指针与 unsafe"一节目前是**愿景**：
   嵌套深度，写死缩进会与 Rust 不一致，`108_debug_pretty.zr` 逐个对照
   `rustc {:#?}`），以及格式引擎入口 `Type__debug_fmt(*const void, bool, *mut u8, usize) -> usize`
   （把值按 `pretty` 渲染进调用方缓冲、返回所需长度；`io::fmt_debug` 拿它组装
-  `FormatArg`，见 §4 的 `println` 条）；**剩**：泛型类型 / 枚举 `Default` /
+  `FormatArg`，见 §4 的 `println` 条）；**剩**：泛型类型 / 带显式判别式的
   枚举 `Ord` 显式报错。
+- **`#[derive]` 枚举的 `Default`**：✅ 已实现——早先直接报 "zr has no
+  `#[default]` variant attribute"。现在 `Variant` AST 加了 `attrs` 字段、
+  `parse_variant` 解析变体上的 `#[...]`，`derive_methods` 对枚举找恰好一个
+  `#[default]` 变体（没有或多个都报错，与 Rust 一致），生成
+  `Type__default()` 构造该变体，载荷字段按结构体同样的规则取零值 / 递归
+  `__default()`（`default_enum_fn` + `payload_field_infos`）。
+  回归 `tests/cases/116_enum_default.zr`；负向 `tests/negative/14_enum_default.zr`
+  （无 `#[default]`）。
+- **`union` 构造与字段访问**：✅ 已实现——早先 `union U { i: i32 }` 能声明但
+  `U { i: 42 }` 报 `` `U` is not a struct ``、`u.i` 报 `no field i on type U`。
+  三处接上：`check_struct_init` 对 `HirTypeDef::Union` 要求恰好一个字段（Rust
+  语义）并按该字段类型检查实参；`struct_field_tys` 同时返回 union 字段，字段
+  读 / 写走结构体同一套路径；MIR `struct_layout` / `type_size_align` 把 union
+  所有字段放在偏移 0、尺寸 / 对齐取最大字段——类型双关（写 f32 读 bytes）天然
+  成立。`ty_is_aggregate` 把 union 算作聚合（按地址传 / 返回）。覆盖构造、字段
+  读写、类型双关、按值传参 / 返回，回归 `tests/cases/117_union.zr`。
 - **`#[derive]` 枚举的 `PartialOrd` / `Ord`**：✅ 已实现——早先直接报
   "ordering needs discriminant comparison, which derive does not implement"。
   但**无显式判别式**的枚举，判别式就是声明下标，按声明顺序比即是正确语义，

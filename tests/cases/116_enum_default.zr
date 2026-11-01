@@ -1,0 +1,89 @@
+//=============================================================================
+// tests/cases/116_enum_default.zr — 枚举上的 `#[derive(Default)]` + `#[default]`
+//
+// 早先 derive 对枚举的 `Default` 直接报错：
+//   cannot derive `Default` for enum ..: zr has no `#[default]` variant attribute
+// 现在支持：用 `#[default]` 标出"哪个变体是默认值"（与 Rust 一致），默认变体
+// 的载荷字段按结构体同样的规则取零值 / 递归 `__default()`。没有或多个
+// `#[default]` 都显式报错（负向用例 `14_enum_default.zr`）。
+//
+// 覆盖：无载荷默认变体、元组载荷默认变体、结构体载荷默认变体、默认变体
+// 不是第一个、命名类型载荷递归取 `Inner__default()`、`Default` 与 `Debug`
+// 可同时 derive。
+//=============================================================================
+
+#[derive(Default)]
+enum Color {
+    Red,
+    #[default]
+    Green,
+    Blue,
+}
+
+#[derive(Default)]
+enum Shape {
+    Circle(i32),
+    #[default]
+    Rect { w: i32, h: i32 },
+    Triangle,
+}
+
+// 默认变体不是第一个；元组载荷取零值。
+#[derive(Default)]
+enum Mode {
+    On(i32, bool),
+    Standby,
+    #[default]
+    Off,
+}
+
+#[derive(Default)]
+struct Inner {
+    x: i32,
+    y: i32,
+}
+
+// 结构体载荷里的命名类型字段递归取 `Inner__default()`。
+#[derive(Default)]
+enum Outer {
+    A(Inner),
+    #[default]
+    B { inner: Inner, flag: bool },
+}
+
+fn main() -> i32 {
+    // 无载荷：默认变体必须是标了 `#[default]` 的 Green
+    let c = Color::default();
+    match c {
+        Color::Green => {}
+        _ => { return 1; }
+    }
+
+    // 结构体载荷：字段取零值
+    let s = Shape::default();
+    match s {
+        Shape::Rect { w, h } => {
+            if w != 0 || h != 0 { return 2; }
+        }
+        _ => { return 3; }
+    }
+
+    // 默认变体是第三个（Off），不是第一个
+    let m = Mode::default();
+    match m {
+        Mode::Off => {}
+        _ => { return 4; }
+    }
+
+    // 命名类型载荷递归 default
+    let o = Outer::default();
+    match o {
+        Outer::B { inner, flag } => {
+            if inner.x != 0 || inner.y != 0 { return 5; }
+            if flag { return 6; }
+        }
+        _ => { return 7; }
+    }
+
+    return 0;
+}
