@@ -790,6 +790,31 @@ _zr_file_mode:
     ret
 
 #------------------------------------------------------------------------------
+# zr_file_ctime(path) -> i64
+#   返回状态变更时间（Unix 秒）；不存在或出错返回 -1。
+#   macOS `struct stat`：st_ctimespec 在偏移 64（tv_sec 8 字节 + tv_nsec 8 字节）。
+#------------------------------------------------------------------------------
+    .globl _zr_file_ctime
+_zr_file_ctime:
+    push    rbp
+    mov     rbp, rsp
+    and     rsp, -16
+    sub     rsp, 144
+    mov     rsi, rsp
+    call    _stat$INODE64
+    test    eax, eax
+    jnz     .fctime_err
+    mov     rax, qword ptr [rsp+64]    // st_ctimespec.tv_sec
+    jmp     .fctime_done
+.fctime_err:
+    mov     rax, -1
+.fctime_done:
+    add     rsp, 144
+    mov     rsp, rbp
+    pop     rbp
+    ret
+
+#------------------------------------------------------------------------------
 # zr_readdir_count(path) -> i64
 #   目录项个数；出错返回 -1。（包含 "." 与 ".."）
 #------------------------------------------------------------------------------

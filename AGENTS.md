@@ -278,11 +278,13 @@ README 里"指针与 unsafe"一节目前是**愿景**：
   `tests/cases/105_borrow_nll.zr`。已知局限：多绑定 / 未关联借用按作用域结束、
   跨作用域重名可能混淆 last-use。
 - **移动检查**：✅ 最小版已实现（`let b = a` 对含 drop glue 的类型是移动，读被移动的源报错）。
-- **元数据**（权限、时间戳）与 `tempfile`：✅ 已补齐（`db0b01f`）——`std/fs`
-  新增 `temp_file()`/`temp_file_raw()`（`/tmp/zr_tmp_<纳秒>`）、`file_mtime(path)`、
-  `file_mode(path)`；运行时新增 `zr_file_mtime`/`zr_file_mode`（macOS x86-64 用
-  `stat$INODE64` 偏移 48/4，Linux x86-64 用 `newfstatat` 偏移 88/24，其它平台暂
-  返回 -1）；`tests/cases/99_fs_tempfile_metadata.zr`。早先标注的 `fs::file_size(str)`
+- **元数据**（权限、时间戳）与 `tempfile`：✅ 已补齐（`db0b01f`，ctime 于 2026-11-01 补）——
+  `std/fs` 新增 `temp_file()`/`temp_file_raw()`（`/tmp/zr_tmp_<纳秒>`）、`file_mtime(path)`、
+  `file_mode(path)`、`file_ctime(path)`（状态变更时间）；运行时新增 `zr_file_mtime`/
+  `zr_file_mode`/`zr_file_ctime`（macOS x86-64 用 `stat$INODE64` 偏移 48/4/64，
+  Linux x86-64 用 `newfstatat` 偏移 88/24/104，其它平台暂
+  返回 -1）；`tests/cases/99_fs_tempfile_metadata.zr`（ctime 值已对照系统 `stat -f %c` 验证）。
+  早先标注的 `fs::file_size(str)`
   "变量路径返回 -1"其实是**命名冲突**：`io::file_size(fd)`（`File::size` 的 fd 版）
   与它同名，撞成一个 `z_file_size` 符号、MIR 去重只留首个，调用点可能走到 fd 版
   （str 被当 fd 读）。已修：`io::file_size` 改名 `file_size_fd`，`fs::file_size`

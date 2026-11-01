@@ -18,6 +18,7 @@
 //   fs::temp_file_raw()           -> i32    临时文件 fd，出错 -1
 //   fs::file_mtime(path)          -> i64    修改时间（Unix 秒），出错 -1
 //   fs::file_mode(path)           -> i64    mode 位（st_mode），出错 -1
+//   fs::file_ctime(path)          -> i64    状态变更时间（Unix 秒），出错 -1
 //
 // 目录遍历跳过 "." 与 ".."：下标 0..count-1 直接对应真实条目。
 //=============================================================================
@@ -80,6 +81,10 @@ extern "C" {
 
 extern "C" {
     fn zr_file_mode(path: *const u8) -> i64;
+}
+
+extern "C" {
+    fn zr_file_ctime(path: *const u8) -> i64;
 }
 
 //----- 辅助 -------------------------------------------------------------------
@@ -258,8 +263,10 @@ pub fn temp_file() -> File {
 
 //----- 元数据 ---------------------------------------------------------------
 //
-// `st_mtimespec.tv_sec`（Unix 秒）与 `st_mode` 由运行时的 `zr_file_mtime` /
-// `zr_file_mode` 提供；`st_mode` 的低 12 位是权限位，高 4 位是文件类型。
+// `st_mtimespec.tv_sec`（Unix 秒）、`st_mode` 与 `st_ctimespec.tv_sec` 由运行时的
+// `zr_file_mtime` / `zr_file_mode` / `zr_file_ctime` 提供；`st_mode` 的低 12 位是
+// 权限位，高 4 位是文件类型。ctime 是"状态变更时间"（inode 元数据改动，如权限、
+// 属主、链接数），与 mtime（文件内容改动）不同，但对只做读写文件的程序二者常相同。
 
 /// 文件 / 目录的最后修改时间（Unix 秒）；不存在或出错返回 -1。
 pub fn file_mtime(path: str) -> i64 {
@@ -277,6 +284,15 @@ pub fn file_mode(path: str) -> i64 {
         return -1;
     }
     return zr_file_mode(&buf[0] as *const u8);
+}
+
+/// 文件 / 目录的状态变更时间（Unix 秒）；不存在或出错返回 -1。
+pub fn file_ctime(path: str) -> i64 {
+    let mut buf: [u8; 1024] = [0; 1024];
+    if !to_cstr(path, &mut buf[0], 1024) {
+        return -1;
+    }
+    return zr_file_ctime(&buf[0] as *const u8);
 }
 
 //----- 原始指针接口 -----------------------------------------------------------
@@ -318,6 +334,10 @@ pub fn file_mtime_raw(path: *const u8) -> i64 {
 
 pub fn file_mode_raw(path: *const u8) -> i64 {
     return zr_file_mode(path);
+}
+
+pub fn file_ctime_raw(path: *const u8) -> i64 {
+    return zr_file_ctime(path);
 }
 
 pub fn read_dir_count_raw(path: *const u8) -> i64 {

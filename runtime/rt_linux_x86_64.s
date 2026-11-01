@@ -825,6 +825,31 @@ zr_file_mode:
     ret
 
 #------------------------------------------------------------------------------
+# zr_file_ctime(path) -> i64
+#   rdi = path（NUL 结尾）
+# 返回状态变更时间（Unix 秒）；不存在或出错返回 -1。
+# Linux x86-64 `struct stat`：st_ctim.tv_sec 在偏移 104。
+#------------------------------------------------------------------------------
+    .globl zr_file_ctime
+zr_file_ctime:
+    subq    $160, %rsp
+    leaq    0(%rsp), %rdx      # statbuf
+    movq    %rdi, %rsi         # path
+    movq    $-100, %rdi        # AT_FDCWD
+    xorq    %r10, %r10         # flags = 0
+    movq    $262, %rax         # SYS_newfstatat
+    syscall
+    testq   %rax, %rax
+    jnz     .fctime_err
+    movq    104(%rsp), %rax    # st_ctim.tv_sec
+    jmp     .fctime_done
+.fctime_err:
+    movq    $-1, %rax
+.fctime_done:
+    addq    $160, %rsp
+    ret
+
+#------------------------------------------------------------------------------
 # zr_readdir_count(path) -> i64
 #   rdi = path（NUL 结尾）
 # 打开目录并用 getdents64 枚举，返回条目数（不含 "." 与 ".."）；

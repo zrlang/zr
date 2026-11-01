@@ -224,6 +224,15 @@ _zr_file_mtime:
 _zr_file_mode:
     mov     x0, #-1
     ret
+
+#------------------------------------------------------------------------------
+# zr_file_ctime(path) -> i64
+#   该平台未实现，返回 -1（与 zr_file_size 的空实现一致）。
+#------------------------------------------------------------------------------
+    .globl _zr_file_ctime
+_zr_file_ctime:
+    mov     x0, #-1
+    ret
 .globl _zr_readdir_count
 _zr_readdir_count:
     mov     x0, #-1

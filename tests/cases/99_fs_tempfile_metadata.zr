@@ -7,16 +7,17 @@
 //   fs::temp_file() / temp_file_raw()   创建 `/tmp/zr_tmp_<纳秒>` 并打开（可写）
 //   fs::file_mtime(path) -> i64         Unix 秒；不存在 -1
 //   fs::file_mode(path) -> i64          st_mode 位；不存在 -1
+//   fs::file_ctime(path) -> i64         状态变更时间（Unix 秒）；不存在 -1
 //
-// 运行时新增 `zr_file_mtime` / `zr_file_mode`（macOS x86-64 用 `stat$INODE64`
-// 的偏移 48 / 4；Linux x86-64 用 `newfstatat` 的偏移 88 / 24；其它平台暂返回 -1，
-// 与 `zr_file_size` 的空实现一致）。`zr_time_unix_ns` 与 `zr_open` 原本就有，
-// 临时文件名字用纳秒时间戳保证唯一。
+// 运行时新增 `zr_file_mtime` / `zr_file_mode` / `zr_file_ctime`（macOS x86-64 用
+// `stat$INODE64` 的偏移 48 / 4 / 64；Linux x86-64 用 `newfstatat` 的偏移 88 / 24 /
+// 104；其它平台暂返回 -1，与 `zr_file_size` 的空实现一致）。`zr_time_unix_ns` 与
+// `zr_open` 原本就有，临时文件名字用纳秒时间戳保证唯一。
 //
 // 本用例全部必须在 `-O0..-O3/-Oz` 下编译并返回 0。
 //=============================================================================
 
-use fs::{temp_file, file_mtime, file_mode, file_size, file_size_raw, remove_file};
+use fs::{temp_file, file_mtime, file_mode, file_ctime, file_size, file_size_raw, file_ctime_raw, remove_file};
 use io::File;
 // max/min 命名冲突回归：`core::max(a,b)`（二元）与 `slice::max(s)`（1 参切片，
 // 已改名 `max_slice`）同名会撞成一个 `z_max__T` 符号，`use core::max` 可能绑到
@@ -46,6 +47,7 @@ fn main() -> i32 {
     let mode = file_mode("/tmp");
     if mode <= 0 { return 4; }
     if (mode & 0x4000) == 0 { return 5; }   // S_IFDIR = 0x4000
+    if file_ctime("/tmp") <= 0 { return 15; }
 
     // 3) 元数据：一个真实存在的常规文件，类型位应是 S_IFREG（0x8000）。
     //    `file_size` 按**路径**取大小（`fs::file_size(str)`）；早先它与
@@ -62,6 +64,7 @@ fn main() -> i32 {
     let fmode = file_mode(path);
     if fmode <= 0 { return 8; }
     if (fmode & 0x8000) == 0 { return 9; }   // S_IFREG = 0x8000
+    if file_ctime(path) <= 0 { return 16; }
     // 路径版 `file_size`（字面量 + 变量路径都走这条，不再被 io::file_size 遮蔽）。
     if file_size(path) != 4 { return 10; }
     let pathvar = path;                       // 变量路径：早先返回 -1 的误判根因
@@ -71,12 +74,14 @@ fn main() -> i32 {
     while i < path.len { pb[i] = path.ptr[i]; i = i + 1; }
     pb[i] = 0;
     if file_size_raw(&pb[0] as *const u8) != 4 { return 12; }
+    if file_ctime_raw(&pb[0] as *const u8) <= 0 { return 17; }
     remove_file(path);
 
     // 4) 元数据：不存在的路径应返回 -1（不是垃圾值）。
     let missing = "/tmp/zr_no_such_path_xyz";
     if file_mtime(missing) != -1 { return 13; }
     if file_mode(missing) != -1 { return 14; }
+    if file_ctime(missing) != -1 { return 18; }
 
     return 0;
 }

@@ -175,18 +175,20 @@ zr 的做法是让被调方是**泛型**函数（`fn apply<F>(f: F, ..)`）：`F
 
 ### P1-6 元数据 / tempfile API
 
-现状：✅ 已补（`db0b01f`）。`std/fs` 新增 `temp_file()`/`temp_file_raw()`
-（`/tmp/zr_tmp_<纳秒>`，用已有 `zr_open` + `zr_time_unix_ns`）、`file_mtime(path)`
-（Unix 秒）、`file_mode(path)`（`st_mode` 位）；运行时新增 `zr_file_mtime` /
-`zr_file_mode`（macOS x86-64 用 `stat$INODE64` 偏移 48/4，Linux x86-64 用
-`newfstatat` 偏移 88/24，其它平台暂返回 -1）；`tests/cases/99_fs_tempfile_metadata.zr`。
+现状：✅ 已补（`db0b01f`；ctime 于 2026-11-01 补）。`std/fs` 新增 `temp_file()`/
+`temp_file_raw()`（`/tmp/zr_tmp_<纳秒>`，用已有 `zr_open` + `zr_time_unix_ns`）、
+`file_mtime(path)`（Unix 秒）、`file_mode(path)`（`st_mode` 位）、`file_ctime(path)`
+（状态变更时间，Unix 秒）；运行时新增 `zr_file_mtime` / `zr_file_mode` / `zr_file_ctime`
+（macOS x86-64 用 `stat$INODE64` 偏移 48/4/64，Linux x86-64 用
+`newfstatat` 偏移 88/24/104，其它平台暂返回 -1）；`tests/cases/99_fs_tempfile_metadata.zr`
+（ctime 值已对照系统 `stat -f %c` 验证）。
 早先标注的 `fs::file_size(str)`"变量路径返回 -1"实为**命名冲突**：`io::file_size(fd)`
 与其同名、撞成一个 `z_file_size` 符号、MIR 去重只留首个，调用点可能走到 fd 版。
 已修：`io::file_size` 改名 `file_size_fd`，`fs::file_size` 现在是唯一路径版。
 
 | 子任务 | 内容 | 状态 |
 |---|---|---|
-| P1-6a | `fs::metadata` → `{ len, mode, mtime, ctime }`（`stat` syscall） | 🔧 部分（mtime/mode 已出，len 走 `file_size_raw`，ctime 未出） |
+| P1-6a | `fs::metadata` → `{ len, mode, mtime, ctime }`（`stat` syscall） | ✅ `file_size`/`file_mode`/`file_mtime`/`file_ctime` + `_raw` 版齐 |
 | P1-6b | `tempfile::temp_dir()` / `temp_dir_file()` | ✅ `temp_file()`/`temp_file_raw()` |
 
 ### P1-7 `String::push_bytes` 扩容算错导致越界写堆
