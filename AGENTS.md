@@ -4,8 +4,8 @@ zr 是一门系统编程语言（Rust/Zig 混合取向），编译器用 Rust �
 本文件给在代码库里工作的 AI agent 看，是操作约定与"哪些文档可信"的清单。
 项目入口与功能全景见根目录 `AGENTS.md`。
 
-> 最近更新：2026-10-29。工作树干净；`feat/lang-features` 上连续几个提交修的都是
-> "编译通过、运行不崩、结果全错"的静默 bug，清单见 §5。
+> 最近更新：2026-11-01。工作树在 `feat/lang-features`；`i128`/`u128` 的乘除取模、
+> 枚举的 `derive(PartialOrd, Ord)` 已补上，清单见 §5。
 
 ---
 
@@ -25,10 +25,15 @@ zr 是一门系统编程语言（Rust/Zig 混合取向），编译器用 Rust �
 
 **结论：以源码为准。任何"已实现"的声明都要 `grep` 验证。**
 
-`future/README.md` 标 ✅ 但实际是空壳或没接线的：`lto`（`src/opt/lto.rs`，`opt/mod.rs` 只声明 `pass_manager`）、
-`pgo`（`src/opt/pgo.rs`，同上）、`macro_system`（`src/macro_system/`，`main.rs` 未 `mod` 声明）、
-`const_generics` / `specialization` / `negative_bounds` / `higher_ranked` / `impl_trait` /
-`coherence_rules` / `assoc_type_projection`（trait 求解代码里查无实现）。
+`future/README.md` 的状态列在 2026-11-01 已按源码重排，当前的不接线 / 空壳项：
+`lto`（`src/opt/lto.rs` 有完整实现，但 `opt/mod.rs` 未声明、CLI 无开关）、
+`pgo`（`src/opt/pgo.rs`，同上）、`macro_system`（`src/macro_system/`，`main.rs` 未 `mod` 声明；
+`macro_rules!` 走的是 `src/macros.rs`）、`const_generics`（`<const N: usize>` 解析接受但
+检查时报错）、`negative_bounds` / `higher_ranked` / `assoc_type_projection`（trait 求解里查无实现）、
+`impl_trait`（`-> impl Trait` 能解析，但值是 `opaque(impl_trait_N)`，任何访问都报错）。
+**已接线且确实可用**：`coherence_rules`（`check_orphan_rule` / `check_overlap`，
+`src/typeck/mod.rs:1812-1814`）、`c_backend`（`--emit-c`）、`specialization` 的**选择**
+（更 specific 的 impl 优先，但无 `default fn` 特化）。
 
 ---
 
@@ -49,11 +54,15 @@ target/debug/zr prog.zr -O1 -o /tmp/prog   # 编译单个程序
   `ld` 直接断言崩溃（`atomShouldReplaceExisting`）。先 `nm` 看目标文件有没有
   重复符号，再下结论。已修复（提交 `1ef4a02`：MIR 按最终符号名去重，保留首个
   用户定义）。
-- 测试：`tests/zr_language.rs` 把 106 个 `tests/cases/*.zr` 各在
-  `-O0/-O1/-O2/-O3/-Oz` 跑一遍（525 次编译+运行）。退出码 0 = 过，非 0 = 失败（编号指向失败的断言）。
+- 测试：`tests/zr_language.rs` 把 115 个 `tests/cases/*.zr` 各在
+  `-O0/-O1/-O2/-O3/-Oz` 跑一遍（575 次编译+运行）。退出码 0 = 过，非 0 = 失败（编号指向失败的断言）。
   宿主端另有 `io_print_matches_rust` 等 Rust 对照用例。
-- **没有负向测试机制。** `tests/cases/` 下每个 `.zr` 都必须编译通过并返回 0。
-  想验证"某错误真被拦住了"，单独写 `/tmp/x.zr` 手工编译确认。
+- **负向测试机制是 `tests/zr_negative.rs`**（`cargo test --test zr_negative`，
+  26 个用例）。`tests/negative/*.zr` 每个都必须**编译失败**，且报错文本里含
+  文件里 `// expect: <子串>` 标注的期望子串；没有 `// expect:` 的行只要求
+  "确实报错"。子串而非精确匹配，是为了不让行号/列号漂移把整个套件变红。
+  `tests/cases/` 下每个 `.zr` 仍然必须编译通过并返回 0，**两边不要混放**
+  （`zr_language_cases` 用 `read_dir` 扫 `tests/cases`，放进去就会被当成编译失败）。
 - 最小复现优先放 `/tmp/`，**别塞进 `tests/cases/`**（塞进去就会挂测试）。
 
 诊断开关：`--dump-tokens|ast|hir|mir|ssa|ssa-after|asm`、`--wat`、`--emit-llvm`；
@@ -75,10 +84,18 @@ lexer → parser(ast) → typeck(hir, infer) → mir → ssa → opt → codegen
   `impl_matches_type` 是恒返回 `true` 的死桩，别去那里找逻辑。
 - 后端 6 个：`encoder.rs`(x86-64)、`encoder_aarch64.rs`、`encoder_arm.rs`(A32)、
   `encoder_thumb.rs`(Thumb-2)、`encoder_riscv.rs`(RV32/64IM)、`wasm.rs`(wasm32/64)。
-  目标格式：`objfile.rs`(ELF)、`macho.rs`、`pe.rs`、`wasm.rs`。另有 `c_backend.rs`（**未接 CLI**）。
+  目标格式：`objfile.rs`(ELF)、`macho.rs`、`pe.rs`、`wasm.rs`。另有 `c_backend.rs`：**已接 CLI**
+  （`--emit-c` 从 HIR 直译成一个 C 翻译单元，自举路径，见 `main.rs:762-766`）。
 - 标准库 `std/`：14 个 `.zr` 源文件（编译器自编译）——
   `async` `collections` `core` `error` `fs` `io` `mem` `net` `path` `process` `simd` `slice` `string` `thread`。
   **注意模块名不带 `std::` 前缀**：`use core::Option;`，不是 `use std::core::Option;`。
+  **2026-11-01 实测**（macOS x86-64，`use <m>::*;` + 空 `main`，全链路编译+链接）：
+  **12 个通过**（collections/core/fs/io/mem/net/path/process/simd/slice/string/thread），
+  两个不可加载——`async`（`pub struct Join2<..> where ..` 的**结构体 where 子句**
+  解析不了，报 `expected '{' after struct name: found KwWhere`；`async fn` 与协程
+  codegen 也未接，源码另缺 `use collections::Vec`）、`error`（`as *const _` 的
+  **推断类型占位 `_`** 解析不了，报 `expected type, found Underscore`；即使解析
+  过了，`(&dyn Error).cause()` 还需要 vtable 分派）。
 - 运行时 `runtime/*.s`：每平台一份汇编（Linux/macOS/Windows 的 x86-64+aarch64，裸机 ARM/RISC-V）。
   提供 `zr_write` / `zr_alloc` 等符号，与编译器分离编译。
 - 已接线的优化 pass（`src/opt/mod.rs:68-102`，按 `-O` 等级分层）：
@@ -96,9 +113,9 @@ lexer → parser(ast) → typeck(hir, infer) → mir → ssa → opt → codegen
 | `src/macro_system/` | `main.rs` 未 `mod` 声明（`macro_rules!` 走的是 `src/macros.rs`） |
 | `src/opt/lto.rs` | `opt/mod.rs` 未声明 |
 | `src/opt/pgo.rs` | `opt/mod.rs` 未声明 |
-| `src/codegen/c_backend.rs` | CLI 无 `--emit-c` 入口 |
 
 **不要在这几个目录里"修 bug"——先确认它们该不该接线。**
+（`src/codegen/c_backend.rs` 已由 `--emit-c` 接线，不属于此表。）
 
 ---
 
@@ -137,6 +154,14 @@ lexer → parser(ast) → typeck(hir, infer) → mir → ssa → opt → codegen
    浮点形参（`fn outer(f: f64) { inner(f) }`）反推不出来，会被当成整数走 rdi，
    而调用方按 SysV 放在 xmm0 —— 位模式当指针用直接 SIGSEGV，或者后面所有整数
    形参整体错位（读到的全是别人的值）。新增后端要照抄这一步。
+12. **`SsaInstr::Call` 不携带实参类型，实参宽度只能查被调方的声明。**
+   128 位实参要占**两个**实参寄存器，少送一个字会让被调方读到下一个实参
+   （`div128(-100, 7)` 只送 rdi:rsi 而 `_z_div128` 读 rdi:rsi:rdx:rcx，-O2/-Oz
+   直接 SIGILL）。宽度靠 `regalloc::CalleeParams`（`codegen::compile` 用
+   `module.functions` 的 `name`/`param_types` 建表，逐层传给
+   `emit_one` → `emit_function` → `assign_int_widths`）判定；`CallIndirect` 的
+   被调方是运行期指针、没有声明可查，故**不标**实参宽度——间接调用目前只能
+   传机器字宽的值。新增后端必须接这个参数，别只按返回值标宽。
 
 ---
 
@@ -144,8 +169,12 @@ lexer → parser(ast) → typeck(hir, infer) → mir → ssa → opt → codegen
 
 README 里"指针与 unsafe"一节目前是**愿景**：
 
-- **没有 `unsafe` 关键字。** `src/lexer/` 搜不到 `KwUnsafe`，`unsafe { }` 无法解析。
-- **没有 `dyn` 关键字**，trait 对象不可用，因此 `std/error` 导入不了。
+- **`unsafe` 是关键字、`unsafe { ... }` 能解析并通过类型检查，但不改变语义**
+  （`src/lexer/mod.rs:815` `KwUnsafe`、`src/parser/expr.rs:449`；按块表达式透传）。
+- **`dyn` 是关键字、`&dyn Trait` 能解析，但没有 vtable 分派**（`src/lexer/token.rs:97`
+  `KwDyn`、`src/parser/ty.rs` 的 `Type::Dyn`；类型检查把它当 `dyn trait#N`）。
+  方法/字段访问一律报 `cannot access field `..` on type `dyn trait#N``，所以
+  `std/error.zr`（`(&dyn Error).cause()`）仍加载不了；`dyn` 值也构造不出来。
 - **切片/数组索引不做越界检查**：`check_index_scalar` 不检查边界。
 - **借用检查是最小切片**：同位置的借用与已有借用重叠（`&mut` 独占、`&` 可共享，
   至少一个可变）报 `cannot borrow ... while already borrowed`；**写被借用位置**
@@ -163,7 +192,12 @@ README 里"指针与 unsafe"一节目前是**愿景**：
   是临时量不是绑定值（`with_value_pos`），语句结束释放。
   已知局限：多绑定 / 未关联的借用（`let (a, b) = (&mut x, &mut y)`）仍按作用域
   结束；`binding_last_use` 按局部 id 记最后使用，跨作用域重名（遮蔽）可能混淆。
-- **移动语义不检查**：`let s2 = s1;` 之后再用 `s1` 不报错。
+- **移动语义只做最小检查**：`let b = a` 后读 `a` 报 `use of moved value`，
+  但**仅当 `a` 的类型含 drop glue**（自身或成员递归 `impl Drop`，
+  `has_drop_glue`，`src/typeck/mod.rs:5895`）。`std/string.zr` 的 `String`
+  与 `collections` 的 `Vec` **都没有 `impl Drop`**，因此 `let s2 = s1; s1.len()`
+  仍静默通过（`std/net.zr:752` 的 `Socket` 是唯一带 Drop 的标准库类型）。
+  字段级移动、实参移动、容器内元素移动都不检查。
 - **可见性检查**：解析阶段保留 `pub` / `pub(crate)` / `pub(super)`（早先
   `_visibility` 直接丢弃，`pub(crate)` / `pub(super)` 被当成 `pub`，私有条目
   跨模块访问不设防）。模块加载器给每个条目打上声明模块路径，类型检查在
@@ -230,15 +264,17 @@ README 里"指针与 unsafe"一节目前是**愿景**：
 3. **栈上传参的偏移要跟着 `rsp` 走**：`Src::Mem(slot)` 是 `[rsp + 8*slot]` 的原始帧偏移，
    压入实参后必须整体加 `released/8`；被调方读 `[rbp + 16 + 8k]`（`rbp` 才是稳定基准）。
 
-### `cargo test` 当前基线（2026-10-29，全绿）
+### `cargo test` 当前基线（2026-11-01，全绿）
 
-- `cargo test --bin zr`：265 项。
-- `cargo test --test zr_language`：106 个用例 × 5 个优化等级 = 530 项，另有 3 个宿主端
+- `cargo test --bin zr`：267 项。
+- `cargo test --test zr_language`：115 个用例 × 5 个优化等级 = 575 项，另有 3 个宿主端
   对照用例（`io_print_matches_rust`——逐字符对比 Rust 的格式化输出，含 `{:e}` / `{:E}`
   与大浮点 Display（`|v| ≥ 2⁶⁴` 不带 `.0`）的回归；`extern_c_write_prints_string_literal`；
   `toolchain_subcommands_emit`——`zr fmt` / `zr fmt --check` / `zr pkg init` / `zr lsp`
   与 `--emit-llvm` / `--wat` 的发射验证）。
-- `cargo test --test zr_negative`：24 个负向用例（含新加的越界、use-after-move 与枚举缺臂 `17_match_missing_variant.zr`、`19_debug_float.zr`）。
+- `cargo test --test zr_negative`：26 个负向用例（含枚举缺臂
+  `17_match_missing_variant.zr`、`19_debug_float.zr`、借用检查 20/21/22、
+  带显式判别式的枚举 Ord `26_enum_ord_discriminant.zr`）。
 
 ### 最近修掉的静默 bug（都在 `tests/` 里留了钉子）
 
@@ -255,6 +291,21 @@ README 里"指针与 unsafe"一节目前是**愿景**：
 
 以下项已在本分支上完成或部分完成，更新如下：
 
+- **生命周期参数 / 实参（`Foo<'a>` / `&'a mut T` / `&'static dyn T`）**：✅ 已可解析并
+  全链路跑通（2026-11-01）。三处解析缺口：(1) `parse_generic_args` 早先对每个实参都
+  调 `parse_type()`，`Foo<'a>` 里 `'a` 被前缀吃掉后撞上 `>`，报
+  `expected type, found Gt`——`impl<'a> Ctx<'a>` 的头解析不了；(2) `&` 分支先看
+  `mut`，`&'a mut T` 的 `'a` 被当成"不可变"，`mut` 撞 `expected type, found KwMut`；
+  (3) 跳生命周期的代码排在 `dyn` 分支之后，`&'static dyn Error` 报
+  `expected type, found KwDyn`。现在生命周期实参**跳过不登记**（`Type` 没有生命周期
+  变体，类型检查本来就整体丢弃），`&` 后先吃生命周期，跳过提到前缀最前面。
+  **下游还有一处**：`check_function_bodies` 早先看 `impl_gens.is_empty()` 判"泛型 impl"，
+  纯生命周期 impl 的方法体被整体跳过 → 方法永不发射、调用点留未定义符号
+  （`_Ctx__get`），链接期才炸。现在只把**类型 / const** 参数算泛型。
+  回归 `tests/cases/115_lifetime_args.zr`。**仍不支持**：结构体上的 `where` 子句
+  （`pub struct S<..> where ..` 报 `expected '{' after struct name`，`std/async.zr`
+  卡在这里）、类型位置的推断占位 `_`（`as *const _` 报 `expected type, found
+  Underscore`）、`'_` 作为**必须**的实参（会被跳过，`Foo<'_>` 等于 `Foo`）。
 - **`#[derive]`**：方法体已生成（`PartialEq`/`Eq`/`Hash`/`PartialOrd`/`Ord`/`Default`/`Debug`），
   `Hash` 已覆盖**指针/引用按地址**（`b5f5a56`）、**元组按内容**（`38f1ddd`）、
   **数组按内容**（`caab7a0`）、**`str`/切片按内容**（`41ec8f4`，`96_str_slice_hash.zr`）；
@@ -269,6 +320,17 @@ README 里"指针与 unsafe"一节目前是**愿景**：
   （把值按 `pretty` 渲染进调用方缓冲、返回所需长度；`io::fmt_debug` 拿它组装
   `FormatArg`，见 §4 的 `println` 条）；**剩**：泛型类型 / 枚举 `Default` /
   枚举 `Ord` 显式报错。
+- **`#[derive]` 枚举的 `PartialOrd` / `Ord`**：✅ 已实现——早先直接报
+  "ordering needs discriminant comparison, which derive does not implement"。
+  但**无显式判别式**的枚举，判别式就是声明下标，按声明顺序比即是正确语义，
+  根本不需要求值任何表达式。现在生成两级 `match`（`lt_enum_fn`）：外层按
+  `self` 的变体、内层按 `other` 的变体，不同变体按声明顺序定序，同一变体内
+  对载荷字段做字典序比较（`payload_lt`，与结构体的 `lt_fn` 同一规则）；
+  `le`/`gt`/`ge` 仍由 `lt`/`eq` 组合而来。**带显式判别式**（`A = 5`）的枚举
+  继续显式报错（判别式顺序可能与声明顺序相反），负向钉子
+  `tests/negative/26_enum_ord_discriminant.zr`；回归
+  `tests/cases/114_enum_ord_derive.zr`（无载荷枚举全序、带载荷枚举的跨变体
+  与同变体字典序、命名类型载荷递归进 `Key__lt`、方法与运算符一致性）。
 - **`loop` 带值 break**：✅ 已实现（`87ef09a` + `daf9763`）——`let x = loop { break 7; }`
   不再静默得 0（`ExprKind::Break` 现在携带值，`Loop` 按其类型化）；
   `tests/cases/97_loop_value.zr`（含聚合 break 值）。`daf9763` 修掉聚合 break
@@ -333,11 +395,14 @@ README 里"指针与 unsafe"一节目前是**愿景**：
 - **闭包**：**无捕获**闭包已可存进变量/当实参/返回（提升成 `__closure_N` 顶层函数指针）；**带捕获**闭包已可存进变量/嵌套/多次调用（`tests/cases/84_closure_capture_value.zr`）；**跨函数传 env 已支持**——把环境结构体按值当实参传给**泛型**形参（`fn apply<F>(f: F, ..)`，`F` 单态化到 `__env_N`，被调函数体的 `f(x)` 按环境 DefId 内联展开，`tests/cases/109_closure_env_cross_fn.zr`）。**`fn(..)` 形参/返回值两条路径仍明确报错**——传给 `fn(..)` 形参报 `captured closure cannot be passed as a plain `fn` value`（负向 `07_closure_capture.zr`），作为 `fn(..)` 返回值报 `captured closure cannot be returned as a plain `fn` value`（负向 `25_closure_return.zr`；早先编译通过、运行 SIGSEGV）；要支持需 `Fn` 边界 / 胖指针，属独立大工程。返回路径的检查在 `check_expr` 的 `Expression::Return` 分支，与实参检查（`check_call`）对称。跨函数内联靠 `substitute_local` 把捕获 local 替换成形参 `f.__cN`——**该函数必须递归进 `Index` 的基址、`Array`/`Tuple` 元素**，早先 `Index(_, v)` 只替换下标，数组捕获跨函数内联读到别的栈帧直接 SIGSEGV（同函数内联因外层 local 还在而"碰巧"对）。
 - **`i128`/`u128`**：✅ 已在 64 位目标（x86-64）上打通——拆成两个连续 8 字节栈槽
   （lo / hi），加减 `adc`/`sbb`、位运算逐字、移位 `shld`/`shrd`、比较按高位优先
-  定序，传参 / 返回走 `rdx:rax`，字面量 / 拷贝 / 转换可用；**乘 / 除 / 取模显式
-  报错**（`target backend does not implement binary op 'Mul'` 等，未做）。
+  定序，传参 / 返回走 `rdx:rax`，字面量 / 拷贝 / 转换可用；**乘 / 除 / 取模也已
+  实现**——乘拆四段 64 位部分积（两个跨字项的高半累加进 `hi`），除 / 取模走
+  128 轮软件长除（商每轮左移、余数 `(rem<<1)|carry` 左移进被除数位、`sub/sbb`
+  比较、借位恢复；有符号按"两符号异或的最低位"定商符号、余数符号跟随被除数）。
   `regalloc::assign_int_widths` 按「类型宽于机器字」标宽值，宽值不占寄存器池、
-  统一走连续栈槽。**32 位目标仍禁用**（类型检查阶段报错）。回归
-  `tests/cases/111_i128.zr`。
+  统一走连续栈槽。**32 位目标仍禁用**（类型检查阶段报错）。
+  回归 `tests/cases/111_i128.zr`（加减/位/移位/比较/转换）与
+  `tests/cases/113_i128_muldiv.zr`（乘除取模，含**跨函数**的宽实参）。
 - **泛型推断**：✅ 已改进（`bab298c`）——`try_instantiate_call` 推不出类型参数时
   留推断变量、等用法体约束（`let v = Vec::new(); v.push(1)` 不再报
   `cannot infer type parameter`）；`check_instance_body` 里若仍停在未解析推断变量

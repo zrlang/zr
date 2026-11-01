@@ -27,7 +27,7 @@
 | `i8` / `i16` / `i32` / `i64` | 全部可用 | ✅ | 字面量后缀（`42u64`）、类型推导、`as` 截断转换都与 Rust 一致；实参位置允许隐式拓宽（`i32` → `i64`） |
 | `u8` / `u16` / `u32` | 全部可用 | ✅ | 字面量后缀、推导、`as` 截断转换、比较 / 移位 / 除法均按无符号处理 |
 | `u64` | 全部可用 | ✅ | 比较用 `setb`/`seta`、右移用逻辑右移、除法用 `div`（含 ≥ 2⁶³ 的值）；有符号仍走 `setl`/`sar`/`idiv` |
-| `i128` / `u128` | 64 位目标可用 | 🟡 | 拆成两个连续 8 字节栈槽（lo / hi）：加减走 `adc`/`sbb`、移位走 `shld`/`shrd`、比较按高位优先定序，传参 / 返回用 `rdx:rax`；字面量 / 拷贝 / 转换可用。**乘 / 除 / 取模暂不支持**（需拆四段 / 软件长除），显式报错；32 位目标仍禁用。回归 `tests/cases/111_i128.zr` |
+| `i128` / `u128` | 64 位目标可用 | 🟡 | 拆成两个连续 8 字节栈槽（lo / hi）：加减走 `adc`/`sbb`、移位走 `shld`/`shrd`、比较按高位优先定序，传参 / 返回用 `rdx:rax`；字面量 / 拷贝 / 转换可用；**乘 / 除 / 取模也已实现**（乘拆四段 64 位部分积，除 / 取模走 128 轮软件长除，有符号商向零截断、余数符号跟随被除数）；32 位目标仍禁用。回归 `tests/cases/111_i128.zr`、`tests/cases/113_i128_muldiv.zr` |
 | `isize` / `usize` | 可用 | ✅ | 宽度等于目标指针宽度 |
 | `f32` / `f64` | 可用 | ✅ | 算术、比较、字面量后缀（`3.14f32`）正常；实参位置允许 `f32` / 整数 → `f64` 的隐式拓宽，反向窄化需 `as` |
 | `f8` / `f16` | 可用（zr 自定义格式） | ✅ | 窄浮点按 IEEE 754 binary16 / zr 自定义 8 位格式实现；传给 `f32` / `f64` 形参时会自动拓宽 |
@@ -60,7 +60,7 @@
 | 关联类型 | 可用 | ✅ | `type Output;` + `type Output = i32;` 正常，`Self::Output` 能取到 |
 | `impl` 块 | 可用 | ✅ | 关联函数、`self` / `&self` / `&mut self` 三种接收者、`Self` 类型均可 |
 | `type` 别名 | 可用（含泛型） | ✅ | 在**使用点展开**：`let x: MyInt`、结构体字段、数组 / 指针、`Vec<MyInt>`、别名套别名、前向引用都正常；**泛型别名 `type V<T> = Vec<T>` 已支持**（`74_generic_alias.zr`，提交 `8d6c475`：保留参数并登记占位符，展平按实参替换） |
-| 生命周期标注 `'a` | 解析后丢弃 | 🟡 | `&'a T`、`struct S<'a>` 能写，但类型检查阶段直接丢掉标注（`src/parser/ty.rs`），**没有生命周期 / 存活检查**（借用检查只是 §2.4 的最小切片） |
+| 生命周期标注 `'a` | 解析后丢弃 | 🟡 | `&'a T`、`&'a mut T`、`&'static dyn Tomb`、`struct S<'a>`、`impl<'a> S<'a>`、`S<'a>` / `S<'_>` 都能解析（生命周期实参在 `parse_generic_args` 里跳过、不登记，见 `115_lifetime_args.zr`），类型检查阶段直接丢掉标注（`src/parser/ty.rs`），**没有生命周期 / 存活检查**（借用检查只是 §2.4 的最小切片）。**仍不支持**：结构体上的 `where` 子句、类型位置的推断占位 `_`（`as *const _`） |
 | `dyn Trait` / trait 对象 | 骨架可用 | 🔧 | 词法+解析+类型检查三层已实现（`88_dyn_keyword.zr`：参数/局部注解里出现 `&dyn Error` 不再报错）；**完整 vtable 分派与 trait-object 转换仍在未实现状态**，调用 trait 方法不在此用例范围 |
 | auto trait | 不支持 | ❌ | 无 auto trait 机制、无 blanket impl 语法 |
 | `PhantomData<T>` | 不存在 | ❌ | `std::core` 里没有 `PhantomData`，也没有等价物 |
@@ -114,7 +114,7 @@
 | 块表达式 | 可用 | ✅ | `let v = { let a = 1; a + 1 };` |
 | 函数指针 `fn(T) -> R` | 可用 | ✅ | 取址、传参、返回值、存进结构体字段都行（x86-64 专属，其它后端明确报错） |
 | 闭包 `\|x\| x * factor` | 基本可用 | 🟡 | 无捕获闭包可存变量 / 当实参 / 返回；带捕获闭包也可存变量 / 嵌套 / 多次调用、按值传给**泛型**形参 / 从泛型返回值透传（`84_closure_capture_value.zr`、`109_closure_env_cross_fn.zr`、`110_closure_env_generic_passthrough.zr`）。**带捕获闭包传给裸 `fn(..)` 形参 / 作为 `fn(..)` 返回值仍明确报错**（负向 `07_closure_capture.zr` / `25_closure_return.zr`） |
-| `impl Trait` 参数 | 不支持 | ❌ | `fn f(op: impl Fn(T) -> T)` → `zr: expected ')': expected LParen`；`impl Fn(T) -> T` 这种 trait 路径参数写不了 |
+| `impl Trait` 参数 / 返回值 | 仅语法骨架 | ❌ | `-> impl Trait`（RPIT）能解析、能构造返回值，但返回的类型是 `opaque(impl_trait_N)`——任何字段访问 / 方法调用都报 `cannot access field ... on type opaque(impl_trait_N)`，实质不可用；`impl Fn(T) -> T` 这种带括号的 trait 路径仍解析失败（`expected RParen, found LParen`） |
 | `?` 运算符 | 可用 | ✅ | 对 `Result<T, E>` / `Option<T>` 生效：成功取载荷，失败从当前函数 `return Err(e)` / `return None`。返回类型必须是同一种枚举，错误类型必须一致（没有 `From` 转换） |
 | `try` / `catch` | 明确报错 | ❌ | 语法能解析，类型检查报 `` `try` / `catch` is not implemented yet; use the postfix `?` operator ... `` |
 | `throw` | 明确报错 | ❌ | 类型检查报 `` `throw` is not implemented yet; return `Err(...)` instead `` |
@@ -252,8 +252,11 @@
    `Debug` 已生成 `.debug()` 方法体（`Type__debug(self) -> String`，Rust `{:?}`
    风格；浮点/指针/数组/元组/`String` 字段显式报错；**结构体变体载荷里的
    `str` 字段与 `str` 后嵌套字段两处组合错经 `EnumField` 聚合特判后也已对齐
-   Rust**）；泛型类型上的 derive 明确报错；
-   枚举的 `Default` / `PartialOrd` / `Ord` 明确报错；字段类型缺少所需 trait 时
+   Rust**）；泛型类型上的 derive 明确报错；枚举的 `Default` 明确报错
+   （zr 没有 `#[default]` 变体属性）；**枚举的 `PartialOrd` / `Ord` 已支持**
+   （无显式判别式时按声明顺序比变体、同一变体内再比载荷字典序，
+   `114_enum_ord_derive.zr`；带显式判别式的枚举仍报错，负向
+   `26_enum_ord_discriminant.zr`）；字段类型缺少所需 trait 时
    报的是整个类型的方法检查失败，尚未精确指向字段。可接受的 derive 名：
    `Debug` `Clone` `Copy` `PartialEq` `Eq` `PartialOrd` `Ord` `Hash` `Default`；
    其它名字报 `cannot derive ...`。
@@ -287,12 +290,17 @@
    需 `Fn` 边界 / 胖指针，属独立大工程。
 6. **`i128` / `u128` 只在 64 位目标上可用**（拆成两个连续 8 字节栈槽，加减
    走 `adc`/`sbb`、移位走 `shld`/`shrd`、比较按高位优先定序、传参 / 返回用
-   `rdx:rax`；源码见 `src/codegen/encoder.rs`）。**乘 / 除 / 取模显式报错**
-   （`target backend does not implement binary op 'Mul'` 等，需拆四段 / 软件
-   长除，未做）；**32 位目标仍禁用**（类型检查阶段报错）。回归
-   `tests/cases/111_i128.zr`。
-7. **泛型推断的边界**：类型参数只从实参和期望返回类型推断，不看作法体
-   （`let v = Vec::new(); v.push(1)` 推不出 `T`，需要 `let v: Vec<i32>` 注解）。
+   `rdx:rax`；源码见 `src/codegen/encoder.rs`）。**乘 / 除 / 取模已实现**
+   （乘拆四段 64 位部分积、除 / 取模走 128 轮软件长除；宽整数实参要占两个
+   实参寄存器，宽度靠 `regalloc::CalleeParams` 查被调方声明——早先只按返回值
+   标宽，`div128(-100, 7)` 在 -O2/-Oz 直接 SIGILL）；**32 位目标仍禁用**
+   （类型检查阶段报错）。回归 `tests/cases/111_i128.zr`、
+   `tests/cases/113_i128_muldiv.zr`。
+7. **泛型推断的边界**：类型参数从实参、期望返回类型**和用法体**推断
+   （`try_instantiate_call` 推不出时留推断变量，`let v = Vec::new(); v.push(1)`
+   能靠 `push(1)` 定出 `T = i32`，`98_generic_infer_usage.zr`；若整个实例化
+   体检查完仍停在未解析的推断变量才报 `cannot infer type parameter`，
+   负向 `18_generic_infer_unused.zr`）。
    `T: Trait` / `where` 约束现在会在**单态化时**校验（`check_trait_bounds`，
    含超类型的双向展开）。
 

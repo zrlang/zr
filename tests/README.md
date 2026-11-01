@@ -16,6 +16,19 @@ cargo test --test zr_language
 属性、断言内建这些设施编译器目前还不支持（闭包已可用，见 `83_closure_fnptr.zr`
 与 `84_closure_capture_value.zr`；见下方"尚未覆盖"）。
 
+`tests/cases/` 现有 115 个用例，每个在 `-O0/-O1/-O2/-O3/-Oz` 各跑一遍。
+
+"该报错的还在报错"由另一半套件补上：`tests/negative/*.zr`（26 个）每个都必须
+**编译失败**，且报错文本要含文件里 `// expect: <子串>` 标注的期望子串
+（子串匹配，行号/列号漂移不会把套件变红）：
+
+```sh
+cargo test --test zr_negative
+```
+
+两个目录不要混放——`zr_language_cases` 用 `read_dir` 扫 `tests/cases`，
+把负向用例放进去会被当成编译失败。
+
 ## 已覆盖
 
 | 用例 | 对应 Rust Book 章节 |
@@ -121,8 +134,11 @@ cargo test --test zr_language
 | `108_debug_pretty.zr` | `#[derive(Debug)]` 生成的多行 `.debug_pretty()`（Rust `{:#?}` 风格）：命名结构体/结构体变体每字段一行、元组结构体/元组变体逐元素一行、单元变体与空结构体只打名字；嵌套命名类型递归 `Inner__debug_pretty_at(e, ind)`，`__ind` 是**运行期**参数（同一类型出现在深度 0 与深度 2 都对齐 Rust）。期望串逐个对照 `rustc {:#?}` |
 | `109_closure_env_cross_fn.zr` | 带捕获闭包**跨函数**传递：把环境结构体 `__env_N` 按值当实参传给**泛型**形参（`fn apply<F>(f: F, ..)`，`F` 单态化到 `__env_N`），被调函数体的 `f(x)` 同样按环境 DefId 内联展开。覆盖单元/多捕获、同一闭包传给两个泛型函数、重复调用、**数组捕获 + 变量下标**（早先 `substitute_local` 的 `Index` 分支只替换下标不替换数组基址，跨函数内联读到别的栈帧、SIGSEGV）、元组捕获、闭包体内数组字面量（`Array` 子表达式含捕获）与 `return`。`fn(..)` 形参仍拒绝（见负向 `07_closure_capture.zr`） |
 | `110_closure_env_generic_passthrough.zr` | 带捕获闭包的**值传递**穿函数边界与结构体字段：泛型透传返回（`fn idf<F>(f: F) -> F`）、存进泛型结构体字段并调用 `h.f(x)`、把结构体传给泛型函数再调用字段、数组捕获穿过字段 + 泛型函数（变量下标）、捕获的值拷贝语义（捕获后改外层不影响闭包）。这些形态在泛型路径下本就可用；做不到的只是转裸 `fn(..)` 指针 |
-| `111_i128.zr` | x86-64 上的 `i128`/`u128`：拆成两个连续 8 字节栈槽（lo/hi），加减 `adc`/`sbb`、位运算逐字、移位 `shld`/`shrd`、比较按高位优先定序，传参/返回走 `rdx:rax`，字面量/拷贝/转换；**乘/除/取模显式报错**，32 位目标仍禁用 |
+| `111_i128.zr` | x86-64 上的 `i128`/`u128`：拆成两个连续 8 字节栈槽（lo/hi），加减 `adc`/`sbb`、位运算逐字、移位 `shld`/`shrd`、比较按高位优先定序，传参/返回走 `rdx:rax`，字面量/拷贝/转换；32 位目标仍禁用（乘 / 除 / 取模见 `113`） |
 | `112_fmt_debug.zr` | 格式引擎接自定义类型 Debug（P1-5c）：`FormatArg` 加 `kind = 7` 类型化值通道（`obj_ptr` + `debug_fn`），`#[derive(Debug)]` 生成 `Type__debug_fmt(*const void, bool, *mut u8, usize) -> usize`，`io::fmt_debug` 组装参数。断言单行/多行两态逐字符对齐 Rust、超容量按容量截断且返回所需总长度、嵌套结构体递归渲染，并经 `println_fmt` 端到端冒烟 |
+| `113_i128_muldiv.zr` | `i128`/`u128` 的乘 / 除 / 取模：乘拆四段 64 位部分积（跨 64 位边界、`2^128` 截断为 0、负负得正），除 / 取模走 128 轮软件长除（有符号商向零截断、余数符号跟随被除数、两负数相除商为正）；**每个宽运算都同时走"就地算"与"函数调用"两条路径**——`SsaInstr::Call` 不带实参类型，宽实参的宽度靠 `regalloc::CalleeParams` 查被调方声明，早先漏标只送 2 个字，-O2/-Oz 直接 SIGILL |
+| `114_enum_ord_derive.zr` | `#[derive(PartialOrd, Ord)]` 生成枚举的 `__lt`：两级 match（外层 self 变体、内层 other 变体），不同变体按**声明顺序**定序、同一变体内按载荷字段字典序；覆盖无载荷枚举全序、带载荷枚举的跨变体与同变体、命名类型载荷递归进 `Key__lt`、方法与运算符一致性。带显式判别式的枚举仍报错（负向 `26`） |
+| `115_lifetime_args.zr` | 生命周期参数与实参：`Ctx<'a>` / `Pair<'a, T>` / `Pair<'_, i64>` 的解析、`impl<'a> Ctx<'a>` 的方法能真正发射并调用（早先方法体被当"泛型 impl"整体跳过，链接期才有未定义符号 `_Ctx__get`）、`&'a mut T`（`set(self: &'a mut Ctx<'a>)`）、`&'static dyn Trait` / `&'static T` 签名（只解析，无 vtable 分派） |
 
 ## 尚未覆盖（编译器还不支持）
 
