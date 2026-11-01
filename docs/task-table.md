@@ -111,12 +111,20 @@ i64 读，运行期越界 SIGSEGV（`/tmp/sl_bug.zr`）。`let a: []const i64 = 
 ### P1-2 闭包捕获 env 跨函数
 
 现状：带捕获闭包已可存进变量 / 嵌套 / 多次调用（`84_closure_capture_value.zr`），
-但**跨函数传 env** 仍报 `closures can only be invoked immediately where they are defined`。
+但**跨函数传 env**（把环境结构体按值/引用交给另一个函数的闭包调用点）仍**未实现**。
+当前行为已从"静默出错/文案过时"收敛为**两条路径都明确报错**：
+
+- 带捕获闭包作为**实参**传给 `fn(..)` → 报
+  `captured closure cannot be passed as a plain `fn` value`（负向 `07_closure_capture.zr`）。
+- 带捕获闭包作为 `fn(..)` 的**返回值** → 早先**编译通过、运行 SIGSEGV**（环境结构体
+  被 MIR 当函数地址 `call`），现报
+  `captured closure cannot be returned as a plain `fn` value`（负向 `25_closure_return.zr`）。
 
 | 子任务 | 内容 | 状态 |
 |---|---|---|
-| P1-2a | 带捕获闭包作为**函数实参**传递（env 打包成栈上结构体，按引用/值传给被调函数） | ⬜ |
-| P1-2b | 带捕获闭包作为**返回值** / 存进结构体字段（env 生命周期管理） | ⬜ |
+| P1-2a | 带捕获闭包作为**函数实参**传递（env 打包成栈上结构体，按引用/值传给被调函数）——未实现，当前明确报错 | ⬜ |
+| P1-2b | 带捕获闭包作为**返回值** / 存进结构体字段（env 生命周期管理）——未实现；**返回值这条已从静默 SIGSEGV 改为明确报错**（负向 `25_closure_return.zr`） | 🔧 |
+
 
 ### P1-3 `i128` / `u128` 64 位目标——拆 2 个子任务
 

@@ -140,7 +140,7 @@ Rust Book 的其余章节目前一个都测不了，因为对应特性尚未实�
 | 集合（Vector / String / HashMap） | 🟡 `std/collections` 与 `std/string` 已加载，但 `String` 无 `BufRead::read_line` 形态的 API；无 `HashMap` |
 | 错误处理（`panic!` / `Result` / `?`） | ✅ `69_question.zr`：`?` 对 `Result`/`Option` 生效；`Option`/`Result`（含变体）已在 prelude（`89_prelude_variant.zr`）。`panic!` 未实现 |
 | 泛型 / Trait / 生命周期 | ✅ 泛型函数/impl 与 `T: Trait` 边界校验已实现（`66_generics.zr`、`74_generic_alias.zr`）；trait 方法/关联类型/`Self` 可用。**生命周期标注 `'a` 解析后丢弃**，无借用/存活检查 |
-| 函数式（闭包 / 迭代器） | 🟡 **无捕获**闭包已可存进变量/当实参/返回（`83_closure_fnptr.zr`）；**带捕获**闭包已可存进变量/嵌套/多次调用（`84_closure_capture_value.zr`），但跨函数传 env 仍有限制 |
+| 函数式（闭包 / 迭代器） | 🟡 **无捕获**闭包已可存进变量/当实参/返回（`83_closure_fnptr.zr`）；**带捕获**闭包已可存进变量/嵌套/多次调用（`84_closure_capture_value.zr`）；**跨函数传 env 未实现**，但两条路径都明确报错而不是静默出错——传给 `fn(..)` 形参报 `captured closure cannot be passed as a plain `fn` value`（负向 `07_closure_capture.zr`），作为 `fn(..)` 返回值报 `captured closure cannot be returned as a plain `fn` value`（负向 `25_closure_return.zr`；早先编译通过、运行 SIGSEGV） |
 | 智能指针（`Box` / `Rc` / `RefCell`） | ❌ 未实现 |
 | 并发（线程 / 通道 / `Mutex` / `Send`） | 🟡 线程已覆盖（`59_threads.zr`）；无通道 / `Mutex` / `Send` |
 | 面向对象 / 状态模式 | ✅ `trait` 与 `enum` 都已实现；trait 对象 `dyn` 骨架已搭（`88_dyn_keyword.zr`），vtable 分派未完工 |

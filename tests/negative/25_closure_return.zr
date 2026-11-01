@@ -1,0 +1,17 @@
+// 负向用例：**带捕获**的闭包当作 `fn(..)` 返回值仍必须明确报错。
+//
+// 与 `07_closure_capture.zr`（传给 `fn(..)` 形参）是同一个坑的另一半：带捕获
+// 闭包的 HIR 值已降级成环境结构体字面量（`__env_N`），不是函数指针。跨函数
+// 环境传递机制不存在，`fn make(base) -> fn(i32)->i32 { return |x| x + base; }`
+// 早先能编译通过，返回的环境结构体被 MIR 当函数地址 `call`，运行期 SIGSEGV。
+// 现在在 `return` 处明确报错，而不是发射必崩的代码。
+//
+// expect: captured closure cannot be returned
+fn make(base: i32) -> fn(i32) -> i32 {
+    return |x| x + base;
+}
+
+fn main() -> i32 {
+    let f = make(10);
+    return f(5);
+}

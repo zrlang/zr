@@ -3294,6 +3294,28 @@ impl TypeChecker {
                 let v = if let Some(val) = value {
                     let e = self.check_expr(val, &ret_ty)?;
                     self.check_partial_move(&e, val.span())?;
+                    // 带捕获闭包（环境结构体 `__env_N`）当作 `fn(..)` 返回值：
+                    // 与"传给 `fn(..)` 形参"同一个坑（见 `check_call` 的实参检查
+                    // 与 `closure_env_id` 注释）。闭包的 HIR 值此时已经降级成环境
+                    // 结构体字面量，不是函数指针；跨函数环境传递机制不存在，
+                    // 被调方（调用返回值的那个调用点）在**另一个函数**里按环境
+                    // DefId 查 `closures_by_env` 也查不到（该表按单文件收集，但
+                    // 返回值已被强转成函数类型，MIR 把结构体当函数地址 `call`），
+                    // 运行必崩（实测 `fn make(base){ return |x| x + base; }`
+                    // SIGSEGV）。明确报错而不是发射必崩的代码。
+                    if let Ty::Named(env_id, _) = self.infer.resolve(&e.ty) {
+                        if self.closures_by_env.contains_key(&env_id) {
+                            let ret = self.infer.resolve(&ret_ty);
+                            if matches!(ret, Ty::Function { .. } | Ty::Infer(_)) {
+                                return Err(CompileError::type_error(
+                                    "captured closure cannot be returned as a plain `fn` \
+                                     value; a closure that captures variables carries its \
+                                     environment and cannot be converted to a function pointer",
+                                )
+                                .with_span(val.span()));
+                            }
+                        }
+                    }
                     self.infer.unify(&e.ty, &ret_ty, span).ok();
                     Some(Box::new(e))
                 } else {
