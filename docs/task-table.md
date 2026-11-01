@@ -153,13 +153,17 @@ i64 读，运行期越界 SIGSEGV（`/tmp/sl_bug.zr`）。`let a: []const i64 = 
 
 现状：`std/io.zr` 格式引擎支持 `{}` `{:?}` `{:x}` …、位置参数、动态宽度/精度；
 **命名参数 `{name}` 已实现**（`io::println_fmt_named(fmt, &[NamedArg], n)`，
-`0d40ab1`）；**`{:#?}` 多行聚合 Debug 未实现**（`#` 对 `{:?}` 被忽略，只输出
-一行）。
+`0d40ab1`）。**`{:#?}` 多行聚合 Debug 分两步**：derive 侧已落地——`#[derive(Debug)]`
+生成 `.debug_pretty()` / `.debug_pretty_at(e, ind)`，输出对齐 Rust `{:#?}`；
+但**格式引擎尚未把 `{:#?}` 接到自定义类型**（`FormatArg` 只带标量/字符串种类），
+所以现在只能直接调生成的 `.debug_pretty()` 方法，还不能写
+`println_fmt("… {:#?}", …)`。
 
 | 子任务 | 内容 | 状态 |
 |---|---|---|
 | P1-5a | 命名参数 `{name}`：格式引擎按名字查值（`NamedArg { name, value }`，名字与值同结构体） | ✅ `0d40ab1` |
-| P1-5b | `{:#?}` 聚合多行：递归 pretty-print。**不再受阻**——聚合 Debug（P1-1c）已落地，此前认定的"编译器阻塞"实为 `String::push_bytes` 扩容算错（见下 P1-7，已修），代码生成器无缺陷 | ⬜ |
+| P1-5b | `{:#?}` 多行 derive 侧：`#[derive(Debug)]` 生成 `Type__debug_pretty`（入口）/ `Type__debug_pretty_at(e, ind)`（递归 worker；缩进是**运行期**参数，同一类型不同深度都对齐 Rust）；`String::push_indent` 做缩进。`108_debug_pretty.zr` 逐个对照 `rustc {:#?}` | ✅ `13acff2` |
+| P1-5c | 格式引擎接 `{:?}` / `{:#?}`：`println_fmt` 让自定义类型的 `Debug` 走格式串（需在 `FormatArg` 之外加类型化值通道） | ⬜ |
 
 ### P1-6 元数据 / tempfile API
 

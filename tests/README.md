@@ -118,6 +118,7 @@ cargo test --test zr_language
 | `96_str_slice_hash.zr` | `str`/切片按内容 Hash：`"abc"`=96354、`""`=0、相等⇒同哈希、不同⇒不同、数组字面量切片元素类型传播（早先 `str`/切片按 `0` 计入，碰撞严重；且首版用 `loop` 当块尾得 0） |
 | `97_loop_value.zr` | `loop` 表达式带值 `break`：`let x = loop { break 7; }` = 7、累加器 = 0+1+2+3、嵌套 break 值只外层生效、`while`/`for` break 作语句、发散循环（早先 `Break` 只记标签丢弃值、`Loop` 恒 `Never`，全静默得 0）。**聚合 break 值在 `-O3`/`-Oz` 有已知 codegen 缺陷** |
 | `107_string_push_bytes_reserve.zr` | `String::push_bytes` 扩容算错：早先传 `reserve(new_len - capacity)`（只在 `len == capacity` 时够），其余情况少 reserve、拷贝循环越界写堆，可能覆写相邻对象/`SIGABRT`；本用例在循环里 `push_byte` 触发 realloc 后再 `push_bytes` 多字节字面量，断言字节完整、无 NUL |
+| `108_debug_pretty.zr` | `#[derive(Debug)]` 生成的多行 `.debug_pretty()`（Rust `{:#?}` 风格）：命名结构体/结构体变体每字段一行、元组结构体/元组变体逐元素一行、单元变体与空结构体只打名字；嵌套命名类型递归 `Inner__debug_pretty_at(e, ind)`，`__ind` 是**运行期**参数（同一类型出现在深度 0 与深度 2 都对齐 Rust）。期望串逐个对照 `rustc {:#?}` |
 
 ## 尚未覆盖（编译器还不支持）
 
@@ -556,8 +557,9 @@ stdio 上的 JSON-RPC 2.0，实现：
 - `#[repr(C | packed | transparent | simd)]` / `#[repr(align = N)]`：
   写错会报错（`#[repr(bogus)]`、`#[repr(size = 4)]`），不再默默回退到默认布局。
 
-仍然只是解析、没有任何语义的部分：`#[derive(..)]`、`#[cfg(..)]`、
-`#[no_mangle]` 等。
+`#[derive(..)]`（生成 `clone`/`eq`/`lt`/`hash`/`default`/`debug`/`debug_pretty`
+方法体）与 `#[cfg(..)]`（条件过滤）已有语义；仍然只是解析、没有任何语义的部分：
+`#[no_mangle]` 等（属性会被保留，但不改变发射出的符号名）。
 
 ## 优化等级
 

@@ -179,7 +179,11 @@ README 里"指针与 unsafe"一节目前是**愿景**：
   支持 `{}` `{:?}` `{:x}` `{:X}` `{:b}` `{:o}` `{:e}` `{:E}`、位置参数、填充/对齐/`+`/`#`/`0`/宽度/精度、
   动态宽度 `{:1$}`、动态精度 `{:.*}` / `{:.1$}`（与 Rust 逐字符对比一致）；
   **命名参数 `{name}`** 走 `println_fmt_named(fmt, &[NamedArg], n)`（名字与值放
-  同一个结构体）；`{:#?}` 也只输出一行（`#` 对 `{:?}` 被忽略）。
+  同一个结构体）；`{:#?}` 在**格式引擎里**也只输出一行（`#` 对 `{:?}` 被忽略，
+  且 `FormatArg` 目前只带标量/字符串种类，没接自定义类型）。多行聚合 Debug 走
+  `#[derive(Debug)]` 生成的 `.debug_pretty()` 方法（见 §5 的 `Debug` 条）。
+- **`Path {}`（零字段）结构体字面量可解析**（`41d8cb9`：`{` 后直接是 `}` 也算
+  结构体字面量，见 `looks_like_struct_literal`）。
 - **索引不做越界检查**，但对**标量**下标会在类型检查阶段报错
   （``cannot index a value of type `u8` ``）；指针下标写成 `p[i]`，不要写 `(*p)[i]`。
 
@@ -252,8 +256,12 @@ README 里"指针与 unsafe"一节目前是**愿景**：
   `Debug` 也已生成 `.debug()` 方法体（`Type__debug(self) -> String`，Rust `{:?}` 风格，
   `100_debug_derive.zr` + 负向 `19_debug_float.zr`；浮点/指针/数组/元组/`String` 字段显式报错；
   **结构体变体载荷里的 `str` 字段与 `str` 后嵌套字段两处"组合错"经 `EnumField`
-  聚合特判后也已对齐 Rust**，见 `AGENTS.md` §7 的 `Debug` 说明）；**剩**：泛型类型 /
-  枚举 `Default` / 枚举 `Ord` 显式报错。
+  聚合特判后也已对齐 Rust**，见 `AGENTS.md` §7 的 `Debug` 说明）；
+  `Debug` 还生成了多行 `.debug_pretty()` / `.debug_pretty_at(self, __ind)`
+  （Rust `{:#?}` 风格，`13acff2`；缩进是**运行期**参数——同一类型可能在不同
+  嵌套深度，写死缩进会与 Rust 不一致，`108_debug_pretty.zr` 逐个对照
+  `rustc {:#?}`）；**剩**：泛型类型 / 枚举 `Default` / 枚举 `Ord` 显式报错，
+  格式引擎（`println_fmt`）尚未把 `{:#?}` 接到自定义类型。
 - **`loop` 带值 break**：✅ 已实现（`87ef09a` + `daf9763`）——`let x = loop { break 7; }`
   不再静默得 0（`ExprKind::Break` 现在携带值，`Loop` 按其类型化）；
   `tests/cases/97_loop_value.zr`（含聚合 break 值）。`daf9763` 修掉聚合 break
@@ -285,8 +293,10 @@ README 里"指针与 unsafe"一节目前是**愿景**：
   `read_line_stream`（net.zr 目前有 `#[repr(C, align(4))]` 解析问题、加载不了，
   改名为将来消除隐患）。根因是扁平符号表 + 路径导入不区分模块——`use core::max`
   取 `symbols["max"]`（先收集者），不是 core 模块里的那个；根治需按模块限定。
-- **格式串**：命名参数 `{name}` 已实现（`println_fmt_named`，见下）；多行 Debug
-  `{:#?}` 没做（`#` 对 `{:?}` 被忽略，只输出一行）。
+- **格式串**：命名参数 `{name}` 已实现（`println_fmt_named`，见下）；多行聚合
+  Debug 已由 `#[derive(Debug)]` 生成 `.debug_pretty()`（`13acff2`，见本节末尾）；
+  **格式引擎本身仍不支持 `{:#?}`**（`#` 对 `{:?}` 被忽略，只输出一行，且
+  `FormatArg` 目前没接自定义类型）。
   **2026-11-01 定根因（此前"代码生成器寄存器/局部槽别名缺陷"的结论全部作废）**：
   该 bug 与代码生成无关，真凶在 `std/string.zr::push_bytes` 自己的 `reserve`
   算错。`push_bytes` 追加 `bytes` 后要保证 `capacity >= len + bytes.len`，却把
@@ -302,7 +312,8 @@ README 里"指针与 unsafe"一节目前是**愿景**：
   **修复**：改传 `reserve(bytes.len)`（`self.capacity` 比较仍用 `new_len > capacity`）。
   **回归**：`tests/cases/107_string_push_bytes_reserve.zr`（循环里 realloc +
   之后 `push_bytes` 多字节字面量）。**代码生成器无缺陷**——`{:#?}` 多行 Debug
-  不再被"编译器 bug"阻塞，只是单纯尚未实现。
+  不再被"编译器 bug"阻塞：derive 侧已实现（`13acff2`，`108_debug_pretty.zr`），
+  只是格式引擎（`println_fmt`）的 `{:#?}` 接入尚未做。
 - **格式串命名参数 `{name}`**：✅ 已实现——`println_fmt` 是函数不是宏，`{name}`
   需要按名查参。新增 `io::println_fmt_named(fmt, &[NamedArg], n)`（`NamedArg { name: str, value: FormatArg }`），
   名字与值放同一个结构体（zr 里 `&["x","y"]` 无法强转成 `*const str`，分开两个
