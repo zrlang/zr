@@ -277,7 +277,8 @@ HIR 直译成一个 C 翻译单元）；`src/zr0/` 仍未 `mod` 声明。
 ### P2-5 宏系统 / `yield` / const 泛型 / trait 高级特性
 
 现状：`src/macro_system/` 未 `mod` 声明（`macro_rules!` 走 `src/macros.rs`）；`yield`
-是类型占位；`const` 泛型解析接受但检查报错；trait 高级特性里**关联类型投影
+是类型占位；`const` 泛型**已实现**（`<const N: usize>` 进类型作用域，数组长度
+按参数名延迟替换，实例化后支持结构体 / 函数 / `impl` 方法与值位置使用）；trait 高级特性里**关联类型投影
 （含 `<T as Tr>::Item` 限定写法）、`impl Trait` 参数位置脱糖、孤儿规则/重叠检查
 已实现**，仍缺 HRTB、负边界、`default fn` 特化、RPIT。
 
@@ -285,7 +286,7 @@ HIR 直译成一个 C 翻译单元）；`src/zr0/` 仍未 `mod` 声明。
 |---|---|---|
 | P2-5a | 关联类型投影（`Self::Output`/`P::Output`/`<T as Tr>::Item`）：`resolve_assoc_type` + `generic_impl_assocs`，限定写法带 trait 校验 | ✅ 已实现（回归 `118` / `119`，负向 `29`） |
 | P2-5b | `yield` 协程：从类型占位升级为可执行（frame 状态机） | ⬜ |
-| P2-5c | `const` 泛型 `<const N: usize>`：检查期接受并支持数组长度参数 | ⬜ |
+| P2-5c | `const` 泛型 `<const N: usize>`：检查期接受并支持数组长度参数 | ✅ 已实现（回归 `122`，负向 `32` / `33` / `34`） |
 | P2-5d | 负边界 / 特化 / 孤儿规则 / `impl Trait` 参数 | 🟡 孤儿规则 + 重叠检查已接线（`check_orphan_rule` / `check_overlap`）；特化只有 impl 选择、无 `default fn`。**`impl Trait` 参数（APIT）已脱糖成匿名泛型参数并真校验边界**（`120`，负向 `30`）；返回位置（RPIT）仍是 `opaque` 占位。负边界 / HRTB 仍缺 |
 
 ---

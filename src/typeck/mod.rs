@@ -35,6 +35,18 @@ fn const_array_len(n: i128, span: Span) -> hir::ArrayLen {
     }))
 }
 
+/// 数组长度表达式若是「一个裸标识符 / 单段路径」，返回它的名字。
+///
+/// 用来识别 `[T; N]` 里的 `const` 泛型参数；其它形状（`N + 1`、`40 + 2`）
+/// 仍按普通编译期常量表达式走 `lower_const_expr`。
+fn const_len_param_name(e: &Expression) -> Option<String> {
+    match e {
+        Expression::Variable(name, _) => Some(name.clone()),
+        Expression::Path(path, _) if path.len() == 1 => Some(path[0].clone()),
+        _ => None,
+    }
+}
+
 /// 一个被提升成顶层函数的无捕获闭包。
 ///
 /// `check_lambda` 在捕获集为空时登记；`finalize_lifted_closures` 在
@@ -419,6 +431,13 @@ struct GenericImplAssoc {
     /// 字段 / 载荷类型里出现的就是这些 `Ty::Infer`；`Ty::Named(id, args)`
     /// 取值时用 `args` 替换它们。
     type_generic_params: HashMap<DefId, Vec<Ty>>,
+    /// `const` 泛型参数的声明类型（参数名 → 整数类型）。
+    ///
+    /// 参数在**值**位置被用到时（`N as i32`、`0..N`），实例化后作用域里
+    /// 已经是 `Ty::ConstVal(n)`，但降成字面量还需要一个具体类型；这里按
+    /// 声明里的类型（`usize` / `i32` …）给，避免永远是 `u64` 让宽度核验
+    /// 误报。同名参数在不同作用域（嵌套泛型）会互相覆盖，取最后登记者。
+    const_param_tys: HashMap<String, Ty>,
 }
 
 /// 一次泛型单态化：用 `subst` 里的具体类型替换泛型参数。
@@ -505,6 +524,7 @@ impl Default for TypeChecker {
             mono_cache: HashMap::new(),
             mono_pending: Vec::new(),
             type_generic_params: HashMap::new(),
+            const_param_tys: HashMap::new(),
         }
     }
 }
@@ -1993,20 +2013,22 @@ impl TypeChecker {
                 .chain(f.generics.iter())
                 .filter_map(|g| match g {
                     ast::GenericParam::Type(n, _) => Some(n.clone()),
+                    // `const` 参数也进 `generic_names`：`Ty::Named` 的实参
+                    // 列表与 `ordered` 都按**全部**泛型参数排布（`fn first
+                    // <const N: usize>(a: [i32; N])` 的 `N` 要能从实参数组
+                    // 长度推出来并落进 `ordered`）。
+                    ast::GenericParam::Const(n, _) => Some(n.clone()),
                     _ => None,
                 })
                 .collect();
             if !generic_names.is_empty() {
                 // 边界按和 `generic_names` 完全相同的顺序收集：先 `impl<T>`、
-                // 再 `fn<T>`，且只收类型参数。顺序错位会让 `T: Ord` 的边界
-                // 落到另一个参数头上——静默放错约束比不检查更糟。
+                // 再 `fn<T>`。`const` 参数没有 trait 边界，这里必须留一个
+                // **空 vec 占位**，否则 `bounds[i]` 与实际参数错位——早先
+                // 注释担心的正是这种错位（那时 const 参数不进 names）。
                 let generic_bounds: Vec<Vec<DefId>> = impl_gens
                     .iter()
                     .chain(f.generics.iter())
-                    // 必须和 `generic_names` 一样**只收类型参数**，不能给
-                    // 生命周期 / `const` 参数留占位空 vec：否则
-                    // `fn f<'a, T: Ord>` 的 `names` 是 `["T"]` 而 `bounds` 是
-                    // `[[], [Ord]]`，`T` 索引到空 vec，边界静默丢失。
                     .filter_map(|g| match g {
                         ast::GenericParam::Type(_, b) => Some(
                             b.iter()
@@ -2018,6 +2040,7 @@ impl TypeChecker {
                                 })
                                 .collect::<Vec<_>>(),
                         ),
+                        ast::GenericParam::Const(_, _) => Some(Vec::new()),
                         _ => None,
                     })
                     .collect();
@@ -2629,6 +2652,32 @@ impl TypeChecker {
                 return Ok(HirExpr { kind, ty, span });
             }
             Expression::Variable(name, _) => {
+                // `const` 泛型参数在**值**位置使用（`N as i32`、`0..N`）：
+                // 单态实例的类型作用域里它已经绑成 `Ty::ConstVal(n)`，直接
+                // 降成整数字面量；声明体（还没代入值）里则是 `Ty::ConstParam`，
+                // 明确报错而不是掉进"找不到这个名字"。
+                match self.lookup_type_param(name) {
+                    Some(Ty::ConstVal(n)) => {
+                        let ty = self
+                            .const_param_tys
+                            .get(name)
+                            .cloned()
+                            .unwrap_or(Ty::Uint(self.pointer_bits));
+                        return Ok(HirExpr {
+                            kind: ExprKind::Literal(HirLiteral::Int(n)),
+                            ty,
+                            span,
+                        });
+                    }
+                    Some(Ty::ConstParam(_)) => {
+                        return Err(CompileError::type_error(format!(
+                            "const generic parameter `{name}` has no value here; \
+                             it can only be used in array lengths"
+                        ))
+                        .with_span(span));
+                    }
+                    _ => {}
+                }
                 // 借用检查：读被借用位置。`x` 出现在任何读上下文（`if x != 5`、
                 // `foo(x)`、`let y = x`）都是读 `x`；`x = 5` 的 lhs 是写（走
                 // `Assign` 分支的写检查）、`&mut x` 的操作数是取地址（走
@@ -3591,6 +3640,17 @@ impl TypeChecker {
                 if let Some(rep) = repeat {
                     let n = match &**rep {
                         Expression::Literal(AstLiteral::Int(n, _), _) => *n,
+                        // `[0; N]`：重复次数可以就是 `const` 泛型参数。单态
+                        // 实例里它已经绑成具体值，直接取；声明体（还没代入）
+                        // 仍按"必须是字面量"报错。
+                        Expression::Variable(name, _) => match self.lookup_type_param(name) {
+                            Some(Ty::ConstVal(n)) => n,
+                            _ => {
+                                return Err(CompileError::type_error(
+                                    "array repeat length must be an integer literal".to_string(),
+                                ))
+                            }
+                        },
                         _ => {
                             return Err(CompileError::type_error(
                                 "array repeat length must be an integer literal".to_string(),
@@ -4684,13 +4744,16 @@ impl TypeChecker {
         }
         if ty_args.len() != names.len() {
             return Err(CompileError::type_error(format!(
-                "expected {} type argument(s) for `{}`, found {}",
+                "expected {} generic argument(s) for `{}`, found {}",
                 names.len(),
                 ast_fn.name,
                 ty_args.len()
             ))
             .with_span(span));
         }
+        // `const` 参数与类型实参种类校验：`first::<i32>` 把类型塞给
+        // `const N: usize` 必须在这里报，而不是带着 `Ty::Int` 去当数组长度。
+        self.check_const_arg_kinds(base, &ty_args, span)?;
         // 编译期内建：`size_of` / `align_of` 直接算成字面量。
         if ast_fn.body.is_none() && matches!(ast_fn.name.as_str(), "size_of" | "align_of") {
             let ty = &ty_args[0];
@@ -6951,11 +7014,24 @@ impl TypeChecker {
         generics: &[ast::GenericParam],
         scope: &HashMap<String, Ty>,
     ) {
+        // `const` 参数的声明类型单独登记：值位置用到它时（`N as i32`）要按
+        // 声明里写的整数类型降字面量，不能一律当 `u64`。
+        for g in generics {
+            if let ast::GenericParam::Const(n, declared) = g {
+                if let Ok(t @ (Ty::Int(_) | Ty::Uint(_))) = self.ast_to_hir_type(declared) {
+                    self.const_param_tys.insert(n.clone(), t);
+                }
+            }
+        }
         let params: Vec<Ty> = generics
             .iter()
             .filter_map(|g| match g {
                 ast::GenericParam::Type(n, _) => scope.get(n).cloned(),
-                _ => None,
+                // `const` 参数也占一个位置：`Ty::Named` 的实参列表按**全部**
+                // 泛型参数（类型 + const）的顺序排布，`subst_def_ty` 的
+                // 位置对齐依赖这一点。
+                ast::GenericParam::Const(n, _) => scope.get(n).cloned(),
+                ast::GenericParam::Lifetime(_) => None,
             })
             .collect();
         if !params.is_empty() {
@@ -6979,7 +7055,16 @@ impl TypeChecker {
                 _ => None,
             })
             .collect();
-        self.subst_infer(ty, &map)
+        // `const` 参数按**名字**替换（数组长度 `[T; N]` 引用的是名字）。
+        let consts: HashMap<String, i128> = params
+            .iter()
+            .zip(args)
+            .filter_map(|(p, a)| match (p, a) {
+                (Ty::ConstParam(name), Ty::ConstVal(v)) => Some((name.clone(), *v)),
+                _ => None,
+            })
+            .collect();
+        self.subst_infer(ty, &map, &consts)
     }
 
     /// 把枚举变体载荷字段的**声明**类型按 scrutinee 的实际类型实参替换。
@@ -7000,35 +7085,60 @@ impl TypeChecker {
     }
 
     /// 把类型里出现的占位符 `InferId` 替换成具体类型。
-    fn subst_infer(&self, ty: &Ty, map: &HashMap<InferId, Ty>) -> Ty {
+    fn subst_infer(
+        &self,
+        ty: &Ty,
+        map: &HashMap<InferId, Ty>,
+        consts: &HashMap<String, i128>,
+    ) -> Ty {
         match ty {
             Ty::Infer(id) => map.get(id).cloned().unwrap_or_else(|| ty.clone()),
             Ty::Named(id, args) => Ty::Named(
                 *id,
-                args.iter().map(|t| self.subst_infer(t, map)).collect(),
+                args.iter().map(|t| self.subst_infer(t, map, consts)).collect(),
             ),
-            Ty::Pointer(t, m) => Ty::Pointer(Box::new(self.subst_infer(t, map)), *m),
-            Ty::Reference(t, m) => Ty::Reference(Box::new(self.subst_infer(t, map)), *m),
-            Ty::Array(t, len) => Ty::Array(Box::new(self.subst_infer(t, map)), len.clone()),
-            Ty::Slice(t, m) => Ty::Slice(Box::new(self.subst_infer(t, map)), *m),
-            Ty::Tuple(ts) => Ty::Tuple(ts.iter().map(|t| self.subst_infer(t, map)).collect()),
+            Ty::Pointer(t, m) => Ty::Pointer(Box::new(self.subst_infer(t, map, consts)), *m),
+            Ty::Reference(t, m) => Ty::Reference(Box::new(self.subst_infer(t, map, consts)), *m),
+            Ty::Array(t, len) => {
+                // `[T; N]` 声明期长度是 `ArrayLen::Param("N")`，这里按名
+                // 换成具体值。替换表里没有该名字（例如类型在本定义里递归
+                // 出现、实参缺省）时保持原样，让布局阶段明确失败而不是
+                // 静默编出错误尺寸。
+                let len = match len {
+                    hir::ArrayLen::Param(name) => match consts.get(name) {
+                        Some(v) => const_array_len(*v, ast::Span::unknown()),
+                        None => len.clone(),
+                    },
+                    other => other.clone(),
+                };
+                Ty::Array(Box::new(self.subst_infer(t, map, consts)), len)
+            }
+            Ty::Slice(t, m) => Ty::Slice(Box::new(self.subst_infer(t, map, consts)), *m),
+            Ty::Tuple(ts) => Ty::Tuple(
+                ts.iter()
+                    .map(|t| self.subst_infer(t, map, consts))
+                    .collect(),
+            ),
             Ty::Function {
                 params,
                 ret,
                 is_async,
                 abi,
             } => Ty::Function {
-                params: params.iter().map(|t| self.subst_infer(t, map)).collect(),
-                ret: Box::new(self.subst_infer(ret, map)),
+                params: params
+                    .iter()
+                    .map(|t| self.subst_infer(t, map, consts))
+                    .collect(),
+                ret: Box::new(self.subst_infer(ret, map, consts)),
                 is_async: *is_async,
                 abi: abi.clone(),
             },
-            Ty::Optional(t) => Ty::Optional(Box::new(self.subst_infer(t, map))),
+            Ty::Optional(t) => Ty::Optional(Box::new(self.subst_infer(t, map, consts))),
             Ty::ErrorUnion(t, e) => Ty::ErrorUnion(
-                Box::new(self.subst_infer(t, map)),
-                Box::new(self.subst_infer(e, map)),
+                Box::new(self.subst_infer(t, map, consts)),
+                Box::new(self.subst_infer(e, map, consts)),
             ),
-            Ty::Pin(t) => Ty::Pin(Box::new(self.subst_infer(t, map))),
+            Ty::Pin(t) => Ty::Pin(Box::new(self.subst_infer(t, map, consts))),
             _ => ty.clone(),
         }
     }
@@ -7157,7 +7267,7 @@ impl TypeChecker {
         if !self.bind_infer_args(&impl_ty, &ty, &mut map) {
             return false;
         }
-        self.subst_infer(&impl_ty, &map) == ty
+        self.subst_infer(&impl_ty, &map, &HashMap::new()) == ty
     }
 
     /// 结构匹配：把 `pattern` 里的 `Ty::Infer` 绑到 `actual` 的对应子类型。
@@ -7266,6 +7376,55 @@ impl TypeChecker {
         Ok(())
     }
 
+    /// 校验泛型实参的种类与声明参数一一对应。
+    ///
+    /// 只在实参个数与声明参数个数相同时检查（个数不匹配的既有路径维持
+    /// 原行为，避免把 `Vec` 省略实参的现状一并打挂）。关键是拦住两类
+    /// "种类错位"：类型实参送给 `const` 参数、整数值送给类型参数。
+    fn check_const_arg_kinds(
+        &self,
+        def_id: DefId,
+        args: &[Ty],
+        span: ast::Span,
+    ) -> Result<()> {
+        let Some(params) = self.type_generic_params.get(&def_id) else {
+            return Ok(());
+        };
+        if params.len() != args.len() {
+            return Ok(());
+        }
+        for (p, a) in params.iter().zip(args) {
+            match (p, a) {
+                // 声明期透传：`impl<const N: usize> Arr<N>` 的实参 `N` 本身就是
+                // const 参数占位，位置对应正确，放行（实例化时再换成具体值）。
+                (Ty::ConstParam(_), Ty::ConstParam(_)) => {}
+                // 类型参数的声明期占位（推断变量）同样是透传：`Foo<T>` 里
+                // `T` 还是 `Infer`，实例化后才变具体类型。
+                (Ty::Infer(_), Ty::Infer(_)) => {}
+                (Ty::ConstParam(name), other) if !matches!(other, Ty::ConstVal(_)) => {
+                    return Err(CompileError::type_error(format!(
+                        "generic argument for const parameter `{name}` must be an integer literal"
+                    ))
+                    .with_span(span));
+                }
+                (_, Ty::ConstParam(name)) => {
+                    return Err(CompileError::type_error(format!(
+                        "const generic parameter `{name}` cannot be passed as a type argument"
+                    ))
+                    .with_span(span));
+                }
+                (_, Ty::ConstVal(_)) if !matches!(p, Ty::ConstParam(_)) => {
+                    return Err(CompileError::type_error(
+                        "integer constant passed as a type generic argument".to_string(),
+                    )
+                    .with_span(span));
+                }
+                _ => {}
+            }
+        }
+        Ok(())
+    }
+
     /// 结构体的字段类型（按 `args` 替换泛型参数）。
     fn struct_field_tys(&self, def_id: DefId, args: &[Ty]) -> Vec<(String, Ty, usize)> {
         match self.type_defs.get(&def_id) {
@@ -7340,9 +7499,30 @@ impl TypeChecker {
             | (Ty::Reference(p, _), Ty::Pointer(a, _))
             | (Ty::Reference(p, _), Ty::Reference(a, _))
             | (Ty::Slice(p, _), Ty::Slice(a, _))
-            | (Ty::Array(p, _), Ty::Array(a, _))
             | (Ty::Optional(p), Ty::Optional(a))
             | (Ty::Pin(p), Ty::Pin(a)) => self.bind_type_args(p, a, params, out, span),
+            // `[T; N]` 与 `[i32; 3]` 匹配：元素递归绑，长度按具体值反推
+            // const 参数。早先长度整个被忽略，`Arr { data: [1, 2, 3] }`
+            // 没写注解时 `N` 无从推断，报成 `cannot infer type parameter #0`
+            // 这种带内部编号的文案。
+            (Ty::Array(p, plen), Ty::Array(a, alen)) => {
+                self.bind_type_args(p, a, params, out, span)?;
+                if let hir::ArrayLen::Param(name) = plen {
+                    if let (Some(i), Some(n)) = (
+                        params
+                            .iter()
+                            .position(|q| matches!(q, Ty::ConstParam(qn) if qn == name)),
+                        hir::array_len_value(alen),
+                    ) {
+                        let v = Ty::ConstVal(n);
+                        match out[i].clone() {
+                            Some(prev) => self.infer.unify(&prev, &v, span)?,
+                            None => out[i] = Some(v),
+                        }
+                    }
+                }
+                Ok(())
+            }
             (Ty::ErrorUnion(p1, p2), Ty::ErrorUnion(a1, a2)) => {
                 self.bind_type_args(p1, a1, params, out, span)?;
                 self.bind_type_args(p2, a2, params, out, span)
@@ -7391,12 +7571,26 @@ impl TypeChecker {
             self.bind_type_args(p, a, &params, &mut out, span)?;
         }
         let mut args = Vec::with_capacity(params.len());
-        for o in out {
+        for (i, o) in out.into_iter().enumerate() {
             match o {
                 Some(t) => args.push(self.infer.resolve(&t)),
                 // 推不出来的参数先留一个推断变量：`Option::None` 自己没有
                 // 载荷，`T` 要靠上下文（同一调用的其它实参 / 返回值）定。
-                None => args.push(self.infer.fresh_infer(span)),
+                //
+                // `const` 参数没有"用法体里再约束"的机会——值不会因为后面
+                // 怎么用就冒出来，直接报错（早先会留成推断变量，最后报成
+                // `cannot infer type parameter #0`，内部编号对用户毫无意义）。
+                None => match &params[i] {
+                    Ty::ConstParam(name) => {
+                        let owner = self.def_names.get(&def_id).cloned().unwrap_or_default();
+                        return Err(CompileError::type_error(format!(
+                            "cannot infer const parameter `{name}` of `{owner}`; \
+                             add an explicit annotation like `{owner}<{name}>`"
+                        ))
+                        .with_span(span));
+                    }
+                    _ => args.push(self.infer.fresh_infer(span)),
+                },
             }
         }
         Ok(args)
@@ -7472,9 +7666,37 @@ impl TypeChecker {
                 }
                 Ok(())
             }
-            AstType::Array(inner, _) => {
-                if let Ty::Array(a, _) = &actual {
+            AstType::Array(inner, len) => {
+                if let Ty::Array(a, alen) = &actual {
                     self.match_generic_ast(inner, a, names, subst, span)?;
+                    // `fn first<const N: usize>(a: [i32; N])`：从实参数组的
+                    // 长度推出 `N`。只认"长度就是某个泛型参数名"的形状
+                    // （`[i32; N]`），`[i32; N + 1]` 这类表达式不做反解。
+                    if let ast::ArrayLen::Const(e) = len {
+                        if let Some(name) = const_len_param_name(e) {
+                            if names.iter().any(|n| n == &name) {
+                                if let Some(v) = hir::array_len_value(alen) {
+                                    match subst.get(&name).cloned() {
+                                        Some(prev) => {
+                                            if prev != Ty::ConstVal(v) {
+                                                return Err(CompileError::type_error(format!(
+                                                    "const parameter `{name}` inferred as both `{}` and `{v}`",
+                                                    match prev {
+                                                        Ty::ConstVal(p) => p.to_string(),
+                                                        other => self.infer.type_name(&other),
+                                                    }
+                                                ))
+                                                .with_span(span));
+                                            }
+                                        }
+                                        None => {
+                                            subst.insert(name.clone(), Ty::ConstVal(v));
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
                 }
                 Ok(())
             }
@@ -7575,6 +7797,19 @@ impl TypeChecker {
             match subst.get(n) {
                 Some(t) => ordered.push(self.infer.resolve(t)),
                 None => {
+                    // `const` 参数推不出来时不能留推断变量：数组长度在
+                    // `build_instance_signature` 里按名字查作用域，推断变量
+                    // 会让 `[i32; N]` 掉回"按值求值 N"（报 cannot find value
+                    // N）。这里直接给明确文案。
+                    if ast_fn.generics.iter().any(|g| {
+                        matches!(g, ast::GenericParam::Const(cn, _) if cn == n)
+                    }) {
+                        return Err(CompileError::type_error(format!(
+                            "cannot infer const parameter `{n}` for `{}`",
+                            ast_fn.name
+                        ))
+                        .with_span(span));
+                    }
                     // P1-4：从实参/期望类型推不出该类型参数时，先留一个推断
                     // 变量、按它实例化，等用法体（`let v = Vec::new();
                     // v.push(1)` 里的 `push` 把 `T` 约束成 `i32`）把它定下来。
@@ -7806,7 +8041,7 @@ impl TypeChecker {
             let name = match g {
                 ast::GenericParam::Type(name, _) => name.as_str(),
                 ast::GenericParam::Lifetime(name) => name.as_str(),
-                ast::GenericParam::Const(name) => name.as_str(),
+                ast::GenericParam::Const(name, _) => name.as_str(),
             };
             if !seen.insert(name) {
                 self.errors.push(
@@ -7814,11 +8049,35 @@ impl TypeChecker {
                         .with_span(span),
                 );
             }
-            // 生命周期 / const 参数不进入类型环境：生命周期不影响代码生成，
-            // const 泛型还没实现（用到时另行报错）。
-            if let ast::GenericParam::Type(name, _) = g {
-                let ty = self.infer.fresh_infer(span);
-                scope.insert(name.clone(), ty);
+            // 生命周期参数不进入类型环境：生命周期不影响代码生成。
+            // `const` 参数进同一个作用域，但绑成 `Ty::ConstParam` 占位——
+            // 它只允许出现在数组长度里（`ast_to_hir_type` 的 Array 分支
+            // 据此产出 `ArrayLen::Param`），位置/类型里用它会明确报错。
+            match g {
+                ast::GenericParam::Type(name, _) => {
+                    let ty = self.infer.fresh_infer(span);
+                    scope.insert(name.clone(), ty);
+                }
+                ast::GenericParam::Const(name, declared) => {
+                    // 常量参数必须是整数类型（`usize` / `u8` / `i64` …）：
+                    // 浮点 / 结构体做数组长度或位宽没有意义。`usize`/`isize`
+                    // 降成目标指针宽度的整数，能过这一关。
+                    match self.ast_to_hir_type(declared) {
+                        Ok(t @ (Ty::Int(_) | Ty::Uint(_))) => {
+                            self.const_param_tys.insert(name.clone(), t);
+                        }
+                        _ => {
+                            self.errors.push(
+                                CompileError::type_error(format!(
+                                    "const generic parameter `{name}` must have an integer type"
+                                ))
+                                .with_span(span),
+                            );
+                        }
+                    }
+                    scope.insert(name.clone(), Ty::ConstParam(name.clone()));
+                }
+                ast::GenericParam::Lifetime(_) => {}
             }
         }
         self.type_params.push(scope.clone());
@@ -8697,6 +8956,17 @@ impl TypeChecker {
                 // 泛型参数优先：声明里的 `T` 是类型变量，不是用户类型。
                 if path.len() == 1 && generics.is_empty() {
                     if let Some(ty) = self.lookup_type_param(&path[0]) {
+                        // `const` 泛型参数只能出现在数组长度里，不能当类型用
+                        // （`let x: N` 没有意义）。早先 const 参数不进类型
+                        // 作用域，这句话会掉到 `resolve_type_path` 报
+                        // 「cannot find type `N`」，同样费解但至少报了错；
+                        // 现在把它显式化，文案直接指出是 const 参数。
+                        if let Ty::ConstParam(name) = &ty {
+                            return Err(CompileError::type_error(format!(
+                                "`{name}` is a const generic parameter and cannot be used as a type"
+                            ))
+                            .with_span(ast::Span::unknown()));
+                        }
                         return Ok(ty);
                     }
                 }
@@ -8728,13 +8998,16 @@ impl TypeChecker {
                     }
                 }
                 let id = self.resolve_type_path(path)?;
-                let ty = Ty::Named(
-                    id,
-                    generics
-                        .iter()
-                        .map(|g| self.ast_to_hir_type(g))
-                        .collect::<Result<_>>()?,
-                );
+                let args: Vec<Ty> = generics
+                    .iter()
+                    .map(|g| self.ast_to_hir_type_arg(g))
+                    .collect::<Result<_>>()?;
+                // `const` 参数与类型实参必须一一对应：`Arr<i32>`（把类型塞给
+                // const 参数）或 `Vec<3>`（把值塞给类型参数）都要在注解处
+                // 报错，而不是留到布局阶段变成 `ArrayLen::Param` 未代入、
+                // 或把 `ConstVal` 当普通类型一路带下去。
+                self.check_const_arg_kinds(id, &args, ast::Span::unknown())?;
+                let ty = Ty::Named(id, args);
                 // 别名不是独立的名义类型：`type MyInt = i32` 之后 `Vec<MyInt>`
                 // 必须能与 `Vec<i32>` 统一，否则泛型推断把 `T` 绑成 `MyInt`，
                 // 再遇 `i32` 就报「推断成两个不同的类型」。所以在这里展平别名。
@@ -8747,15 +9020,34 @@ impl TypeChecker {
             AstType::Reference(inner, m) => {
                 Ty::Reference(Box::new(self.ast_to_hir_type(inner)?), *m)
             }
-            AstType::Array(inner, len) => Ty::Array(
-                Box::new(self.ast_to_hir_type(inner)?),
-                match len {
+            AstType::Array(inner, len) => {
+                let elem = self.ast_to_hir_type(inner)?;
+                let hlen = match len {
                     ast::ArrayLen::Const(e) => {
-                        hir::ArrayLen::Const(Box::new(self.lower_const_expr(e)?))
+                        // 数组长度可以就是 `const` 泛型参数本身：`[T; N]`。
+                        // 声明期参数没有值（占位 `Ty::ConstParam`）——记成
+                        // `ArrayLen::Param(name)`，实例化时按名字替换成具体
+                        // 长度；实例化期作用域里已是 `Ty::ConstVal(3)`，直接
+                        // 落成常量。
+                        match const_len_param_name(e) {
+                            Some(name) => match self.lookup_type_param(&name) {
+                                Some(Ty::ConstVal(n)) => {
+                                    const_array_len(n, ast::Span::unknown())
+                                }
+                                Some(Ty::ConstParam(_)) => hir::ArrayLen::Param(name),
+                                _ => hir::ArrayLen::Const(Box::new(self.lower_const_expr(e)?)),
+                            },
+                            None => hir::ArrayLen::Const(Box::new(self.lower_const_expr(e)?)),
+                        }
                     }
                     ast::ArrayLen::Dynamic => hir::ArrayLen::Dynamic,
-                },
-            ),
+                };
+                Ty::Array(Box::new(elem), hlen)
+            }
+            // 泛型实参里的整数常量（`Arr<3>` 的 `3`）：降成值载体，
+            // 由 `const` 参数替换逻辑消费。出现在非泛型实参位置是语法上
+            // 不可能的事（`Type` 只由类型文法产生）。
+            AstType::ConstInt(n) => Ty::ConstVal(*n),
             AstType::Slice(inner, m) => Ty::Slice(Box::new(self.ast_to_hir_type(inner)?), *m),
             AstType::Tuple(tys) => Ty::Tuple(
                 tys.iter()
@@ -8879,6 +9171,24 @@ impl TypeChecker {
                 Ty::Dyn(id)
             }
         })
+    }
+
+    /// 降低**泛型实参**位置的类型。
+    ///
+    /// 与 `ast_to_hir_type` 唯一的区别：裸标识符若是 `const` 泛型参数
+    /// （`impl<const N: usize> Arr<N>` 的实参 `N`），产出 `Ty::ConstParam`
+    /// 占位而不是报「const 参数不能当类型用」——在实参位置它是"把参数透传
+    /// 给另一个泛型"，位置是否合法由 `check_const_arg_kinds` 按声明参数
+    /// 逐个判定。类型位置（`let x: N`）仍走 `ast_to_hir_type` 报错。
+    fn ast_to_hir_type_arg(&mut self, t: &AstType) -> Result<Ty> {
+        if let AstType::Named { path, generics } = t {
+            if path.len() == 1 && generics.is_empty() {
+                if let Some(Ty::ConstParam(name)) = self.lookup_type_param(&path[0]) {
+                    return Ok(Ty::ConstParam(name));
+                }
+            }
+        }
+        self.ast_to_hir_type(t)
     }
 
     /// 展平别名类型，返回别名目标。
@@ -10242,6 +10552,22 @@ fn const_index_of(expr: &Expression) -> Option<i128> {
     }
 }
 
+/// 数组长度在错误消息里的文字形式：`3` / `N` / `_`。
+///
+/// 早先 `[i32; _]` 把长度一律打成 `_`，`Arr<2>` 与 `[1, 2, 3]`（长度 3）的
+/// 不匹配报成 `expected [i32; _], found [i32; _]`——两边一模一样，看不出
+/// 差别在哪。
+fn array_len_text(len: &hir::ArrayLen) -> String {
+    match len {
+        hir::ArrayLen::Const(_) => match hir::array_len_value(len) {
+            Some(n) => n.to_string(),
+            None => "_".to_string(),
+        },
+        hir::ArrayLen::Param(name) => name.clone(),
+        hir::ArrayLen::Dynamic => "_".to_string(),
+    }
+}
+
 /// 格式化类型名为字符串（用于错误消息）。
 fn ty_name(ty: &Ty) -> String {
     match ty {
@@ -10256,7 +10582,7 @@ fn ty_name(ty: &Ty) -> String {
         Ty::Named(id, _) => format!("type#{}", id.0),
         Ty::Pointer(t, _) => format!("*{}", ty_name(t)),
         Ty::Reference(t, _) => format!("&{}", ty_name(t)),
-        Ty::Array(t, _) => format!("[{}; _]", ty_name(t)),
+        Ty::Array(t, len) => format!("[{}; {}]", ty_name(t), array_len_text(len)),
         Ty::Slice(t, _) => format!("[]{}", ty_name(t)),
         Ty::Tuple(ts) => format!(
             "({})",
@@ -10269,6 +10595,9 @@ fn ty_name(ty: &Ty) -> String {
         Ty::Opaque(id) => format!("opaque({})", id.0),
         Ty::Pin(inner) => format!("Pin<{}>", ty_name(inner)),
         Ty::Dyn(trait_id) => format!("dyn trait#{}", trait_id.0),
+        // const 泛型：报错时按值 / 名字打印。
+        Ty::ConstVal(n) => n.to_string(),
+        Ty::ConstParam(name) => name.clone(),
     }
 }
 

@@ -2389,6 +2389,15 @@ fn align_up(n: i128, align: i128) -> i128 {
     }
 }
 
+/// 把 `[T; N]` 的 `ArrayLen::Param` 替换成具体值时构造常量长度。
+fn const_array_len(n: i128) -> hir::ArrayLen {
+    hir::ArrayLen::Const(Box::new(hir::HirExpr {
+        kind: hir::ExprKind::Literal(hir::HirLiteral::Int(n)),
+        ty: hir::Ty::Uint(64),
+        span: hir::Span::unknown(),
+    }))
+}
+
 /// 用类型定义的泛型实参替换类型里的占位符。
 fn subst_generic(
     b: &Builder,
@@ -2410,39 +2419,70 @@ fn subst_generic(
             _ => None,
         })
         .collect();
-    subst_infer_ty(ty, &map)
+    // `const` 参数按名字替换（数组长度 `[T; N]` 引用名字，见
+    // `hir::ArrayLen::Param`）。
+    let consts: HashMap<String, i128> = params
+        .iter()
+        .zip(args)
+        .filter_map(|(p, a)| match (p, a) {
+            (hir::Ty::ConstParam(name), hir::Ty::ConstVal(v)) => Some((name.clone(), *v)),
+            _ => None,
+        })
+        .collect();
+    subst_infer_ty(ty, &map, &consts)
 }
 
 /// 递归替换 `Ty::Infer` 占位符。
-fn subst_infer_ty(ty: &hir::Ty, map: &HashMap<hir::InferId, hir::Ty>) -> hir::Ty {
+fn subst_infer_ty(
+    ty: &hir::Ty,
+    map: &HashMap<hir::InferId, hir::Ty>,
+    consts: &HashMap<String, i128>,
+) -> hir::Ty {
     use hir::Ty;
     match ty {
         Ty::Infer(id) => map.get(id).cloned().unwrap_or_else(|| ty.clone()),
-        Ty::Named(id, args) => {
-            Ty::Named(*id, args.iter().map(|t| subst_infer_ty(t, map)).collect())
+        Ty::Named(id, args) => Ty::Named(
+            *id,
+            args.iter().map(|t| subst_infer_ty(t, map, consts)).collect(),
+        ),
+        Ty::Pointer(t, m) => Ty::Pointer(Box::new(subst_infer_ty(t, map, consts)), *m),
+        Ty::Reference(t, m) => Ty::Reference(Box::new(subst_infer_ty(t, map, consts)), *m),
+        Ty::Array(t, len) => {
+            let len = match len {
+                hir::ArrayLen::Param(name) => match consts.get(name) {
+                    Some(v) => const_array_len(*v),
+                    None => len.clone(),
+                },
+                other => other.clone(),
+            };
+            Ty::Array(Box::new(subst_infer_ty(t, map, consts)), len)
         }
-        Ty::Pointer(t, m) => Ty::Pointer(Box::new(subst_infer_ty(t, map)), *m),
-        Ty::Reference(t, m) => Ty::Reference(Box::new(subst_infer_ty(t, map)), *m),
-        Ty::Array(t, len) => Ty::Array(Box::new(subst_infer_ty(t, map)), len.clone()),
-        Ty::Slice(t, m) => Ty::Slice(Box::new(subst_infer_ty(t, map)), *m),
-        Ty::Tuple(ts) => Ty::Tuple(ts.iter().map(|t| subst_infer_ty(t, map)).collect()),
+        Ty::Slice(t, m) => Ty::Slice(Box::new(subst_infer_ty(t, map, consts)), *m),
+        Ty::Tuple(ts) => Ty::Tuple(
+            ts.iter()
+                .map(|t| subst_infer_ty(t, map, consts))
+                .collect(),
+        ),
         Ty::Function {
             params,
             ret,
             is_async,
             abi,
         } => Ty::Function {
-            params: params.iter().map(|t| subst_infer_ty(t, map)).collect(),
-            ret: Box::new(subst_infer_ty(ret, map)),
+            params: params
+                .iter()
+                .map(|t| subst_infer_ty(t, map, consts))
+                .collect(),
+            ret: Box::new(subst_infer_ty(ret, map, consts)),
             is_async: *is_async,
             abi: abi.clone(),
         },
-        Ty::Optional(t) => Ty::Optional(Box::new(subst_infer_ty(t, map))),
+        Ty::Optional(t) => Ty::Optional(Box::new(subst_infer_ty(t, map, consts))),
         Ty::ErrorUnion(t, e) => Ty::ErrorUnion(
-            Box::new(subst_infer_ty(t, map)),
-            Box::new(subst_infer_ty(e, map)),
+            Box::new(subst_infer_ty(t, map, consts)),
+            Box::new(subst_infer_ty(e, map, consts)),
         ),
-        Ty::Pin(t) => Ty::Pin(Box::new(subst_infer_ty(t, map))),
+        Ty::Pin(t) => Ty::Pin(Box::new(subst_infer_ty(t, map, consts))),
         _ => ty.clone(),
     }
 }

@@ -1,0 +1,15 @@
+// 负向用例：`const` 泛型参数不能当类型用。
+//
+// 声明期 `N` 在类型作用域里是 `Ty::ConstParam` 占位，只允许出现在数组
+// 长度里（`[T; N]`）。把 `N` 直接当字段类型 / 注解类型用没有意义，必须
+// 明确报错——早先 `N` 根本不进类型作用域，会掉到 `resolve_type_path`
+// 报「cannot find type `N`」，看不出是 `const` 参数的问题。
+//
+// expect: `N` is a const generic parameter and cannot be used as a type
+struct Bad<const N: usize> {
+    x: N,
+}
+
+fn main() -> i32 {
+    return 0;
+}

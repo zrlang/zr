@@ -395,6 +395,15 @@ impl Parser {
             self.advance();
             return Ok(());
         }
+        // 整数常量实参：`Arr<3>` / `first::<4>(..)` 的 `3`、`4`。
+        // `Type` 是泛型实参列表的元素类型（`Named.generics` 与 turbofish
+        // 都收 `Vec<Type>`），整数实参没有独立的 AST 节点，用
+        // `Type::ConstInt` 带进来，由类型检查降成 `Ty::ConstVal`。
+        if let TokenKind::IntLiteral(n, _) = self.peek().kind {
+            self.advance();
+            args.push(Type::ConstInt(n));
+            return Ok(());
+        }
         let lhs = self.parse_type()?;
         if self.match_kind(&TokenKind::Eq) {
             // `Assoc = Type`：消费 RHS，不登记（关联类型绑定暂不支持）。

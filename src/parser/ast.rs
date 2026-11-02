@@ -206,6 +206,13 @@ pub enum Type {
     /// 类型检查阶段展开成一个新的推断变量，由上下文（赋值目标、函数形参等）
     /// 解析；若最终无法解析，收尾时报 `type annotations needed`。
     Infer,
+    /// 泛型实参里的整数常量：`Arr<3>` 里的 `3`。
+    ///
+    /// 只在泛型实参位置出现（`Named.generics` / turbofish），不是真正的类型。
+    /// 解析器把 `Vec<Type>` 当泛型实参列表，整数实参没有别的 AST 表示，
+    /// 于是借这个变体把它们带进类型检查；`ast_to_hir_type` 把它降成
+    /// `Ty::ConstVal`，由 `const` 泛型参数的替换逻辑消费。
+    ConstInt(i128),
 }
 
 /// 数组长度（可以是编译期常量表达式）。
@@ -655,7 +662,11 @@ pub enum GenericParam {
     /// `Ord`——`needs_clone(SomeStructWithoutClone)` 静默通过，是类型安全漏洞。
     Type(String, Vec<Type>),
     /// 常量参数：`<const N: usize>`。
-    Const(String),
+    ///
+    /// 第二个元素是声明里写的类型（`usize` / `u8` …）。类型检查只用它校验
+    /// "确实是整数类型"：常量值在编译期统一按 `i128` 传递，宽差异由目标
+    /// 布局阶段按具体值处理。
+    Const(String, Type),
 }
 
 /// `where` 子句谓词。

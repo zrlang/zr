@@ -104,6 +104,15 @@ pub enum Ty {
     /// `&'static dyn Error` 可解析），方法调用经 vtable 分派的完整实现
     /// 尚在途，见 `docs/rust-parity.md`。
     Dyn(DefId),
+    /// `const` 泛型参数的**声明期占位**：`struct Arr<const N: usize>` 里的
+    /// `N`。它只存在于声明的类型作用域里（`push_type_params` 绑定），
+    /// 不参与任何布局 / 代码生成；实例化时由具体值 `Ty::ConstVal` 替换。
+    /// 携带名字而不是 `InferId`，是因为数组长度在 HIR 里按名字
+    /// （`ArrayLen::Param`）引用它，替换需要按名字查表。
+    ConstParam(String),
+    /// `const` 泛型的**具体实参值**：`Arr<3>` 的 `3`。只在泛型实参列表
+    /// 里出现（`Ty::Named` 的 args），由 `subst_*` 消费成数组长度。
+    ConstVal(i128),
 }
 
 /// 数组长度。
@@ -111,6 +120,14 @@ pub enum Ty {
 pub enum ArrayLen {
     /// 编译期常量。
     Const(Box<HirExpr>),
+    /// `const` 泛型参数：`[T; N]` 里的 `N`（声明期）。
+    ///
+    /// 声明里数组长度不是具体数字，而 `HirExpr` 又存不下"未绑定的参数值"、
+    /// 无法做常量折叠。单独记名字：实例化时 `subst_infer` / `subst_infer_ty`
+    /// 按名字换成 `Const(具体值)`，布局阶段（`array_len_value`）因此只在
+    /// 实例化后的类型上求值。它和 `Dynamic` 一样求不出值，但语义不同——
+    /// `Dynamic` 是切片/未定长，`Param` 是"还没代入的泛型常量"。
+    Param(String),
     /// 动态长度（切片 / 未定长数组）。
     Dynamic,
 }
@@ -126,6 +143,8 @@ pub fn array_len_value(len: &ArrayLen) -> Option<i128> {
             },
             _ => None,
         },
+        // 参数尚未代入具体值（声明期），求不出来。
+        ArrayLen::Param(_) => None,
         ArrayLen::Dynamic => None,
     }
 }
@@ -134,6 +153,7 @@ impl PartialEq for ArrayLen {
     fn eq(&self, other: &Self) -> bool {
         match (self, other) {
             (ArrayLen::Dynamic, ArrayLen::Dynamic) => true,
+            (ArrayLen::Param(a), ArrayLen::Param(b)) => a == b,
             (ArrayLen::Const(a), ArrayLen::Const(b)) => {
                 match (
                     array_len_value(&ArrayLen::Const(a.clone())),
@@ -154,11 +174,13 @@ impl Eq for ArrayLen {}
 impl std::hash::Hash for ArrayLen {
     fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
         std::mem::discriminant(self).hash(state);
-        if let ArrayLen::Const(e) = self {
-            match array_len_value(self) {
+        match self {
+            ArrayLen::Const(e) => match array_len_value(self) {
                 Some(n) => n.hash(state),
                 None => format!("{:?}", e).hash(state),
-            }
+            },
+            ArrayLen::Param(name) => name.hash(state),
+            ArrayLen::Dynamic => {}
         }
     }
 }

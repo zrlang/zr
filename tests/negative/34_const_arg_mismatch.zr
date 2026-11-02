@@ -1,0 +1,17 @@
+// 负向用例：两个不同的 `const` 实参是不同类型，不能互相赋值。
+//
+// `Arr<3>` 与 `Arr<5>` 的布局不同（`[i32; 3]` vs `[i32; 5]`），统一时必须
+// 比较常量值。早先 `unify` 只看具名类型的 DefId 与实参个数，值不等也当
+// 同一类型放行，赋值到栈上会按错误的大小拷贝。
+//
+// expect: const generic argument mismatch: expected `5`, found `3`
+struct Arr<const N: usize> {
+    data: [i32; N],
+}
+
+fn main() -> i32 {
+    let a: Arr<3> = Arr { data: [1, 2, 3] };
+    let b: Arr<5> = a;
+    let _ = b;
+    return 0;
+}

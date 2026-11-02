@@ -1,0 +1,94 @@
+//=============================================================================
+// tests/cases/122_const_generic.zr — `const` 泛型参数 `<const N: usize>`
+//
+// 早先 `const` 泛型只做到"解析阶段接受、检查阶段报错"：`struct Arr<const N:
+// usize> { data: [i32; N] }` 声明不了（`N` 被当普通表达式求值，报
+// `cannot find value N`），`Arr<3>` 也解析不了（泛型实参走 `parse_type()`
+//，整数实参撞 `expected type, found IntLiteral(3)`）。
+//
+// 现在 `const` 参数是一条完整链路：
+//   - 解析：`GenericParam::Const(name, 声明类型)`，泛型实参里的整数进
+//     `Type::ConstInt` → `Ty::ConstVal`；
+//   - 检查：声明期占位 `Ty::ConstParam` / 数组长度 `ArrayLen::Param`，
+//     实例化按名字替换成具体值（`subst_infer` / `subst_infer_ty`）；
+//   - 推断：能从实参数组长度反推（`first(arr)`）、能显式 turbofish
+//     （`pick::<4>()`）、结构体字面量能从字段数组字面量长度反推。
+//
+// 覆盖：
+//   - `struct Arr<const N: usize> { data: [i32; N] }` 的构造、字段读写
+//   - 没写注解的结构体字面量（N 从数组字面量长度推出）
+//   - `fn total<const N: usize>(a: [i32; N])`：N 从实参数组长度反推
+//   - `N` 在**值**位置使用（`while i < N`）
+//   - 显式 turbofish 的 const 实参（`repeat::<4>`）
+//   - `impl<const N: usize> Arr<N>` 的方法、`[0; N]` 重复、按值返回聚合
+//   - 同一结构体的两个不同 N 实例共存
+//=============================================================================
+
+struct Arr<const N: usize> {
+    data: [i32; N],
+}
+
+impl<const N: usize> Arr<N> {
+    // 全填成 `v`，返回整个 `Arr<N>`（按值返回聚合类型）。
+    fn fill(v: i32) -> Arr<N> {
+        let mut a: Arr<N> = Arr { data: [0; N] };
+        let mut i: i32 = 0;
+        while i < N {
+            a.data[i] = v;
+            i = i + 1;
+        }
+        return a;
+    }
+
+    fn first(self) -> i32 {
+        return self.data[0];
+    }
+}
+
+fn total<const N: usize>(a: [i32; N]) -> i32 {
+    let mut s: i32 = 0;
+    let mut i: i32 = 0;
+    while i < N {
+        s = s + a[i];
+        i = i + 1;
+    }
+    return s;
+}
+
+fn repeat<const N: usize>(v: i32) -> i32 {
+    return v * N;
+}
+
+fn main() -> i32 {
+    // --- 显式注解的构造 + 字段读写 ---
+    let mut a: Arr<3> = Arr { data: [1, 2, 3] };
+    if a.data[0] != 1 { return 1; }
+    if a.data[2] != 3 { return 2; }
+    a.data[1] = 20;
+    if a.data[0] + a.data[1] + a.data[2] != 24 { return 3; }
+
+    // --- 没写注解：N 从数组字面量长度 4 推出 ---
+    let b = Arr { data: [10, 20, 30, 40] };
+    if b.data[3] != 40 { return 4; }
+
+    // --- N 从函数实参的数组长度反推（两个不同长度）---
+    let xs: [i32; 4] = [1, 2, 3, 4];
+    let ys: [i32; 2] = [10, 20];
+    if total(xs) != 10 { return 5; }
+    if total(ys) != 30 { return 6; }
+
+    // --- 显式 turbofish 的 const 实参 ---
+    if repeat::<4>(3) != 12 { return 7; }
+    if repeat::<0>(3) != 0 { return 8; }
+
+    // --- 泛型 impl 方法：`[0; N]` + 循环写 + 按值返回 ---
+    let c: Arr<3> = Arr::<3>::fill(9);
+    if c.first() != 9 { return 9; }
+
+    // --- 同一类型两个 N 实例共存 ---
+    let d: Arr<3> = Arr { data: [1, 1, 1] };
+    let e: Arr<5> = Arr { data: [2, 2, 2, 2, 2] };
+    if total(d.data) + total(e.data) != 13 { return 10; }
+
+    return 0;
+}

@@ -73,6 +73,7 @@
 | `fn f(x: Option<i32>)` | 可用 | ✅ | 签名与函数体一致 |
 | `Option::<i32>::None` | 可用 | ✅ | turbofish 后面继续吃路径段，类型实参挂在整条路径上：无载荷变体（`Option::<i32>::None`）、关联函数（`Box::<i32>::new(7)`）、元组结构体（`Wrap::<i32>(7)`）、结构体载荷变体（`Shape::<u8>::Circle { r: 7 }`）都可用。显式实参当期望类型喂给构造器；无上下文的 `Option::None` 仍需 `let` 注解 |
 | `Vec<Vec<i32>>`（嵌套泛型，`>>` 收尾） | 可用 | ✅ | 词法器把 `>>` / `<<` 切成 `Shr` / `Shl`（为移位表达式），类型位置原先解析不了嵌套泛型。现在 `Parser::split_angle` 只在类型语境内把 `Shl`→`Lt Lt`、`Shr`→`Gt Gt`，`Vec<Vec<i32>>`、`Option<<T as Tr>::Item>` 都能解析（`119_qualified_assoc.zr`） |
+| `struct Arr<const N: usize> { data: [i32; N] }` | 可用 | ✅ | `const` 参数进类型作用域（占位 `Ty::ConstParam`），数组长度记 `ArrayLen::Param(N)`，单态化时按名字换成具体值。声明 / 注解（`Arr<3>`）/ turbofish（`f::<4>`）/ 从实参数组长度反推都可用；`impl<const N: usize> Arr<N>` 的方法、`[0; N]` 重复、`N` 在值位置（`while i < N`）也可用（`122_const_generic.zr`，负向 `32`/`33`/`34`）。**仍缺**：表达式位置更复杂的常量（`[T; N + 1]`）与省略实参时的类型侧推断（结构体字面量只能从字段数组字面量长度反推） |
 
 ---
 

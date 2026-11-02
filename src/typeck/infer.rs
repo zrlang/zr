@@ -131,6 +131,7 @@ impl<'a> InferCtxt<'a> {
             Ty::Array(inner, len) => {
                 let n = match len {
                     hir::ArrayLen::Const(_) => 1, // 简化：无法求值时按 1 计
+                    hir::ArrayLen::Param(_) => 0, // 声明期 const 参数（尚未代入）
                     hir::ArrayLen::Dynamic => 0,
                 };
                 self.size_of(inner) * n
@@ -194,6 +195,8 @@ impl<'a> InferCtxt<'a> {
             Ty::Opaque(_) => 0,
             Ty::Pin(inner) => self.size_of(inner),
             Ty::Infer(_) => 0,
+            // const 泛型参数不是真正的运行时值类型，尺寸按 1 计只为不 panic。
+            Ty::ConstVal(_) | Ty::ConstParam(_) => 1,
         }
     }
 
@@ -236,6 +239,7 @@ impl<'a> InferCtxt<'a> {
             Ty::Opaque(_) => 1,
             Ty::Pin(inner) => self.align_of(inner),
             Ty::Infer(_) => 1,
+            Ty::ConstVal(_) | Ty::ConstParam(_) => 1,
         }
     }
 
@@ -252,6 +256,7 @@ impl<'a> InferCtxt<'a> {
                 Box::new(self.resolve(t)),
                 match len {
                     hir::ArrayLen::Const(e) => hir::ArrayLen::Const(e.clone()),
+                    hir::ArrayLen::Param(name) => hir::ArrayLen::Param(name.clone()),
                     hir::ArrayLen::Dynamic => hir::ArrayLen::Dynamic,
                 },
             ),
@@ -345,6 +350,17 @@ impl<'a> InferCtxt<'a> {
                 }
                 Ok(())
             }
+            // `const` 泛型实参：值相等才统一（`Arr<3>` 与 `Arr<4>` 是不同类型）。
+            (Ty::ConstVal(a), Ty::ConstVal(b)) if a == b => Ok(()),
+            // 值不等：走通用 `expected`/`found` 只会打出两个光秃秃的数字
+            // （`expected `5`, found `3``），看不出是在比泛型常量实参。
+            (Ty::ConstVal(a), Ty::ConstVal(b)) => Err(CompileError::type_error(format!(
+                "const generic argument mismatch: expected `{a}`, found `{b}`"
+            ))
+            .with_span(span)),
+            // 声明期的 const 参数占位（`Ty::ConstParam`）只出现在声明内部，
+            // 与具体值相遇时按"占位可被具体值满足"处理（实例化会再次替换）。
+            (Ty::ConstParam(_), Ty::ConstVal(_)) | (Ty::ConstVal(_), Ty::ConstParam(_)) => Ok(()),
             // 不透明类型（impl Trait）：可以与任何类型统一（隐藏类型推断）
             (Ty::Opaque(_), _) | (_, Ty::Opaque(_)) => Ok(()),
             _ => Err(self.type_mismatch(&a, &b, span)),
@@ -521,6 +537,9 @@ impl<'a> InferCtxt<'a> {
             Ty::Str => "str".into(),
             Ty::Unit => "()".into(),
             Ty::Never => "!".into(),
+            // `const` 泛型实参 / 声明期占位：诊断里按值 / 名字直接打印。
+            Ty::ConstVal(n) => n.to_string(),
+            Ty::ConstParam(name) => name.clone(),
             Ty::Named(id, args) => {
                 let name = self.type_id_name(*id);
                 if args.is_empty() {
@@ -556,7 +575,13 @@ impl<'a> InferCtxt<'a> {
             ),
             Ty::Array(t, len) => {
                 let l = match len {
-                    hir::ArrayLen::Const(_) => "_".to_string(),
+                    // 长度能求值就打印具体值：早先一律 `_`，`[i32; 2]` 与
+                    // `[i32; 3]` 的不匹配报成两边完全相同，看不出问题在哪。
+                    hir::ArrayLen::Const(_) => match hir::array_len_value(len) {
+                        Some(n) => n.to_string(),
+                        None => "_".to_string(),
+                    },
+                    hir::ArrayLen::Param(name) => name.clone(),
                     hir::ArrayLen::Dynamic => "_".to_string(),
                 };
                 format!("[{}; {}]", self.type_name(t), l)
@@ -666,7 +691,15 @@ impl fmt::Display for Ty {
             Ty::Named(_, _) => "named".to_string(),
             Ty::Pointer(t, _) => format!("*{}", t),
             Ty::Reference(t, _) => format!("&{}", t),
-            Ty::Array(t, _) => format!("[{}]", t),
+            // 数组长度能求出值时打印具体值，否则打印参数名 / 省略——早先
+            // 一律 `[T]`，长度不匹配的错误两边长得一模一样。
+            Ty::Array(t, len) => match hir::array_len_value(len) {
+                Some(n) => format!("[{}; {}]", t, n),
+                None => match len {
+                    hir::ArrayLen::Param(name) => format!("[{}; {}]", t, name),
+                    _ => format!("[{}]", t),
+                },
+            },
             Ty::Slice(t, _) => format!("[]{}", t),
             Ty::Tuple(_) => "tuple".to_string(),
             Ty::Function { .. } => "fn".to_string(),
@@ -676,6 +709,9 @@ impl fmt::Display for Ty {
             Ty::Opaque(_) => "opaque".to_string(),
             Ty::Pin(inner) => format!("Pin<{}>", inner),
             Ty::Dyn(trait_id) => format!("dyn trait#{}", trait_id.0),
+            // const 泛型实参 / 声明期参数：报错时按值或名字打印，便于定位。
+            Ty::ConstVal(n) => n.to_string(),
+            Ty::ConstParam(name) => name.clone(),
         };
         f.write_str(&name)
     }

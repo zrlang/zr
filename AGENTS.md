@@ -29,11 +29,11 @@ zr 是一门系统编程语言（Rust/Zig 混合取向），编译器用 Rust �
 `future/README.md` 的状态列在 2026-11-01 已按源码重排，当前的不接线 / 空壳项：
 `lto`（`src/opt/lto.rs` 有完整实现，但 `opt/mod.rs` 未声明、CLI 无开关）、
 `pgo`（`src/opt/pgo.rs`，同上）、`macro_system`（`src/macro_system/`，`main.rs` 未 `mod` 声明；
-`macro_rules!` 走的是 `src/macros.rs`）、`const_generics`（`<const N: usize>` 解析接受但
-检查时报错）、`negative_bounds` / `higher_ranked`（trait 求解里查无实现）、
+`macro_rules!` 走的是 `src/macros.rs`）、`negative_bounds` / `higher_ranked`（trait 求解里查无实现）、
 `impl_trait`（**参数位置 APIT 已实现**——`x: impl Trait` 脱糖成匿名泛型参数；
 `-> impl Trait`（RPIT）仍只是骨架：能解析，但值是 `opaque(impl_trait_N)`，任何访问都报错）。
-**已接线且确实可用**：`coherence_rules`（`check_orphan_rule` / `check_overlap`，
+**已接线且确实可用**：`const_generics`（`<const N: usize>` 全链路，见 §5 的在途工作）、
+`coherence_rules`（`check_orphan_rule` / `check_overlap`，
 `src/typeck/mod.rs:1812-1814`）、`c_backend`（`--emit-c`）、`specialization` 的**选择**
 （更 specific 的 impl 优先，但无 `default fn` 特化）。
 
@@ -56,11 +56,11 @@ target/debug/zr prog.zr -O1 -o /tmp/prog   # 编译单个程序
   `ld` 直接断言崩溃（`atomShouldReplaceExisting`）。先 `nm` 看目标文件有没有
   重复符号，再下结论。已修复（提交 `1ef4a02`：MIR 按最终符号名去重，保留首个
   用户定义）。
-- 测试：`tests/zr_language.rs` 把 121 个 `tests/cases/*.zr` 各在
-  `-O0/-O1/-O2/-O3/-Oz` 跑一遍（605 次编译+运行）。退出码 0 = 过，非 0 = 失败（编号指向失败的断言）。
+- 测试：`tests/zr_language.rs` 把 122 个 `tests/cases/*.zr` 各在
+  `-O0/-O1/-O2/-O3/-Oz` 跑一遍（610 次编译+运行）。退出码 0 = 过，非 0 = 失败（编号指向失败的断言）。
   宿主端另有 `io_print_matches_rust` 等 Rust 对照用例。
 - **负向测试机制是 `tests/zr_negative.rs`**（`cargo test --test zr_negative`，
-  31 个用例）。`tests/negative/*.zr` 每个都必须**编译失败**，且报错文本里含
+  34 个用例）。`tests/negative/*.zr` 每个都必须**编译失败**，且报错文本里含
   文件里 `// expect: <子串>` 标注的期望子串；没有 `// expect:` 的行只要求
   "确实报错"。子串而非精确匹配，是为了不让行号/列号漂移把整个套件变红。
   `tests/cases/` 下每个 `.zr` 仍然必须编译通过并返回 0，**两边不要混放**
@@ -275,18 +275,19 @@ README 里"指针与 unsafe"一节目前是**愿景**：
 ### `cargo test` 当前基线（2026-11-02，全绿）
 
 - `cargo test --bin zr`：267 项。
-- `cargo test --test zr_language`：121 个用例 × 5 个优化等级 = 605 项，另有 3 个宿主端
+- `cargo test --test zr_language`：122 个用例 × 5 个优化等级 = 610 项，另有 3 个宿主端
   对照用例（`io_print_matches_rust`——逐字符对比 Rust 的格式化输出，含 `{:e}` / `{:E}`
   与大浮点 Display（`|v| ≥ 2⁶⁴` 不带 `.0`）的回归；`extern_c_write_prints_string_literal`；
   `toolchain_subcommands_emit`——`zr fmt` / `zr fmt --check` / `zr pkg init` / `zr lsp`
   与 `--emit-llvm` / `--wat` 的发射验证）。
-- `cargo test --test zr_negative`：31 个负向用例（含枚举缺臂
+- `cargo test --test zr_negative`：34 个负向用例（含枚举缺臂
   `17_match_missing_variant.zr`、`19_debug_float.zr`、借用检查 20/21/22、
   带显式判别式的枚举 Ord `26_enum_ord_discriminant.zr`、调用实参核验
   `27_scalar_to_ref_arg.zr` / `28_str_to_ref_string.zr`、限定路径的 trait 校验
   `29_qualified_trait_not_impl.zr`、APIT 边界校验
   `30_apit_bound.zr`、`let` 位置的可反驳模式
-  `31_let_refutable.zr`）。
+  `31_let_refutable.zr`、const 泛型实参种类 / 值不匹配
+  `32_const_arg_kind.zr` / `33_const_param_as_type.zr` / `34_const_arg_mismatch.zr`）。
 
 ### 最近修掉的静默 bug（都在 `tests/` 里留了钉子）
 
@@ -386,6 +387,28 @@ README 里"指针与 unsafe"一节目前是**愿景**：
   回归 `tests/cases/120_apit.zr`；负向 `tests/negative/30_apit_bound.zr`
   （`i64` 没实现该 trait，边界必须报错）。**仍不支持**：trait 声明里的方法
   签名不做这个改写（声明本身不参与单态化）。
+- **`const` 泛型 `<const N: usize>`**：✅ 已实现（2026-11-02）——早先解析阶段
+  `GenericParam::Const(name)` 丢掉声明类型、`parse_generic_args` 只走
+  `parse_type()`（`Arr<3>` 报 `expected type, found IntLiteral(3)`），检查阶段
+  `N` 只是"找不到的名字"（`[i32; N]` 报 `cannot find value N`）。现在：
+  (1) **AST**：`Type::ConstInt(i128)` 借泛型实参的 `Vec<Type>` 通道带整数，
+  `GenericParam::Const(String, Type)` 保留声明类型；
+  (2) **HIR**：`Ty::ConstParam(String)` 是声明期占位（进 `type_params` 作用域），
+  `Ty::ConstVal(i128)` 是具体实参（只在 `Ty::Named` 的 args 里出现），
+  数组长度新增 `ArrayLen::Param(name)`——声明期不求值，实例化时由
+  `subst_infer`（typeck）/ `subst_infer_ty`（MIR）按名字换成 `Const(具体值)`，
+  `type_generic_params` 按「类型 + const」**全参数顺序**登记，位置对齐不变；
+  (3) **推断**：`match_generic_ast` 的 Array 分支从实参数组长度反推、
+  `bind_type_args` 同理（结构体字面量没写注解时 `N` 从字段数组字面量长度推）、
+  显式 turbofish 走 `check_turbofish_call` + `check_const_arg_kinds`；
+  推不出来报 ``cannot infer const parameter `N` for `f` ``；
+  (4) **值位置**：`N` 在 `while i < N` / `N as i32` 里按 `const_param_tys`
+  记录的声明类型降成整数字面量；`[0; N]` 的重复次数同理；
+  (5) **种类核验**：`Arr<i32>`（类型塞给 const 参数）、`Vec<3>`（值塞给类型
+  参数）、`N` 当类型用（`let x: N`）都在注解处报错。
+  **仍不支持**：`[T; N + 1]` 这类含参数的常量表达式（长度表达式仍按编译期常量
+  求值），以及类型侧的"省略实参自动推断"（结构体字面量只能从数组字面量长度推）。
+  回归 `tests/cases/122_const_generic.zr`；负向 `32` / `33` / `34`。
 - **`#[derive]`**：方法体已生成（`PartialEq`/`Eq`/`Hash`/`PartialOrd`/`Ord`/`Default`/`Debug`），
   `Hash` 已覆盖**指针/引用按地址**（`b5f5a56`）、**元组按内容**（`38f1ddd`）、
   **数组按内容**（`caab7a0`）、**`str`/切片按内容**（`41ec8f4`，`96_str_slice_hash.zr`）；

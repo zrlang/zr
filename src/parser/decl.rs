@@ -896,11 +896,14 @@ impl Parser {
         if self.match_kind(&TokenKind::KwConst) {
             let name = self.consume_ident("expected const parameter name")?;
             self.consume(&TokenKind::Colon, "expected ':'")?;
-            let _ = self.parse_type()?;
+            // 声明类型（`<const N: usize>` 的 `usize`）保留下来：类型检查
+            // 用它校验常量参数确实是整数类型。默认值 `= ...` 目前不参与
+            // 语义（Rust 的默认 const 参数在省略实参时生效），消费掉即可。
+            let ty = self.parse_type()?;
             if self.match_kind(&TokenKind::Eq) {
                 let _ = self.parse_expression()?;
             }
-            Ok(GenericParam::Const(name))
+            Ok(GenericParam::Const(name, ty))
         } else if matches!(self.peek().kind, TokenKind::Lifetime(_)) {
             // 生命周期参数：`struct Foo<'a> { ... }`
             let name = match &self.peek().kind {

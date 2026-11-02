@@ -1,0 +1,18 @@
+// 负向用例：`const` 泛型参数的种类必须与实参一致。
+//
+// `struct Arr<const N: usize>` 的泛型参数是**值**参数，实参必须是整数
+// 字面量。早先 `Arr<3>` 连解析都过不了（`parse_type()` 撞
+// `expected type, found IntLiteral(3)`）；现在整数实参能带进类型检查，
+// 但把类型塞给 const 参数（`Arr<i32>`）必须在这里报错，而不是留到布局
+// 阶段变成未代入的 `ArrayLen::Param`。
+//
+// expect: generic argument for const parameter `N` must be an integer literal
+struct Arr<const N: usize> {
+    data: [i32; N],
+}
+
+fn main() -> i32 {
+    let a: Arr<i32> = Arr { data: [1, 2] };
+    let _ = a;
+    return 0;
+}
