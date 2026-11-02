@@ -16,9 +16,9 @@ cargo test --test zr_language
 属性、断言内建这些设施编译器目前还不支持（闭包已可用，见 `83_closure_fnptr.zr`
 与 `84_closure_capture_value.zr`；见下方"尚未覆盖"）。
 
-`tests/cases/` 现有 121 个用例，每个在 `-O0/-O1/-O2/-O3/-Oz` 各跑一遍。
+`tests/cases/` 现有 123 个用例，每个在 `-O0/-O1/-O2/-O3/-Oz` 各跑一遍。
 
-"该报错的还在报错"由另一半套件补上：`tests/negative/*.zr`（31 个）每个都必须
+"该报错的还在报错"由另一半套件补上：`tests/negative/*.zr`（36 个）每个都必须
 **编译失败**，且报错文本要含文件里 `// expect: <子串>` 标注的期望子串
 （子串匹配，行号/列号漂移不会把套件变红）：
 
@@ -145,6 +145,8 @@ cargo test --test zr_negative
 | `119_qualified_assoc.zr` | 限定路径 `<T as Trait>::Item`（Rust qualified path）：泛型函数返回 `<F as Future>::Output`、泛型 impl 方法签名里的 `<Self as Future>::Output`、具体类型上的限定注解。相对 `F::Output` 多出的语义是 **trait 校验**（`direct_impls` 里没有该 trait 就报 `the trait `X` is not implemented for `Y``，负向 `29`）。顺带把类型位置的 `<<`/`>>` 拆开——早先 `Vec<Vec<i32>>` 报 `expected '>' to close generic arguments: expected Gt, found Shr` |
 | `120_apit.zr` | `impl Trait` 参数位置（APIT）：裸 `impl Area`、`&impl Area`（匿名参数绑内层类型）、`Vec<impl Area>`、`impl Area + Mark` 多边界、与显式泛型参数共存、同一函数被多个类型实例化。早先参数位置的 `impl Trait` 被降成 `opaque(impl_trait_N)`，实参核验 / 方法访问全报错；现在声明收集前脱糖成匿名泛型参数，边界真校验（负向 `30`） |
 | `121_let_destructure.zr` | `let` 位置上的解构模式：元组 / 嵌套元组 / 结构体 / 定长数组切片 `let [a, b] = arr` / 切片 `let [a, b] = xs else { .. }` / 通配丢弃 / `match` 上的切片模式。早先 `Statement::Let` 只取 `first_binding` 当唯一绑定（只认简单绑定），子绑定永不初始化，`let (a, b) = (3, 4); a + b` 读到栈上垃圾；`match` 的切片模式直接报"未实现"。可反驳模式在 `let` 位置报错（负向 `31`） |
+| `122_const_generic.zr` | `const` 泛型 `<const N: usize>`：泛型函数 / 结构体 / `impl` 方法上的 const 参数、数组长度按参数名延迟替换、值位置使用（`while i < N`、`N as i32`、`[0; N]`）、从实参数组长度与结构体字面量反推 const 实参。种类核验（类型当 const、值当类型、`N` 当类型用）在注解处报错（负向 `32` / `33` / `34`） |
+| `123_yield_cooperative.zr` | `yield` 协作让出点：spawn 两个带 `yield` 的 worker 交错执行（顺序 1,2,3,4）、`yield foo(p)` 的操作数副作用必须发生、循环里多轮让出且结构体/元组活跃值跨挂起点存活、tail 位置 `yield`。早先 `yield` 是类型占位（`Ty::Infer(InferId(0))`），操作数被 `let _ = inner;` 整体丢弃（`foo` 从不被调用），同步函数里静默空操作；现在同步函数与闭包体里的 `yield` 报错（负向 `35` / `36`） |
 
 ## 尚未覆盖（编译器还不支持）
 
@@ -171,7 +173,7 @@ Rust Book 的其余章节目前一个都测不了，因为对应特性尚未实�
 | 智能指针（`Box` / `Rc` / `RefCell`） | ❌ 未实现 |
 | 并发（线程 / 通道 / `Mutex` / `Send`） | 🟡 线程已覆盖（`59_threads.zr`）；无通道 / `Mutex` / `Send` |
 | 面向对象 / 状态模式 | ✅ `trait` 与 `enum` 都已实现；trait 对象 `dyn` 骨架已搭（`88_dyn_keyword.zr`），vtable 分派未完工 |
-| `async` / 协程 | ✅ `29_async.zr` / `47..51` 覆盖 `.await` / future / `spawn`；`yield` 只是类型占位 |
+| `async` / 协程 | ✅ `29_async.zr` / `47..51` 覆盖 `.await` / future / `spawn`；`123_yield_cooperative.zr` 覆盖 `yield` 协作让出（交错顺序 / 操作数副作用 / 循环多轮 + 聚合活跃值）；负向 `35` / `36` 钉住同步函数与闭包体里的 `yield` 报错 |
 
 | 32 位目标上的宽整数（`i64` / `u64` / `i128`） | 32 位寄存器放不下，多字长（寄存器对）尚未实现；**写出来会在类型检查阶段报错** |
 | Thumb-2 的 spilling | 超过 8 个活跃寄存器会（正确地）报 `unsupported_pressure`；栈上传参（≥5 个）同理 |

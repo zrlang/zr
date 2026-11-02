@@ -393,8 +393,14 @@ pub enum ExprKind {
         /// 输入操作数：`in(reg) expr`，约束与已降级的表达式。
         inputs: Vec<(String, HirExpr)>,
     },
-    /// `yield`。
-    Yield,
+    /// `yield expr` 协作让出点。
+    ///
+    /// 携带操作数是为了**保留它的副作用**：`yield foo(p)` 里的 `foo(p)` 必须
+    /// 求值（早先 `ExprKind::Yield` 不带操作数，typeck 把检查完的内层表达式直接
+    /// `let _ = inner;` 丢掉，MIR 只发一条 `Suspend`——`foo` 从不被调用，副作用
+    /// 静默消失）。操作数产出的值本身丢弃：zr 的 `yield` 是 async fn 里的协作
+    /// 让出点，不是生成器的产出（生成器语义需要 resume 协议，未实现）。
+    Yield(Box<HirExpr>),
     /// `spawn`：把内层 future 交给执行器。
     Spawn(Box<HirExpr>),
     /// `sizeof` / `alignof` / `typeof` / `offsetof` 内置。

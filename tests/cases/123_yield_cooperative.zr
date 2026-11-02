@@ -1,0 +1,102 @@
+//=============================================================================
+// tests/cases/123_yield_cooperative.zr — `yield` 协作让出点
+//
+// `yield expr` 是 async fn 里的协作让出点：MIR 发一条 `Suspend`，由
+// `async_lower` 的状态机拆分降成「保存活跃值 + state=N + return Pending」，
+// 执行器（`zr_run_tasks`）把 Pending 任务重挂队尾、下次轮询从 state 续体
+// 恢复。同步函数与闭包体里的 `yield` 报错（负向 `35`）。
+//
+// 早先 `yield` 是类型占位：类型检查返回 `Ty::Infer(InferId(0))`，操作数
+// 只检查不求值（`yield foo(p)` 里 `foo` 从不被调用，副作用静默消失）；
+// 表达式类型也是"永不绑定的推断变量"。现在操作数照常求值、值丢弃、
+// 表达式类型是 `()`。
+//
+// 覆盖：
+//   - spawn 两个带 `yield` 的 worker 交错执行（协作让出顺序 1,2,3,4）
+//   - `yield` 操作数的副作用必须发生
+//   - 循环里多轮 `yield`，跨挂起点保住聚合活跃值（结构体 + 元组）
+//   - `yield` 在尾部（tail 表达式位置）
+//=============================================================================
+
+fn put(p: *mut i32, v: i32) {
+    let i: i32 = *p;
+    p[1 + i] = v;
+    *p = i + 1;
+}
+
+async fn worker(p: *mut i32, first: i32, second: i32) {
+    put(p, first);
+    yield 0;
+    put(p, second);
+}
+
+async fn tick() -> i32 {
+    return 7;
+}
+
+// `yield` 操作数的副作用必须发生：`mark(p)` 写入 42，值本身丢弃。
+fn mark(p: *mut i32) -> i32 {
+    *p = 42;
+    return 0;
+}
+
+async fn side_effect(p: *mut i32) {
+    yield mark(p);
+    return;
+}
+
+struct Acc { sum: i64, n: i32 }
+
+// 循环里多轮让出：前缀和 1,3,6,10,15,21 逐个写入缓冲；跨挂起点存活
+// 结构体 `a` 与元组 `pair`（状态机恢复后读回）。
+async fn accumulate(buf: *mut i64) {
+    let mut a: Acc = Acc { sum: 0, n: 0 };
+    let mut i: i64 = 1;
+    while i <= 6 {
+        let pair: (i64, i32) = (i, (i % 3) as i32);
+        a.sum = a.sum + pair.0;
+        a.n = a.n + 1;
+        yield a.sum;
+        buf[i as usize] = a.sum;
+        i = i + 1;
+    }
+    buf[7] = a.sum;
+    buf[8] = a.n as i64;
+}
+
+// tail 位置的 `yield`：块以 `yield 3;` 结尾，值丢弃、类型 `()`。
+async fn tail_yield() {
+    yield 3;
+}
+
+async fn main() -> i32 {
+    // 1) 交错执行：两个 worker 各让出一次，顺序必须是 1,2,3,4。
+    let mut buf: [i32; 5] = [0, 0, 0, 0, 0];
+    let p: *mut i32 = &mut buf[0];
+    spawn(worker(p, 1, 3));
+    spawn(worker(p, 2, 4));
+    let v: i32 = tick().await;
+    if v != 7 { return 9; }
+    if buf[0] != 4 { return 10 + buf[0]; }
+    if buf[1] != 1 || buf[2] != 2 || buf[3] != 3 || buf[4] != 4 { return 55; }
+
+    // 2) 操作数副作用：mark 必须把 x 写成 42。
+    let mut x: i32 = 0;
+    side_effect(&mut x).await;
+    if x != 42 { return 20 + x; }
+
+    // 3) 循环多轮让出 + 聚合活跃值。
+    let mut lbuf: [i64; 16] = [0; 16];
+    accumulate(&mut lbuf[0]).await;
+    if lbuf[1] != 1 { return 31; }
+    if lbuf[2] != 3 { return 32; }
+    if lbuf[4] != 10 { return 33; }
+    if lbuf[6] != 21 { return 34; }
+    if lbuf[7] != 21 { return 35; }
+    if lbuf[8] != 6 { return 36; }
+
+    // 4) tail 位置 `yield`。
+    tail_yield().await;
+
+    return 0;
+}

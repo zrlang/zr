@@ -5,8 +5,8 @@ zr 是一门系统编程语言（Rust/Zig 混合取向），编译器用 Rust �
 项目入口与功能全景见根目录 `AGENTS.md`。
 
 > 最近更新：2026-11-02。工作树在 `feat/lang-features`；调用实参 / 字段值的类型
-> 核验已落地（`check_call_arg` / `check_field_value`），`std/error` 因此可加载，
-> 清单见 §5。
+> 核验已落地（`check_call_arg` / `check_field_value`），`std/error` 因此可加载；
+> `yield` 已从类型占位升级为可执行的协作让出点（非生成器）。清单见 §5。
 
 ---
 
@@ -56,11 +56,11 @@ target/debug/zr prog.zr -O1 -o /tmp/prog   # 编译单个程序
   `ld` 直接断言崩溃（`atomShouldReplaceExisting`）。先 `nm` 看目标文件有没有
   重复符号，再下结论。已修复（提交 `1ef4a02`：MIR 按最终符号名去重，保留首个
   用户定义）。
-- 测试：`tests/zr_language.rs` 把 122 个 `tests/cases/*.zr` 各在
-  `-O0/-O1/-O2/-O3/-Oz` 跑一遍（610 次编译+运行）。退出码 0 = 过，非 0 = 失败（编号指向失败的断言）。
+- 测试：`tests/zr_language.rs` 把 123 个 `tests/cases/*.zr` 各在
+  `-O0/-O1/-O2/-O3/-Oz` 跑一遍（615 次编译+运行）。退出码 0 = 过，非 0 = 失败（编号指向失败的断言）。
   宿主端另有 `io_print_matches_rust` 等 Rust 对照用例。
 - **负向测试机制是 `tests/zr_negative.rs`**（`cargo test --test zr_negative`，
-  34 个用例）。`tests/negative/*.zr` 每个都必须**编译失败**，且报错文本里含
+  36 个用例）。`tests/negative/*.zr` 每个都必须**编译失败**，且报错文本里含
   文件里 `// expect: <子串>` 标注的期望子串；没有 `// expect:` 的行只要求
   "确实报错"。子串而非精确匹配，是为了不让行号/列号漂移把整个套件变红。
   `tests/cases/` 下每个 `.zr` 仍然必须编译通过并返回 0，**两边不要混放**
@@ -277,19 +277,21 @@ README 里"指针与 unsafe"一节目前是**愿景**：
 ### `cargo test` 当前基线（2026-11-02，全绿）
 
 - `cargo test --bin zr`：267 项。
-- `cargo test --test zr_language`：122 个用例 × 5 个优化等级 = 610 项，另有 3 个宿主端
+- `cargo test --test zr_language`：123 个用例 × 5 个优化等级 = 615 项，另有 3 个宿主端
   对照用例（`io_print_matches_rust`——逐字符对比 Rust 的格式化输出，含 `{:e}` / `{:E}`
   与大浮点 Display（`|v| ≥ 2⁶⁴` 不带 `.0`）的回归；`extern_c_write_prints_string_literal`；
   `toolchain_subcommands_emit`——`zr fmt` / `zr fmt --check` / `zr pkg init` / `zr lsp`
   与 `--emit-llvm` / `--wat` 的发射验证）。
-- `cargo test --test zr_negative`：34 个负向用例（含枚举缺臂
+- `cargo test --test zr_negative`：36 个负向用例（含枚举缺臂
   `17_match_missing_variant.zr`、`19_debug_float.zr`、借用检查 20/21/22、
   带显式判别式的枚举 Ord `26_enum_ord_discriminant.zr`、调用实参核验
   `27_scalar_to_ref_arg.zr` / `28_str_to_ref_string.zr`、限定路径的 trait 校验
   `29_qualified_trait_not_impl.zr`、APIT 边界校验
   `30_apit_bound.zr`、`let` 位置的可反驳模式
   `31_let_refutable.zr`、const 泛型实参种类 / 值不匹配
-  `32_const_arg_kind.zr` / `33_const_param_as_type.zr` / `34_const_arg_mismatch.zr`）。
+  `32_const_arg_kind.zr` / `33_const_param_as_type.zr` / `34_const_arg_mismatch.zr`、
+  同步函数与闭包体里的 `yield` 上下文校验
+  `35_yield_sync.zr` / `36_yield_closure.zr`）。
 
 ### 最近修掉的静默 bug（都在 `tests/` 里留了钉子）
 
@@ -457,6 +459,26 @@ README 里"指针与 unsafe"一节目前是**愿景**：
   `tests/cases/97_loop_value.zr`（含聚合 break 值）。`daf9763` 修掉聚合 break
   值在 `-O3`/`-Oz` 的寄存器分配缺陷（`live_intervals` 线性位置改按 RPO）。
 - **`unsafe` 关键字**：✅ 已实现（`unsafe { ... }` 块可解析和通过类型检查；当前不改变语义，按块表达式透传）。
+- **`yield` 协作让出点**：✅ 已从"类型占位"升级为可执行（2026-11-02）。
+  语义是 **async fn 内的协作让出点**，不是生成器产出：`yield expr` 的操作数
+  **照常求值**（副作用保留）、值丢弃、表达式类型 `()`；MIR 发一条 `Suspend`，
+  由 `async_lower` 的既有状态机降成「保存活跃值 + `state=N` + `return Pending`」，
+  `zr_run_tasks` 把 Pending 任务重挂队尾、下次轮询从 state 续体恢复。
+  早先三个洞：(1) 表达式类型是 `Ty::Infer(InferId(0))` 占位（红线 2 禁止的
+  "活推断变量当哨兵"）；(2) `let _ = inner;` 把检查完的操作数整体丢掉，
+  `yield foo(p)` 里的 `foo` **从不被调用**——副作用静默消失；(3) 同步函数与闭包
+  体里的 `yield` 静默当空操作（不报错也不做事）。现在 `ExprKind::Yield` 携带
+  操作数（`Box<HirExpr>`），`substitute_local` / `remap_lifted_body` 都要下沉到
+  它（否则闭包捕获跨函数内联读到外层帧）；`check_lambda` 显式把
+  `current_is_async` 置假——闭包要么被提升成顶层函数、要么在调用点内联，
+  两处都没有异步状态机，泄漏进来会让闭包体里的 `yield` 检查通过却永不生效。
+  回归 `tests/cases/123_yield_cooperative.zr`（spawn 两 worker 交错顺序、
+  操作数副作用、循环多轮让出 + 结构体/元组活跃值跨挂起点、tail 位置）；
+  负向 `tests/negative/35_yield_sync.zr` / `36_yield_closure.zr`。
+  **仍不支持**：生成器语义（`yield v` 产出值 + 调用方 resume 消费，需要新的
+  生成器类型与 resume 协议）；`intrinsic!(yield)`（`std/async.zr::yield_now()`）
+  在 typeck 就把 kind 丢成 `ExprKind::Intrinsic` 单位变体，MIR 无消费分支，
+  且普通函数里的 `Suspend` 不会被状态机拆分——属独立工程。
 - **`dyn` 关键字**：✅ 词法+解析+类型检查骨架已实现；vtable 分派仍在未实现状态。
 - **借用检查**：🟡 最小切片已实现——同位置借用重叠（`&mut`+`&mut` / `&`+`&mut`）
   报 `cannot borrow ... while already borrowed`；**写被借用位置**（`x = 5` 而

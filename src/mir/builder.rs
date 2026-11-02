@@ -1275,7 +1275,11 @@ fn lower_expr(b: &mut Builder, expr: &HirExpr) -> MirValue {
             }
             MirValue::Unit
         }
-        Yield => {
+        Yield(e) => {
+            // 操作数先求值：`yield foo(p)` 里 `foo(p)` 的副作用必须发生。
+            // 产出的值丢弃（zr 的 `yield` 是协作让出点，不是生成器产出）。
+            let v = lower_expr(b, e);
+            b.consume_temp(&v);
             b.current_block_mut().instrs.push(MirInstr::Suspend);
             MirValue::Unit
         }

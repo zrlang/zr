@@ -1,0 +1,18 @@
+// 负向用例：闭包体里的 `yield` 同样不允许。
+//
+// 闭包要么被提升成独立顶层函数、要么在调用点内联展开，两处都没有异步
+// 状态机；外层 `async fn` 的 `current_is_async` 若泄漏进闭包检查，这里的
+// `yield` 会检查通过、`Suspend` 在 SSA 被跳过——静默空操作。
+//
+// expect: 只能出现在 `async fn` 内部
+async fn work() -> i32 {
+    let f = |x: i32| {
+        yield 0;
+        x
+    };
+    return f(1);
+}
+
+async fn main() -> i32 {
+    return work().await;
+}

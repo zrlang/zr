@@ -3841,11 +3841,25 @@ impl TypeChecker {
                 });
             }
             Expression::Yield(e, _) => {
-                let inner = self.check_expr(e, &Ty::Infer(InferId(0)))?;
-                let _ = inner;
+                // `yield` 是 async fn 里的**协作让出点**：MIR 发一条 `Suspend`，
+                // 由 `async_lower` 的状态机拆分降成「保存活跃值 + state=N +
+                // return Pending」。同步函数里没有状态机可拆，早先静默当空操作
+                // 放过去——那不报错也不做事，是最坏的一种"通过"。`.await` 早在
+                // 前面就做了同样的上下文检查（`` `.await` 只能出现在 `async fn`
+                // 内部``），这里补上对称的一条。
+                if !self.current_is_async {
+                    return Err(CompileError::type_error(
+                        "`yield` 只能出现在 `async fn` 内部".to_string(),
+                    ));
+                }
+                // 操作数**照常求值**（副作用必须保留），产出的值丢弃：zr 的
+                // `yield` 不是生成器产出。早先这里把检查完的内层表达式直接
+                // `let _ = inner;` 扔掉，`yield foo(p)` 里的 `foo` 从不被调用。
+                let any = self.infer.fresh_infer(span);
+                let inner = self.check_expr(e, &any)?;
                 return Ok(HirExpr {
-                    kind: ExprKind::Yield,
-                    ty: Ty::Infer(InferId(0)),
+                    kind: ExprKind::Yield(Box::new(inner)),
+                    ty: Ty::Unit,
                     span,
                 });
             }
@@ -8164,8 +8178,15 @@ impl TypeChecker {
         // 立即恢复：闭包体检查完，外层函数的 `return` 语义要原样保留。
         let saved_ret = self.infer.return_ty.take();
         self.infer.return_ty = Some(ret_ty.clone());
+        // 闭包**不是**异步上下文。外层是 `async fn` 时 `current_is_async` 为真，
+        // 不屏蔽的话闭包体里的 `yield` 会检查通过；而闭包要么被提升成独立顶层
+        // 函数、要么在调用点内联展开，两处都没有异步状态机，那条 `Suspend` 在
+        // SSA 里被直接跳过——静默空操作。这里显式置假，让 `yield` 在闭包体里
+        // 报「只能出现在 `async fn` 内部」。
+        let saved_async = std::mem::replace(&mut self.current_is_async, false);
         let checked_body = self.check_block(body, &ret_ty)?;
         self.infer.return_ty = saved_ret;
+        self.current_is_async = saved_async;
         // 返回类型是推断变量（`let f = |x| x + 1;`）：`check_block` 的 tail
         // 走 `subtype`，而 `subtype` 对 `Infer` 期望类型直接放行**不绑定**，
         // 于是 `ret_ty` 永远停在 Infer，收尾报 `type annotations needed`。
@@ -9414,7 +9435,9 @@ impl TypeChecker {
                 }
             }
             Expression::Await(_, _) => self.infer.fresh_infer(e.span()),
-            Expression::Yield(_, _) => self.infer.fresh_infer(e.span()),
+            // `yield expr` 的值是 `()`：这里给足类型，别再用新鲜推断变量占位
+            // （下游 `let x = yield v;` 会拿到一个永不绑定的 `?T`）。
+            Expression::Yield(_, _) => Ty::Unit,
             Expression::Spawn(_, _) => self.infer.fresh_infer(e.span()),
             Expression::Unsafe(inner, _) => self.infer_expr_ty(inner)?,
             _ => self.infer.fresh_infer(e.span()),
@@ -10885,6 +10908,9 @@ fn substitute_local(e: &mut hir::HirExpr, target: LocalId, with: &hir::HirExpr) 
                 substitute_local(f, target, with);
             }
         }
+        // `yield foo(x)` 的操作数里可能有捕获的局部量，跨函数内联时必须
+        // 一起替换（与 `Index` / 数组 / 元组同一原因）。
+        ExprKind::Yield(e) => substitute_local(e, target, with),
         ExprKind::Comptime(_)
         | ExprKind::Literal(_)
         | ExprKind::Local(_)
@@ -10898,7 +10924,6 @@ fn substitute_local(e: &mut hir::HirExpr, target: LocalId, with: &hir::HirExpr) 
         | ExprKind::Throw(_)
         | ExprKind::Closure { .. }
         | ExprKind::Asm { .. }
-        | ExprKind::Yield
         | ExprKind::Intrinsic => {}
     }
 }
@@ -11039,6 +11064,7 @@ fn remap_lifted_body(
                     remap_expr(el, map, next);
                 }
             }
+            ExprKind::Yield(e) => remap_expr(e, map, next),
             ExprKind::Comptime(_)
             | ExprKind::Literal(_)
             | ExprKind::Def(_)
@@ -11050,7 +11076,6 @@ fn remap_lifted_body(
             | ExprKind::Throw(_)
             | ExprKind::Closure { .. }
             | ExprKind::Asm { .. }
-            | ExprKind::Yield
             | ExprKind::Intrinsic => {}
         }
     }

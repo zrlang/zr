@@ -1,0 +1,12 @@
+// 负向用例：`yield` 只能出现在 `async fn` 内部。
+//
+// 同步函数没有异步状态机可拆，早先 `yield` 静默当空操作放过去（不报错
+// 也不做事）；闭包也不是异步上下文（外层是 `async fn` 时 `current_is_async`
+// 为真，必须显式屏蔽，否则闭包体里的 `yield` 会检查通过、那条 `Suspend`
+// 在 SSA 被直接跳过）。`.await` 早有对称的上下文检查，这里补上。
+//
+// expect: 只能出现在 `async fn` 内部
+fn main() -> i32 {
+    yield 0;
+    return 0;
+}

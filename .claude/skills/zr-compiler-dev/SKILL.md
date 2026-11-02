@@ -128,7 +128,7 @@ lexer(token) → parser → typeck → mir → ssa → codegen → std/ → test
 | `docs/rust-parity.md` | ⚠️ 逐条核对，个别结论已过期 |
 | `tests/README.md` "尚未覆盖"表 | ❌ 严重过期（说 enum/match/泛型未实现，实际都有用例且通过） |
 | `future/README.md` 状态列 | ❌ 不可信，几乎全标 ✅ Done |
-| `Cargo.toml` description | ❌ 夸大（称 full async runtime，实际 `yield` 是占位、async 仅 x86-64） |
+| `Cargo.toml` description | ❌ 夸大（称 full async runtime，实际 async 状态机仅 x86-64；`yield` 是协作让出点而非生成器，`intrinsic!(yield)` 仍无降级路径） |
 
 **凡"已实现"的声明都要 grep 验证。**
 
