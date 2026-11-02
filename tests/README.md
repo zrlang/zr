@@ -16,9 +16,9 @@ cargo test --test zr_language
 属性、断言内建这些设施编译器目前还不支持（闭包已可用，见 `83_closure_fnptr.zr`
 与 `84_closure_capture_value.zr`；见下方"尚未覆盖"）。
 
-`tests/cases/` 现有 117 个用例，每个在 `-O0/-O1/-O2/-O3/-Oz` 各跑一遍。
+`tests/cases/` 现有 119 个用例，每个在 `-O0/-O1/-O2/-O3/-Oz` 各跑一遍。
 
-"该报错的还在报错"由另一半套件补上：`tests/negative/*.zr`（28 个）每个都必须
+"该报错的还在报错"由另一半套件补上：`tests/negative/*.zr`（29 个）每个都必须
 **编译失败**，且报错文本要含文件里 `// expect: <子串>` 标注的期望子串
 （子串匹配，行号/列号漂移不会把套件变红）：
 
@@ -142,6 +142,7 @@ cargo test --test zr_negative
 | `116_enum_default.zr` | 枚举的 `#[derive(Default)]`：用 `#[default]` 标出恰好一个变体；覆盖无载荷 / 元组载荷 / 结构体载荷默认变体、默认变体不是第一个、命名类型载荷递归 `Inner__default()`。没有或多个 `#[default]` 报错（负向 `14`） |
 | `117_union.zr` | `union` 的构造（恰好一个字段）、字段读 / 写、类型双关（写 f32 1.0 读 bytes 验证 IEEE 754）、按值传参 / 返回、大字段决定 union 尺寸 |
 | `118_assoc_projection.zr` | 泛型关联类型投影：`F::Output`（`F: Future` 泛型参数）、`Self::Output`（泛型 impl 内）、非泛型 impl 的 `Type::Output`；`block_on<F: Future>(f) -> F::Output` 全链路返回正确类型 |
+| `119_qualified_assoc.zr` | 限定路径 `<T as Trait>::Item`（Rust qualified path）：泛型函数返回 `<F as Future>::Output`、泛型 impl 方法签名里的 `<Self as Future>::Output`、具体类型上的限定注解。相对 `F::Output` 多出的语义是 **trait 校验**（`direct_impls` 里没有该 trait 就报 `the trait `X` is not implemented for `Y``，负向 `29`）。顺带把类型位置的 `<<`/`>>` 拆开——早先 `Vec<Vec<i32>>` 报 `expected '>' to close generic arguments: expected Gt, found Shr` |
 
 ## 尚未覆盖（编译器还不支持）
 

@@ -709,6 +709,34 @@ impl Parser {
         }
     }
 
+    /// 在**类型 / 泛型实参**位置把复合尖括号拆成单个：`<<` → `<` `<`、
+    /// `>>` → `>` `>`。
+    ///
+    /// 词法器按表达式切 token（`a << b` 是一个 `Shl`、`a >> b` 是 `Shr`），
+    /// 类型位置没有移位运算，但嵌套泛型 `Vec<Vec<i32>>` 与限定路径
+    /// `Option<<F as Future>::Output>` 会产出 `Shr` / `Shl`。不拆的话
+    /// 前者报 `expected '>' to close generic arguments: expected Gt,
+    /// found Shr`，后者连外层泛型实参都解析不起来（`Option` 后面不是
+    /// `Lt`）。
+    ///
+    /// 只在确认处于类型语境的几处调用——表达式解析里的 `Shl`/`Shr`
+    /// 必须保持原样。
+    fn split_angle(&mut self) {
+        let Some(tok) = self.tokens.get(self.pos) else {
+            return;
+        };
+        // 拆出来的两个 token 共享原 token 的 span（诊断位置一致性由
+        // 词法层的行列信息保证，这里只关心种类）。
+        let (first, second) = match &tok.kind {
+            TokenKind::Shl => (TokenKind::Lt, TokenKind::Lt),
+            TokenKind::Shr => (TokenKind::Gt, TokenKind::Gt),
+            _ => return,
+        };
+        let span = tok.span;
+        self.tokens[self.pos] = Token::new(first, span);
+        self.tokens.insert(self.pos + 1, Token::new(second, span));
+    }
+
     /// 必须匹配给定种类，否则报错。
     fn consume(&mut self, kind: &TokenKind, msg: &str) -> Result<Token> {
         if self.check(kind) {

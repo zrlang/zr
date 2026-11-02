@@ -371,12 +371,12 @@ zr 0.8.0 shell — :help 查看元命令，Ctrl-D 退出
 
 ### v0.11.0 — 类型系统（3 周）
 
-- 生命周期 `'a` 保留 + 子类型判定（§2.3）。
-- `dyn Trait` + vtable（§3.2）。
-- 关联类型解析 + 求解（`HirAssocType` 从空结构体升级）。
-- `impl Trait` 在参数位置（APIT）真作为泛型参数处理。
-- `for<'a>` 高阶边界保留 + 求解。
-- **目标**：`std/error` 能导入。
+- 生命周期 `'a` 保留 + 子类型判定（§2.3）。— **已部分完成**：`'a` 全链路解析并跑通（`115_lifetime_args.zr`），但类型检查仍整体丢弃标注，无存活检查。
+- `dyn Trait` + vtable（§3.2）。— **未完成**：词法+解析+类型检查骨架已落地（`88_dyn_keyword.zr`），vtable 分派仍缺。
+- 关联类型解析 + 求解（`HirAssocType` 从空结构体升级）。— **已完成**：`resolve_assoc_type` + `generic_impl_assocs`，覆盖 `Self::Output` / `F::Output` / `Type::Output` / `<T as Trait>::Item`（限定写法带 trait 校验，`118` / `119`，负向 `29`）。
+- `impl Trait` 在参数位置（APIT）真作为泛型参数处理。— **未完成**。
+- `for<'a>` 高阶边界保留 + 求解。— **未完成**。
+- **目标**：`std/error` 能导入。— **已达成**（2026-11-02，随调用实参 / 字段值类型核验落地；`(&dyn Error).cause()` 的 vtable 分派仍不可用，模块里没有走它的路径）。
 
 ### v0.12.0 — 易用性（2 周）
 

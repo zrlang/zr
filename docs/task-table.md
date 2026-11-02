@@ -253,24 +253,26 @@ zr 的做法是让被调方是**泛型**函数（`fn apply<F>(f: F, ..)`）：`F
 
 ### P2-4 C 后端接 CLI / 自举
 
-现状：`src/codegen/c_backend.rs` 无 `--emit-c` 入口；`src/zr0/` 未 `mod` 声明。
+现状：`src/codegen/c_backend.rs` 已由 `--emit-c` 接线（`src/main.rs` CLI 解析 + 从
+HIR 直译成一个 C 翻译单元）；`src/zr0/` 仍未 `mod` 声明。
 
 | 子任务 | 内容 | 状态 |
 |---|---|---|
-| P2-4a | `--emit-c` CLI 入口接 `c_backend.rs`（自举关键路径，roadmap §8.6 决策：真做） | ⬜ |
+| P2-4a | `--emit-c` CLI 入口接 `c_backend.rs`（自举关键路径，roadmap §8.6 决策：真做） | ✅ 已接线（`src/main.rs` 的 `--emit-c` 分支） |
 
 ### P2-5 宏系统 / `yield` / const 泛型 / trait 高级特性
 
 现状：`src/macro_system/` 未 `mod` 声明（`macro_rules!` 走 `src/macros.rs`）；`yield`
-是类型占位；`const` 泛型解析接受但检查报错；trait 高级特性（关联类型投影、HRTB、
-特化、孤儿规则、负边界、`impl Trait`）全缺。
+是类型占位；`const` 泛型解析接受但检查报错；trait 高级特性里**关联类型投影
+（含 `<T as Tr>::Item` 限定写法）与孤儿规则/重叠检查已实现**，仍缺 HRTB、
+负边界、`impl Trait`、`default fn` 特化。
 
 | 子任务 | 内容 | 状态 |
 |---|---|---|
-| P2-5a | 关联类型投影（`Self::Output`/`P::Output`）：`HirAssocType` 从空结构体升级为记录名字 + impl 绑定，`resolve_type_path` 支持投影（roadmap v0.11） | ⬜ |
+| P2-5a | 关联类型投影（`Self::Output`/`P::Output`/`<T as Tr>::Item`）：`resolve_assoc_type` + `generic_impl_assocs`，限定写法带 trait 校验 | ✅ 已实现（回归 `118` / `119`，负向 `29`） |
 | P2-5b | `yield` 协程：从类型占位升级为可执行（frame 状态机） | ⬜ |
 | P2-5c | `const` 泛型 `<const N: usize>`：检查期接受并支持数组长度参数 | ⬜ |
-| P2-5d | 负边界 / 特化 / 孤儿规则 / `impl Trait` 参数 | ⬜ |
+| P2-5d | 负边界 / 特化 / 孤儿规则 / `impl Trait` 参数 | 🟡 孤儿规则 + 重叠检查已接线（`check_orphan_rule` / `check_overlap`）；特化只有 impl 选择、无 `default fn`；负边界 / HRTB / `impl Trait` 参数仍缺 |
 
 ---
 

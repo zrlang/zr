@@ -618,6 +618,10 @@ impl Parser {
             }
             if self.match_kind(&TokenKind::ColonColon) {
                 // 泛型实参（turbofish）：`size_of::<T>()` 的 `::<T>`
+                //
+                // `::<<T as Tr>::Item>` 里 `::` 后紧跟的两个 `<` 被词法器连成
+                // `Shl`（与 `parse_generic_args` 同一理由），先拆再判。
+                self.split_angle();
                 if self.check(&TokenKind::Lt) {
                     self.advance();
                     let type_args = self.parse_generic_args()?;

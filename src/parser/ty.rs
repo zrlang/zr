@@ -101,6 +101,38 @@ impl Parser {
             return Ok(Type::Infer);
         }
 
+        // 限定路径 `<T as Trait>::Item`。类型位置不可能以 `<` 开头——
+        // 泛型实参由标识符分支自己吃（`Vec<T>`），所以这里见到 `<` 只能是
+        // 限定路径。顺序要在 `impl` / `dyn` 之前无所谓，但不能落在基础类型
+        // 分派里，否则报 `expected type, found Lt`。
+        //
+        // 前缀位置只拆 `<<`（`Option<<T as Tr>::Item>` 的外层 `<` 与限定
+        // 路径的 `<` 被词法器连成 `Shl`）；`>>` 在类型开头本身是语法错，
+        // 拆了只会让报错文案更远。
+        if self.check(&TokenKind::Shl) {
+            self.split_angle();
+        }
+        if self.match_kind(&TokenKind::Lt) {
+            let self_ty = self.parse_type()?;
+            if !self.match_kind(&TokenKind::KwAs) {
+                return Err(crate::error::CompileError::type_error(
+                    "expected `as` in qualified path `<T as Trait>::Item`".to_string(),
+                ));
+            }
+            let trait_ty = self.parse_type()?;
+            self.consume(&TokenKind::Gt, "expected '>' to close qualified path")?;
+            self.consume(
+                &TokenKind::ColonColon,
+                "expected '::' after qualified path",
+            )?;
+            let item = self.consume_ident("expected associated type name after '::'")?;
+            return Ok(Type::Qualified {
+                self_ty: Box::new(self_ty),
+                trait_ty: Box::new(trait_ty),
+                item,
+            });
+        }
+
         // `impl Trait` / `impl Trait1 + Trait2`
         if self.match_kind(&TokenKind::KwImpl) {
             let mut bounds = vec![self.parse_type_bp(10)?];
@@ -257,6 +289,9 @@ impl Parser {
                 while self.match_kind(&TokenKind::ColonColon) {
                     path.push(self.consume_ident("expected path segment")?);
                 }
+                if self.check(&TokenKind::Shl) {
+                    self.split_angle();
+                }
                 let generics = if self.match_kind(&TokenKind::Lt) {
                     self.parse_generic_args()?
                 } else {
@@ -270,6 +305,9 @@ impl Parser {
                 let mut path = vec![first];
                 while self.match_kind(&TokenKind::ColonColon) {
                     path.push(self.consume_ident("expected path segment")?);
+                }
+                if self.check(&TokenKind::Shl) {
+                    self.split_angle();
                 }
                 let generics = if self.match_kind(&TokenKind::Lt) {
                     self.parse_generic_args()?
@@ -323,15 +361,21 @@ impl Parser {
     /// 生命周期的类型引用都解析不了（`std/async.zr` 因此整模块加载不了）。
     pub(crate) fn parse_generic_args(&mut self) -> Result<Vec<Type>, crate::error::CompileError> {
         let mut args = Vec::new();
+        // `>>` / `<<` 拆分：这里正要解析第一个实参，而它可能以 `<` 开头
+        // （`Vec<<T as Tr>::Item>`）；反过来收尾处可能撞上 `>>`
+        // （`Vec<Vec<i32>>`）。
+        self.split_angle();
         if !self.check(&TokenKind::Gt) {
             self.parse_one_generic_arg(&mut args)?;
             while self.match_kind(&TokenKind::Comma) {
+                self.split_angle();
                 if self.check(&TokenKind::Gt) {
                     break;
                 }
                 self.parse_one_generic_arg(&mut args)?;
             }
         }
+        self.split_angle();
         self.consume(&TokenKind::Gt, "expected '>' to close generic arguments")?;
         Ok(args)
     }

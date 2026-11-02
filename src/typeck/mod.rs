@@ -8565,6 +8565,59 @@ impl TypeChecker {
                 Box::new(self.ast_to_hir_type(e)?),
             ),
             AstType::Anytype => Ty::Infer(InferId(0)),
+            // 限定路径 `<T as Trait>::Item`：显式指明 trait 后取关联类型。
+            // 与双段命名路径 `F::Output` 是同一件事，多出来的是**trait 校验**：
+            // `F::Output` 只按基类型查 impl 表，写错 trait 也不报；限定写法
+            // 是"我确实要这个 trait 的关联类型"的检查点（也是同名关联类型
+            // 冲突时的消歧手段，将来按 trait 过滤 impl 表时直接用它）。
+            AstType::Qualified {
+                self_ty,
+                trait_ty,
+                item,
+            } => {
+                let base = self.ast_to_hir_type(self_ty)?;
+                let (trait_id, _trait_args) = match self.ast_to_hir_type(trait_ty)? {
+                    Ty::Named(id, args) => (id, args),
+                    other => {
+                        return Err(CompileError::type_error(format!(
+                            "`as` in a qualified path expects a trait, found `{}`",
+                            self.infer.type_name(&other)
+                        ))
+                        .with_span(ast::Span::unknown()));
+                    }
+                };
+                let trait_name = self
+                    .def_names
+                    .get(&trait_id)
+                    .cloned()
+                    .unwrap_or_else(|| "?".to_string());
+                // 声明期泛型参数（`<F as Future>::Output`，`F` 还没绑定）：
+                // 投影不出来，留新的推断变量，等实例化重降签名时再算。
+                if matches!(self.infer.resolve(&base), Ty::Infer(_)) {
+                    return Ok(self.infer.fresh_infer(ast::Span::unknown()));
+                }
+                // 这条校验是限定写法相对 `F::Output` 唯一多出来的语义。
+                if !self.direct_impls(&base).contains(&trait_id) {
+                    return Err(CompileError::type_error(format!(
+                        "the trait `{}` is not implemented for `{}`",
+                        trait_name,
+                        self.infer.type_name(&base)
+                    ))
+                    .with_span(ast::Span::unknown()));
+                }
+                match self.resolve_assoc_type(&base, item, ast::Span::unknown()) {
+                    Some(t) => t,
+                    None => {
+                        return Err(CompileError::type_error(format!(
+                            "no associated type `{}` in the impl of `{}` for `{}`",
+                            item,
+                            trait_name,
+                            self.infer.type_name(&base)
+                        ))
+                        .with_span(ast::Span::unknown()));
+                    }
+                }
+            }
             // 类型位置的 `_`（`as *const _` / `Vec<_>`）：展开成一个新的推断
             // 变量，由上下文（赋值目标、函数形参的 unify）解析；解析不了时
             // 收尾报 `type annotations needed`。注意不能复用 `InferId(0)`——

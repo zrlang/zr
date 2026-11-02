@@ -160,6 +160,20 @@ pub enum Type {
         path: Vec<String>,
         generics: Vec<Type>,
     },
+    /// 限定路径：`<T as Trait>::Item`（Rust 的 qualified path）。
+    ///
+    /// 用来在泛型参数上**显式**指定 trait 再取关联类型
+    /// （`<F as Future>::Output`）。与双段命名路径 `F::Output` 的区别是
+    /// 多了"trait 必须确实被实现"的校验：`F::Output` 只按基类型的 impl
+    /// 查表，两份 `type Output` 同名时无法区分；限定写法指明走哪个 trait。
+    Qualified {
+        /// `as` 左边的类型（`T` / `Self` / `Ready<i32>`）。
+        self_ty: Box<Type>,
+        /// `as` 右边的 trait（`Future` / `core::Future`，可带泛型实参）。
+        trait_ty: Box<Type>,
+        /// 关联类型名（`Output` / `Item`）。
+        item: String,
+    },
     /// 指针：`*T` / `*const T` / `*mut T`
     Pointer(Box<Type>, Mutability),
     /// 引用：`&T` / `&mut T`

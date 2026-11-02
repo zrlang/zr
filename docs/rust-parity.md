@@ -57,10 +57,10 @@
 | 泛型函数 | 可用 | ✅ | 按调用点单态化（含递归泛型）；类型实参从实参 / 期望返回类型推断。泛型约束（`T: Ord`、`where`）在**单态化时**校验（`check_trait_bounds`，含超类型展开）；实例化后再按具体类型检查方法调用 |
 | 泛型类型 | 可用 | ✅ | 泛型结构体 / 枚举 + `impl<T> Type<T>` 的方法均可用（`Vec<T>`、`Option<T>` 等）；字段与载荷类型按类型实参替换 |
 | `trait` | 可用 | ✅ | `trait` + `impl Trait for Type` 正常（`std::core` 的 `Eq`/`Ord`/`Copy`/`Clone`/`Display` 都在用） |
-| 关联类型 | 可用 | ✅ | `type Output;` + `type Output = i32;` 正常；`Self::Output`（impl 内）、`F::Output`（`F: Trait` 泛型参数）、`Type::Output`（具体类型）均可投影，含泛型 impl `impl<T> Tr for S<T> { type Item = T; }` |
+| 关联类型 | 可用 | ✅ | `type Output;` + `type Output = i32;` 正常；`Self::Output`（impl 内）、`F::Output`（`F: Trait` 泛型参数）、`Type::Output`（具体类型）均可投影，含泛型 impl `impl<T> Tr for S<T> { type Item = T; }`；**限定写法 `<T as Trait>::Item` 已支持**（`119_qualified_assoc.zr`），相对 `F::Output` 多出的是 trait 校验（没实现就报 `the trait `X` is not implemented for `Y``，负向 `29`）。**仍不支持**：投影不按 trait 过滤 impl 表，两个 trait 同名关联类型时无法真正消歧 |
 | `impl` 块 | 可用 | ✅ | 关联函数、`self` / `&self` / `&mut self` 三种接收者、`Self` 类型均可 |
 | `type` 别名 | 可用（含泛型） | ✅ | 在**使用点展开**：`let x: MyInt`、结构体字段、数组 / 指针、`Vec<MyInt>`、别名套别名、前向引用都正常；**泛型别名 `type V<T> = Vec<T>` 已支持**（`74_generic_alias.zr`，提交 `8d6c475`：保留参数并登记占位符，展平按实参替换） |
-| 生命周期标注 `'a` | 解析后丢弃 | 🟡 | `&'a T`、`&'a mut T`、`&'static dyn Tomb`、`struct S<'a>`、`impl<'a> S<'a>`、`S<'a>` / `S<'_>` 都能解析（生命周期实参在 `parse_generic_args` 里跳过、不登记，见 `115_lifetime_args.zr`），类型检查阶段直接丢掉标注（`src/parser/ty.rs`），**没有生命周期 / 存活检查**（借用检查只是 §2.4 的最小切片）。**仍不支持**：结构体上的 `where` 子句、类型位置的推断占位 `_`（`as *const _`） |
+| 生命周期标注 `'a` | 解析后丢弃 | 🟡 | `&'a T`、`&'a mut T`、`&'static dyn Tomb`、`struct S<'a>`、`impl<'a> S<'a>`、`S<'a>` / `S<'_>` 都能解析（生命周期实参在 `parse_generic_args` 里跳过、不登记，见 `115_lifetime_args.zr`），类型检查阶段直接丢掉标注（`src/parser/ty.rs`），**没有生命周期 / 存活检查**（借用检查只是 §2.4 的最小切片）。结构体 `where` 子句与 `as *const _` 推断占位已补上。**仍不支持**：`'_` 作为**必须**的实参（会被跳过，`Foo<'_>` 等于 `Foo`） |
 | `dyn Trait` / trait 对象 | 骨架可用 | 🔧 | 词法+解析+类型检查三层已实现（`88_dyn_keyword.zr`：参数/局部注解里出现 `&dyn Error` 不再报错）；**完整 vtable 分派与 trait-object 转换仍在未实现状态**，调用 trait 方法不在此用例范围 |
 | auto trait | 不支持 | ❌ | 无 auto trait 机制、无 blanket impl 语法 |
 | `PhantomData<T>` | 不存在 | ❌ | `std::core` 里没有 `PhantomData`，也没有等价物 |
@@ -72,6 +72,7 @@
 | `let x: Option<i32> = ...;` | 可用 | ✅ | 类型注解里的泛型实参保留，字段 / 载荷类型按实参替换 |
 | `fn f(x: Option<i32>)` | 可用 | ✅ | 签名与函数体一致 |
 | `Option::<i32>::None` | 可用 | ✅ | turbofish 后面继续吃路径段，类型实参挂在整条路径上：无载荷变体（`Option::<i32>::None`）、关联函数（`Box::<i32>::new(7)`）、元组结构体（`Wrap::<i32>(7)`）、结构体载荷变体（`Shape::<u8>::Circle { r: 7 }`）都可用。显式实参当期望类型喂给构造器；无上下文的 `Option::None` 仍需 `let` 注解 |
+| `Vec<Vec<i32>>`（嵌套泛型，`>>` 收尾） | 可用 | ✅ | 词法器把 `>>` / `<<` 切成 `Shr` / `Shl`（为移位表达式），类型位置原先解析不了嵌套泛型。现在 `Parser::split_angle` 只在类型语境内把 `Shl`→`Lt Lt`、`Shr`→`Gt Gt`，`Vec<Vec<i32>>`、`Option<<T as Tr>::Item>` 都能解析（`119_qualified_assoc.zr`） |
 
 ---
 

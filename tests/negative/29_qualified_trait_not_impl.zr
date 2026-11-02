@@ -1,0 +1,16 @@
+// 负向用例：限定路径 `<T as Trait>::Item` 的 trait 校验。
+//
+// 限定写法相对双段命名路径 `T::Item` 唯一多出来的语义就是"这个 trait 确实
+// 被 `T` 实现"。`Foo` 没有 `impl Future`，写 `<Foo as Future>::Output` 必须
+// 报错（早先类型位置见到 `<` 直接掉进基础类型分派，报 `expected type,
+// found Lt`——那是语法错，不是语义错）。
+//
+// expect: the trait `Future` is not implemented for
+trait Future { type Output; }
+
+struct Foo { v: i32 }
+
+fn main() -> i32 {
+    let x: <Foo as Future>::Output = 5;
+    return x;
+}

@@ -55,11 +55,11 @@ target/debug/zr prog.zr -O1 -o /tmp/prog   # 编译单个程序
   `ld` 直接断言崩溃（`atomShouldReplaceExisting`）。先 `nm` 看目标文件有没有
   重复符号，再下结论。已修复（提交 `1ef4a02`：MIR 按最终符号名去重，保留首个
   用户定义）。
-- 测试：`tests/zr_language.rs` 把 115 个 `tests/cases/*.zr` 各在
-  `-O0/-O1/-O2/-O3/-Oz` 跑一遍（575 次编译+运行）。退出码 0 = 过，非 0 = 失败（编号指向失败的断言）。
+- 测试：`tests/zr_language.rs` 把 119 个 `tests/cases/*.zr` 各在
+  `-O0/-O1/-O2/-O3/-Oz` 跑一遍（595 次编译+运行）。退出码 0 = 过，非 0 = 失败（编号指向失败的断言）。
   宿主端另有 `io_print_matches_rust` 等 Rust 对照用例。
 - **负向测试机制是 `tests/zr_negative.rs`**（`cargo test --test zr_negative`，
-  26 个用例）。`tests/negative/*.zr` 每个都必须**编译失败**，且报错文本里含
+  29 个用例）。`tests/negative/*.zr` 每个都必须**编译失败**，且报错文本里含
   文件里 `// expect: <子串>` 标注的期望子串；没有 `// expect:` 的行只要求
   "确实报错"。子串而非精确匹配，是为了不让行号/列号漂移把整个套件变红。
   `tests/cases/` 下每个 `.zr` 仍然必须编译通过并返回 0，**两边不要混放**
@@ -268,15 +268,16 @@ README 里"指针与 unsafe"一节目前是**愿景**：
 ### `cargo test` 当前基线（2026-11-02，全绿）
 
 - `cargo test --bin zr`：267 项。
-- `cargo test --test zr_language`：115 个用例 × 5 个优化等级 = 575 项，另有 3 个宿主端
+- `cargo test --test zr_language`：119 个用例 × 5 个优化等级 = 595 项，另有 3 个宿主端
   对照用例（`io_print_matches_rust`——逐字符对比 Rust 的格式化输出，含 `{:e}` / `{:E}`
   与大浮点 Display（`|v| ≥ 2⁶⁴` 不带 `.0`）的回归；`extern_c_write_prints_string_literal`；
   `toolchain_subcommands_emit`——`zr fmt` / `zr fmt --check` / `zr pkg init` / `zr lsp`
   与 `--emit-llvm` / `--wat` 的发射验证）。
-- `cargo test --test zr_negative`：28 个负向用例（含枚举缺臂
+- `cargo test --test zr_negative`：29 个负向用例（含枚举缺臂
   `17_match_missing_variant.zr`、`19_debug_float.zr`、借用检查 20/21/22、
   带显式判别式的枚举 Ord `26_enum_ord_discriminant.zr`、调用实参核验
-  `27_scalar_to_ref_arg.zr` / `28_str_to_ref_string.zr`）。
+  `27_scalar_to_ref_arg.zr` / `28_str_to_ref_string.zr`、限定路径的 trait 校验
+  `29_qualified_trait_not_impl.zr`）。
 
 ### 最近修掉的静默 bug（都在 `tests/` 里留了钉子）
 
@@ -321,7 +322,30 @@ README 里"指针与 unsafe"一节目前是**愿景**：
   （泛型 impl 内）、`F::Output`（泛型参数）、非泛型 impl 的 `Type::Output`，
   回归 `tests/cases/118_assoc_projection.zr`。`std/async.zr` 的 `block_on<F:
   Future>` 签名现在能过类型检查；剩余阻塞是 `Box` 类型未实现与 `*mut dyn Wake`
-  的 vtable 分派（`dyn` 仍未接）。**仍不支持**：`<T as Tr>::Item` 显式限定写法。
+  的 vtable 分派（`dyn` 仍未接）。`<T as Tr>::Item` 限定写法已支持，见下一条。
+- **限定路径 `<T as Trait>::Item`**：✅ 已实现（2026-11-02）——早先类型位置
+  见到 `<` 就掉进基础类型分派，报 `expected type, found Lt`，所以只能在泛型参数
+  上用双段命名路径 `F::Output`（它按基类型的 impl 表查 `Output`，**不校验 trait**，
+  两份同名关联类型时也无法消歧）。现在 `AstType::Qualified`（`src/parser/ast.rs`）
+  → `parse_type_prefix` 在 `Underscore` 之后、`impl`/`dyn` 之前识别 `<` 开头
+  → `ast_to_hir_type` 降低 self 类型、降低 trait 类型（必须是 `Ty::Named`）→
+  `direct_impls` 校验该 trait 确实被实现（不在就报
+  `the trait `X` is not implemented for `Y``，负向 `29_qualified_trait_not_impl.zr`）
+  → 复用 `resolve_assoc_type` 投影。声明期泛型参数未绑定（`Ty::Infer`）时返回
+  新推断变量，等实例化重降签名再算（与 `F::Output` 同一策略）。
+  **顺带修掉一个既有缺口**：词法器把 `<<` / `>>` 切成 `Shl` / `Shr`（为移位
+  表达式），类型位置因此**嵌套泛型根本解析不了**——`Vec<Vec<i32>>` 报
+  `expected '>' to close generic arguments: expected Gt, found Shr`，
+  `Option<<T as Tr>::Item>` 连外层实参都起不来。新增
+  `Parser::split_angle`（`src/parser/mod.rs`）在**类型语境**把 `Shl`→`Lt Lt`、
+  `Shr`→`Gt Gt`，调用点只在 `parse_type_prefix`（前缀仅拆 `<<`）、
+  `Ident`/`KwUpperSelf` 之后、`parse_generic_args`（首实参前与收尾处）——
+  表达式解析里的 `Shl`/`Shr` 必须保持原样。回归
+  `tests/cases/119_qualified_assoc.zr`（泛型函数返回限定投影、泛型 impl 方法
+  签名里的 `<Self as Future>::Output`、具体类型限定注解）。**仍不支持**：
+  限定写法**不按 trait 过滤 impl 表**（投影仍复用 `resolve_assoc_type` 的
+  "按类型 DefId 查关联类型"路径），两个 trait 同时为同一类型定义同名关联类型
+  时无法真正消歧。
 - **`#[derive]`**：方法体已生成（`PartialEq`/`Eq`/`Hash`/`PartialOrd`/`Ord`/`Default`/`Debug`），
   `Hash` 已覆盖**指针/引用按地址**（`b5f5a56`）、**元组按内容**（`38f1ddd`）、
   **数组按内容**（`caab7a0`）、**`str`/切片按内容**（`41ec8f4`，`96_str_slice_hash.zr`）；

@@ -1,0 +1,73 @@
+// 限定路径 `<T as Trait>::Item`（Rust 的 qualified path）。
+//
+// 早先这种写法完全解析不了：类型位置见到 `<` 就掉进基础类型分派，
+// 报 `expected type, found Lt`。于是泛型关联类型只能用双段命名路径
+// `F::Output`——它按基类型的 impl 表查 `Output`，不校验 trait，
+// 两份同名关联类型时也无法消歧。
+//
+// 现在 `Type::Qualified` 走：降低 self 类型 → 降低 trait 类型（必须是
+// `Ty::Named`）→ `direct_impls` 校验该 trait 确实被实现 → 复用
+// `resolve_assoc_type` 投影关联类型。声明期泛型参数还没绑定时留新的
+// 推断变量，等实例化重降签名再算（与 `F::Output` 同一策略）。
+//
+// 本用例覆盖：泛型函数返回 `<F as Future>::Output`、泛型 impl 方法签名里的
+// `<Self as Future>::Output`、具体类型上的限定注解。
+use core::Option;
+
+trait Future {
+    type Output;
+    fn poll(self) -> Option<Self::Output>;
+}
+
+// 泛型 impl：`Ready<T>::Output = T`。
+struct Ready<T> { value: T }
+impl<T> Future for Ready<T> {
+    type Output = T;
+    fn poll(self) -> Option<Self::Output> { return Option::Some(self.value); }
+}
+
+// 非泛型 impl：`IntFut::Output = i32`。
+struct IntFut { v: i32 }
+impl Future for IntFut {
+    type Output = i32;
+    fn poll(self) -> Option<Self::Output> { return Option::Some(self.v); }
+}
+
+// 泛型函数返回类型用限定写法。
+fn qualified<F: Future>(f: F) -> <F as Future>::Output {
+    match f.poll() {
+        Option::Some(v) => return v,
+        Option::None => return loop { },
+    }
+}
+
+// 泛型 impl 方法签名里的 `<Self as Future>::Output`。
+struct Wrapper<T> { inner: T }
+impl<T> Future for Wrapper<T> {
+    type Output = T;
+    fn poll(self) -> Option<<Self as Future>::Output> {
+        return Option::Some(self.inner);
+    }
+}
+
+fn main() -> i32 {
+    // 泛型 impl：`Ready<i32>` 的关联类型是 `i32`。
+    let a = qualified(Ready { value: 42 });
+    if a != 42 { return 1; }
+
+    // 非泛型 impl：`IntFut` 的关联类型是 `i32`。
+    let b = qualified(IntFut { v: 7 });
+    if b != 7 { return 2; }
+
+    // 具体类型上的限定注解（按值收窄成 i32）。
+    let x: <IntFut as Future>::Output = 5;
+    if x != 5 { return 3; }
+
+    // `<Self as Future>::Output` 在方法签名里走通。
+    match Wrapper { inner: 11 }.poll() {
+        Option::Some(v) => if v != 11 { return 4; },
+        Option::None => return 5,
+    }
+
+    return 0;
+}
