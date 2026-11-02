@@ -2385,9 +2385,84 @@ impl TypeChecker {
                     None
                 };
                 let hir_pat = self.lower_pattern(_pat, &ty)?;
-                // 非绑定模式（通配 / 字面量 / 元组）没有单个可引用的名字，
-                // 用一个匿名局部占位，保证 `HirStmt::Let` 的形状不变。
-                let local = first_binding(&hir_pat).unwrap_or_else(|| self.alloc_local());
+                // 简单绑定（`let x = ..` / `let mut x = ..`）直接落成单条
+                // `HirStmt::Let`，保持推断变量与借用关联的既有路径；
+                // 解构模式（元组 / 结构体 / 切片 …）会绑定**多个**局部量，
+                // `HirStmt::Let` 只承载一个，必须自己展开。
+                //
+                // 早先一律取 `first_binding(...)` 当唯一绑定，而它只认
+                // `HirPattern::Binding`——Tuple/Struct/Slice 的子绑定由
+                // `lower_pattern` 分配却**永不初始化**，`let (a, b) = (3, 4);
+                // a + b` 读到栈上垃圾（编译通过、结果全错）。
+                let local = match &hir_pat {
+                    hir::HirPattern::Binding(local) => *local,
+                    _ => {
+                        // 展开成：`let scrut = init; let p1 = scrut.e0; ...`
+                        // 借用检查：把本初始化里创建的 `let_bound` 借用关联到
+                        // 第一个真实绑定（没有绑定则关联临时 scrutinee），
+                        // 这样借用按该局部的最后使用释放（NLL），而不是被
+                        // "只用在临时量里" 过早判死。
+                        let init_hir = match init_hir {
+                            Some(h) => h,
+                            None => {
+                                return Err(CompileError::type_error(
+                                    "destructuring let requires an initializer",
+                                )
+                                .with_span(*span));
+                            }
+                        };
+                        let resolved = self.infer.resolve(&ty);
+                        let scrut_local = self.alloc_local();
+                        self.locals.insert(scrut_local, resolved.clone());
+                        self.infer.locals.insert(scrut_local, resolved.clone());
+                        let scrutinee = HirExpr {
+                            kind: ExprKind::Local(scrut_local),
+                            ty: resolved.clone(),
+                            span: *span,
+                        };
+                        let (pat_cond, binds) = self.pat_match(&scrutinee, &hir_pat, *span)?;
+                        // `let` 位置只能是不可反驳模式：可反驳模式（字面量 /
+                        // 范围 / 枚举变体 / 定长切片）在 Rust 里同样报错，
+                        // 而不是静默地"匹配失败也继续"。
+                        if pat_cond.is_some() {
+                            self.errors.push(
+                                CompileError::type_error(
+                                    "refutable pattern in local binding; use `let ... else`",
+                                )
+                                .with_span(*span),
+                            );
+                        }
+                        let bind_target =
+                            binds.first().map(|(l, _)| *l).unwrap_or(scrut_local);
+                        for b in self.live_borrows[borrow_start..].iter_mut() {
+                            if b.let_bound && b.binding.is_none() {
+                                b.binding = Some(bind_target);
+                                self.binding_last_use
+                                    .entry(bind_target)
+                                    .or_insert(span.start);
+                            }
+                        }
+                        let mut stmts = vec![hir::HirStmt::Let {
+                            local: scrut_local,
+                            init: Some(init_hir),
+                        }];
+                        for (local, value) in binds {
+                            stmts.push(hir::HirStmt::Let {
+                                local,
+                                init: Some(Box::new(value)),
+                            });
+                        }
+                        let block = hir::HirBlock {
+                            stmts,
+                            tail: None,
+                        };
+                        return Ok(HirStmt::Expr(Box::new(HirExpr {
+                            kind: ExprKind::Block(block),
+                            ty: Ty::Unit,
+                            span: *span,
+                        })));
+                    }
+                };
                 // 借用检查：把本 `let` 初始化里创建的 `let_bound` 借用关联到
                 // 绑定局部。关联后借用按该局部的**最后使用**释放（NLL），而非
                 // 作用域结束——`let r = &mut x; *r = 5; if x != 5` 里读 `x` 时
@@ -5707,9 +5782,9 @@ impl TypeChecker {
     /// - 绑定替换：模式里绑定的局部量 → 取值表达式。结构化模式的绑定落在
     ///   字段上（`P { x: v }` 的 v 是 `p.x`），不是整个 scrutinee。
     ///
-    /// 目前支持字面量、绑定、通配与**结构体模式**（字段模式可以是字面量 /
-    /// 绑定 / 通配）。元组 / 枚举变体 / 切片 / 范围模式还没有对应的运行期
-    /// 表示，遇到时直接报错——不静默当恒真。
+    /// 目前支持字面量、绑定、通配、**结构体模式**、元组模式、枚举变体、
+    /// 范围与**切片模式**（子模式落在 `scrut[i]` 上，长度条件按定长数组的
+    /// 编译期长度或切片的运行期 `.len` 生成）。
     fn pat_match(
         &self,
         scrutinee: &HirExpr,
@@ -5854,10 +5929,92 @@ impl TypeChecker {
                 let cond = conds.into_iter().reduce(|a, b| and_expr(a, b, span));
                 Ok((cond, binds))
             }
-            hir::HirPattern::Slice => Err(CompileError::type_error(
-                "match on slice patterns is not implemented yet",
-            )
-            .with_span(span)),
+            hir::HirPattern::Slice(elems) => {
+                // 被匹配值可能是引用 / 指针——穿透一层看它的目标类型。
+                let resolved = self.infer.resolve(&scrutinee.ty);
+                let target = match &resolved {
+                    Ty::Reference(inner, _) | Ty::Pointer(inner, _) => (**inner).clone(),
+                    other => other.clone(),
+                };
+                let elem_ty = match &target {
+                    Ty::Array(elem, _) | Ty::Slice(elem, _) => (**elem).clone(),
+                    Ty::Str => Ty::Uint(8),
+                    _ => {
+                        return Err(CompileError::type_error(format!(
+                            "slice pattern matched against a non-slice value of type `{}`",
+                            self.infer.type_name(&target)
+                        ))
+                        .with_span(span));
+                    }
+                };
+                // 定长数组的长度是编译期常量：与模式元素个数不等是编译错误；
+                // 切片 / str 的长度未知，要生成 `scrut.len == n` 的运行期条件。
+                let static_len = match &target {
+                    Ty::Array(_, len) => match hir::array_len_value(len) {
+                        Some(v) => Some(v),
+                        None => {
+                            return Err(CompileError::type_error(
+                                "slice pattern on an array of dynamic length is not supported",
+                            )
+                            .with_span(span));
+                        }
+                    },
+                    _ => None,
+                };
+                let n = elems.len() as i128;
+                if let Some(len) = static_len {
+                    if len != n {
+                        return Err(CompileError::type_error(format!(
+                            "slice pattern has {} element(s), but array has {}",
+                            n, len
+                        ))
+                        .with_span(span));
+                    }
+                }
+                let mut conds: Vec<HirExpr> = Vec::new();
+                if static_len.is_none() {
+                    let len_expr = hir::HirExpr {
+                        kind: ExprKind::Field(Box::new(scrutinee.clone()), "len".to_string()),
+                        ty: Ty::Uint(64),
+                        span,
+                    };
+                    let want = hir::HirExpr {
+                        kind: ExprKind::Literal(hir::HirLiteral::Int(n)),
+                        ty: Ty::Uint(64),
+                        span,
+                    };
+                    conds.push(hir::HirExpr {
+                        kind: ExprKind::Binary(
+                            hir::BinaryOp::Eq,
+                            Box::new(len_expr),
+                            Box::new(want),
+                        ),
+                        ty: Ty::Bool,
+                        span,
+                    });
+                }
+                let mut binds: Vec<(hir::LocalId, HirExpr)> = Vec::new();
+                for (i, sub) in elems.iter().enumerate() {
+                    // 子值 = `scrutinee[下标]`。
+                    let sub_value = hir::HirExpr {
+                        kind: ExprKind::Index(
+                            Box::new(scrutinee.clone()),
+                            Box::new(hir::HirExpr {
+                                kind: ExprKind::Literal(hir::HirLiteral::Int(i as i128)),
+                                ty: Ty::Uint(64),
+                                span,
+                            }),
+                        ),
+                        ty: elem_ty.clone(),
+                        span,
+                    };
+                    let (cond, sub_binds) = self.pat_match(&sub_value, sub, span)?;
+                    conds.extend(cond);
+                    binds.extend(sub_binds);
+                }
+                let cond = conds.into_iter().reduce(|a, b| and_expr(a, b, span));
+                Ok((cond, binds))
+            }
             hir::HirPattern::Range {
                 start,
                 end,
@@ -6607,13 +6764,28 @@ impl TypeChecker {
                     args: hir_args?,
                 })
             }
-            AstPattern::Slice(pats, _) => {
+            AstPattern::Slice(pats, span) => {
+                // 每个元素模式对应**元素类型**（不是整个切片 / 数组）。
+                // 早先一律拿 `ty` 传给子模式，于是 `[a, b]` 的 `a` / `b` 被
+                // 当成整个切片；而且结果被整体丢弃（`let _ = hir_pats?;`），
+                // 子绑定分配了却永不写值——静默读到垃圾。
+                let resolved = self.infer.resolve(ty);
+                let elem_ty = match &resolved {
+                    Ty::Array(elem, _) | Ty::Slice(elem, _) => (**elem).clone(),
+                    Ty::Str => Ty::Uint(8),
+                    _ => {
+                        return Err(CompileError::type_error(format!(
+                            "slice pattern cannot match a value of type `{}`",
+                            self.infer.type_name(&resolved)
+                        ))
+                        .with_span(*span));
+                    }
+                };
                 let hir_pats: Result<Vec<_>> = pats
                     .iter()
-                    .map(|p| self.lower_pattern(p, ty))
+                    .map(|p| self.lower_pattern(p, &elem_ty))
                     .collect();
-                let _ = hir_pats?;
-                Ok(hir::HirPattern::Slice)
+                Ok(hir::HirPattern::Slice(hir_pats?))
             }
             AstPattern::Range(start, end, inclusive, _) => {
                 // 范围两端的类型要与被匹配的值一致（字面量也因此拿到正确的

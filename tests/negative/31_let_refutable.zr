@@ -1,0 +1,11 @@
+// 负向用例：`let` 位置不接受可反驳模式。
+//
+// `let` 的绑定一定生效，没有"匹配失败"的分支——字面量 / 范围 / 枚举变体 /
+// 定长切片这类可能不匹配的模式只能出现在 `match` / `if let` / `let ... else`。
+// 早先这些模式在 `let` 里会被静默接受（子绑定永不初始化，读到垃圾）。
+//
+// expect: refutable pattern in local binding
+fn main() -> i32 {
+    let 3 = 5;
+    return 0;
+}

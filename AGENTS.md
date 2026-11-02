@@ -56,11 +56,11 @@ target/debug/zr prog.zr -O1 -o /tmp/prog   # 编译单个程序
   `ld` 直接断言崩溃（`atomShouldReplaceExisting`）。先 `nm` 看目标文件有没有
   重复符号，再下结论。已修复（提交 `1ef4a02`：MIR 按最终符号名去重，保留首个
   用户定义）。
-- 测试：`tests/zr_language.rs` 把 120 个 `tests/cases/*.zr` 各在
-  `-O0/-O1/-O2/-O3/-Oz` 跑一遍（600 次编译+运行）。退出码 0 = 过，非 0 = 失败（编号指向失败的断言）。
+- 测试：`tests/zr_language.rs` 把 121 个 `tests/cases/*.zr` 各在
+  `-O0/-O1/-O2/-O3/-Oz` 跑一遍（605 次编译+运行）。退出码 0 = 过，非 0 = 失败（编号指向失败的断言）。
   宿主端另有 `io_print_matches_rust` 等 Rust 对照用例。
 - **负向测试机制是 `tests/zr_negative.rs`**（`cargo test --test zr_negative`，
-  30 个用例）。`tests/negative/*.zr` 每个都必须**编译失败**，且报错文本里含
+  31 个用例）。`tests/negative/*.zr` 每个都必须**编译失败**，且报错文本里含
   文件里 `// expect: <子串>` 标注的期望子串；没有 `// expect:` 的行只要求
   "确实报错"。子串而非精确匹配，是为了不让行号/列号漂移把整个套件变红。
   `tests/cases/` 下每个 `.zr` 仍然必须编译通过并返回 0，**两边不要混放**
@@ -164,6 +164,12 @@ lexer → parser(ast) → typeck(hir, infer) → mir → ssa → opt → codegen
    `emit_one` → `emit_function` → `assign_int_widths`）判定；`CallIndirect` 的
    被调方是运行期指针、没有声明可查，故**不标**实参宽度——间接调用目前只能
    传机器字宽的值。新增后端必须接这个参数，别只按返回值标宽。
+13. **`HirStmt::Let` 只承载一个 `local`，解构模式必须展开成多条语句。**
+    `Statement::Let` 的简单绑定（`HirPattern::Binding`）直接落成一条 `Let`，
+    其余模式（元组 / 结构体 / 切片 / 通配）要先"临时 scrutinee + 逐子值
+    `Let`"展开（复用 `pat_match`）。只取 `first_binding(...)` 当唯一绑定会让
+    子绑定**永不初始化**——`let (a, b) = (3, 4); a + b` 编译通过、读到栈上垃圾。
+    `HirParam` 同样只有一个 local，函数形参上的解构模式仍是这个限制。
 
 ---
 
@@ -269,20 +275,32 @@ README 里"指针与 unsafe"一节目前是**愿景**：
 ### `cargo test` 当前基线（2026-11-02，全绿）
 
 - `cargo test --bin zr`：267 项。
-- `cargo test --test zr_language`：120 个用例 × 5 个优化等级 = 600 项，另有 3 个宿主端
+- `cargo test --test zr_language`：121 个用例 × 5 个优化等级 = 605 项，另有 3 个宿主端
   对照用例（`io_print_matches_rust`——逐字符对比 Rust 的格式化输出，含 `{:e}` / `{:E}`
   与大浮点 Display（`|v| ≥ 2⁶⁴` 不带 `.0`）的回归；`extern_c_write_prints_string_literal`；
   `toolchain_subcommands_emit`——`zr fmt` / `zr fmt --check` / `zr pkg init` / `zr lsp`
   与 `--emit-llvm` / `--wat` 的发射验证）。
-- `cargo test --test zr_negative`：30 个负向用例（含枚举缺臂
+- `cargo test --test zr_negative`：31 个负向用例（含枚举缺臂
   `17_match_missing_variant.zr`、`19_debug_float.zr`、借用检查 20/21/22、
   带显式判别式的枚举 Ord `26_enum_ord_discriminant.zr`、调用实参核验
   `27_scalar_to_ref_arg.zr` / `28_str_to_ref_string.zr`、限定路径的 trait 校验
   `29_qualified_trait_not_impl.zr`、APIT 边界校验
-  `30_apit_bound.zr`）。
+  `30_apit_bound.zr`、`let` 位置的可反驳模式
+  `31_let_refutable.zr`）。
 
 ### 最近修掉的静默 bug（都在 `tests/` 里留了钉子）
 
+- **`let` 解构模式子绑定永不初始化**：`Statement::Let` 算完 `hir_pat` 后只取
+  `first_binding(...)` 当唯一绑定，而 `first_binding` 只认 `HirPattern::Binding`——
+  元组 / 结构体 / 切片模式的子绑定由 `lower_pattern` 分配却永不写值：
+  `let (a, b) = (3, 4); return a + b;` 编译通过、exit 192（应 7）；
+  `let [a, b] = arr;` exit 208（应 7）。现在非简单绑定时展开成
+  "临时 scrutinee + 逐子值 `HirStmt::Let`"（复用 `pat_match`），可反驳模式在
+  `let` 位置报 `refutable pattern in local binding; use \`let ... else\``。
+  切片模式顺带从"明确未实现"变成可用：`HirPattern::Slice` 携带子模式，
+  `pat_match` 按定长数组的编译期长度 / 切片的运行期 `.len` 生成条件，
+  绑定落在 `scrut[i]` 上。钉子：`tests/cases/121_let_destructure.zr`、
+  负向 `tests/negative/31_let_refutable.zr`。
 - **穷尽 `match` 的返回值被 `Unit` 覆盖**：靠变体/bool 全覆盖证明穷尽的 match 没有
   `_` 臂，脱糖出的 if/else 链最后一条分支"有值"，于是整块被当成 `()`，返回值被
   丢掉。现在 `check_match` 在这种形状下补一个发散 else（`hir::ExprKind::Unreachable`

@@ -512,8 +512,12 @@ pub enum HirPattern {
         index: usize,
         args: Vec<HirPattern>,
     },
-    /// 切片模式。
-    Slice,
+    /// 切片模式：`[p1, p2]`——逐个位置上的元素模式。
+    ///
+    /// 元素模式必须留下来：匹配时既要按**长度**判条件，绑定也要落在
+    /// 各下标上（`scrut[i]`），而不是整个切片。早先只留一个无载荷的
+    /// `Slice`，`let [a, b] = arr;` 的子绑定永不初始化。
+    Slice(Vec<HirPattern>),
     /// 范围模式：`start..=end`（`inclusive` 为真）或 `start..end`。
     Range {
         start: Box<HirExpr>,

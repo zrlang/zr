@@ -78,6 +78,20 @@ i64 读，运行期越界 SIGSEGV（`/tmp/sl_bug.zr`）。`let a: []const i64 = 
 | P0-6c | 回归：`tests/cases/97_loop_value.zr`（标量 break 值 + 累加 + 嵌套 + 语句 break + 发散循环） | ✅ `87ef09a` |
 | P0-7 | **已修** `daf9763`：聚合（结构体/元组/数组）作为 `loop` break 值在 `-O3`/`-Oz` 触发寄存器分配 bug——`live_intervals` 线性位置按数组顺序排块（非 RPO），定义在 break 块、用在出口块的值区间倒挂、不分配寄存器，codegen 拿被常量 `8` 覆盖的寄存器当基址，`load [r8]` 读到地址 8 段错误。修复：线性位置改按 RPO 编号（`src/codegen/regalloc.rs`，`mir_rpo` 改 `pub(crate)`） | ✅ `daf9763` |
 
+### P0-8 `let` 解构模式静默未初始化（已修）
+
+现状：`Statement::Let` 早先算完 `hir_pat` 后只取 `first_binding(...)` 当**唯一**
+绑定，而它只认简单绑定 `x`——元组 / 结构体 / 切片模式的子绑定由
+`lower_pattern` 分配却**永不写值**：`let (a, b) = (3, 4); a + b` 编译通过、
+运行 exit 192（应 7）；`let [a, b] = arr;` 同理（exit 208）。切片模式此前在
+`match` 里也直接报 `match on slice patterns is not implemented yet`。
+
+| 子任务 | 内容 | 状态 |
+|---|---|---|
+| P0-8a | 复现：`let (a, b)` / `let [a, b]` 均静默读栈上垃圾 | ✅ |
+| P0-8b | 修复：`let` 非简单绑定时展开成"临时 scrutinee + 逐子值 `HirStmt::Let`"，复用 `pat_match`；可反驳模式（字面量/范围/变体/切片长度）报 `refutable pattern in local binding; use \`let ... else\``；`HirPattern::Slice` 携带子模式，`pat_match` 生成长度条件（定长数组按编译期长度、切片按运行期 `.len`）与 `scrut[i]` 绑定 | ✅ |
+| P0-8c | 回归：`tests/cases/121_let_destructure.zr`（元组/嵌套/结构体/数组切片/切片 `let ... else`/match 切片模式）、负向 `tests/negative/31_let_refutable.zr` | ✅ |
+
 ### P0-1 借用检查（NLL）——拆 4 个子任务
 
 现状：**已实现最小切片**（`src/typeck/mod.rs`——注意 `src/typeck/infer.rs::check_borrows`

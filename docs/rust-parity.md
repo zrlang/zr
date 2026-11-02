@@ -86,6 +86,7 @@
 | `if` 表达式 | 可用 | ✅ | `let m = if a > b { a } else { b };` |
 | `if let` | 可用 | ✅ | 本地枚举与导入枚举（`use core::Option;`）都能用 |
 | `let ... else` | 可用 | ✅ | `let Step::Value(v) = s else { return 1; };`；else 必须发散 |
+| `let` 解构 `let (a, b) = ...` | 可用 | ✅ | 元组 / 结构体 / 定长数组切片都能解构，子绑定逐个初始化；可反驳模式在 `let` 位置报 `refutable pattern in local binding; use \`let ... else\``。**函数形参上的解构模式仍只取一个 local** |
 | `while let` | 可用 | ✅ | 脱糖成 `loop { let tmp = EXPR; if let PAT = tmp { .. } else { break; } }`，每轮只求值一次 |
 | `loop` / `while` / `for` | 可用 | ✅ | `for i in 0..10`、`for i in 1..=10`、`for x in array` 均正常 |
 | `break` 带值 | 可用 | ✅ | `let v = loop { break 42; };` |
@@ -105,7 +106,7 @@
 | 枚举变体模式 `Shape::Circle(r)` | 可用 | ✅ | 判别式比较正确（`Shape::Empty` 能被正确排除） |
 | 守卫 `n if n > 100` | 可用 | ✅ | |
 | 穷尽性检查 | 可用 | ✅ | 枚举全覆盖时可以**不写 `_`**（与 Rust 一致）；缺臂时报错**列出缺失的变体名**（``match is not exhaustive: `Color` variant not covered: Blue``，`17_match_missing_variant.zr`）；整型 / 标量仍保留尾 `_` 臂措辞 |
-| 切片模式 `[a, b, c]` | 不支持 | ❌ | `zr: match on slice patterns is not implemented yet` |
+| 切片模式 `[a, b, c]` | 定长可用 | 🟡 | 按**长度 + 逐下标**匹配：定长数组的长度是编译期常量（元素个数不符报 `slice pattern has N element(s), but array has M`），切片 / `str` 生成运行期 `.len == N` 条件；元素模式落在 `scrut[i]`。`let` 位置出现切片模式视为可反驳（`let [a, b] = xs else { .. };`）。**仍不支持 `..` 剩余模式**（`[first, .., last]` 的 `..` 在切片模式里不解析） |
 | 引用模式 `&v` | 不支持 | ❌ | 解析期就失败：`zr: expected pattern, found Amp`（类型检查器里还有一条 `zr: match on reference patterns is not implemented yet` 但到不了） |
 
 ### 2.3 函数与表达式

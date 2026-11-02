@@ -16,9 +16,9 @@ cargo test --test zr_language
 属性、断言内建这些设施编译器目前还不支持（闭包已可用，见 `83_closure_fnptr.zr`
 与 `84_closure_capture_value.zr`；见下方"尚未覆盖"）。
 
-`tests/cases/` 现有 120 个用例，每个在 `-O0/-O1/-O2/-O3/-Oz` 各跑一遍。
+`tests/cases/` 现有 121 个用例，每个在 `-O0/-O1/-O2/-O3/-Oz` 各跑一遍。
 
-"该报错的还在报错"由另一半套件补上：`tests/negative/*.zr`（30 个）每个都必须
+"该报错的还在报错"由另一半套件补上：`tests/negative/*.zr`（31 个）每个都必须
 **编译失败**，且报错文本要含文件里 `// expect: <子串>` 标注的期望子串
 （子串匹配，行号/列号漂移不会把套件变红）：
 
@@ -144,6 +144,7 @@ cargo test --test zr_negative
 | `118_assoc_projection.zr` | 泛型关联类型投影：`F::Output`（`F: Future` 泛型参数）、`Self::Output`（泛型 impl 内）、非泛型 impl 的 `Type::Output`；`block_on<F: Future>(f) -> F::Output` 全链路返回正确类型 |
 | `119_qualified_assoc.zr` | 限定路径 `<T as Trait>::Item`（Rust qualified path）：泛型函数返回 `<F as Future>::Output`、泛型 impl 方法签名里的 `<Self as Future>::Output`、具体类型上的限定注解。相对 `F::Output` 多出的语义是 **trait 校验**（`direct_impls` 里没有该 trait 就报 `the trait `X` is not implemented for `Y``，负向 `29`）。顺带把类型位置的 `<<`/`>>` 拆开——早先 `Vec<Vec<i32>>` 报 `expected '>' to close generic arguments: expected Gt, found Shr` |
 | `120_apit.zr` | `impl Trait` 参数位置（APIT）：裸 `impl Area`、`&impl Area`（匿名参数绑内层类型）、`Vec<impl Area>`、`impl Area + Mark` 多边界、与显式泛型参数共存、同一函数被多个类型实例化。早先参数位置的 `impl Trait` 被降成 `opaque(impl_trait_N)`，实参核验 / 方法访问全报错；现在声明收集前脱糖成匿名泛型参数，边界真校验（负向 `30`） |
+| `121_let_destructure.zr` | `let` 位置上的解构模式：元组 / 嵌套元组 / 结构体 / 定长数组切片 `let [a, b] = arr` / 切片 `let [a, b] = xs else { .. }` / 通配丢弃 / `match` 上的切片模式。早先 `Statement::Let` 只取 `first_binding` 当唯一绑定（只认简单绑定），子绑定永不初始化，`let (a, b) = (3, 4); a + b` 读到栈上垃圾；`match` 的切片模式直接报"未实现"。可反驳模式在 `let` 位置报错（负向 `31`） |
 
 ## 尚未覆盖（编译器还不支持）
 
@@ -157,11 +158,11 @@ Rust Book 的其余章节目前一个都测不了，因为对应特性尚未实�
 
 | Rust Book 章节 | 现状 |
 |----------------|------|
-| 所有权 / 借用 / 引用 / 切片 | 🟡 部分：最小移动检查已实现（`87_move_check.zr`：`let b = a` 后读 `a` 报 use-after-move；字段级/按值传参移动暂不覆盖）；**借用检查最小切片已实现**（`src/typeck/mod.rs`：同位置重叠借用报 `cannot borrow ... while already borrowed`、写被借用位置报 `cannot assign ... while it is borrowed`、读被可变借用位置报 `cannot read ... while it is mutably borrowed`；NLL 按 last-use 近似，`105_borrow_nll.zr` + 负向 20/21/22。`infer.rs::check_borrows` 只是未接线的空壳残留）；切片已覆盖（`65_slices.zr`） |
+| 所有权 / 借用 / 引用 / 切片 | 🟡 部分：最小移动检查已实现（`87_move_check.zr`：`let b = a` 后读 `a` 报 use-after-move；字段级/按值传参移动暂不覆盖）；**借用检查最小切片已实现**（`src/typeck/mod.rs`：同位置重叠借用报 `cannot borrow ... while already borrowed`、写被借用位置报 `cannot assign ... while it is borrowed`、读被可变借用位置报 `cannot read ... while it is mutably borrowed`；NLL 按 last-use 近似，`105_borrow_nll.zr` + 负向 20/21/22。`infer.rs::check_borrows` 只是未接线的空壳残留）；切片已覆盖（`65_slices.zr`）；`let` 解构（元组/结构体/切片）已初始化子绑定（`121_let_destructure.zr`） |
 | 枚举 | ✅ `57_enum.zr`：变体构造 / 判别式 / 变体模式 / 穷尽性 / 拷贝语义；`80_match_value.zr` 钉 match 返回值 |
 | 浮点（仅 ARM32 / Thumb / RISC-V / wasm） | x86-64 与 aarch64 已支持；其余后端遇到浮点字面量会**明确报错**（不再静默发射 0） |
 | 字符串字面量（仅 ARM32 / Thumb / RISC-V / wasm） | x86-64 与 aarch64 已落 `.rodata`（可取址、按地址比较），并可通过 `extern "C"` 调用运行时的 `zr_write` 输出；其余后端遇到字符串字面量会**明确报错**。尚无解引用 / 索引（需要 SSA 内存模型） |
-| 模式匹配（`match` / `if let` / 解构） | ✅ `25_match.zr`（字面量/绑定/或/guard）、`52_if_let.zr`、`54_struct_pattern.zr`、`55_tuple_pattern.zr`、`56_range_pattern.zr`、`62_while_let.zr`；`match` 脱糖成 if/else 链。**缺臂报错已改进**（枚举列出缺失变体名） |
+| 模式匹配（`match` / `if let` / 解构） | ✅ `25_match.zr`（字面量/绑定/或/guard）、`52_if_let.zr`、`54_struct_pattern.zr`、`55_tuple_pattern.zr`、`56_range_pattern.zr`、`62_while_let.zr`、`121_let_destructure.zr`（`let` 解构 + 切片模式）；`match` 脱糖成 if/else 链。**缺臂报错已改进**（枚举列出缺失变体名） |
 | 包管理与 Cargo | 🟡 模块系统已支持 `mod` / `use` / `use a::{b,c}` / `use x as y`（`75_use_alias.zr`）/ `use foo::*`（`90_glob_import.zr`）；但无 Cargo 等价物 |
 | 集合（Vector / String / HashMap） | 🟡 `std/collections` 与 `std/string` 已加载，但 `String` 无 `BufRead::read_line` 形态的 API；无 `HashMap` |
 | 错误处理（`panic!` / `Result` / `?`） | ✅ `69_question.zr`：`?` 对 `Result`/`Option` 生效；`Option`/`Result`（含变体）已在 prelude（`89_prelude_variant.zr`）。`panic!` 未实现 |
