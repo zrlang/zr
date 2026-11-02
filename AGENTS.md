@@ -29,7 +29,7 @@ zr 是一门系统编程语言（Rust/Zig 混合取向），编译器用 Rust �
 `lto`（`src/opt/lto.rs` 有完整实现，但 `opt/mod.rs` 未声明、CLI 无开关）、
 `pgo`（`src/opt/pgo.rs`，同上）、`macro_system`（`src/macro_system/`，`main.rs` 未 `mod` 声明；
 `macro_rules!` 走的是 `src/macros.rs`）、`const_generics`（`<const N: usize>` 解析接受但
-检查时报错）、`negative_bounds` / `higher_ranked` / `assoc_type_projection`（trait 求解里查无实现）、
+检查时报错）、`negative_bounds` / `higher_ranked`（trait 求解里查无实现）、
 `impl_trait`（`-> impl Trait` 能解析，但值是 `opaque(impl_trait_N)`，任何访问都报错）。
 **已接线且确实可用**：`coherence_rules`（`check_orphan_rule` / `check_overlap`，
 `src/typeck/mod.rs:1812-1814`）、`c_backend`（`--emit-c`）、`specialization` 的**选择**
@@ -91,11 +91,9 @@ lexer → parser(ast) → typeck(hir, infer) → mir → ssa → opt → codegen
   **注意模块名不带 `std::` 前缀**：`use core::Option;`，不是 `use std::core::Option;`。
   **2026-11-01 实测**（macOS x86-64，`use <m>::*;` + 空 `main`，全链路编译+链接）：
   **12 个通过**（collections/core/fs/io/mem/net/path/process/simd/slice/string/thread），
-  两个不可加载——`async`（`pub struct Join2<..> where ..` 的**结构体 where 子句**
-  解析不了，报 `expected '{' after struct name: found KwWhere`；`async fn` 与协程
-  codegen 也未接，源码另缺 `use collections::Vec`）、`error`（`as *const _` 的
-  **推断类型占位 `_`** 解析不了，报 `expected type, found Underscore`；即使解析
-  过了，`(&dyn Error).cause()` 还需要 vtable 分派）。
+  两个不可加载——`async`（`Box` 类型未实现 + `*mut dyn Wake` 需要 vtable 分派；
+  结构体 `where` 子句、`F::Output` 关联类型投影已在本分支补上，不再是阻塞项）、
+  `error`（`(&dyn Error).cause()` 需要 vtable 分派；`as *const _` 推断占位已补上）。
 - 运行时 `runtime/*.s`：每平台一份汇编（Linux/macOS/Windows 的 x86-64+aarch64，裸机 ARM/RISC-V）。
   提供 `zr_write` / `zr_alloc` 等符号，与编译器分离编译。
 - 已接线的优化 pass（`src/opt/mod.rs:68-102`，按 `-O` 等级分层）：
@@ -302,10 +300,24 @@ README 里"指针与 unsafe"一节目前是**愿景**：
   **下游还有一处**：`check_function_bodies` 早先看 `impl_gens.is_empty()` 判"泛型 impl"，
   纯生命周期 impl 的方法体被整体跳过 → 方法永不发射、调用点留未定义符号
   （`_Ctx__get`），链接期才炸。现在只把**类型 / const** 参数算泛型。
-  回归 `tests/cases/115_lifetime_args.zr`。**仍不支持**：结构体上的 `where` 子句
-  （`pub struct S<..> where ..` 报 `expected '{' after struct name`，`std/async.zr`
-  卡在这里）、类型位置的推断占位 `_`（`as *const _` 报 `expected type, found
-  Underscore`）、`'_` 作为**必须**的实参（会被跳过，`Foo<'_>` 等于 `Foo`）。
+  回归 `tests/cases/115_lifetime_args.zr`。**仍不支持**：`'_` 作为**必须**的实参
+  （会被跳过，`Foo<'_>` 等于 `Foo`）；结构体 `where` 子句与 `as *const _` 已补上。
+- **泛型关联类型投影 `F::Output`**：✅ 已实现——早先 `F::Output`（`F: Future`）报
+  `cannot find value F`：`ast_to_hir_type` 的关联类型分支只认基类型是
+  `Ty::Named` 的情况，泛型参数 `F` 还是推断变量时漏过，掉到 `resolve_type_path`
+  当值路径查。现在：(1) 声明期 `F` 是推断变量 → 返回新推断变量占位，等实例化
+  重算；(2) 实例化期 `F` 是具体类型 → `resolve_assoc_type` 走泛型 impl 路径
+  （`generic_impl_assocs` 保留目标 AST 与泛型参数名，用 `match_generic_ast` 把
+  `Ready<T>` 的 `T` 绑到实参，再把 `type Output = T` 的 AST 在新作用域里降低）。
+  同时修了 `impl_target_matches` 用结构体 InferId 建替换表的 bug（impl 的 `T`
+  与结构体的 `T` 是不同 InferId，泛型 trait 边界 `F: Future` 因此判不了
+  `Ready<i32>` 满足），改用 `bind_infer_args` 直接从 impl 目标抓 Infer。还修了
+  `build_instance_signature` 没推 `Self` 的 bug（泛型 impl 方法签名里的
+  `Self` / `Self::Output` 在实例化重降低时找不到）。覆盖 `Self::Output`
+  （泛型 impl 内）、`F::Output`（泛型参数）、非泛型 impl 的 `Type::Output`，
+  回归 `tests/cases/118_assoc_projection.zr`。`std/async.zr` 的 `block_on<F:
+  Future>` 签名现在能过类型检查；剩余阻塞是 `Box` 类型未实现与 `*mut dyn Wake`
+  的 vtable 分派（`dyn` 仍未接）。**仍不支持**：`<T as Tr>::Item` 显式限定写法。
 - **`#[derive]`**：方法体已生成（`PartialEq`/`Eq`/`Hash`/`PartialOrd`/`Ord`/`Default`/`Debug`），
   `Hash` 已覆盖**指针/引用按地址**（`b5f5a56`）、**元组按内容**（`38f1ddd`）、
   **数组按内容**（`caab7a0`）、**`str`/切片按内容**（`41ec8f4`，`96_str_slice_hash.zr`）；

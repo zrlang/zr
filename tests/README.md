@@ -141,6 +141,7 @@ cargo test --test zr_negative
 | `115_lifetime_args.zr` | 生命周期参数与实参：`Ctx<'a>` / `Pair<'a, T>` / `Pair<'_, i64>` 的解析、`impl<'a> Ctx<'a>` 的方法能真正发射并调用（早先方法体被当"泛型 impl"整体跳过，链接期才有未定义符号 `_Ctx__get`）、`&'a mut T`（`set(self: &'a mut Ctx<'a>)`）、`&'static dyn Trait` / `&'static T` 签名（只解析，无 vtable 分派） |
 | `116_enum_default.zr` | 枚举的 `#[derive(Default)]`：用 `#[default]` 标出恰好一个变体；覆盖无载荷 / 元组载荷 / 结构体载荷默认变体、默认变体不是第一个、命名类型载荷递归 `Inner__default()`。没有或多个 `#[default]` 报错（负向 `14`） |
 | `117_union.zr` | `union` 的构造（恰好一个字段）、字段读 / 写、类型双关（写 f32 1.0 读 bytes 验证 IEEE 754）、按值传参 / 返回、大字段决定 union 尺寸 |
+| `118_assoc_projection.zr` | 泛型关联类型投影：`F::Output`（`F: Future` 泛型参数）、`Self::Output`（泛型 impl 内）、非泛型 impl 的 `Type::Output`；`block_on<F: Future>(f) -> F::Output` 全链路返回正确类型 |
 
 ## 尚未覆盖（编译器还不支持）
 

@@ -57,7 +57,7 @@
 | 泛型函数 | 可用 | ✅ | 按调用点单态化（含递归泛型）；类型实参从实参 / 期望返回类型推断。泛型约束（`T: Ord`、`where`）在**单态化时**校验（`check_trait_bounds`，含超类型展开）；实例化后再按具体类型检查方法调用 |
 | 泛型类型 | 可用 | ✅ | 泛型结构体 / 枚举 + `impl<T> Type<T>` 的方法均可用（`Vec<T>`、`Option<T>` 等）；字段与载荷类型按类型实参替换 |
 | `trait` | 可用 | ✅ | `trait` + `impl Trait for Type` 正常（`std::core` 的 `Eq`/`Ord`/`Copy`/`Clone`/`Display` 都在用） |
-| 关联类型 | 可用 | ✅ | `type Output;` + `type Output = i32;` 正常，`Self::Output` 能取到 |
+| 关联类型 | 可用 | ✅ | `type Output;` + `type Output = i32;` 正常；`Self::Output`（impl 内）、`F::Output`（`F: Trait` 泛型参数）、`Type::Output`（具体类型）均可投影，含泛型 impl `impl<T> Tr for S<T> { type Item = T; }` |
 | `impl` 块 | 可用 | ✅ | 关联函数、`self` / `&self` / `&mut self` 三种接收者、`Self` 类型均可 |
 | `type` 别名 | 可用（含泛型） | ✅ | 在**使用点展开**：`let x: MyInt`、结构体字段、数组 / 指针、`Vec<MyInt>`、别名套别名、前向引用都正常；**泛型别名 `type V<T> = Vec<T>` 已支持**（`74_generic_alias.zr`，提交 `8d6c475`：保留参数并登记占位符，展平按实参替换） |
 | 生命周期标注 `'a` | 解析后丢弃 | 🟡 | `&'a T`、`&'a mut T`、`&'static dyn Tomb`、`struct S<'a>`、`impl<'a> S<'a>`、`S<'a>` / `S<'_>` 都能解析（生命周期实参在 `parse_generic_args` 里跳过、不登记，见 `115_lifetime_args.zr`），类型检查阶段直接丢掉标注（`src/parser/ty.rs`），**没有生命周期 / 存活检查**（借用检查只是 §2.4 的最小切片）。**仍不支持**：结构体上的 `where` 子句、类型位置的推断占位 `_`（`as *const _`） |

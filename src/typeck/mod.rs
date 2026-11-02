@@ -139,6 +139,22 @@ struct AccessCandidate {
     local: LocalId,
 }
 
+/// 泛型 impl 的关联类型投影信息。
+///
+/// `impl<T> Future for Ready<T> { type Output = T; }` 这类泛型 impl 的关联
+/// 类型不能提前算好（`T` 还没绑定）。这里保留目标类型 AST、泛型参数名和
+/// 关联类型 AST，到投影时（`Ready<i32>::Output`）用 `match_generic_ast`
+/// 把 `T` 绑成 `i32`，再把 `Output` 的 AST 在新作用域里重新降低。
+#[derive(Debug, Clone)]
+struct GenericImplAssoc {
+    /// impl 目标的 AST（如 `Ready<T>`）。
+    target_ast: AstType,
+    /// impl 的泛型参数名（如 `["T"]`），只收类型参数。
+    generic_names: Vec<String>,
+    /// 关联类型：名字 → 定义体 AST（如 `("Output", `T`)`）。
+    assoc_types: Vec<(String, AstType)>,
+}
+
 /// 类型检查器。
 #[derive(Debug)]pub struct TypeChecker {
     /// 目标允许的最大整数位宽（默认 128，即不额外限制）。
@@ -173,7 +189,11 @@ struct AccessCandidate {
     /// impl 块里定义的关联类型：目标类型 DefId → (关联类型名 → 具体类型)。
     /// `Self::Output` 在 impl 方法签名里靠它解析——早先 impl 的
     /// `type Output = i32` 被整个丢弃，`Self::Output` 报 `cannot find value Self`。
+    /// 只存**非泛型** impl 的关联类型（值是具体类型）；泛型 impl 的关联类型
+    /// 见 `generic_impl_assocs`，需要投影时替换泛型参数。
     impl_assoc_types: HashMap<DefId, HashMap<String, Ty>>,
+    /// 泛型 impl 的关联类型投影信息（保留 AST，投影时再替换泛型参数）。
+    generic_impl_assocs: Vec<GenericImplAssoc>,
     /// 常量表。
     consts: HashMap<DefId, hir::HirConst>,
     /// 静态变量表。
@@ -432,6 +452,7 @@ impl Default for TypeChecker {
             impl_targets: HashMap::new(),
             drop_impls: HashMap::new(),
             impl_assoc_types: HashMap::new(),
+            generic_impl_assocs: Vec::new(),
             consts: HashMap::new(),
             statics: HashMap::new(),
             locals: HashMap::new(),
@@ -1743,19 +1764,48 @@ impl TypeChecker {
         {
             let target = self.ast_to_hir_type(&ib.target)?;
             // 登记 impl 块里的关联类型（`type Output = i32;`），供
-            // `Self::Output` 在 impl 方法签名里解析。只处理目标是命名类型
-            // 的情况（泛型 impl 的关联类型需要投影，暂不支持）。
-            if let Ty::Named(type_id, _) = &target {
-                let mut map = HashMap::new();
-                for at in &ib.assoc_types {
-                    if let Some(ty_ast) = &at.ty {
-                        if let Ok(ty) = self.ast_to_hir_type(ty_ast) {
-                            map.insert(at.name.clone(), ty);
+            // `Self::Output` / `F::Output` 在方法签名里解析。
+            //
+            // 非泛型 impl：目标是具体命名类型，关联类型在无泛型作用域里
+            // 降低，结果是具体的，直接存 `impl_assoc_types`。
+            // 泛型 impl（`impl<T> Future for Ready<T> { type Output = T; }`）：
+            // 关联类型可能引用 `T`，提前降低会留下未绑定的推断变量。这里
+            // 保留 AST 与泛型参数名，投影时再替换——见 `generic_impl_assocs`
+            // 与 `resolve_assoc_type`。
+            let impl_generic_names: Vec<String> = ib
+                .generics
+                .iter()
+                .filter_map(|g| match g {
+                    ast::GenericParam::Type(n, _) => Some(n.clone()),
+                    _ => None,
+                })
+                .collect();
+            if impl_generic_names.is_empty() {
+                if let Ty::Named(type_id, _) = &target {
+                    let mut map = HashMap::new();
+                    for at in &ib.assoc_types {
+                        if let Some(ty_ast) = &at.ty {
+                            if let Ok(ty) = self.ast_to_hir_type(ty_ast) {
+                                map.insert(at.name.clone(), ty);
+                            }
                         }
                     }
+                    if !map.is_empty() {
+                        self.impl_assoc_types.insert(*type_id, map);
+                    }
                 }
-                if !map.is_empty() {
-                    self.impl_assoc_types.insert(*type_id, map);
+            } else {
+                let assoc_types: Vec<(String, AstType)> = ib
+                    .assoc_types
+                    .iter()
+                    .filter_map(|at| at.ty.as_ref().map(|t| (at.name.clone(), t.clone())))
+                    .collect();
+                if !assoc_types.is_empty() {
+                    self.generic_impl_assocs.push(GenericImplAssoc {
+                        target_ast: ib.target.clone(),
+                        generic_names: impl_generic_names,
+                        assoc_types,
+                    });
                 }
             }
             // `Drop` 是编译器内建 trait，不要求用户先声明它。
@@ -6334,6 +6384,66 @@ impl TypeChecker {
         self.type_params.push(scope);
     }
 
+    /// 解析关联类型投影（`Self::Output` / `F::Output` / `Ready<i32>::Output`）。
+    ///
+    /// `base_ty` 是投影的基类型（`Self` / `F` / `Ready<i32>` 降低后的类型）。
+    /// 返回 `Some(ty)` 表示投影成功；`None` 表示找不到（调用方走
+    /// `resolve_type_path` 报错或返回推断变量占位）。
+    ///
+    /// 两条路径：
+    /// 1. 非泛型 impl：`impl_assoc_types` 里按目标 DefId 直接查（值是具体
+    ///    类型，`impl Future for IntFut { type Output = i32; }`）。
+    /// 2. 泛型 impl：`generic_impl_assocs` 里逐个拿目标 AST 与 `base_ty` 做
+    ///    结构匹配（`match_generic_ast`），把泛型参数绑成具体类型，再把
+    ///    关联类型的 AST 在新作用域里重新降低。
+    fn resolve_assoc_type(
+        &mut self,
+        base_ty: &Ty,
+        name: &str,
+        span: ast::Span,
+    ) -> Option<Ty> {
+        let base = self.infer.resolve(base_ty);
+        // 基类型还是推断变量（泛型函数声明期 `F::Output`，`F` 还没绑定）：
+        // 没法投影，返回 None 让调用方留推断变量等实例化时再算。
+        if matches!(base, Ty::Infer(_)) {
+            return None;
+        }
+        // 路径 1：非泛型 impl 的关联类型。
+        if let Ty::Named(base_id, _) = &base {
+            if let Some(map) = self.impl_assoc_types.get(base_id) {
+                if let Some(assoc_ty) = map.get(name) {
+                    return Some(assoc_ty.clone());
+                }
+            }
+        }
+        // 路径 2：泛型 impl 的关联类型。逐个尝试用 `base_ty` 去匹配 impl
+        // 目标 AST，匹配成功就把关联类型 AST 在替换后的作用域里降低。
+        for entry in self.generic_impl_assocs.clone() {
+            let mut subst = HashMap::new();
+            if self
+                .match_generic_ast(&entry.target_ast, &base, &entry.generic_names, &mut subst, span)
+                .is_err()
+            {
+                continue;
+            }
+            let Some((_, assoc_ast)) = entry.assoc_types.iter().find(|(n, _)| n == name) else {
+                continue;
+            };
+            let saved = std::mem::take(&mut self.type_params);
+            self.push_type_scope(
+                &subst
+                    .into_iter()
+                    .collect::<Vec<_>>(),
+            );
+            let result = self.ast_to_hir_type(assoc_ast).ok();
+            self.type_params = saved;
+            if result.is_some() {
+                return result;
+            }
+        }
+        None
+    }
+
     /// 调用表达式是不是直接指向一个可单态化的泛型函数。
     fn generic_call_target(&self, callee: &Expression) -> Option<DefId> {
         if let Expression::Variable(name, _) = callee {
@@ -6560,35 +6670,56 @@ impl TypeChecker {
             return true;
         }
         // 泛型 impl（`impl<T> Future for Ready<T>`）：目标里留着未绑定的 `Infer`
-        // 占位符，上面整体比必然不等，改按位置绑定一级实参后重比。
-        let Ty::Named(impl_id, ref impl_args) = impl_ty else {
-            return false;
-        };
-        let Ty::Named(ty_id, ref ty_args) = ty else {
-            return false;
-        };
-        if ty_id != impl_id {
-            return false;
-        }
-        let params = self
-            .type_generic_params
-            .get(&impl_id)
-            .cloned()
-            .unwrap_or_default();
-        if params.len() != ty_args.len() {
+        // 占位符，上面整体比必然不等。用结构匹配把 impl 目标里的 Infer 绑到
+        // 实际类型的对应位置，绑完后 impl 目标应与实际类型相等。
+        //
+        // 注意：impl 的泛型参数 `T` 是 `push_type_params` 新建的 Infer，与
+        // 结构体定义时的 `T` 不是同一个 InferId——所以不能用
+        // `type_generic_params`（存的是结构体的 InferId）来建替换表，必须
+        // 直接从 impl 目标里抓 Infer。
+        let mut map = HashMap::new();
+        if !self.bind_infer_args(&impl_ty, &ty, &mut map) {
             return false;
         }
-        let map: HashMap<InferId, Ty> = params
-            .iter()
-            .zip(ty_args.iter())
-            .filter_map(|(p, a)| match p {
-                Ty::Infer(id) => Some((*id, a.clone())),
-                _ => None,
-            })
-            .collect();
-        impl_args.iter().zip(ty_args.iter()).all(|(exp, got)| {
-            self.subst_infer(exp, &map) == *got
-        })
+        self.subst_infer(&impl_ty, &map) == ty
+    }
+
+    /// 结构匹配：把 `pattern` 里的 `Ty::Infer` 绑到 `actual` 的对应子类型。
+    ///
+    /// `pattern` 是泛型 impl 的目标类型（含 Infer 占位），`actual` 是被检查的
+    /// 具体类型。返回 `true` 表示形状匹配（Infer 已绑进 `map`，重复出现的
+    /// Infer 要求两次绑到同一类型）。
+    fn bind_infer_args(&self, pattern: &Ty, actual: &Ty, map: &mut HashMap<InferId, Ty>) -> bool {
+        let pat = self.resolve_ty(pattern);
+        let act = self.resolve_ty(actual);
+        match (&pat, &act) {
+            (Ty::Infer(id), _) => match map.get(id) {
+                Some(existing) => existing == &act,
+                None => {
+                    map.insert(*id, act);
+                    true
+                }
+            },
+            (Ty::Named(pi, pa), Ty::Named(ai, aa)) => {
+                pi == ai
+                    && pa.len() == aa.len()
+                    && pa.iter().zip(aa).all(|(p, a)| self.bind_infer_args(p, a, map))
+            }
+            (Ty::Pointer(p, _), Ty::Pointer(a, _)) => self.bind_infer_args(p, a, map),
+            (Ty::Reference(p, _), Ty::Reference(a, _)) | (Ty::Reference(p, _), Ty::Pointer(a, _)) => {
+                self.bind_infer_args(p, a, map)
+            }
+            (Ty::Array(p, _), Ty::Array(a, _)) => self.bind_infer_args(p, a, map),
+            (Ty::Slice(p, _), Ty::Slice(a, _)) | (Ty::Slice(p, _), Ty::Array(a, _)) => {
+                self.bind_infer_args(p, a, map)
+            }
+            (Ty::Optional(p), Ty::Optional(a)) => self.bind_infer_args(p, a, map),
+            (Ty::Tuple(ps), Ty::Tuple(as_)) => {
+                ps.len() == as_.len()
+                    && ps.iter().zip(as_).all(|(p, a)| self.bind_infer_args(p, a, map))
+            }
+            _ => pat == act,
+        }
     }
 
     /// 解析推断占位符（这里只做结构解析，不查外部表）。
@@ -7044,6 +7175,14 @@ impl TypeChecker {
     ) -> Result<hir::HirFunction> {
         let saved = std::mem::take(&mut self.type_params);
         self.push_type_scope(subst);
+        // impl 方法的 `Self`：目标类型在替换后的作用域里降低
+        // （`Ready<T>` → `Ready<i32>`），否则返回类型 / 参数里的 `Self`
+        // / `Self::Output` 解析不了。非 impl 函数 `impl_targets` 无条目。
+        if let Some(target) = self.impl_targets.get(&ast_fn.name).cloned() {
+            if let Ok(ty) = self.ast_to_hir_type(&target) {
+                self.push_named_type("Self", ty);
+            }
+        }
         let ret = self.ast_to_hir_type(&ast_fn.return_type)?;
         let mut params = Vec::with_capacity(ast_fn.params.len() + 1);
         if let Some(ty) = self.receiver_ty(ast_fn)? {
@@ -8073,18 +8212,30 @@ impl TypeChecker {
                         return Ok(ty);
                     }
                 }
-                // 关联类型投影（具体类型）：`Self::Output` / `IntFut::Output`。
-                // 只支持目标是 impl 块里登记过的命名类型（`impl ... for IntFut
-                // { type Output = i32; }`）。泛型参数的关联类型（`F::Output`
-                // 里 `F: Future`）需要真投影，属架构级特性，暂不支持。
+                // 关联类型投影：`Self::Output` / `F::Output` / `IntFut::Output`。
+                //
+                // `path[0]` 可以是：
+                // - 类型参数（`Self`、泛型函数的 `F`）——`lookup_type_param` 命中；
+                // - 具体命名类型（`IntFut`）——`resolve_type_path` 拿到 DefId。
+                //
+                // 泛型函数声明期 `F` 还是推断变量，投影不出具体类型——返回一个
+                // 新的推断变量占位，等实例化时（`build_instance_signature`，
+                // `F` 已被替换成具体类型）重新降低签名时再投影。
                 if path.len() == 2 && generics.is_empty() {
-                    if let Some(base_ty) = self.lookup_type_param(&path[0]) {
-                        if let Ty::Named(base_id, _) = self.infer.resolve(&base_ty) {
-                            if let Some(map) = self.impl_assoc_types.get(&base_id) {
-                                if let Some(assoc_ty) = map.get(&path[1]) {
-                                    return Ok(assoc_ty.clone());
-                                }
-                            }
+                    let base_ty = if let Some(ty) = self.lookup_type_param(&path[0]) {
+                        Some(ty)
+                    } else if let Ok(id) = self.resolve_type_path(&[path[0].clone()]) {
+                        Some(Ty::Named(id, Vec::new()))
+                    } else {
+                        None
+                    };
+                    if let Some(base_ty) = base_ty {
+                        if let Some(assoc_ty) = self.resolve_assoc_type(&base_ty, &path[1], ast::Span::unknown()) {
+                            return Ok(assoc_ty);
+                        }
+                        // 基类型是推断变量（声明期 `F::Output`）：留推断变量等实例化。
+                        if matches!(self.infer.resolve(&base_ty), Ty::Infer(_)) {
+                            return Ok(self.infer.fresh_infer(ast::Span::unknown()));
                         }
                     }
                 }

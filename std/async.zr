@@ -74,6 +74,7 @@ pub struct Task {
     pub id:    u64,
 }
 
+#[derive(PartialEq, Eq)]
 pub enum TaskState {
     /// 尚未开始运行。
     Created,

@@ -1,0 +1,63 @@
+// 泛型关联类型投影：`F::Output`（F: Future）、`Self::Output`（泛型 impl 内）、
+// 以及非泛型 impl 的关联类型解析。
+//
+// 早先 `F::Output` 在泛型函数签名里报 `cannot find value F`——
+// `ast_to_hir_type` 的关联类型分支只认 `lookup_type_param` 解析成
+// `Ty::Named` 的基类型，泛型参数 `F` 还是推断变量时直接漏过，掉到
+// `resolve_type_path` 当值路径查。现在：
+//   1. 声明期 `F` 是推断变量 → 返回新推断变量占位，等实例化重算；
+//   2. 实例化期 `F` 是具体类型 → `resolve_assoc_type` 走泛型 impl 路径，
+//      用 `match_generic_ast` 把 `Ready<T>` 的 `T` 绑到实参，再把
+//      `type Output = T` 的 AST 在新作用域里降低成具体类型。
+// 同时修了 `impl_target_matches` 用结构体 InferId 建替换表的 bug（impl 的
+// `T` 与结构体的 `T` 是不同 InferId），泛型 trait 边界 `F: Future` 才能
+// 正确判定 `Ready<i32>` 满足。
+use core::Option;
+
+trait Future {
+    type Output;
+    fn poll(self) -> Option<Self::Output>;
+}
+
+// 非泛型 impl 的关联类型：`IntFut::Output` 直接是 `i32`。
+struct IntFut { v: i32 }
+impl Future for IntFut {
+    type Output = i32;
+    fn poll(self) -> Option<i32> { return Option::Some(self.v); }
+}
+
+// 泛型 impl 的关联类型：`Ready<T>::Output = T`。
+struct Ready<T> { value: T }
+impl<T> Future for Ready<T> {
+    type Output = T;
+    // `Self::Output` 在泛型 impl 方法签名里也得能解析（self 是 Ready<T>）。
+    fn poll(self) -> Option<Self::Output> { return Option::Some(self.value); }
+}
+
+fn ready<T>(v: T) -> Ready<T> { return Ready { value: v }; }
+
+// 关键：泛型函数返回 `F::Output`。
+fn block_on<F: Future>(f: F) -> F::Output {
+    match f.poll() {
+        Option::Some(v) => return v,
+        Option::None => return loop { },
+    }
+}
+
+fn main() -> i32 {
+    // 泛型 impl：`block_on(ready(42))` 返回 `i32`（`Ready<i32>::Output`）。
+    let a = block_on(ready(42));
+    if a != 42 { return 1; }
+
+    // 非泛型 impl：`block_on(IntFut{v: 7})` 返回 `i32`。
+    let b = block_on(IntFut { v: 7 });
+    if b != 7 { return 2; }
+
+    // 泛型 impl 的 `Self::Output` 方法签名走通：直接调 poll。
+    match ready(99).poll() {
+        Option::Some(v) => if v != 99 { return 3; },
+        Option::None => return 4,
+    }
+
+    return 0;
+}

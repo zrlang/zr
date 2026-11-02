@@ -26,7 +26,7 @@ subsystem. Each file uses the following status legend:
 ### trait_system
 | File                     | Status | Summary                       |
 |--------------------------|--------|-------------------------------|
-| assoc_type_projection.md | ⬜     | `<T as Tr>::Item` 归一化未实现（`Self::Output` 可用但无投影求解） |
+| assoc_type_projection.md | 🔧     | `Self::Output` / `F::Output`（`F: Trait`）已支持（含泛型 impl 的 `impl<T> Tr for S<T> { type Item = T; }` 投影）；`<T as Tr>::Item` 显式限定写法未实现 |
 | higher_ranked.md         | ⬜     | `for<'a>` 绑定器未实现 |
 | specialization.md        | 🔧     | 重叠 impl 的**选择**已按"更 specific 优先"（`is_more_specific`，`impl<T> Tr for T` 与 `impl Tr for A` 同时存在时 `a.method()` 走具体实现）；但 `default fn` 式的"泛型体特化"仍无 |
 | coherence_rules.md       | ✅     | 孤儿规则（`check_orphan_rule`）与重叠检查（`check_overlap`）已在 `src/typeck/mod.rs:1812-1814` 接线，报 `coherence_error`；marker trait 允许重叠 |
