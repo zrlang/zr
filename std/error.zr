@@ -5,7 +5,10 @@
 // 以及统一的错误报告机制。
 //=============================================================================
 
-use core::{String, Vec, Option, panic};
+use core::{Option, exit, panic};
+use collections::Vec;
+use string::String;
+use io::eprintln;
 
 //=============================================================================
 // Error trait — 所有错误类型都应实现
@@ -25,18 +28,18 @@ pub trait Error {
 
 /// 一个简单的静态字符串错误，用于测试与原型开发。
 pub struct SimpleError {
-    pub msg: &'static str,
+    pub msg: str,
 }
 
 impl SimpleError {
-    pub fn new(msg: &'static str) -> SimpleError {
+    pub fn new(msg: str) -> SimpleError {
         return SimpleError { msg };
     }
 }
 
 impl Error for SimpleError {
     fn description(self) -> String {
-        return String::from_bytes(self.msg as *const u8 as *const u8 as *const _);
+        return String::from_bytes(self.msg);
     }
 }
 
@@ -49,7 +52,10 @@ pub struct RuntimeError {
 impl Error for RuntimeError {
     fn description(self) -> String {
         let mut s = String::new();
-        s.push_str("runtime error ");
+        // push_str 收 `&String`（真引用），字面量是 16 字节 `str` 值、塞进
+        // 8 字节引用形参会被截断——字面量一律走 push_bytes（`[]const u8`
+        // 与 `str` 同为 {ptr,len}，切片规则放行）。
+        s.push_bytes("runtime error ");
         s.push_int(self.code as i64);
         s.push_byte(b':');
         s.push_byte(b' ');
@@ -85,13 +91,10 @@ impl Backtrace {
 
     /// 打印回溯到标准错误。
     pub fn print(self: &Backtrace) {
-        use io::eprintln;
         eprintln("stack backtrace:");
         let mut i = 0;
         while i < self.frames.len {
             let f = self.frames.get(i);
-            use io::print_fmt;
-            use io::FormatArg;
             // 简化输出
             i = i + 1;
         }
@@ -106,7 +109,6 @@ impl Backtrace {
 
 /// 报告一个致命错误并退出进程。
 pub fn report_fatal<E: Error>(err: E) -> ! {
-    use io::eprintln;
     eprintln(err.description().as_bytes());
     if err.backtrace().is_some() {
         err.backtrace().unwrap().print();
@@ -116,7 +118,6 @@ pub fn report_fatal<E: Error>(err: E) -> ! {
 
 /// 报告一个非致命错误（仅打印，不退出）。
 pub fn report<E: Error>(err: E) {
-    use io::eprintln;
     eprintln(err.description().as_bytes());
 }
 
@@ -130,7 +131,7 @@ pub fn to_string<E: Error>(err: E) -> String {
 //=============================================================================
 
 /// 调试断言：失败时打印回溯并终止。
-pub fn debug_assert(cond: bool, msg: &'static str) {
+pub fn debug_assert(cond: bool, msg: str) {
     if !cond {
         let bt = Backtrace::capture();
         bt.print();
@@ -158,8 +159,11 @@ pub struct WithContext<E> {
 impl<E: Error> Error for WithContext<E> {
     fn description(self) -> String {
         let mut s = String::new();
-        s.push_str(self.inner.description());
-        s.push_str(" (context: ");
+        // description() 返回 24 字节 String 值，push_str 收 `&String`——
+        // 值不能当引用传；走 as_bytes()（[]const u8，与 str 同布局）再进
+        // push_bytes。
+        s.push_bytes(self.inner.description().as_bytes());
+        s.push_bytes(" (context: ");
         s.push_str(&self.context);
         s.push_byte(b')');
         return s;

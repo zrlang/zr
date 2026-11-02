@@ -4,8 +4,9 @@ zr 是一门系统编程语言（Rust/Zig 混合取向），编译器用 Rust �
 本文件给在代码库里工作的 AI agent 看，是操作约定与"哪些文档可信"的清单。
 项目入口与功能全景见根目录 `AGENTS.md`。
 
-> 最近更新：2026-11-01。工作树在 `feat/lang-features`；`i128`/`u128` 的乘除取模、
-> 枚举的 `derive(PartialOrd, Ord)` 已补上，清单见 §5。
+> 最近更新：2026-11-02。工作树在 `feat/lang-features`；调用实参 / 字段值的类型
+> 核验已落地（`check_call_arg` / `check_field_value`），`std/error` 因此可加载，
+> 清单见 §5。
 
 ---
 
@@ -89,11 +90,13 @@ lexer → parser(ast) → typeck(hir, infer) → mir → ssa → opt → codegen
 - 标准库 `std/`：14 个 `.zr` 源文件（编译器自编译）——
   `async` `collections` `core` `error` `fs` `io` `mem` `net` `path` `process` `simd` `slice` `string` `thread`。
   **注意模块名不带 `std::` 前缀**：`use core::Option;`，不是 `use std::core::Option;`。
-  **2026-11-01 实测**（macOS x86-64，`use <m>::*;` + 空 `main`，全链路编译+链接）：
-  **12 个通过**（collections/core/fs/io/mem/net/path/process/simd/slice/string/thread），
-  两个不可加载——`async`（`Box` 类型未实现 + `*mut dyn Wake` 需要 vtable 分派；
-  结构体 `where` 子句、`F::Output` 关联类型投影已在本分支补上，不再是阻塞项）、
-  `error`（`(&dyn Error).cause()` 需要 vtable 分派；`as *const _` 推断占位已补上）。
+  **2026-11-02 实测**（macOS x86-64，`use <m>::*;` + 空 `main`，全链路编译+链接）：
+  **13 个通过**（collections/core/error/fs/io/mem/net/path/process/simd/slice/string/thread；
+  `error` 随调用实参/字段值类型核验落地而可加载——`as *const _` 推断占位、
+  字面量传 `push_bytes` 的切片放行均已补上；`(&dyn Error).cause()` 的
+  vtable 分派仍不可用，模块里没有走它的路径就能加载），
+  一个不可加载——`async`（`Box` 类型未实现 + `*mut dyn Wake` 需要 vtable 分派；
+  结构体 `where` 子句、`F::Output` 关联类型投影已在本分支补上，不再是阻塞项）。
 - 运行时 `runtime/*.s`：每平台一份汇编（Linux/macOS/Windows 的 x86-64+aarch64，裸机 ARM/RISC-V）。
   提供 `zr_write` / `zr_alloc` 等符号，与编译器分离编译。
 - 已接线的优化 pass（`src/opt/mod.rs:68-102`，按 `-O` 等级分层）：
@@ -262,7 +265,7 @@ README 里"指针与 unsafe"一节目前是**愿景**：
 3. **栈上传参的偏移要跟着 `rsp` 走**：`Src::Mem(slot)` 是 `[rsp + 8*slot]` 的原始帧偏移，
    压入实参后必须整体加 `released/8`；被调方读 `[rbp + 16 + 8k]`（`rbp` 才是稳定基准）。
 
-### `cargo test` 当前基线（2026-11-01，全绿）
+### `cargo test` 当前基线（2026-11-02，全绿）
 
 - `cargo test --bin zr`：267 项。
 - `cargo test --test zr_language`：115 个用例 × 5 个优化等级 = 575 项，另有 3 个宿主端
@@ -270,9 +273,10 @@ README 里"指针与 unsafe"一节目前是**愿景**：
   与大浮点 Display（`|v| ≥ 2⁶⁴` 不带 `.0`）的回归；`extern_c_write_prints_string_literal`；
   `toolchain_subcommands_emit`——`zr fmt` / `zr fmt --check` / `zr pkg init` / `zr lsp`
   与 `--emit-llvm` / `--wat` 的发射验证）。
-- `cargo test --test zr_negative`：26 个负向用例（含枚举缺臂
+- `cargo test --test zr_negative`：28 个负向用例（含枚举缺臂
   `17_match_missing_variant.zr`、`19_debug_float.zr`、借用检查 20/21/22、
-  带显式判别式的枚举 Ord `26_enum_ord_discriminant.zr`）。
+  带显式判别式的枚举 Ord `26_enum_ord_discriminant.zr`、调用实参核验
+  `27_scalar_to_ref_arg.zr` / `28_str_to_ref_string.zr`）。
 
 ### 最近修掉的静默 bug（都在 `tests/` 里留了钉子）
 
@@ -495,6 +499,28 @@ README 里"指针与 unsafe"一节目前是**愿景**：
   么给 Linux 运行时接 libc，要么这 3 个在 Linux 上返回错误；未做。
   `tests/cases/104_socket_runtime.zr`（钉住）。
 - **穷尽性报错**：✅ 已改进（`a526953`：枚举缺臂列出缺失变体名，`17_match_missing_variant.zr`；整型/标量仍保留尾 `_` 臂措辞）。
+- **调用实参 / 字段值的类型核验**：✅ 已实现（2026-11-02）——早先实参核验是个静默洞：
+  `check_method_call` 缺参时拿 `InferId(0)` 哨兵兜底、实参整体没有核验路径，
+  `std/error.zr` 里字面量直传 `String__push_str(&String)` 这类"16 字节值的高 8
+  字节被当指针用"的必然 SIGSEGV 代码静默通过。现在统一走
+  `check_call_arg` / `check_field_value`：先精确 `unify`，引用/指针形状再按
+  **内层** unify 绑推断变量（`push_slice(&mut req, ..)` 的 `Vec<_>` 才有机会
+  绑到 `u8`），最后落 `ty_equiv_relaxed` 宽松等价——整数族宽度差异、切片家族
+  `{ptr,len}`（`str` ↔ `[]const u8`）、引用↔裸指针、聚合值↔引用（方法
+  receiver）、**数组退化**（`&[FormatArg; 2]` → `*const FormatArg`，只单向）。
+  **方法 receiver 有自动取引用语法糖**：裸 `self` 由 `receiver_ty` 降成
+  `&Self`（zr 约定，不同于 Rust 的按值 self），标量 receiver 也走这条
+  （`a.lt(b)` 的 `a: i64` 对 `self: &i64`），核验前剥一层引用；**普通调用
+  没有这个语法糖**（`g(v)` 传 `fn(&i64)` 仍报错，负向 `27`；`str` 塞
+  `&String` 报错，负向 `28`）。顺带修了三个被核验暴露的类型检查 bug：
+  (1) `?` 的载荷标注早先取自启发式兜底（`infer_expr_ty` 没有 Field 分支时
+  兜成当前函数返回类型），改用 `check_expr` 之后 `expr.ty` 的真实类型实参；
+  (2) `lower_pattern` 的 Tuple 分支不 resolve 就拆，`let (a, b) = f()?;`
+  的子绑定拿到整个元组；(3) `ty_equiv_relaxed` 规则 3a 早先直接 `return`
+  递归结果，数组退化（3c）永远轮不到。核验暴露的既有错误点已逐个修正
+  （`std/error.zr` 调用点改 `push_bytes`、`std/mem.zr` 的
+  `Layout::from_size_align` 返回 `Result`）。`std/error` 因此可加载
+  （std 模块 12→13，见 §2）；回归 `cargo test` 三套件全绿。
 - **文档债**：✅ 已清（`fb4dfb2` 修 `tests/README.md` / `future/README.md`；`1d38ca3` 修 README 安全模型节 / `rust-parity.md` / `CONTRIBUTING.md` / `Cargo.toml` description）。
 
 ## 6. 工作约定

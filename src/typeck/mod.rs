@@ -2008,11 +2008,28 @@ impl TypeChecker {
                 self.async_outputs.insert(opaque_id, ret.clone());
                 ret = Ty::Opaque(opaque_id);
             }
-            let mut params = self
-                .functions
-                .get(&id)
-                .map(|f| f.params.clone())
-                .unwrap_or_default();
+            // 参数类型也在阶段 6 解析。早先这里只解析返回类型，参数要等阶段 7
+            // 逐个函数检查体时才补上——但阶段 7 按源码顺序走，"调用点在源码里
+            // 排在被调方之前"的前向调用与方法调用读到的是**空参数表**：
+            //
+            // - 普通调用靠 `fresh_infer` 兜底，实参从未被真正核验（静默洞）；
+            // - 方法调用更是拿全局 `InferId(0)` 当哨兵——红线 2：它是**活的**
+            //   推断变量，会被更早的调用绑上（`a.set(&b)` 把它绑成
+            //   `*const T`），后面 std/string.zr 的 `reserve(8)` 实参 `u64`
+            //   resolve 出旧值，报出无中生有的 `expected *const T, found u64`。
+            //
+            // 签名必须在函数体检查开始前就完整。这里把参数类型一并降低
+            // （local 是占位号，阶段 7 带模式绑定重查后整体覆盖）。
+            let mut params: Vec<hir::HirParam> = f
+                .params
+                .iter()
+                .map(|p| {
+                    Ok(hir::HirParam {
+                        local: self.alloc_local(),
+                        ty: self.ast_to_hir_type(&p.ty)?,
+                    })
+                })
+                .collect::<Result<_>>()?;
             if let Some(recv_ty) = self.receiver_ty(f)? {
                 params.insert(
                     0,
@@ -4240,6 +4257,7 @@ impl TypeChecker {
                 };
                 let want = self.subst_def_ty(def_id, &targs, ty);
                 let h = self.check_expr(expr, &want)?;
+                let h = self.check_field_value(h, &want, expr.span())?;
                 rechecked.push(h);
             }
             if rechecked.len() == checked.len() {
@@ -4455,6 +4473,7 @@ impl TypeChecker {
             }
             let want = self.subst_def_ty(enum_id, &targs, &var_fields[idx].ty);
             let checked = self.check_expr(expr, &want)?;
+            let checked = self.check_field_value(checked, &want, expr.span())?;
             self.check_partial_move(&checked, expr.span())?;
             args[idx] = Some(checked);
         }
@@ -4594,6 +4613,7 @@ impl TypeChecker {
                 None => self.infer.fresh_infer(span),
             };
             let h = self.check_expr(e, &pty)?;
+            let h = self.check_call_arg(h, &pty, e.span())?;
             self.check_partial_move(&h, e.span())?;
             hir_args.push(h);
         }
@@ -4631,6 +4651,23 @@ impl TypeChecker {
             );
         }
         let mut hir_args = Vec::with_capacity(args.len() + 1);
+        // 接收者核验：方法调用对 receiver **自动取引用**——这是语法糖的一
+        // 部分。裸 `self` 在 impl 方法里由 receiver_ty 降成 `&Self`（zr 约定，
+        // 不同于 Rust 的按值 self），于是 `a.lt(b)`（`a: i64` → `self: &i64`）、
+        // `s.push_byte(x)`（`s: String` → `self: &mut String`）的实参都是
+        // **值**、形参都是引用。早先实参从未被核验（哨兵洞）所以两边差一
+        // 层引用也没人看见；现在核验真跑了，这里必须把引用形参剥掉一层再
+        // 比内层类型，否则标量 receiver（聚合靠 check_call_arg 的
+        // "聚合值 ↔ 引用"放行，标量没有对应规则）报无中生有的
+        // `expected &i64, found i64`（`std/core.zr` 的 `max` 调 `a.lt(b)`）。
+        // MIR 层不用动：调用点的 by_ref 按被调方形参类型传地址，receiver
+        // 值本就走"聚合值 = 地址"的通路。
+        // 注意普通调用没有这个语法糖——`g(5)` 传 `fn(&i64)` 形参仍然报错。
+        let recv_expect: Ty = match self.infer.resolve(&sig.params[0].ty) {
+            Ty::Reference(inner, _) => (*inner).clone(),
+            other => other,
+        };
+        let receiver = self.check_call_arg(receiver, &recv_expect, span)?;
         if !matches!(
             self.infer.resolve(&sig.params[0].ty),
             Ty::Reference(..) | Ty::Pointer(..)
@@ -4638,16 +4675,29 @@ impl TypeChecker {
             self.check_partial_move(&receiver, span)?;
         }
         hir_args.push(receiver);
+        // 实参数必须与形参表对齐（`sig.params[0]` 是 receiver）。签名在阶段 6
+        // 已完整，数目对不上就是用户代码的 arity 错误——早先这里拿
+        // `Ty::Infer(InferId(0))` 兜底缺位的形参，把活推断变量当哨兵用（红线
+        // 2），实参类型被绑进去、从未被核验，还会污染后面的方法调用。
+        if args.len() + 1 != sig.params.len() {
+            let want = sig.params.len() - 1;
+            return Err(CompileError::type_error(format!(
+                "method `{}` takes {} argument{}, but {} {} supplied",
+                sig.name,
+                want,
+                if want == 1 { "" } else { "s" },
+                args.len(),
+                if args.len() == 1 { "was" } else { "were" },
+            ))
+            .with_span(span));
+        }
         for (i, arg) in args.iter().enumerate() {
             let a = match arg {
                 ast::Argument::Pos(e) | ast::Argument::Named(_, e) => e,
             };
-            let param_ty = sig
-                .params
-                .get(i + 1)
-                .map(|p| p.ty.clone())
-                .unwrap_or(Ty::Infer(InferId(0)));
+            let param_ty = sig.params[i + 1].ty.clone();
             let arg = self.check_expr(a, &param_ty)?;
+            let arg = self.check_call_arg(arg, &param_ty, a.span())?;
             if !matches!(
                 self.infer.resolve(&param_ty),
                 Ty::Reference(..) | Ty::Pointer(..)
@@ -4735,6 +4785,7 @@ impl TypeChecker {
                 None => self.infer.fresh_infer(span),
             };
             let h = self.check_expr(e, &pty)?;
+            let h = self.check_call_arg(h, &pty, e.span())?;
             self.check_partial_move(&h, e.span())?;
             final_args.push(h);
         }
@@ -5028,6 +5079,9 @@ impl TypeChecker {
             // `f32` 的 4 字节位模式会被当 `f64` 直接读出来（结果是 0.0），
             // 整数更根本不在 XMM 里、形参拿到的是寄存器残留。
             let arg = self.widen_arg_for_call(arg, &param_ty)?;
+            // 调用点类型核验：见 check_call_arg 的文档（原先实参完全不校验，
+            // i32 当指针传这类代码直接编译过，运行期 SIGSEGV）。
+            let arg = self.check_call_arg(arg, &param_ty, a.span())?;
             if !matches!(
                 self.infer.resolve(&param_ty),
                 Ty::Reference(..) | Ty::Pointer(..)
@@ -5115,6 +5169,204 @@ impl TypeChecker {
             ty: want.clone(),
             span,
         })
+    }
+
+    /// 调用实参 / 结构体字段值的类型核验。
+    ///
+    /// 早先调用点对实参**完全不做类型校验**——`check_expr` 对变量实参只发
+    /// `Local(id)`、忽略 `expected`，字面量也不回看期望类型。于是
+    /// `g(5)`（`g(p: &i32)`）把整数 5 当指针解引用直接 SIGSEGV，
+    /// `takes_f32(f64 值)` 把 8 字节位模式当 4 字节读（恒为 0.0），
+    /// `str`（16 字节 `{ptr, len}`）塞进 `&str`（8 字节引用）字段静默截断
+    /// （曾让 `std/error.zr` 的 `SimpleError.msg` 读出垃圾长度）。
+    /// `widen_arg_for_call` 的注释早记录了这笔债（"要真正禁止窄化得在调用
+    /// 点补一次类型校验"），本方法就是那笔债的偿还。
+    ///
+    /// 放行的隐式转换（`unify` 之外）全部收在 [`Self::ty_equiv_relaxed`]，
+    /// 每一类都有**确切的机器表示依据**：整数族宽度差异（8 字节槽位模式
+    /// 无损）、切片家族（`[]T` / `mem::Slice<T>` / `str` 都是 16 字节
+    /// `{ptr, len}` 双字值）、引用 / 指针家族（`&T` ↔ `*const T` 都 8 字节
+    /// 地址；聚合值 ↔ 引用在寄存器传递下就是同一个地址）。
+    ///
+    /// 除此之外一律报错。标量 `i32` → `&i32`（值当指针用）、`f64` → `f32`
+    /// （位模式读错）这类必然产生内存错误的代码不再静默放行。
+    fn check_call_arg(&mut self, arg: HirExpr, param_ty: &Ty, span: ast::Span) -> Result<HirExpr> {
+        let param = self.infer.resolve(param_ty);
+        let have = self.infer.resolve(&arg.ty);
+        if self.infer.unify(&param, &have, span).is_ok() {
+            return Ok(arg);
+        }
+        // 引用 / 裸指针家族（规则 3a 的形状）先做一次**内层绑定**：
+        // `push_slice(&mut req, ..)`（`req: Vec<_>` 从 `Vec::new()` 来，形参
+        // `&mut Vec<u8>`）整体 unify 卡在 Pointer vs Reference 的变体差异上，
+        // 内层推断变量永远没机会绑到 u8，后面的宽松等价又把"未绑定的
+        // Infer"当"不等"——报出 `expected &mut Vec<u8>, found *mut Vec<_>`
+        // 这种用户根本没法修的错（`_` 是编译器自己的推断变量）。先按内层
+        // unify（有绑定效果），绑上了就是精确匹配；绑不上再走下面的
+        // ty_equiv_relaxed（纯比较，不做绑定）。
+        if let (
+            Ty::Reference(inner_param, _) | Ty::Pointer(inner_param, _),
+            Ty::Reference(inner_have, _) | Ty::Pointer(inner_have, _),
+        ) = (&param, &have)
+        {
+            let (ip, ih) = ((**inner_param).clone(), (**inner_have).clone());
+            if self.infer.unify(&ip, &ih, span).is_ok() {
+                return Ok(arg);
+            }
+        }
+        if self.ty_equiv_relaxed(&param, &have, true) {
+            return Ok(arg);
+        }
+        Err(
+            CompileError::type_error(format!(
+                "type mismatch: expected `{}`, found `{}`",
+                self.infer.type_name(&param),
+                self.infer.type_name(&have)
+            ))
+            .with_span(span),
+        )
+    }
+
+    /// 机器表示等价的"宽松等价"判定（调用实参 / 字段值核验共用）。
+    ///
+    /// `unify` 之外的放行集合，每一类都有**确切的机器表示依据**：
+    ///
+    /// 1. 整数族宽度差异（`i32` → `usize` 等）：整数一律住 8 字节槽，
+    ///    位模式无损；`let cap = 8; zr_alloc(cap, 1)`（字面量落成 i32 再
+    ///    传 usize）在标准库里有几十处。浮点不参与——`f64` → `i64` 是
+    ///    位模式误读，保持报错。
+    /// 2. 切片家族（`[]T` / `[]const T` / `[]mut T` / `mem::Slice<T>` /
+    ///    `mem::SliceMut<T>` / `str`）：全是 16 字节 `{ptr, len}` 双字值，
+    ///    元素类型一致即放（const/mut 指针位表示相同，丢写权限安全）；
+    ///    `str` 只与 `[]const u8` / `[]mut u8` 互放（`str` 就是字节切片）。
+    ///    `Slice { ptr, len }` 字面量传切片形参（`String::from_bytes`）与
+    ///    反向都靠它。
+    /// 3. 引用 / 指针家族（`allow_ref = true` 才参与）：(a) `&T` ↔
+    ///    `*const T` / `*mut T`（`&expr` 产出裸指针，形参多写成引用，
+    ///    两者都是 8 字节地址，inner 宽松等价即放，不要求聚合：
+    ///    `f(&x)`（`p: &i32`）是 zr 的常规按引用传参写法）；(b) **聚合**
+    ///    值 ↔ 其引用 / 指针：聚合局部在 MIR 里本来就是"存储的地址"
+    ///    （`ty_is_aggregate`），实参寄存器里装的就是地址（MIR Call 的
+    ///    `by_ref` 分支特意不做结构体复制）。方法接收者 `s.push_byte(b)`
+    ///    （`s: String` → `self: &mut String`）就靠它。`&mut 切片` 也在这
+    ///    一类：MIR 的 `AddrOf` 对聚合直接透传（[mir/builder.rs] 1229 行
+    ///    起），`&mut limbs[0..160]` 机器层产出的就是切片值。
+    ///
+    /// 字段位置（`check_field_value`）传 `allow_ref = false`：字段是内存
+    /// 布局位置，8 字节的引用字段装 16 字节的聚合值会静默截断（存进 ptr
+    /// 丢掉 len，读 `.len` 全是垃圾，曾让 `SimpleError.msg` 读出垃圾长度）。
+    fn ty_equiv_relaxed(&self, a: &Ty, b: &Ty, allow_ref: bool) -> bool {
+        let a = self.infer.resolve(a);
+        let b = self.infer.resolve(b);
+        if a == b {
+            return true;
+        }
+        // 规则 1：整数族宽度差异。
+        if matches!(a, Ty::Int(_) | Ty::Uint(_)) && matches!(b, Ty::Int(_) | Ty::Uint(_)) {
+            return true;
+        }
+        // 规则 2：切片家族。`str` 归一成 u8 元素；`mem::Slice<T>` /
+        // `SliceMut<T>` 按定义名归一成元素类型 `T`。
+        let slice_elem = |t: &Ty| -> Option<Ty> {
+            match t {
+                Ty::Slice(elem, _) => Some((**elem).clone()),
+                Ty::Str => Some(Ty::Uint(8)),
+                Ty::Named(id, args) if args.len() == 1 => {
+                    match self.def_names.get(id).map(String::as_str) {
+                        Some("Slice") | Some("SliceMut") => Some(args[0].clone()),
+                        _ => None,
+                    }
+                }
+                _ => None,
+            }
+        };
+        if let (Some(ea), Some(eb)) = (slice_elem(&a), slice_elem(&b)) {
+            if self.ty_equiv_relaxed(&ea, &eb, false) {
+                return true;
+            }
+        }
+        // 规则 3a：引用 ↔ 裸指针（`*const u8` 收 `*mut u8` 等）。都是
+        // 8 字节地址，字段位置同样无损，不受 `allow_ref` 限制；inner
+        // 宽松等价即可（可变性差异一并放行）。inner 等价就放行，**不**
+        // 等价时继续往下试——下面的规则 3c（数组退化）形状与 3a 相同
+        //（两边都是引用 / 指针），早先这里直接 `return` 递归结果，
+        // `*const [T; N]` → `*const T` 永远轮不到。
+        match (&a, &b) {
+            (Ty::Reference(h, _) | Ty::Pointer(h, _), Ty::Reference(p, _) | Ty::Pointer(p, _)) => {
+                let (h, p) = ((**h).clone(), (**p).clone());
+                if self.ty_equiv_relaxed(&h, &p, false) {
+                    return true;
+                }
+            }
+            _ => {}
+        }
+        // 规则 3c：数组引用 / 指针 → 元素指针 / 引用（C 的数组退化）。
+        // `println_fmt(fmt, &[a, b], n)` 的 `&[...]` 类型是
+        // `*const [FormatArg; 2]`，形参是 `*const FormatArg`——数组首地址
+        // 就是首元素地址，惯用法遍布 io 与全部调用点（`io_print_matches_rust`
+        // 的宿主端对照也按这个写）。只比元素类型（长度推断变量不参与），
+        // 单向放行：期望元素、实际数组。反向（拿元素指针当数组用，长度
+        // 无从知道）不放。
+        match (&a, &b) {
+            (Ty::Reference(ae, _) | Ty::Pointer(ae, _), Ty::Reference(be, _) | Ty::Pointer(be, _)) => {
+                if let Ty::Array(elem, _) = &**be {
+                    let elem = (**elem).clone();
+                    if self.ty_equiv_relaxed(ae, &elem, false) {
+                        return true;
+                    }
+                }
+            }
+            _ => {}
+        }
+        // 规则 3b：聚合值 ↔ 引用 / 指针（双向，仅调用实参位置）。inner
+        // 与值宽松等价且值是聚合（标量值 ↔ 指针是"值当指针用"，必须拦）。
+        // 字段位置（allow_ref = false）不放：8 字节引用字段装 16 字节
+        // 聚合值会截断。
+        if allow_ref {
+            match (&a, &b) {
+                (Ty::Reference(inner, _) | Ty::Pointer(inner, _), _) => {
+                    let inner = (**inner).clone();
+                    if self.ty_is_aggregate(&b) && self.ty_equiv_relaxed(&inner, &b, false) {
+                        return true;
+                    }
+                }
+                (_, Ty::Reference(inner, _) | Ty::Pointer(inner, _)) => {
+                    let inner = (**inner).clone();
+                    if self.ty_is_aggregate(&a) && self.ty_equiv_relaxed(&a, &inner, false) {
+                        return true;
+                    }
+                }
+                _ => {}
+            }
+        }
+        false
+    }
+
+    /// 结构体 / union / 枚举载荷**字段位置**的核验。
+    ///
+    /// 走 [`Self::ty_equiv_relaxed`] 的**无引用**子集（`allow_ref = false`）：
+    /// 字段是内存布局位置，8 字节的 `&str` 字段装 16 字节的 `str` 值会
+    /// 静默截断（存进 ptr 丢掉 len，读 `.len` 全是垃圾）——引用 / 指针
+    /// 家族不放行，聚合值传引用字段本来就该用 `&` 取地址（那是另一颗
+    /// AST 节点）。整数宽度差异（`String { capacity: cap }` 的 i32 →
+    /// usize）与切片家族（16 字节对 16 字节）仍放行。
+    fn check_field_value(&mut self, arg: HirExpr, field_ty: &Ty, span: ast::Span) -> Result<HirExpr> {
+        let want = self.infer.resolve(field_ty);
+        let have = self.infer.resolve(&arg.ty);
+        if self.infer.unify(&want, &have, span).is_ok() {
+            return Ok(arg);
+        }
+        if self.ty_equiv_relaxed(&want, &have, false) {
+            return Ok(arg);
+        }
+        Err(
+            CompileError::type_error(format!(
+                "type mismatch: expected `{}`, found `{}`",
+                self.infer.type_name(&want),
+                self.infer.type_name(&have)
+            ))
+            .with_span(span),
+        )
     }
 
     // ==================================================================
@@ -5675,6 +5927,7 @@ impl TypeChecker {
             };
             let fty = field.ty.clone();
             let checked_expr = self.check_expr(expr, &fty)?;
+            let checked_expr = self.check_field_value(checked_expr, &fty, expr.span())?;
             self.check_partial_move(&checked_expr, expr.span())?;
             let target_ty = Ty::Named(def_id, Vec::new());
             return Ok(HirExpr {
@@ -5792,6 +6045,7 @@ impl TypeChecker {
             seen.insert(name.clone());
             let fty = &field_tys[idx].1;
             let checked_expr = self.check_expr(expr, fty)?;
+            let checked_expr = self.check_field_value(checked_expr, fty, expr.span())?;
             self.check_partial_move(&checked_expr, expr.span())?;
             checked.push((name.clone(), checked_expr));
         }
@@ -5898,16 +6152,26 @@ impl TypeChecker {
         }
 
         // 载荷类型：以期望类型为准（`let x: i32 = f()?`）。没有具体注解时，从
-        // 成功变体的**真实字段类型**推出来——按当前枚举的类型实参做替换。
+        // 成功变体的**真实字段类型**推出来——按枚举的**实际**类型实参做替换。
         //
         // 这里不能退回一个新的推断变量。在泛型函数里，`T` 自己的占位符是已经
         // 存在的、会被单态化替换的类型；新造的推断变量和它无关。同一个泛型
         // 函数里第二个 `?` 就拿到一个与 `T` 无关的类型，代码生成把值算错
         // （见 `tests/cases/69_question.zr` 的 `chain`：`id(x)?` 之后 `id(a)?`
         // 的结果不随 `a` 变；把 `let a` 注解成 `T` 就正常了，能证明就是这里）。
+        //
+        // 实参必须取自 `check_expr` **之后** inner 的真实类型，不能取自上面
+        // 的启发式 `src_ty`：`self.inner.accept()?`（receiver 是字段访问、
+        // `self` 又是引用）`infer_expr_ty` 没有 Field 分支推不出，`src_ty`
+        // 兜底成**当前函数**的返回类型——`TcpListener::accept` 里兜底结果是
+        // `Result<(TcpStream, SocketAddr), NetError>`，载荷被标成外层的元组，
+        // 解构出的 `sock`（期望 `Socket`）对着错误标注报无中生有的
+        // `expected Socket, found (TcpStream, SocketAddr)`。完整检查链
+        // （check_method_call）拿到的是被调方真实签名，`expr.ty` 才可信。
+        let expr = self.check_expr(inner, &src_ty.clone())?;
         let value_ty = match expected {
             Ty::Infer(_) => {
-                let args = match &src_ty {
+                let args = match self.infer.resolve(&expr.ty) {
                     Ty::Named(_, a) => a.clone(),
                     _ => Vec::new(),
                 };
@@ -5923,7 +6187,6 @@ impl TypeChecker {
             other => other.clone(),
         };
 
-        let expr = self.check_expr(inner, &src_ty.clone())?;
         let tag = HirExpr {
             kind: ExprKind::EnumTag(Box::new(expr.clone())),
             ty: self.enum_tag_type(enum_id),
@@ -6223,14 +6486,22 @@ impl TypeChecker {
                 }
             }
             AstPattern::Tuple(pats, _) => {
-                let elem_tys = match ty {
+                // 绑定类型常以推断变量传来：无标注 let 的绑定类型取自启发式
+                // `infer_expr_ty`，对 `?` 表达式它停在 fresh Infer（load 到
+                // 的真实类型要等下面 unify 才绑上）。不 resolve 就 match
+                // 不上 `Tuple`，每个子绑定拿到**整个**类型——
+                // `let (sock, addr) = self.inner.accept()?;` 的 `sock` 变成
+                // 整个元组，到使用点（`TcpStream { inner: sock }`）才报
+                // `expected Socket, found (Socket, SocketAddr)`。
+                let ty = self.infer.resolve(ty);
+                let elem_tys = match &ty {
                     Ty::Tuple(ts) => ts.clone(),
                     _ => Vec::new(),
                 };
                 let hir_pats: Result<Vec<_>> = pats
                     .iter()
                     .enumerate()
-                    .map(|(i, p)| self.lower_pattern(p, elem_tys.get(i).unwrap_or(ty)))
+                    .map(|(i, p)| self.lower_pattern(p, elem_tys.get(i).unwrap_or(&ty)))
                     .collect();
                 Ok(hir::HirPattern::Tuple(hir_pats?))
             }
@@ -9261,6 +9532,20 @@ impl TypeChecker {
         }
         if matches!(b, Ty::Never) {
             return a.clone();
+        }
+        // 整数族分支宽度不一致（`if cap == 0 { 8 } else { cap * 2 }` 的
+        // i32 vs u64）：取位宽较大者——位模式无损惯例，与 `ty_equiv_relaxed`
+        // 的整数族放行同源。早先直接掉进 `Ty::Unit` 兜底，整个 `if` 的值
+        // 变成 `()`，`grow_to(new_cap)` 在调用点核验报
+        // "expected u64, found ()"（实参其实一直是好值，只是类型被合丢了）。
+        let width = |t: &Ty| -> Option<u16> {
+            match self.infer.resolve(t) {
+                Ty::Int(w) | Ty::Uint(w) => Some(w),
+                _ => None,
+            }
+        };
+        if let (Some(wa), Some(wb)) = (width(a), width(b)) {
+            return if wa >= wb { a.clone() } else { b.clone() };
         }
         Ty::Unit
     }

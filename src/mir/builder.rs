@@ -2717,7 +2717,11 @@ fn enum_layout(b: &Builder, def_id: DefId, args: &[hir::Ty]) -> Option<EnumLayou
 /// 结构体、元组、枚举的值在运行期都是"指向存储的地址"，取它们的字段
 /// 时不该再 Load 一次。
 fn is_aggregate(b: &Builder, ty: &hir::Ty) -> bool {
-    if struct_layout(b, ty).is_some() {
+    // aggregate_layout（不穿透引用），不是 struct_layout：`&str` / `&T`
+    // 的**值**是 8 字节地址，不是内层布局的聚合。穿透版的后果：
+    // 字段读 `s.msg`（msg: &str）不 Load，把字段槽地址当指针值传出，
+    // 再 `.len` 读到槽后面的垃圾；字段写 / 拷贝按 16 字节整块拷溢出。
+    if aggregate_layout(b, ty).is_some() {
         return true;
     }
     match ty {
@@ -2819,7 +2823,8 @@ fn copy_bytes_into(b: &mut Builder, src: MirValue, dst: MirValue, size: i128, al
 ///
 /// 聚合类型（结构体 / 元组 / 枚举）整块复制，其余按标量处理。
 fn copy_value_into(b: &mut Builder, src: MirValue, dst: MirValue, ty: &hir::Ty) {
-    if let Some(layout) = struct_layout(b, ty) {
+    // 不穿透引用（同 store_value）：引用是 8 字节标量。
+    if let Some(layout) = aggregate_layout(b, ty) {
         copy_struct_into(b, src, &layout, dst);
         return;
     }
@@ -2858,7 +2863,12 @@ fn copy_value_into(b: &mut Builder, src: MirValue, dst: MirValue, ty: &hir::Ty) 
 /// 把值写进一个字段/元素位置，结构体和数组递归复制。
 fn store_value(b: &mut Builder, at: MirValue, value: MirValue, ty: &hir::Ty) {
     b.consume_temp(&value);
-    if let Some(layout) = struct_layout(b, ty) {
+    // 必须用 aggregate_layout（不穿透引用）：struct_layout 会看穿 `&T`
+    // 拿内层布局——那是给"基址自动解引用"用的。拿它做**存储尺寸判定**，
+    // `&str` 字段（8 字节引用）会被当成 16 字节聚合整块拷：从地址值处
+    // 拷 16 字节，字段溢出 8 字节，存进去的是被指向内容的头一个字
+    //（`S { msg: &lit }` 之后 `s.msg.len` 读到垃圾）。
+    if let Some(layout) = aggregate_layout(b, ty) {
         copy_struct_into(b, value, &layout, at);
         return;
     }
@@ -2889,7 +2899,9 @@ fn copy_struct_into(b: &mut Builder, src: MirValue, layout: &StructLayout, dst: 
     for (off, field_ty) in &layout.fields {
         let s = offset_addr(b, src.clone(), *off);
         let d = offset_addr(b, dst.clone(), *off);
-        if let Some(nested) = struct_layout(b, field_ty) {
+        // 字段分类用 aggregate_layout（不穿透引用）：引用字段是 8 字节
+        // 标量，按 struct_layout 的穿透结果会整块拷内层布局（溢出）。
+        if let Some(nested) = aggregate_layout(b, field_ty) {
             copy_struct_into(b, s, &nested, d);
         } else if let Some((elem, n, _)) = array_info(b, field_ty) {
             copy_array_into(b, s, &elem, n, d);

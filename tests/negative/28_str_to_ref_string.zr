@@ -1,0 +1,17 @@
+// 负向用例：`str` 字面量是 16 字节 {ptr, len} **值**，不能塞 8 字节的
+// `&String` 引用形参。
+//
+// `std/error.zr` 曾把字面量直接传给 `String__push_str(&String)`——实参从未
+// 被核验时静默通过，MIR 按引用形参传"值本身"，被调方拿 16 字节值的高 8
+// 字节当指针用。现在实参核验真跑了，这里必须报错；调用点改走
+// `push_bytes`（`[]const u8` 与 `str` 同为 {ptr, len}，切片规则放行）。
+//
+// expect: expected `&String`
+use string::String;
+
+fn take(s: &String) -> usize { return s.len; }
+
+fn main() -> i32 {
+    if take("hello") != 5 { return 1; }
+    return 0;
+}
