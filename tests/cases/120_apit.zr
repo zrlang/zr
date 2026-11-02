@@ -1,0 +1,96 @@
+// `impl Trait` 在**参数位置**（APIT）。
+//
+// Rust 语义：`fn f(x: impl Trait)` 就是 `fn f<T: Trait>(x: T)`，调用点按实参
+// 单态化；`&impl Trait` 是 `&T`（匿名参数绑**内层**类型，不是引用本身），
+// `Vec<impl Trait>` 是 `Vec<T>`。
+//
+// 早先 `ast_to_hir_type` 把 `ImplTrait` 一律降成 `opaque(impl_trait_N)`：参数
+// 位置的 `impl Trait` 于是完全用不了——形参拿到一个不透明类型，实参核验报
+// `expected opaque(impl_trait_1), found X`，体内对它做任何方法 / 字段访问都报
+// `cannot access ... on type opaque(impl_trait_N)`。
+//
+// 现在在声明收集**之前**把 AST 改写成匿名泛型参数（`__apit_N`），后面签名
+// 检查、单态化、边界校验、MIR 全部按普通泛型函数走。返回位置的 `impl Trait`
+// （RPIT）不做这个改写，那是真正的存在类型（见 `49_dynamic_future_source.zr`）。
+//
+// 本用例覆盖：裸 `impl Trait`、`&impl Trait`、`Vec<impl Trait>`、
+// `impl A + B` 多边界、与显式泛型参数共存、同一函数被多个类型实例化。
+use collections::Vec;
+
+trait Area {
+    fn area(self) -> i64;
+}
+
+trait Mark {}
+
+struct Sq { n: i64 }
+struct Rect { w: i64, h: i64 }
+
+impl Area for Sq {
+    fn area(self) -> i64 { return self.n * self.n; }
+}
+impl Area for Rect {
+    fn area(self) -> i64 { return self.w * self.h; }
+}
+
+// 多边界：`impl Area + Mark`。`Mark` 只是标记 trait（无方法）。
+impl Mark for Sq {}
+impl Mark for Rect {}
+
+// 1. 裸 APIT。
+fn area_of(a: impl Area) -> i64 {
+    return a.area();
+}
+
+// 2. 引用位置：匿名参数绑内层类型 `T`，形参是 `&T`。
+fn area_ref(a: &impl Area) -> i64 {
+    return a.area();
+}
+
+// 3. 泛型容器里的内层绑定：`Vec<impl Area>` == `Vec<T>`。
+fn area_all(v: Vec<impl Area>) -> i64 {
+    let mut sum: i64 = 0;
+    let mut i: usize = 0;
+    while i < v.len() {
+        sum = sum + v[i].area();
+        i = i + 1;
+    }
+    return sum;
+}
+
+// 4. 与用户显式泛型参数共存，APIT 排在中间。
+fn mix<T>(a: T, b: impl Area, c: i64) -> i64 {
+    let _ = a;
+    return b.area() + c;
+}
+
+// 5. 多边界。
+fn area_marked(a: impl Area + Mark) -> i64 {
+    return a.area();
+}
+
+fn main() -> i32 {
+    let s = Sq { n: 3 };
+    let r = Rect { w: 4, h: 5 };
+
+    // 同一 APIT 函数被两个不同类型实例化。
+    if area_of(Sq { n: 3 }) != 9 { return 1; }
+    if area_of(Rect { w: 4, h: 5 }) != 20 { return 2; }
+
+    // `&impl Area`。
+    if area_ref(&s) != 9 { return 3; }
+
+    // `Vec<impl Area>`：元素全是同一类型（单态化成一个 `T`）。
+    let mut v = Vec::with_capacity(4);
+    v.push(Sq { n: 1 });
+    v.push(Sq { n: 2 });
+    if area_all(v) != 5 { return 4; }
+
+    // 显式泛型参数 + APIT 混合。
+    if mix(1, Sq { n: 7 }, 2) != 51 { return 5; }
+
+    // 多边界（`Sq` 同时实现 `Area` 与 `Mark`）。
+    if area_marked(r) != 20 { return 6; }
+
+    return 0;
+}

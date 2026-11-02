@@ -658,6 +658,39 @@ impl TypeChecker {
             }
         }
         expanded.functions.extend(derived);
+
+        // `impl Trait` 在**参数位置**（APIT）：脱糖成匿名泛型参数。
+        //
+        // Rust 语义：`fn f(x: impl Trait)` 就是 `fn f<T: Trait>(x: T)`，调用点
+        // 单态化；`&impl Trait` 是 `&T`（匿名参数绑**内层**类型，不是引用
+        // 本身），`Vec<impl Trait>` 是 `Vec<T>`。
+        //
+        // 早先 `ast_to_hir_type` 把 `ImplTrait` 一律降成
+        // `opaque(impl_trait_N)`：参数位置的 `impl Trait` 于是完全用不了——
+        // 形参拿到的是一个不透明类型，实参核验报
+        // `expected opaque(impl_trait_1), found X`，体内对它做任何字段 / 方法
+        // 访问都报 `cannot access ... on type opaque(impl_trait_N)`。
+        // 现在在声明收集**之前**把 AST 改写成泛型参数，后面签名检查、
+        // 单态化、边界校验、MIR 全部按普通泛型函数走，不需要新开路径。
+        //
+        // 返回位置的 `impl Trait`（RPIT）**不做**这个改写：那是真正的存在
+        // 类型，改名换姓也变不成泛型参数。
+        let mut apit_seq = 0u32;
+        for f in expanded.functions.iter_mut() {
+            // 外部声明（`extern "C"` 块，`body` 为 `None`）跳过：它们没有
+            // 泛型实例化可言。
+            if f.body.is_none() {
+                continue;
+            }
+            let mut gens: Vec<ast::GenericParam> = Vec::new();
+            for p in f.params.iter_mut() {
+                desugar_apit(&mut p.ty, &mut gens, &mut apit_seq);
+            }
+            // 追加在用户显式写的泛型参数之后，顺序与 `check_function_signatures`
+            // 收集 `generic_names` / `generic_bounds` 的顺序一致。
+            f.generics.extend(gens);
+        }
+
         let prog = &expanded;
 
         // ===== 阶段 1：声明收集（pass 1）=====
@@ -7037,10 +7070,22 @@ impl TypeChecker {
             }
             for trait_id in &bounds[i] {
                 if !self.implements_trait(&ordered[i], *trait_id) {
+                    // APIT（`x: impl Trait`）脱糖出的匿名参数名是 `__apit_N`，
+                    // 直接把它塞进报错会让人不知道该改哪个函数。换成像 Rust 的
+                    // `required by a bound in `take`` 措辞。
+                    let required = if param_name.starts_with("__apit_") {
+                        match self.def_names.get(&base) {
+                            Some(fname) => format!("a bound in `{fname}`"),
+                            None => "an `impl Trait` parameter".to_string(),
+                        }
+                    } else {
+                        format!("`{param_name}`")
+                    };
                     return Err(CompileError::type_error(format!(
-                        "`{}` does not implement trait `{}` (required by `{param_name}`)",
+                        "`{}` does not implement trait `{}` (required by {})",
                         self.infer.type_name(&ordered[i]),
-                        self.def_names.get(trait_id).cloned().unwrap_or_default()
+                        self.def_names.get(trait_id).cloned().unwrap_or_default(),
+                        required
                     ))
                     .with_span(span));
                 }
@@ -9703,6 +9748,54 @@ fn ast_type_name(ty: &AstType) -> Option<String> {
         AstType::Char => Some("char".to_string()),
         AstType::Str => Some("str".to_string()),
         _ => None,
+    }
+}
+
+/// 把参数类型里出现的 `impl Trait`（APIT）替换成匿名泛型参数，并把边界
+/// 挂到 `out` 上。
+///
+/// Rust 语义：`fn f(x: impl Trait)` 等价于 `fn f<T: Trait>(x: T)`，`&impl
+/// Trait` 等价于 `&T`（匿名参数绑的是**内层**类型，不是引用本身），
+/// `Vec<impl Trait>` 等价于 `Vec<T>`。所以这里递归进引用 / 指针 / 泛型实参 /
+/// 元组 / 数组 / 切片 / 可选 / 错误联合，遇到 `ImplTrait` 就地换名。
+///
+/// `fn(..)` 函数指针类型里的 `impl Trait` **不**处理（Rust 也不允许），
+/// 留给下游按 opaque 报错。
+fn desugar_apit(ty: &mut AstType, out: &mut Vec<ast::GenericParam>, seq: &mut u32) {
+    match ty {
+        AstType::ImplTrait(bounds) => {
+            // 取出边界列表，把整块类型换成一个新的匿名泛型参数名。
+            // 注意：`AstType::Named` 只有单段路径也能被 `push_type_params`
+            // 登记成类型参数，因此这里的名字在后续阶段与用户写的 `T` 同权。
+            let bounds = std::mem::take(bounds);
+            *seq += 1;
+            let name = format!("__apit_{seq}");
+            *ty = AstType::Named {
+                path: vec![name.clone()],
+                generics: Vec::new(),
+            };
+            out.push(ast::GenericParam::Type(name, bounds));
+        }
+        AstType::Named { generics, .. } => {
+            for g in generics {
+                desugar_apit(g, out, seq);
+            }
+        }
+        AstType::Pointer(t, _)
+        | AstType::Reference(t, _)
+        | AstType::Array(t, _)
+        | AstType::Slice(t, _)
+        | AstType::Optional(t) => desugar_apit(t, out, seq),
+        AstType::ErrorUnion(a, b) => {
+            desugar_apit(a, out, seq);
+            desugar_apit(b, out, seq);
+        }
+        AstType::Tuple(ts) => {
+            for t in ts {
+                desugar_apit(t, out, seq);
+            }
+        }
+        _ => {}
     }
 }
 

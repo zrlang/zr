@@ -30,7 +30,7 @@ subsystem. Each file uses the following status legend:
 | higher_ranked.md         | ⬜     | `for<'a>` 绑定器未实现 |
 | specialization.md        | 🔧     | 重叠 impl 的**选择**已按"更 specific 优先"（`is_more_specific`，`impl<T> Tr for T` 与 `impl Tr for A` 同时存在时 `a.method()` 走具体实现）；但 `default fn` 式的"泛型体特化"仍无 |
 | coherence_rules.md       | ✅     | 孤儿规则（`check_orphan_rule`）与重叠检查（`check_overlap`）已在 `src/typeck/mod.rs:1812-1814` 接线，报 `coherence_error`；marker trait 允许重叠 |
-| impl_trait.md            | 🔧     | `-> impl Trait`（RPIT）能解析并返回，但值是 `opaque(impl_trait_N)`——任何字段 / 方法访问都报错，实质不可用；`impl Fn(T) -> T` 仍解析失败 |
+| impl_trait.md            | 🔧     | **参数位置（APIT）已实现**：`x: impl Trait` 脱糖成匿名泛型参数，按实参单态化、边界真校验（`120_apit.zr`，负向 `30`）；`&impl Trait` / `Vec<impl Trait>` 绑内层类型。**返回位置（RPIT）仍只是骨架**：值是 `opaque(impl_trait_N)`，任何字段 / 方法访问都报错；`impl Fn(T) -> T` 仍解析失败 |
 | negative_bounds.md       | ⬜     | `where T: !Trait` 未实现 |
 
 ### bootstrap

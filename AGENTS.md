@@ -31,7 +31,8 @@ zr 是一门系统编程语言（Rust/Zig 混合取向），编译器用 Rust �
 `pgo`（`src/opt/pgo.rs`，同上）、`macro_system`（`src/macro_system/`，`main.rs` 未 `mod` 声明；
 `macro_rules!` 走的是 `src/macros.rs`）、`const_generics`（`<const N: usize>` 解析接受但
 检查时报错）、`negative_bounds` / `higher_ranked`（trait 求解里查无实现）、
-`impl_trait`（`-> impl Trait` 能解析，但值是 `opaque(impl_trait_N)`，任何访问都报错）。
+`impl_trait`（**参数位置 APIT 已实现**——`x: impl Trait` 脱糖成匿名泛型参数；
+`-> impl Trait`（RPIT）仍只是骨架：能解析，但值是 `opaque(impl_trait_N)`，任何访问都报错）。
 **已接线且确实可用**：`coherence_rules`（`check_orphan_rule` / `check_overlap`，
 `src/typeck/mod.rs:1812-1814`）、`c_backend`（`--emit-c`）、`specialization` 的**选择**
 （更 specific 的 impl 优先，但无 `default fn` 特化）。
@@ -55,11 +56,11 @@ target/debug/zr prog.zr -O1 -o /tmp/prog   # 编译单个程序
   `ld` 直接断言崩溃（`atomShouldReplaceExisting`）。先 `nm` 看目标文件有没有
   重复符号，再下结论。已修复（提交 `1ef4a02`：MIR 按最终符号名去重，保留首个
   用户定义）。
-- 测试：`tests/zr_language.rs` 把 119 个 `tests/cases/*.zr` 各在
-  `-O0/-O1/-O2/-O3/-Oz` 跑一遍（595 次编译+运行）。退出码 0 = 过，非 0 = 失败（编号指向失败的断言）。
+- 测试：`tests/zr_language.rs` 把 120 个 `tests/cases/*.zr` 各在
+  `-O0/-O1/-O2/-O3/-Oz` 跑一遍（600 次编译+运行）。退出码 0 = 过，非 0 = 失败（编号指向失败的断言）。
   宿主端另有 `io_print_matches_rust` 等 Rust 对照用例。
 - **负向测试机制是 `tests/zr_negative.rs`**（`cargo test --test zr_negative`，
-  29 个用例）。`tests/negative/*.zr` 每个都必须**编译失败**，且报错文本里含
+  30 个用例）。`tests/negative/*.zr` 每个都必须**编译失败**，且报错文本里含
   文件里 `// expect: <子串>` 标注的期望子串；没有 `// expect:` 的行只要求
   "确实报错"。子串而非精确匹配，是为了不让行号/列号漂移把整个套件变红。
   `tests/cases/` 下每个 `.zr` 仍然必须编译通过并返回 0，**两边不要混放**
@@ -268,16 +269,17 @@ README 里"指针与 unsafe"一节目前是**愿景**：
 ### `cargo test` 当前基线（2026-11-02，全绿）
 
 - `cargo test --bin zr`：267 项。
-- `cargo test --test zr_language`：119 个用例 × 5 个优化等级 = 595 项，另有 3 个宿主端
+- `cargo test --test zr_language`：120 个用例 × 5 个优化等级 = 600 项，另有 3 个宿主端
   对照用例（`io_print_matches_rust`——逐字符对比 Rust 的格式化输出，含 `{:e}` / `{:E}`
   与大浮点 Display（`|v| ≥ 2⁶⁴` 不带 `.0`）的回归；`extern_c_write_prints_string_literal`；
   `toolchain_subcommands_emit`——`zr fmt` / `zr fmt --check` / `zr pkg init` / `zr lsp`
   与 `--emit-llvm` / `--wat` 的发射验证）。
-- `cargo test --test zr_negative`：29 个负向用例（含枚举缺臂
+- `cargo test --test zr_negative`：30 个负向用例（含枚举缺臂
   `17_match_missing_variant.zr`、`19_debug_float.zr`、借用检查 20/21/22、
   带显式判别式的枚举 Ord `26_enum_ord_discriminant.zr`、调用实参核验
   `27_scalar_to_ref_arg.zr` / `28_str_to_ref_string.zr`、限定路径的 trait 校验
-  `29_qualified_trait_not_impl.zr`）。
+  `29_qualified_trait_not_impl.zr`、APIT 边界校验
+  `30_apit_bound.zr`）。
 
 ### 最近修掉的静默 bug（都在 `tests/` 里留了钉子）
 
@@ -346,6 +348,26 @@ README 里"指针与 unsafe"一节目前是**愿景**：
   限定写法**不按 trait 过滤 impl 表**（投影仍复用 `resolve_assoc_type` 的
   "按类型 DefId 查关联类型"路径），两个 trait 同时为同一类型定义同名关联类型
   时无法真正消歧。
+- **`impl Trait` 参数位置（APIT）**：✅ 已实现（2026-11-02）——早先
+  `ast_to_hir_type` 把 `ImplTrait` 一律降成 `opaque(impl_trait_N)`，参数位置的
+  `impl Trait` 完全用不了：形参拿到不透明类型，实参核验报
+  `expected opaque(impl_trait_1), found X`，体内任何字段 / 方法访问都报
+  `cannot access ... on type opaque(impl_trait_N)`。现在
+  `check_program`（`src/typeck/mod.rs:662-692`）在**声明收集之前**对
+  `expanded.functions` 跑一遍 `desugar_apit`：参数类型里每个 `impl Trait`
+  就地换成 `Named{path:["__apit_N"]}`，边界作为
+  `GenericParam::Type("__apit_N", bounds)` 追加到 `f.generics`。之后签名检查、
+  单态化、边界校验（`check_trait_bounds`）、MIR 全部按普通泛型函数走，
+  不需要新开路径。递归进引用 / 指针 / 泛型实参 / 元组 / 数组 / 切片 /
+  可选 / 错误联合，所以 `&impl Trait` 绑**内层**类型（`&T`，不是把引用
+  本身当泛型参数）、`Vec<impl Trait>` 是 `Vec<T>`；`impl A + B` 多边界可用。
+  `fn(..)` 函数指针类型里的 `impl Trait` 不处理（Rust 也不允许）。
+  `check_trait_bounds` 的报错对匿名参数特判成 `required by a bound in `f``
+  （早先会直接把内部名 `__apit_N` 塞进文案）。**返回位置（RPIT）不做改写**：
+  那是真正的存在类型（`opaque`），改名换姓也变不成泛型参数。
+  回归 `tests/cases/120_apit.zr`；负向 `tests/negative/30_apit_bound.zr`
+  （`i64` 没实现该 trait，边界必须报错）。**仍不支持**：trait 声明里的方法
+  签名不做这个改写（声明本身不参与单态化）。
 - **`#[derive]`**：方法体已生成（`PartialEq`/`Eq`/`Hash`/`PartialOrd`/`Ord`/`Default`/`Debug`），
   `Hash` 已覆盖**指针/引用按地址**（`b5f5a56`）、**元组按内容**（`38f1ddd`）、
   **数组按内容**（`caab7a0`）、**`str`/切片按内容**（`41ec8f4`，`96_str_slice_hash.zr`）；

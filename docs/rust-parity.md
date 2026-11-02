@@ -115,7 +115,8 @@
 | 块表达式 | 可用 | ✅ | `let v = { let a = 1; a + 1 };` |
 | 函数指针 `fn(T) -> R` | 可用 | ✅ | 取址、传参、返回值、存进结构体字段都行（x86-64 专属，其它后端明确报错） |
 | 闭包 `\|x\| x * factor` | 基本可用 | 🟡 | 无捕获闭包可存变量 / 当实参 / 返回；带捕获闭包也可存变量 / 嵌套 / 多次调用、按值传给**泛型**形参 / 从泛型返回值透传（`84_closure_capture_value.zr`、`109_closure_env_cross_fn.zr`、`110_closure_env_generic_passthrough.zr`）。**带捕获闭包传给裸 `fn(..)` 形参 / 作为 `fn(..)` 返回值仍明确报错**（负向 `07_closure_capture.zr` / `25_closure_return.zr`） |
-| `impl Trait` 参数 / 返回值 | 仅语法骨架 | ❌ | `-> impl Trait`（RPIT）能解析、能构造返回值，但返回的类型是 `opaque(impl_trait_N)`——任何字段访问 / 方法调用都报 `cannot access field ... on type opaque(impl_trait_N)`，实质不可用；`impl Fn(T) -> T` 这种带括号的 trait 路径仍解析失败（`expected RParen, found LParen`） |
+| `impl Trait` 参数位置（APIT） | 可用 | ✅ | `fn f(x: impl Trait)` 在声明收集前脱糖成匿名泛型参数（`fn f<__apit_1: Trait>(x: __apit_1)`），按实参单态化、边界真的被校验（`120_apit.zr`，负向 `30_apit_bound.zr`）。`&impl Trait` 绑**内层**类型（`&T`），`Vec<impl Trait>` 是 `Vec<T>`，支持 `impl A + B` 多边界、与显式泛型参数共存。trait **声明**里的方法签名不做这个改写（声明本身不参与单态化） |
+| `impl Trait` 返回值（RPIT） | 仅语法骨架 | ❌ | `-> impl Trait` 能解析、能构造返回值，但返回的类型是 `opaque(impl_trait_N)`——任何字段访问 / 方法调用都报 `cannot access field ... on type opaque(impl_trait_N)`，实质不可用（异步用例 `29`/`49`/`50` 只把它当 Future 句柄轮询，不走字段访问）；`impl Fn(T) -> T` 这种带括号的 trait 路径仍解析失败（`expected RParen, found LParen`） |
 | `?` 运算符 | 可用 | ✅ | 对 `Result<T, E>` / `Option<T>` 生效：成功取载荷，失败从当前函数 `return Err(e)` / `return None`。返回类型必须是同一种枚举，错误类型必须一致（没有 `From` 转换） |
 | `try` / `catch` | 明确报错 | ❌ | 语法能解析，类型检查报 `` `try` / `catch` is not implemented yet; use the postfix `?` operator ... `` |
 | `throw` | 明确报错 | ❌ | 类型检查报 `` `throw` is not implemented yet; return `Err(...)` instead `` |

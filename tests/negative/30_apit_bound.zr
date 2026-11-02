@@ -1,0 +1,27 @@
+// 负向用例：APIT（`x: impl Trait`）的 trait 边界必须真的被校验。
+//
+// `fn take(a: impl Area)` 脱糖成 `fn take<__apit_1: Area>(a: __apit_1)`。
+// 单态化点拿到具体实参后要验证边界——`i32` 没有 `impl Area`，调用
+// `take(5)` 必须报错。早先参数位置的 `impl Trait` 被降成 `opaque(...)`，
+// 实参核验报的是"类型不匹配"，根本没碰到 trait 边界。
+//
+// expect: does not implement trait `Area`
+trait Area {
+    fn area(self) -> i64;
+}
+
+struct Sq { n: i64 }
+
+impl Area for Sq {
+    fn area(self) -> i64 { return self.n * self.n; }
+}
+
+fn take(a: impl Area) -> i64 {
+    return a.area();
+}
+
+fn main() -> i32 {
+    let v = take(5);
+    let _ = v;
+    return 0;
+}
