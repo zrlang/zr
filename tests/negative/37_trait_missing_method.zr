@@ -1,0 +1,15 @@
+// expect: not all trait items implemented
+//
+// 没有默认体的 trait 方法必须由 impl 提供。早先缺方法能编译通过，只在
+// 调用点报 `no field ... on type S`，与真实原因（trait 没实现全）对不上。
+trait T {
+    fn need(&self) -> i32;
+}
+
+struct S {}
+
+impl T for S {}
+
+fn main() -> i32 {
+    return 0;
+}

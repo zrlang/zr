@@ -12,8 +12,22 @@ use io::*;
 // 实现 Clone + Ord 的具名结构体。
 struct P { a: i32, b: i32 }
 
-impl Clone for P {}
-impl Ord for P {}
+impl Clone for P {
+    fn clone(self) -> Self {
+        return P { a: self.a, b: self.b };
+    }
+}
+// `Ord: Eq`：默认方法 `le`/`gt`/`ge` 会调 `Self::eq`，所以 Eq 也得实现。
+impl Eq for P {
+    fn eq(self, other: Self) -> bool {
+        return self.a == other.a && self.b == other.b;
+    }
+}
+impl Ord for P {
+    fn lt(self, other: Self) -> bool {
+        return self.a < other.a;
+    }
+}
 
 // 多边界泛型函数：T 同时满足 Clone + Ord。
 fn pick<T: Clone + Ord>(x: T) -> i32 {

@@ -778,9 +778,20 @@ impl Parser {
             } else {
                 // impl 里的方法可以带可见性修饰（`pub fn new`）
                 let _pub = self.match_kind(&TokenKind::KwPub);
+                // `default fn`（特化里的默认方法）也必须吃：早先这里只认
+                // `fn`，trait 体里写 `default fn val(..)` 直接报
+                // `expected 'fn': expected KwFn, found KwDefault`。
+                // 语义上 trait 里的 `default fn` 就是"带方法体、impl 可覆盖
+                // 的方法"，和普通带体方法走同一条路径。
+                let is_default = self.match_kind(&TokenKind::KwDefault);
                 let is_async = self.match_kind(&TokenKind::KwAsync);
                 self.consume(&TokenKind::KwFn, "expected 'fn'")?;
-                methods.push(self.parse_function(Visibility::Private, vec![], is_async, false)?);
+                methods.push(self.parse_function(
+                    Visibility::Private,
+                    vec![],
+                    is_async,
+                    is_default,
+                )?);
             }
         }
         self.consume(&TokenKind::RBrace, "expected '}'")?;
@@ -853,9 +864,18 @@ impl Parser {
                 } else {
                     Visibility::Private
                 };
+                // `default fn`（特化里的默认方法）：接受并当作普通方法。
+                // impl 选择本来就按"更 specific 的 impl 优先"，`default`
+                // 只是标明这个实现可被更具体的 impl 覆盖。
+                let is_default = self.match_kind(&TokenKind::KwDefault);
                 let is_async = self.match_kind(&TokenKind::KwAsync);
                 self.consume(&TokenKind::KwFn, "expected 'fn'")?;
-                methods.push(self.parse_function(visibility, vec![], is_async, false)?);
+                methods.push(self.parse_function(
+                    visibility,
+                    vec![],
+                    is_async,
+                    is_default,
+                )?);
             }
         }
         self.consume(&TokenKind::RBrace, "expected '}'")?;

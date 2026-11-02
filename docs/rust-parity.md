@@ -56,7 +56,7 @@
 | `Option<T>` / `Result<T, E>` | 可用 | ✅ | 在 `std::core` 里；`is_some()` / `is_none()` / `is_ok()` / `is_err()` / `unwrap()` / `unwrap_or()` / `map()`、模式匹配与后缀 `?` 均正常 |
 | 泛型函数 | 可用 | ✅ | 按调用点单态化（含递归泛型）；类型实参从实参 / 期望返回类型推断。泛型约束（`T: Ord`、`where`）在**单态化时**校验（`check_trait_bounds`，含超类型展开）；实例化后再按具体类型检查方法调用 |
 | 泛型类型 | 可用 | ✅ | 泛型结构体 / 枚举 + `impl<T> Type<T>` 的方法均可用（`Vec<T>`、`Option<T>` 等）；字段与载荷类型按类型实参替换 |
-| `trait` | 可用 | ✅ | `trait` + `impl Trait for Type` 正常（`std::core` 的 `Eq`/`Ord`/`Copy`/`Clone`/`Display` 都在用） |
+| `trait` | 可用 | ✅ | `trait` + `impl Trait for Type` 正常（`std::core` 的 `Eq`/`Ord`/`Copy`/`Clone`/`Display` 都在用）。**trait 默认方法已实现**（`124_trait_default_methods.zr`）：trait 里带方法体的方法（含 `default fn` 拼写）在 impl 未覆盖时按目标类型合成；没有默认体的方法缺失在 impl 块报 `not all trait items implemented`（负向 `37`）。局限：泛型 impl 的毯覆方法解析与"具体 impl 部分覆盖、其余继承毯覆默认体"的两级特化未做 |
 | 关联类型 | 可用 | ✅ | `type Output;` + `type Output = i32;` 正常；`Self::Output`（impl 内）、`F::Output`（`F: Trait` 泛型参数）、`Type::Output`（具体类型）均可投影，含泛型 impl `impl<T> Tr for S<T> { type Item = T; }`；**限定写法 `<T as Trait>::Item` 已支持**（`119_qualified_assoc.zr`），相对 `F::Output` 多出的是 trait 校验（没实现就报 `the trait `X` is not implemented for `Y``，负向 `29`）。**仍不支持**：投影不按 trait 过滤 impl 表，两个 trait 同名关联类型时无法真正消歧 |
 | `impl` 块 | 可用 | ✅ | 关联函数、`self` / `&self` / `&mut self` 三种接收者、`Self` 类型均可 |
 | `type` 别名 | 可用（含泛型） | ✅ | 在**使用点展开**：`let x: MyInt`、结构体字段、数组 / 指针、`Vec<MyInt>`、别名套别名、前向引用都正常；**泛型别名 `type V<T> = Vec<T>` 已支持**（`74_generic_alias.zr`，提交 `8d6c475`：保留参数并登记占位符，展平按实参替换） |

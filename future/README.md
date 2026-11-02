@@ -28,10 +28,10 @@ subsystem. Each file uses the following status legend:
 |--------------------------|--------|-------------------------------|
 | assoc_type_projection.md | ✅     | `Self::Output` / `F::Output`（`F: Trait`）已支持（含泛型 impl 的 `impl<T> Tr for S<T> { type Item = T; }` 投影）；`<T as Tr>::Item` 限定写法也已实现并带 trait 校验（`119_qualified_assoc.zr`，负向 `29`）。投影仍按类型查 impl 表、不按 trait 过滤，两个 trait 同名关联类型时无法消歧 |
 | higher_ranked.md         | ⬜     | `for<'a>` 绑定器未实现 |
-| specialization.md        | 🔧     | 重叠 impl 的**选择**已按"更 specific 优先"（`is_more_specific`，`impl<T> Tr for T` 与 `impl Tr for A` 同时存在时 `a.method()` 走具体实现）；但 `default fn` 式的"泛型体特化"仍无 |
+| specialization.md        | 🔧     | 重叠 impl 的**选择**已按"更 specific 优先"（`is_more_specific`，`impl<T> Tr for T` 与 `impl Tr for A` 同时存在时 `a.method()` 走具体实现）。**trait 默认方法已实现**（`124`，负向 `37`）：trait 里带方法体的方法在 impl 未覆盖时合成到目标类型，`default fn` 拼写在 trait / impl 两侧都接受；但"具体 impl 只覆盖部分默认方法、其余从毯覆 impl 继承"的两级继承仍无（泛型 impl 的毯覆方法解析本身未做） |
 | coherence_rules.md       | ✅     | 孤儿规则（`check_orphan_rule`）与重叠检查（`check_overlap`）已在 `src/typeck/mod.rs:1812-1814` 接线，报 `coherence_error`；marker trait 允许重叠 |
 | impl_trait.md            | 🔧     | **参数位置（APIT）已实现**：`x: impl Trait` 脱糖成匿名泛型参数，按实参单态化、边界真校验（`120_apit.zr`，负向 `30`）；`&impl Trait` / `Vec<impl Trait>` 绑内层类型。**返回位置（RPIT）仍只是骨架**：值是 `opaque(impl_trait_N)`，任何字段 / 方法访问都报错；`impl Fn(T) -> T` 仍解析失败 |
-| negative_bounds.md       | ⬜     | `where T: !Trait` 未实现 |
+| negative_bounds.md       | ⬜     | `where T: !Trait` 解析后被丢弃（`WherePred` 是空结构，整个 `where` 子句都没有语义）；`<T: !Tr>` 泛型参数位置连解析都过不去 |
 
 ### bootstrap
 | File               | Status | Summary                          |

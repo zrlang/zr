@@ -281,15 +281,15 @@ HIR 直译成一个 C 翻译单元）；`src/zr0/` 仍未 `mod` 声明。
 拆成 Pending + 续体，`zr_run_tasks` 轮询恢复；同步函数与闭包体里的 `yield` 报错）；
 `const` 泛型**已实现**（`<const N: usize>` 进类型作用域，数组长度
 按参数名延迟替换，实例化后支持结构体 / 函数 / `impl` 方法与值位置使用）；trait 高级特性里**关联类型投影
-（含 `<T as Tr>::Item` 限定写法）、`impl Trait` 参数位置脱糖、孤儿规则/重叠检查
-已实现**，仍缺 HRTB、负边界、`default fn` 特化、RPIT。
+（含 `<T as Tr>::Item` 限定写法）、`impl Trait` 参数位置脱糖、孤儿规则/重叠检查、
+trait 默认方法（带方法体的方法 / `default fn` 拼写）已实现**，仍缺 HRTB、负边界、RPIT。
 
 | 子任务 | 内容 | 状态 |
 |---|---|---|
 | P2-5a | 关联类型投影（`Self::Output`/`P::Output`/`<T as Tr>::Item`）：`resolve_assoc_type` + `generic_impl_assocs`，限定写法带 trait 校验 | ✅ 已实现（回归 `118` / `119`，负向 `29`） |
 | P2-5b | `yield` 协程：从类型占位升级为可执行（frame 状态机） | ✅ 已实现（回归 `123`，负向 `35` / `36`） |
 | P2-5c | `const` 泛型 `<const N: usize>`：检查期接受并支持数组长度参数 | ✅ 已实现（回归 `122`，负向 `32` / `33` / `34`） |
-| P2-5d | 负边界 / 特化 / 孤儿规则 / `impl Trait` 参数 | 🟡 孤儿规则 + 重叠检查已接线（`check_orphan_rule` / `check_overlap`）；特化只有 impl 选择、无 `default fn`。**`impl Trait` 参数（APIT）已脱糖成匿名泛型参数并真校验边界**（`120`，负向 `30`）；返回位置（RPIT）仍是 `opaque` 占位。负边界 / HRTB 仍缺 |
+| P2-5d | 负边界 / 特化 / 孤儿规则 / `impl Trait` 参数 | 🟡 孤儿规则 + 重叠检查已接线（`check_orphan_rule` / `check_overlap`）；特化只有 impl 选择（更 specific 的 impl 优先，回归 `spec1` 手工探针）。**trait 默认方法已实现**（2026-11-02）：带方法体的 trait 方法在 impl 未覆盖时合成到目标类型，`default fn` 拼写（trait / impl 两侧）可解析；缺失必需方法在 impl 块报 `not all trait items implemented`（回归 `124`，负向 `37`；局限：泛型 impl 的毯覆方法解析仍不支持）。**`impl Trait` 参数（APIT）已脱糖成匿名泛型参数并真校验边界**（`120`，负向 `30`）；返回位置（RPIT）仍是 `opaque` 占位，方法/字段访问报 `cannot access ... on type opaque(...)`。负边界 / HRTB 仍缺（`where` 子句整体只解析不存储，`<T: !Tr>` 连解析都过不去） |
 
 ---
 

@@ -1,0 +1,103 @@
+// 覆盖：trait 默认方法（带方法体的 trait 方法）与 `default fn` 拼写。
+//
+// 早先 trait 里带方法体的方法等于没写：trait 方法只登记成 `Trait::method`
+// 签名、从不按 impl 目标发射，`s.method()` 在 `lookup_method` 里查
+// `S__method` 查不到，报 `no field method on type S`。现在 impl 没覆盖时
+// 按目标类型合成默认方法体，与手写方法走同一条签名 / 函数体 / MIR 路径。
+//
+// 覆盖点：
+//  1. 普通默认方法（常量返回）；
+//  2. 默认方法读字段 / 调用同 trait 的另一个默认方法（`self` 接收者）；
+//  3. impl 覆盖默认方法；
+//  4. `default fn` 拼写（trait 体里与 impl 体里都接受）；
+//  5. 默认方法参与 `&self` 引用接收者的核验（`self.base()`）。
+use core::*;
+
+trait Counter {
+    fn base(&self) -> i64 {
+        return 3;
+    }
+    default fn twice(&self) -> i64 {
+        return self.base() * 2;
+    }
+    default fn quad(&self) -> i64 {
+        return self.twice() * 2;
+    }
+}
+
+struct Zero {}
+
+impl Counter for Zero {}
+
+trait Shape {
+    fn area(&self) -> i64;
+    fn name(&self) -> i64 {
+        return 1;
+    }
+    default fn scale(&self) -> i64 {
+        return self.area() * 2;
+    }
+}
+
+struct Sq {
+    s: i64,
+}
+
+impl Shape for Sq {
+    fn area(&self) -> i64 {
+        return self.s * self.s;
+    }
+}
+
+struct Rect {
+    w: i64,
+    h: i64,
+}
+
+impl Shape for Rect {
+    fn area(&self) -> i64 {
+        return self.w * self.h;
+    }
+    // 覆盖默认方法：默认体不再生效。
+    fn name(&self) -> i64 {
+        return 2;
+    }
+    // impl 里的 `default fn` 也接受（impl 选择本来就按更具体的 impl 优先）。
+    default fn scale(&self) -> i64 {
+        return self.area() * 3;
+    }
+}
+
+fn main() -> i32 {
+    let z = Zero {};
+    if z.base() != 3 {
+        return 1;
+    }
+    if z.twice() != 6 {
+        return 2;
+    }
+    if z.quad() != 12 {
+        return 3;
+    }
+    let a = Sq { s: 3 };
+    if a.area() != 9 {
+        return 4;
+    }
+    if a.name() != 1 {
+        return 5;
+    }
+    if a.scale() != 18 {
+        return 6;
+    }
+    let b = Rect { w: 2, h: 3 };
+    if b.area() != 6 {
+        return 7;
+    }
+    if b.name() != 2 {
+        return 8;
+    }
+    if b.scale() != 18 {
+        return 9;
+    }
+    return 0;
+}

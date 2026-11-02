@@ -644,6 +644,57 @@ impl TypeChecker {
                 self.impl_generics.insert(m.name.clone(), ib.generics.clone());
                 expanded.functions.push(m);
             }
+            // trait 默认方法（trait 声明里带方法体的方法，含 `default fn`
+            // 拼写）：impl 没有覆盖时，按 impl 的目标类型合成一个
+            // `Type__method`。
+            //
+            // 早先这些方法体等于没写：trait 里的方法只登记成
+            // `Trait::method` 签名（`check_traits`），从不按 impl 目标发射，
+            // `lookup_method` 按 `S__g` 找不到 → `s.g()` 报
+            // `no field g on type S`。合成后与手写方法走同一条路径：签名、
+            // 函数体检查、MIR 降级都不需要新分支。
+            //
+            // 泛型 impl（`impl<T> Tr for T`）不合成：目标名是类型参数 `T`，
+            // 方法名会变成 `T__g`，`lookup_method` 按 receiver 的具体类型名
+            // 查不到——毯覆 impl 的方法解析本来就未支持，与这里无关。
+            if ib.generics.is_empty() {
+                if let Some(tname) = ib.trait_type.as_ref().and_then(ast_type_name) {
+                    if let Some(td) = prog.traits.iter().find(|t| t.name == tname) {
+                        for tm in &td.methods {
+                            if !self.cfg_enabled(&tm.attrs) {
+                                continue;
+                            }
+                            if tm.body.is_none() {
+                                // 没有默认体的方法是必须实现的：缺了它，调用点
+                                // 只会在 `lookup_method` 里报 `no field ...`，
+                                // 与"trait 没实现"的真实原因完全不对应。
+                                // 与 Rust 一致，在 impl 块上直接报缺哪个方法。
+                                //
+                                // 注意只看**本 impl 写出来的**方法名：默认体
+                                // 合成在下面，不算"用户提供了实现"。
+                                if !ib.methods.iter().any(|m| m.name == tm.name) {
+                                    return Err(CompileError::type_error(format!(
+                                        "not all trait items implemented, missing: `{}`",
+                                        tm.name
+                                    ))
+                                    .with_span(ib.span));
+                                }
+                                continue;
+                            }
+                            if ib.methods.iter().any(|m| m.name == tm.name) {
+                                continue;
+                            }
+                            let mut m = tm.clone();
+                            m.name = format!("{target_name}__{}", tm.name);
+                            m.module = ib.module.clone();
+                            self.impl_targets.insert(m.name.clone(), ib.target.clone());
+                            self.impl_generics
+                                .insert(m.name.clone(), ib.generics.clone());
+                            expanded.functions.push(m);
+                        }
+                    }
+                }
+            }
         }
         // `#[derive(..)]` 的方法体：同样在声明收集之前补进函数表。
         //
@@ -4852,7 +4903,26 @@ impl TypeChecker {
             Ty::Reference(inner, _) => (*inner).clone(),
             other => other,
         };
-        let receiver = self.check_call_arg(receiver, &recv_expect, span)?;
+        // 接收者本身就是引用时（`self` 在方法体里永远是 `&Self`，见
+        // `receiver_ty`），按**完整**形参类型核验：`self.eq(other)` 里
+        // `self: &i32`、`eq` 的形参是 `&i32`，两边形状一致，规则 3a 的内层
+        // unify 直接放行。早先这里一律剥掉一层引用再比内层，于是
+        // `expected i32, found &i32`——trait 默认方法体（`Eq::ne` 的
+        // `!self.eq(other)`）一被合成就撞上。
+        let recv_param_full = matches!(
+            self.infer.resolve(&sig.params[0].ty),
+            Ty::Reference(..) | Ty::Pointer(..)
+        );
+        let recv_is_ref = matches!(
+            self.infer.resolve(&receiver.ty),
+            Ty::Reference(..) | Ty::Pointer(..)
+        );
+        let expect = if recv_param_full && recv_is_ref {
+            sig.params[0].ty.clone()
+        } else {
+            recv_expect
+        };
+        let receiver = self.check_call_arg(receiver, &expect, span)?;
         if !matches!(
             self.infer.resolve(&sig.params[0].ty),
             Ty::Reference(..) | Ty::Pointer(..)

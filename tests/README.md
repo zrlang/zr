@@ -16,9 +16,9 @@ cargo test --test zr_language
 属性、断言内建这些设施编译器目前还不支持（闭包已可用，见 `83_closure_fnptr.zr`
 与 `84_closure_capture_value.zr`；见下方"尚未覆盖"）。
 
-`tests/cases/` 现有 123 个用例，每个在 `-O0/-O1/-O2/-O3/-Oz` 各跑一遍。
+`tests/cases/` 现有 124 个用例，每个在 `-O0/-O1/-O2/-O3/-Oz` 各跑一遍。
 
-"该报错的还在报错"由另一半套件补上：`tests/negative/*.zr`（36 个）每个都必须
+"该报错的还在报错"由另一半套件补上：`tests/negative/*.zr`（37 个）每个都必须
 **编译失败**，且报错文本要含文件里 `// expect: <子串>` 标注的期望子串
 （子串匹配，行号/列号漂移不会把套件变红）：
 
@@ -147,6 +147,7 @@ cargo test --test zr_negative
 | `121_let_destructure.zr` | `let` 位置上的解构模式：元组 / 嵌套元组 / 结构体 / 定长数组切片 `let [a, b] = arr` / 切片 `let [a, b] = xs else { .. }` / 通配丢弃 / `match` 上的切片模式。早先 `Statement::Let` 只取 `first_binding` 当唯一绑定（只认简单绑定），子绑定永不初始化，`let (a, b) = (3, 4); a + b` 读到栈上垃圾；`match` 的切片模式直接报"未实现"。可反驳模式在 `let` 位置报错（负向 `31`） |
 | `122_const_generic.zr` | `const` 泛型 `<const N: usize>`：泛型函数 / 结构体 / `impl` 方法上的 const 参数、数组长度按参数名延迟替换、值位置使用（`while i < N`、`N as i32`、`[0; N]`）、从实参数组长度与结构体字面量反推 const 实参。种类核验（类型当 const、值当类型、`N` 当类型用）在注解处报错（负向 `32` / `33` / `34`） |
 | `123_yield_cooperative.zr` | `yield` 协作让出点：spawn 两个带 `yield` 的 worker 交错执行（顺序 1,2,3,4）、`yield foo(p)` 的操作数副作用必须发生、循环里多轮让出且结构体/元组活跃值跨挂起点存活、tail 位置 `yield`。早先 `yield` 是类型占位（`Ty::Infer(InferId(0))`），操作数被 `let _ = inner;` 整体丢弃（`foo` 从不被调用），同步函数里静默空操作；现在同步函数与闭包体里的 `yield` 报错（负向 `35` / `36`） |
+| `124_trait_default_methods.zr` | trait 默认方法与 `default fn`：带方法体的 trait 方法在 impl 未覆盖时合成到目标类型（`A__m`）；覆盖默认方法、默认体读字段 / 调另一个默认体（`self.base()` 的 `&Self` 接收者核验）、trait 体与 impl 体两侧的 `default fn`。早先默认体等于没写，`s.m()` 报 `no field m on type S`；没有默认体的必需方法缺失现在在 impl 块报 `not all trait items implemented`（负向 `37`） |
 
 ## 尚未覆盖（编译器还不支持）
 
