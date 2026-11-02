@@ -506,7 +506,7 @@ fn print_usage(prog: &str) {
     println!("    --dump-ssa          Dump SSA");
     println!("    --dump-ssa-after    Dump SSA after optimization");
     println!("    --dump-asm          Dump assembly");
-    println!("    --emit-llvm         Emit LLVM IR (future)");
+    println!("    --emit-llvm         Emit pseudo LLVM IR (experimental; not consumable by clang)");
     println!("    --emit-c            Emit C source (bootstrap backend)");
     println!("    -h, --help          Show this help");
     println!("    -V, --version       Print version");
@@ -799,7 +799,16 @@ fn compile(input: &str, cmd: &Cli) -> Result<std::path::PathBuf, String> {
     }
 
     // 7.5 发射 LLVM IR（若指定 --emit-llvm）
+    //
+    // 这是**实验性**输出：`emit_llvm_ir` 产生的是手写伪 IR（整数统一 i64、
+    // 指针 i8*），clang / LLVM 工具链消费不了，仅用于人眼检查 SSA 形状。
+    // roadmap §8.5 的决策是"不删开关、标实验性"——删除会打破
+    // `toolchain_subcommands_emit` 回归，且伪 IR 对调试仍有价值。
     if cmd.emit_llvm {
+        eprintln!(
+            "warning: `--emit-llvm` is experimental: the output is pseudo-IR \
+             (integers are always i64, pointers i8*) and is NOT consumable by clang/LLVM"
+        );
         let ir = emit_llvm_ir(&target, &ssa_module);
         let out = Path::new(&cmd.output).to_path_buf();
         std::fs::write(&out, ir)
@@ -950,11 +959,12 @@ fn make_executable(path: &Path, target: &Target) -> Result<(), String> {
     Ok(())
 }
 
-/// 将 SSA 模块以 LLVM IR 文本形式输出（简化版）。
+/// 将 SSA 模块以 LLVM IR 文本形式输出（简化版，**实验性**）。
 ///
 /// 该发射器把 SSA 指令映射为接近 LLVM IR 的文本表示，便于调试与
-/// 对接外部 LLVM 工具链。类型信息做了保守降级（整数统一为 i64，
-/// 浮点为 double，指针为 i8*）。
+/// 人眼检查 SSA 形状。类型信息做了保守降级（整数统一为 i64，
+/// 浮点为 double，指针为 i8*），**clang / LLVM 工具链消费不了**；
+/// 调用点（`--emit-llvm` 分支）会向 stderr 打实验性警告。
 fn emit_llvm_ir(target: &Target, module: &ssa::SsaModule) -> String {
     use ssa::{SsaBinaryOp, SsaInstr, SsaTerminator, SsaUnaryOp};
 

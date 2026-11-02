@@ -261,7 +261,8 @@ fn main() -> i32 {
 /// - `zr fmt` 能重排源码、`zr fmt --check` 能报告"需要格式化 / 已格式化"
 ///   （`--check` 对未格式化返回非 0，对已格式化返回 0——与 `git diff --exit-code`
 ///   的惯例一致）；
-/// - `--emit-llvm` 真能写出 LLVM IR 文本（虽然目前是伪 IR，整数统一 i64）；
+/// - `--emit-llvm` 真能写出 LLVM IR 文本（伪 IR、实验性，整数统一 i64，
+///   stderr 必须带实验性警告）；
 /// - `--wat`（wasm32）能写出 WAT 文本。
 #[test]
 fn toolchain_subcommands_emit() {
@@ -331,6 +332,12 @@ fn toolchain_subcommands_emit() {
     assert!(
         emit.status.success(),
         "`--emit-llvm` 失败: {}",
+        String::from_utf8_lossy(&emit.stderr)
+    );
+    // 实验性标记：伪 IR 必须在 stderr 上声明自己不能喂给 clang（P2-3a）。
+    assert!(
+        String::from_utf8_lossy(&emit.stderr).contains("experimental"),
+        "`--emit-llvm` 应当打印实验性警告，stderr:\n{}",
         String::from_utf8_lossy(&emit.stderr)
     );
     let ir = std::fs::read_to_string(&ir_out).unwrap();

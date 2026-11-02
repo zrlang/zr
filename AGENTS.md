@@ -143,6 +143,8 @@ lexer → parser(ast) → typeck(hir, infer) → mir → ssa → opt → codegen
 7. **占位降级（下游会拿到错的值）**：`src/ssa/mod.rs:1301` `Deref => SsaUnaryOp::Not`；
    `src/mir/builder.rs:1358` `AddrOf => MirUnaryOp::Deref`。
 8. **`--emit-llvm` 输出的是手写伪 IR 文本**（整数统一 i64、指针 i8*），`clang` 消费不了。
+   已标**实验性**（P2-3a）：help 文案写明 "pseudo LLVM IR (experimental)"，发射时
+   stderr 打警告；`toolchain_subcommands_emit` 断言警告存在。
 9. **内联时的值重命名必须"同时替换"**，不能按值逐个 `replace_operand`：被内联体
    `%10 = %1 Add %9` 里先把 `%1` 换成新号 `%9`，再处理 `%9` 就会把两个操作数一起换掉
    （`spawn` 的帧初始化把偏移量当指针，`-O3` SIGSEGV）。用 `map_operands`。

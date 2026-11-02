@@ -258,12 +258,12 @@ zr 的做法是让被调方是**泛型**函数（`fn apply<F>(f: F, ..)`）：`F
 
 ### P2-3 `--emit-llvm` 真 IR / 删伪 IR
 
-现状：`src/main.rs:907 emit_llvm_ir` 手写伪 IR（整数统一 i64、指针 i8*），`clang`
+现状：`src/main.rs::emit_llvm_ir` 手写伪 IR（整数统一 i64、指针 i8*），`clang`
 消费不了。roadmap §8.5 决策：**删**（或 v1.0 后真做）。
 
 | 子任务 | 内容 | 状态 |
 |---|---|---|
-| P2-3a | 按 roadmap 决策删除伪 IR 或标 `--emit-llvm` 为实验性（未定） | ⬜ |
+| P2-3a | 按 roadmap 决策删除伪 IR 或标 `--emit-llvm` 为实验性（未定） | ✅ 已标实验性：help 文案改 "Emit pseudo LLVM IR (experimental; not consumable by clang)"，发射分支向 stderr 打实验性警告；`toolchain_subcommands_emit` 断言警告存在（选"标"而非"删"：删除会打破工具链回归，伪 IR 对人眼检查 SSA 形状仍有价值） |
 
 ### P2-4 C 后端接 CLI / 自举
 
