@@ -59,8 +59,8 @@ target/debug/zr prog.zr -O1 -o /tmp/prog   # 编译单个程序
   `ld` 直接断言崩溃（`atomShouldReplaceExisting`）。先 `nm` 看目标文件有没有
   重复符号，再下结论。已修复（提交 `1ef4a02`：MIR 按最终符号名去重，保留首个
   用户定义）。
-- 测试：`tests/zr_language.rs` 把 125 个 `tests/cases/*.zr` 各在
-  `-O0/-O1/-O2/-O3/-Oz` 跑一遍（625 次编译+运行）。退出码 0 = 过，非 0 = 失败（编号指向失败的断言）。
+- 测试：`tests/zr_language.rs` 把 130 个 `tests/cases/*.zr` 各在
+  `-O0/-O1/-O2/-O3/-Oz` 跑一遍（650 次编译+运行）。退出码 0 = 过，非 0 = 失败（编号指向失败的断言）。
   宿主端另有 `io_print_matches_rust` 等 Rust 对照用例。
 - **负向测试机制是 `tests/zr_negative.rs`**（`cargo test --test zr_negative`，
   37 个用例）。`tests/negative/*.zr` 每个都必须**编译失败**，且报错文本里含
@@ -91,11 +91,12 @@ lexer → parser(ast) → typeck(hir, infer) → mir → ssa → opt → codegen
   `encoder_thumb.rs`(Thumb-2)、`encoder_riscv.rs`(RV32/64IM)、`wasm.rs`(wasm32/64)。
   目标格式：`objfile.rs`(ELF)、`macho.rs`、`pe.rs`、`wasm.rs`。另有 `c_backend.rs`：**已接 CLI**
   （`--emit-c` 从 HIR 直译成一个 C 翻译单元，自举路径，见 `main.rs:762-766`）。
-- 标准库 `std/`：14 个 `.zr` 源文件（编译器自编译）——
-  `async` `collections` `core` `error` `fs` `io` `mem` `net` `path` `process` `simd` `slice` `string` `thread`。
+- 标准库 `std/`：19 个 `.zr` 源文件（编译器自编译）——
+  `async` `cli` `collections` `core` `env` `error` `fs` `io` `json` `mem` `net` `path`
+  `process` `simd` `slice` `string` `thread` `toml` `xml`。
   **注意模块名不带 `std::` 前缀**：`use core::Option;`，不是 `use std::core::Option;`。
   **2026-11-02 实测**（macOS x86-64，`use <m>::*;` + 空 `main`，全链路编译+链接）：
-  **13 个通过**（collections/core/error/fs/io/mem/net/path/process/simd/slice/string/thread；
+  **18 个通过**（cli/collections/core/env/error/fs/io/json/mem/net/path/process/simd/slice/string/thread/toml/xml；
   `error` 随调用实参/字段值类型核验落地而可加载——`as *const _` 推断占位、
   字面量传 `push_bytes` 的切片放行均已补上；`(&dyn Error).cause()` 的
   vtable 分派仍不可用，模块里没有走它的路径就能加载），
@@ -263,6 +264,7 @@ README 里"指针与 unsafe"一节目前是**愿景**：
 | `std/io.zr` | `(*p)[i]` → `p[i]`（两处）；`{:#X}` 的前缀改回小写 `0x`（与 Rust 一致） |
 | `src/ssa/mod.rs`、`src/codegen/encoder*.rs` | `SsaFunction` 新增 `param_types`（从 MIR 抄），两个后端拿它给浮点形参**播种**：只被转手的 `f64` 形参早先被判成整数，走 rdi 而调用方放 xmm0 |
 | `std/io.zr` | 格式串补 `{:e}` / `{:E}`（浮点与整数都走十进制指数形式，整数按有效数字四舍五入）、动态宽度 `{:1$}`、动态精度 `{:.*}` / `{:.1$}`；顺带修 `{:.}`（点后面没数字）不再被当成精度 0 |
+| `src/mir/builder.rs` | `const X: str = "..."` 引用：常量值表里存的是 `MirValue::Str`（后端发射成 8 字节字符串指针），早先直接当表达式值返回，写进 16 字节 `str` 局部只填了 ptr、`len` 留在栈上垃圾（`const LAST: str = "@last"; LAST.len` 实测读出 `0x666e69004e614e`）。现在聚合形态的字符串常量与字符串字面量走同一套"栈上架 `{ptr, len}`"的降级。钉子：`tests/cases/130_toml.zr` 用常量当 `get` / `get_path` 的键 |
 | `tests/cases/76..79`、`81`、`tests/negative/12..15` | 分别钉住上面每一处 |
 
 ### 三个"改对了才算改对"的点（代码里都有长注释）
@@ -280,7 +282,7 @@ README 里"指针与 unsafe"一节目前是**愿景**：
 ### `cargo test` 当前基线（2026-11-02，全绿）
 
 - `cargo test --bin zr`：267 项。
-- `cargo test --test zr_language`：125 个用例 × 5 个优化等级 = 625 项，另有 3 个宿主端
+- `cargo test --test zr_language`：130 个用例 × 5 个优化等级 = 650 项，另有 3 个宿主端
   对照用例（`io_print_matches_rust`——逐字符对比 Rust 的格式化输出，含 `{:e}` / `{:E}`
   与大浮点 Display（`|v| ≥ 2⁶⁴` 不带 `.0`）的回归；`extern_c_write_prints_string_literal`；
   `toolchain_subcommands_emit`——`zr fmt` / `zr fmt --check` / `zr pkg init` / `zr lsp`

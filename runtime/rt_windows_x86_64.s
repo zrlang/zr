@@ -773,3 +773,189 @@ zr_errno:
     call    WSAGetLastError
     add     rsp, 0x28
     ret
+
+#==============================================================================
+# 进程启动参数与环境变量
+#
+# Windows 的入口没有 Unix 的 argv/envp 内存布局（`_start` 由 PE 加载器 /
+# CRT 直接进入），因此参数与环境都改从 kernel32 取：
+#   - GetCommandLineA：原始命令行，复制进 zr_cmdline 后按「空白分隔、
+#     双引号内不切分、引号本身不进入 argv」解析；
+#   - GetEnvironmentStringsA：环境块（连续 NUL 结尾字符串 + 空串结束），
+#     逐条记下指针。该块由系统分配、按进程生命周期有效，这里不释放。
+# 之后的读取接口与其它平台同形（zr_args_count/args_ptr/env_count/env_entry），
+# `std/cli.zr` / `std/env.zr` 只依赖这五个符号。
+#==============================================================================
+
+    .section .bss
+    .align 8
+zr_argc_v:
+    .quad 0
+zr_argv_arr:
+    .zero 2048              # 256 项，每项 8 字节
+zr_envc_v:
+    .quad 0
+zr_env_arr:
+    .zero 8192              # 1024 项
+zr_cmdline:
+    .zero 4096
+
+    .text
+
+# zr_args_init(argc, argv) —— Windows 上入参没有意义，忽略并自行解析。
+    .globl zr_args_init
+zr_args_init:
+    sub     rsp, 0x28
+    call    GetCommandLineA
+
+    # 复制命令行到 zr_cmdline（最多 4095 字节，末尾补 NUL）。
+    lea     rdx, [zr_cmdline]
+    mov     rcx, rax
+    xor     eax, eax
+zr_args_copy:
+    mov     r8b, byte ptr [rcx + rax]
+    mov     byte ptr [rdx + rax], r8b
+    test    r8b, r8b
+    jz      zr_args_copy_done
+    inc     rax
+    cmp     rax, 4095
+    jb      zr_args_copy
+zr_args_copy_done:
+    mov     byte ptr [rdx + rax], 0
+
+    # 原地压缩解析。rsi/rdi 同时指向 zr_cmdline 的读/写位置（写永不追过读）。
+    #   r8  = argv 指针数组基址
+    #   r9  = 条目数
+    #   r10 = 是否在双引号内
+    #   r11 = 当前是否在条目中
+    lea     rsi, [zr_cmdline]
+    lea     rdi, [zr_cmdline]
+    lea     r8, [zr_argv_arr]
+    xor     r9d, r9d
+    xor     r10d, r10d
+    xor     r11d, r11d
+zr_args_loop:
+    movzx   eax, byte ptr [rsi]
+    test    al, al
+    jz      zr_args_end
+    inc     rsi
+    cmp     al, 34              # '"'
+    je      zr_args_quote
+    test    r10d, r10d
+    jnz     zr_args_emit
+    cmp     al, 32              # ' '
+    je      zr_args_sep
+    cmp     al, 9               # '\t'
+    je      zr_args_sep
+zr_args_emit:
+    test    r11d, r11d
+    jnz     zr_args_write
+    cmp     r9, 256
+    jae     zr_args_token_no_reg
+    mov     [r8 + r9*8], rdi
+    inc     r9
+zr_args_token_no_reg:
+    mov     r11d, 1
+zr_args_write:
+    mov     byte ptr [rdi], al
+    inc     rdi
+    jmp     zr_args_loop
+zr_args_quote:
+    xor     r10d, 1
+    test    r11d, r11d
+    jnz     zr_args_loop
+    test    r10d, r10d
+    jz      zr_args_loop
+    cmp     r9, 256
+    jae     zr_args_quote_no_reg
+    mov     [r8 + r9*8], rdi
+    inc     r9
+zr_args_quote_no_reg:
+    mov     r11d, 1
+    jmp     zr_args_loop
+zr_args_sep:
+    test    r11d, r11d
+    jz      zr_args_loop
+    mov     byte ptr [rdi], 0
+    inc     rdi
+    xor     r11d, r11d
+    jmp     zr_args_loop
+zr_args_end:
+    test    r11d, r11d
+    jz      zr_args_env
+    mov     byte ptr [rdi], 0
+zr_args_env:
+    mov     [zr_argc_v], r9
+
+    # 环境块：块内每条以 NUL 结尾，遇到空串（下一个字节就是 NUL）结束。
+    call    GetEnvironmentStringsA
+    test    rax, rax
+    jz      zr_args_done
+    mov     rsi, rax
+    lea     rdi, [zr_env_arr]
+    xor     r9d, r9d
+zr_env_loop:
+    cmp     byte ptr [rsi], 0
+    je      zr_env_end
+    mov     [rdi + r9*8], rsi
+    inc     r9
+zr_env_skip:
+    mov     al, byte ptr [rsi]
+    inc     rsi
+    test    al, al
+    jnz     zr_env_skip
+    cmp     r9, 1024
+    jb      zr_env_loop
+zr_env_end:
+    mov     [zr_envc_v], r9
+zr_args_done:
+    add     rsp, 0x28
+    ret
+
+#------------------------------------------------------------------------------
+# zr_args_count() -> usize
+#------------------------------------------------------------------------------
+    .globl zr_args_count
+zr_args_count:
+    mov     rax, [zr_argc_v]
+    ret
+
+#------------------------------------------------------------------------------
+# zr_args_ptr(i) -> *const u8（越界返回 NULL）
+#   rcx = i
+#------------------------------------------------------------------------------
+    .globl zr_args_ptr
+zr_args_ptr:
+    mov     rax, [zr_argc_v]
+    cmp     rcx, rax
+    jae     zr_args_ptr_none
+    lea     rax, [zr_argv_arr]
+    mov     rax, [rax + rcx*8]
+    ret
+zr_args_ptr_none:
+    xor     eax, eax
+    ret
+
+#------------------------------------------------------------------------------
+# zr_env_count() -> usize
+#------------------------------------------------------------------------------
+    .globl zr_env_count
+zr_env_count:
+    mov     rax, [zr_envc_v]
+    ret
+
+#------------------------------------------------------------------------------
+# zr_env_entry(i) -> *const u8（越界返回 NULL）
+#   rcx = i
+#------------------------------------------------------------------------------
+    .globl zr_env_entry
+zr_env_entry:
+    mov     rax, [zr_envc_v]
+    cmp     rcx, rax
+    jae     zr_env_entry_none
+    lea     rax, [zr_env_arr]
+    mov     rax, [rax + rcx*8]
+    ret
+zr_env_entry_none:
+    xor     eax, eax
+    ret

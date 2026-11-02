@@ -1,0 +1,824 @@
+//=============================================================================
+// std/json.zr — JSON 解析与生成
+//
+// 手写游标解析器 + 两种生成形态（紧凑 / 缩进）。类型是递归枚举，环由
+// `Vec` 破开：`Json::Array(Vec<Json>)` / `Json::Object(Vec<JsonPair>)`。
+//
+//   json_parse(src)                  -> Result<Json, JsonError>
+//   json_stringify(&v)               -> String
+//   json_stringify_pretty(&v, indent)-> String
+//
+// 入口统一带 `json_` 前缀：模块内所有自由函数落到同一个扁平符号表，公开名
+// 必须全局唯一（`parse` / `stringify` 这种名字很容易和别的模块撞）。
+//
+// 覆盖：`null` / `true` / `false`、整数与浮点（含指数）、字符串转义
+// （`\" \\ \/ \b \f \n \r \t` 与 `\uXXXX` 含代理对）、数组、对象。
+// 对象里重复键保留**后写**（与多数实现一致），访问器从后往前找。
+//
+// 已知限制：浮点用 `f64` 存，`json_stringify` 输出最多 6 位小数
+// （去尾零、保底一位），因此天文数字 / 极高精度值不保证逐字节还原。
+//=============================================================================
+
+use core::{Result, Option};
+use string::String;
+use collections::Vec;
+
+/// JSON 值。
+pub enum Json {
+    Null,
+    Bool(bool),
+    Int(i64),
+    Float(f64),
+    Str(String),
+    Array(Vec<Json>),
+    Object(Vec<JsonPair>),
+}
+
+/// 对象的键值对。
+pub struct JsonPair {
+    pub key:   String,
+    pub value: Json,
+}
+
+/// 解析错误：`pos` 是出错字节位置，`msg` 是静态描述。
+pub struct JsonError {
+    pub pos: usize,
+    pub msg: str,
+}
+
+//----- 小工具 ----------------------------------------------------------------
+
+/// 两个字节切片是否相等。
+fn json_bytes_eq(a: []const u8, b: []const u8) -> bool {
+    if a.len != b.len {
+        return false;
+    }
+    let mut i = 0;
+    while i < a.len {
+        if a.ptr[i] != b.ptr[i] {
+            return false;
+        }
+        i = i + 1;
+    }
+    return true;
+}
+
+/// 10 的 `e` 次方（`e` 可为负）。
+fn json_pow10f(e: i64) -> f64 {
+    let mut result = 1.0;
+    let n = if e < 0 { 0 - e } else { e };
+    let mut i: i64 = 0;
+    while i < n {
+        result = result * 10.0;
+        i = i + 1;
+    }
+    if e < 0 {
+        return 1.0 / result;
+    }
+    return result;
+}
+
+/// 把一个 Unicode 码点按 UTF-8 追加进字符串。
+fn json_push_codepoint(out: &mut String, cp: u32) {
+    if cp < 128 {
+        out.push_byte(cp as u8);
+    } else if cp < 2048 {
+        out.push_byte((192 | (cp >> 6)) as u8);
+        out.push_byte((128 | (cp & 63)) as u8);
+    } else if cp < 65536 {
+        out.push_byte((224 | (cp >> 12)) as u8);
+        out.push_byte((128 | ((cp >> 6) & 63)) as u8);
+        out.push_byte((128 | (cp & 63)) as u8);
+    } else {
+        out.push_byte((240 | (cp >> 18)) as u8);
+        out.push_byte((128 | ((cp >> 12) & 63)) as u8);
+        out.push_byte((128 | ((cp >> 6) & 63)) as u8);
+        out.push_byte((128 | (cp & 63)) as u8);
+    }
+}
+
+/// 十六进制数字的数值；非法返回 -1。
+fn json_hex_val(c: u8) -> i32 {
+    if c >= 48 && c <= 57 {
+        return (c - 48) as i32;
+    }
+    if c >= 97 && c <= 102 {
+        return (c - 97 + 10) as i32;
+    }
+    if c >= 65 && c <= 70 {
+        return (c - 65 + 10) as i32;
+    }
+    return -1;
+}
+
+fn json_is_digit(c: u8) -> bool {
+    return c >= 48 && c <= 57;
+}
+
+fn json_is_hex_digit(c: u8) -> bool {
+    return json_hex_val(c) >= 0;
+}
+
+//----- 访问器 ----------------------------------------------------------------
+
+impl Json {
+    /// 类型名，便于断言 / 报错。
+    pub fn type_name(self) -> str {
+        match self {
+            Json::Null => {
+                return "null";
+            }
+            Json::Bool(_) => {
+                return "bool";
+            }
+            Json::Int(_) => {
+                return "int";
+            }
+            Json::Float(_) => {
+                return "float";
+            }
+            Json::Str(_) => {
+                return "string";
+            }
+            Json::Array(_) => {
+                return "array";
+            }
+            Json::Object(_) => {
+                return "object";
+            }
+        }
+    }
+
+    pub fn is_null(self) -> bool {
+        match self {
+            Json::Null => {
+                return true;
+            }
+            _ => {
+                return false;
+            }
+        }
+    }
+
+    pub fn is_array(self) -> bool {
+        match self {
+            Json::Array(_) => {
+                return true;
+            }
+            _ => {
+                return false;
+            }
+        }
+    }
+
+    pub fn is_object(self) -> bool {
+        match self {
+            Json::Object(_) => {
+                return true;
+            }
+            _ => {
+                return false;
+            }
+        }
+    }
+
+    pub fn as_bool(self) -> Option<bool> {
+        match self {
+            Json::Bool(b) => {
+                return Option::Some(b);
+            }
+            _ => {
+                return Option::None;
+            }
+        }
+    }
+
+    pub fn as_int(self) -> Option<i64> {
+        match self {
+            Json::Int(n) => {
+                return Option::Some(n);
+            }
+            _ => {
+                return Option::None;
+            }
+        }
+    }
+
+    pub fn as_float(self) -> Option<f64> {
+        match self {
+            Json::Int(n) => {
+                return Option::Some(n as f64);
+            }
+            Json::Float(f) => {
+                return Option::Some(f);
+            }
+            _ => {
+                return Option::None;
+            }
+        }
+    }
+
+    /// 字符串值的拷贝（`String` 共享同一块堆缓冲，不释放）。
+    pub fn as_str(self) -> Option<String> {
+        match self {
+            Json::Str(s) => {
+                return Option::Some(s);
+            }
+            _ => {
+                return Option::None;
+            }
+        }
+    }
+
+    /// 数组 / 对象的元素个数；其它类型返回 0。
+    pub fn len(self) -> usize {
+        match self {
+            Json::Array(items) => {
+                return items.len();
+            }
+            Json::Object(pairs) => {
+                return pairs.len();
+            }
+            _ => {
+                return 0;
+            }
+        }
+    }
+
+    /// 数组下标访问；越界或非数组返回 None。
+    pub fn at(self, i: usize) -> Option<Json> {
+        match self {
+            Json::Array(items) => {
+                if i >= items.len() {
+                    return Option::None;
+                }
+                return Option::Some(items.get(i));
+            }
+            _ => {
+                return Option::None;
+            }
+        }
+    }
+
+    /// 对象按键取值；重复键返回**最后写入**的那个。
+    pub fn get(self, key: str) -> Option<Json> {
+        match self {
+            Json::Object(pairs) => {
+                // 必须显式标注：无载荷的 `Option::None` 单靠后续赋值推不出
+                // 类型，未标注时（实测）会在运行期取到错误的载荷布局并段错误。
+                let mut found: Option<Json> = Option::None;
+                let mut i = 0;
+                while i < pairs.len() {
+                    let pair = pairs.get(i);
+                    if json_bytes_eq(pair.key.as_bytes(), key) {
+                        found = Option::Some(pair.value);
+                    }
+                    i = i + 1;
+                }
+                return found;
+            }
+            _ => {
+                return Option::None;
+            }
+        }
+    }
+}
+
+//----- 解析 ------------------------------------------------------------------
+
+/// 解析游标。**必须 `pub`**：显式 `use json::json_parse` 时，类型检查会在
+/// crate root 解析函数签名/实现块里的类型名，私有类型会被判"不可访问"。
+pub struct JsonCursor {
+    src: str,
+    pos: usize,
+}
+
+impl JsonCursor {
+    fn peek(self) -> u8 {
+        if self.pos >= self.src.len {
+            return 0;
+        }
+        return self.src.ptr[self.pos];
+    }
+
+    fn at_end(self) -> bool {
+        return self.pos >= self.src.len;
+    }
+
+    fn skip_ws(self: &mut JsonCursor) {
+        while self.pos < self.src.len {
+            let c = self.src.ptr[self.pos];
+            if c == 32 || c == 9 || c == 10 || c == 13 {
+                self.pos = self.pos + 1;
+            } else {
+                return;
+            }
+        }
+    }
+
+    fn err(self, msg: str) -> JsonError {
+        return JsonError { pos: self.pos, msg: msg };
+    }
+}
+
+fn json_parse_value(c: &mut JsonCursor) -> Result<Json, JsonError> {
+    c.skip_ws();
+    if c.at_end() {
+        return Result::Err(c.err("unexpected end of input"));
+    }
+    let ch = c.peek();
+    if ch == 123 { // '{'
+        return json_parse_object(c);
+    }
+    if ch == 91 { // '['
+        return json_parse_array(c);
+    }
+    if ch == 34 { // '"'
+        // 不用 `?`：它对聚合载荷（`Json` 24 字节）的提取会把变体取错，
+        // 实测 `?` 之后 `Ok(Object)` 变成 `Json::Int`。这里显式 match。
+        let r = json_parse_string(c);
+        match r {
+            Result::Ok(s) => {
+                return Result::Ok(Json::Str(s));
+            }
+            Result::Err(e) => {
+                return Result::Err(e);
+            }
+        }
+    }
+    if ch == 116 { // 't'
+        if json_match_literal(c, "true") {
+            return Result::Ok(Json::Bool(true));
+        }
+        return Result::Err(c.err("invalid literal, expected `true`"));
+    }
+    if ch == 102 { // 'f'
+        if json_match_literal(c, "false") {
+            return Result::Ok(Json::Bool(false));
+        }
+        return Result::Err(c.err("invalid literal, expected `false`"));
+    }
+    if ch == 110 { // 'n'
+        if json_match_literal(c, "null") {
+            return Result::Ok(Json::Null);
+        }
+        return Result::Err(c.err("invalid literal, expected `null`"));
+    }
+    if ch == 45 || json_is_digit(ch) {
+        return json_parse_number(c);
+    }
+    return Result::Err(c.err("unexpected character"));
+}
+
+/// 期待并消费 `word`；成功返回 true，失败不移动游标。
+fn json_match_literal(c: &mut JsonCursor, word: str) -> bool {
+    let mut i = 0;
+    while i < word.len {
+        if c.pos + i >= c.src.len || c.src.ptr[c.pos + i] != word.ptr[i] {
+            return false;
+        }
+        i = i + 1;
+    }
+    c.pos = c.pos + word.len;
+    return true;
+}
+
+fn json_parse_string(c: &mut JsonCursor) -> Result<String, JsonError> {
+    // 调用方已确认当前字节是 '"'。
+    c.pos = c.pos + 1;
+    let mut out = String::new();
+    while !c.at_end() {
+        let ch = c.src.ptr[c.pos];
+        c.pos = c.pos + 1;
+        if ch == 34 {
+            return Result::Ok(out);
+        }
+        if ch != 92 { // '\\'
+            out.push_byte(ch);
+            continue;
+        }
+        if c.at_end() {
+            return Result::Err(c.err("unterminated escape sequence"));
+        }
+        let esc = c.src.ptr[c.pos];
+        c.pos = c.pos + 1;
+        if esc == 34 {
+            out.push_byte(34);
+        } else if esc == 92 {
+            out.push_byte(92);
+        } else if esc == 47 {
+            out.push_byte(47);
+        } else if esc == 98 {
+            out.push_byte(8);
+        } else if esc == 102 {
+            out.push_byte(12);
+        } else if esc == 110 {
+            out.push_byte(10);
+        } else if esc == 114 {
+            out.push_byte(13);
+        } else if esc == 116 {
+            out.push_byte(9);
+        } else if esc == 117 {
+            // 同上，不用 `?`（对聚合载荷的提取不可靠）。
+            let r1 = json_read_hex4(c);
+            let mut hi: i32 = 0;
+            match r1 {
+                Result::Ok(v) => {
+                    hi = v;
+                }
+                Result::Err(e) => {
+                    return Result::Err(e);
+                }
+            }
+            if hi >= 55296 && hi <= 56319 {
+                // 高代理：必须紧跟 `\uDC00..\uDFFF` 的低代理。
+                if c.pos + 1 >= c.src.len || c.src.ptr[c.pos] != 92 || c.src.ptr[c.pos + 1] != 117 {
+                    return Result::Err(c.err("lone high surrogate"));
+                }
+                c.pos = c.pos + 2;
+                let r2 = json_read_hex4(c);
+                let mut lo: i32 = 0;
+                match r2 {
+                    Result::Ok(v) => {
+                        lo = v;
+                    }
+                    Result::Err(e) => {
+                        return Result::Err(e);
+                    }
+                }
+                if lo < 56320 || lo > 57343 {
+                    return Result::Err(c.err("invalid low surrogate"));
+                }
+                let cp = 65536 + ((hi - 55296) * 1024) + (lo - 56320);
+                json_push_codepoint(&mut out, cp as u32);
+            } else if hi >= 56320 && hi <= 57343 {
+                return Result::Err(c.err("lone low surrogate"));
+            } else {
+                json_push_codepoint(&mut out, hi as u32);
+            }
+        } else {
+            return Result::Err(c.err("invalid escape sequence"));
+        }
+    }
+    return Result::Err(c.err("unterminated string"));
+}
+
+/// 读 4 位十六进制，返回码点值。
+fn json_read_hex4(c: &mut JsonCursor) -> Result<i32, JsonError> {
+    let mut v: i32 = 0;
+    let mut i = 0;
+    while i < 4 {
+        if c.at_end() {
+            return Result::Err(c.err("truncated \\u escape"));
+        }
+        let h = json_hex_val(c.src.ptr[c.pos]);
+        if h < 0 {
+            return Result::Err(c.err("invalid hex digit in \\u escape"));
+        }
+        v = v * 16 + h;
+        c.pos = c.pos + 1;
+        i = i + 1;
+    }
+    return Result::Ok(v);
+}
+
+fn json_parse_number(c: &mut JsonCursor) -> Result<Json, JsonError> {
+    let start = c.pos;
+    let mut neg = false;
+    if c.peek() == 45 { // '-'
+        neg = true;
+        c.pos = c.pos + 1;
+    }
+    if !json_is_digit(c.peek()) {
+        return Result::Err(JsonError { pos: start, msg: "expected digit" });
+    }
+    let mut val: f64 = 0.0;
+    let mut int_digits = 0;
+    while json_is_digit(c.peek()) {
+        val = val * 10.0 + ((c.peek() - 48) as f64);
+        c.pos = c.pos + 1;
+        int_digits = int_digits + 1;
+    }
+    let mut is_float = false;
+    let mut scale = 0.1;
+    if c.peek() == 46 { // '.'
+        is_float = true;
+        c.pos = c.pos + 1;
+        if !json_is_digit(c.peek()) {
+            return Result::Err(JsonError { pos: c.pos, msg: "expected digit after `.`" });
+        }
+        while json_is_digit(c.peek()) {
+            val = val + ((c.peek() - 48) as f64) * scale;
+            scale = scale * 0.1;
+            c.pos = c.pos + 1;
+        }
+    }
+    if c.peek() == 101 || c.peek() == 69 { // 'e' / 'E'
+        is_float = true;
+        c.pos = c.pos + 1;
+        let mut exp_neg = false;
+        if c.peek() == 43 { // '+'
+            c.pos = c.pos + 1;
+        } else if c.peek() == 45 {
+            exp_neg = true;
+            c.pos = c.pos + 1;
+        }
+        if !json_is_digit(c.peek()) {
+            return Result::Err(JsonError { pos: c.pos, msg: "expected exponent digit" });
+        }
+        let mut exp: i64 = 0;
+        while json_is_digit(c.peek()) {
+            exp = exp * 10 + ((c.peek() - 48) as i64);
+            c.pos = c.pos + 1;
+        }
+        if exp_neg {
+            exp = 0 - exp;
+        }
+        val = val * json_pow10f(exp);
+    }
+    if is_float {
+        if neg {
+            val = 0.0 - val;
+        }
+        return Result::Ok(Json::Float(val));
+    }
+    let n = val as i64;
+    if neg {
+        return Result::Ok(Json::Int(0 - n));
+    }
+    return Result::Ok(Json::Int(n));
+}
+
+fn json_parse_array(c: &mut JsonCursor) -> Result<Json, JsonError> {
+    c.pos = c.pos + 1; // '['
+    let mut items: Vec<Json> = Vec::new();
+    c.skip_ws();
+    if c.peek() == 93 { // ']'
+        c.pos = c.pos + 1;
+        return Result::Ok(Json::Array(items));
+    }
+    loop {
+        let r = json_parse_value(c);
+        match r {
+            Result::Ok(v) => {
+                items.push(v);
+            }
+            Result::Err(e) => {
+                return Result::Err(e);
+            }
+        }
+        c.skip_ws();
+        if c.at_end() {
+            return Result::Err(c.err("unterminated array"));
+        }
+        let ch = c.peek();
+        c.pos = c.pos + 1;
+        if ch == 44 { // ','
+            continue;
+        }
+        if ch == 93 {
+            return Result::Ok(Json::Array(items));
+        }
+        return Result::Err(c.err("expected `,` or `]` in array"));
+    }
+}
+
+fn json_parse_object(c: &mut JsonCursor) -> Result<Json, JsonError> {
+    c.pos = c.pos + 1; // '{'
+    let mut pairs: Vec<JsonPair> = Vec::new();
+    c.skip_ws();
+    if c.peek() == 125 { // '}'
+        c.pos = c.pos + 1;
+        return Result::Ok(Json::Object(pairs));
+    }
+    loop {
+        c.skip_ws();
+        if c.peek() != 34 {
+            return Result::Err(c.err("expected string key"));
+        }
+        let rk = json_parse_string(c);
+        match rk {
+            Result::Ok(key) => {
+                c.skip_ws();
+                if c.peek() != 58 { // ':'
+                    return Result::Err(c.err("expected `:` after object key"));
+                }
+                c.pos = c.pos + 1;
+                let rv = json_parse_value(c);
+                match rv {
+                    Result::Ok(value) => {
+                        pairs.push(JsonPair { key: key, value: value });
+                    }
+                    Result::Err(e) => {
+                        return Result::Err(e);
+                    }
+                }
+                c.skip_ws();
+                if c.at_end() {
+                    return Result::Err(c.err("unterminated object"));
+                }
+                let ch = c.peek();
+                c.pos = c.pos + 1;
+                if ch == 44 { // ','
+                    continue;
+                }
+                if ch == 125 {
+                    return Result::Ok(Json::Object(pairs));
+                }
+                return Result::Err(c.err("expected `,` or `}` in object"));
+            }
+            Result::Err(e) => {
+                return Result::Err(e);
+            }
+        }
+    }
+}
+
+/// 解析一段 JSON 文本。
+pub fn json_parse(src: str) -> Result<Json, JsonError> {
+    let mut c = JsonCursor { src: src, pos: 0 };
+    let r = json_parse_value(&mut c);
+    match r {
+        Result::Ok(value) => {
+            c.skip_ws();
+            if !c.at_end() {
+                return Result::Err(c.err("trailing characters after value"));
+            }
+            return Result::Ok(value);
+        }
+        Result::Err(e) => {
+            return Result::Err(e);
+        }
+    }
+}
+
+//----- 生成 ------------------------------------------------------------------
+
+/// 追加 JSON 字符串字面量（含两侧引号、转义 `"` `\` 与控制字符）。
+fn json_write_string(out: &mut String, s: &String) {
+    out.push_byte(34);
+    let mut i = 0;
+    while i < s.len {
+        let b = s.ptr[i];
+        if b == 34 {
+            out.push_bytes("\\\"");
+        } else if b == 92 {
+            out.push_bytes("\\\\");
+        } else if b == 10 {
+            out.push_bytes("\\n");
+        } else if b == 13 {
+            out.push_bytes("\\r");
+        } else if b == 9 {
+            out.push_bytes("\\t");
+        } else if b == 8 {
+            out.push_bytes("\\b");
+        } else if b == 12 {
+            out.push_bytes("\\f");
+        } else if b < 32 {
+            out.push_bytes("\\u00");
+            let hi = b / 16;
+            let lo = b % 16;
+            out.push_byte(json_hex_digit(hi));
+            out.push_byte(json_hex_digit(lo));
+        } else {
+            out.push_byte(b);
+        }
+        i = i + 1;
+    }
+    out.push_byte(34);
+}
+
+fn json_hex_digit(n: u8) -> u8 {
+    if n < 10 {
+        return 48 + n;
+    }
+    return 97 + n - 10;
+}
+
+/// 追加浮点：最多 6 位小数，去掉尾零，保底一位。
+fn json_write_float(out: &mut String, v: f64) {
+    let mut val = v;
+    if val < 0.0 {
+        out.push_byte(45);
+        val = 0.0 - val;
+    }
+    let ip = val as i64;
+    out.push_int(ip);
+    let mut frac = val - (ip as f64);
+    let mut digits: [u8; 6] = [0; 6];
+    let mut n = 0;
+    while n < 6 {
+        frac = frac * 10.0;
+        let d = frac as i64;
+        digits[n] = d as u8;
+        frac = frac - (d as f64);
+        n = n + 1;
+    }
+    // 去掉末尾的 0，至少保留一位。
+    let mut keep = 6;
+    while keep > 1 && digits[keep - 1] == 0 {
+        keep = keep - 1;
+    }
+    out.push_byte(46); // '.'
+    let mut i = 0;
+    while i < keep {
+        out.push_byte(48 + digits[i]);
+        i = i + 1;
+    }
+}
+
+fn json_write_indent(out: &mut String, depth: usize, indent: usize) {
+    out.push_byte(10);
+    let mut i = 0;
+    while i < depth * indent {
+        out.push_byte(32);
+        i = i + 1;
+    }
+}
+
+fn json_write_value(out: &mut String, v: &Json, depth: usize, pretty: bool, indent: usize) {
+    match v {
+        Json::Null => {
+            out.push_bytes("null");
+        }
+        Json::Bool(true) => {
+            out.push_bytes("true");
+        }
+        Json::Bool(false) => {
+            out.push_bytes("false");
+        }
+        Json::Int(n) => {
+            out.push_int(n);
+        }
+        Json::Float(f) => {
+            json_write_float(out, f);
+        }
+        Json::Str(s) => {
+            json_write_string(out, s);
+        }
+        Json::Array(items) => {
+            if items.len() == 0 {
+                out.push_bytes("[]");
+                return;
+            }
+            out.push_byte(91);
+            let mut i = 0;
+            while i < items.len() {
+                if i > 0 {
+                    out.push_byte(44);
+                }
+                if pretty {
+                    json_write_indent(out, depth + 1, indent);
+                }
+                json_write_value(out, &items.data[i], depth + 1, pretty, indent);
+                i = i + 1;
+            }
+            if pretty {
+                json_write_indent(out, depth, indent);
+            }
+            out.push_byte(93);
+        }
+        Json::Object(pairs) => {
+            if pairs.len() == 0 {
+                out.push_bytes("{}");
+                return;
+            }
+            out.push_byte(123);
+            let mut i = 0;
+            while i < pairs.len() {
+                if i > 0 {
+                    out.push_byte(44);
+                }
+                if pretty {
+                    json_write_indent(out, depth + 1, indent);
+                }
+                let pair = pairs.get(i);
+                json_write_string(out, &pair.key);
+                out.push_byte(58); // ':'
+                if pretty {
+                    out.push_byte(32);
+                }
+                json_write_value(out, &pair.value, depth + 1, pretty, indent);
+                i = i + 1;
+            }
+            if pretty {
+                json_write_indent(out, depth, indent);
+            }
+            out.push_byte(125);
+        }
+    }
+}
+
+/// 紧凑生成。
+pub fn json_stringify(value: &Json) -> String {
+    let mut out = String::new();
+    json_write_value(&mut out, value, 0, false, 0);
+    return out;
+}
+
+/// 缩进生成（每层 `indent` 个空格）。
+pub fn json_stringify_pretty(value: &Json, indent: usize) -> String {
+    let mut out = String::new();
+    json_write_value(&mut out, value, 0, true, indent);
+    return out;
+}

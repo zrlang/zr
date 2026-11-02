@@ -187,6 +187,16 @@
 | `Instant` / `SystemTime` / `sleep` | `zr_time_ns` / `zr_time_unix_ns` / `zr_sleep_ms`（`thread::sleep_ms`） | 🟡 | 只有纳秒整数，没有类型化的时间差 / 格式化 |
 | 临时文件（`tempfile`） | `fs::temp_file()` / `temp_file_raw()` | 🟡 | `/tmp/zr_tmp_<纳秒>`；没有 `NamedTempFile` / 自动删除（`File` 不实现 `Drop`） |
 
+### 3.4 进程参数 / 环境变量 / 配置格式
+
+| Rust 的写法 | zr 的现状 | 状态 | 说明 |
+|------|------|------|------|
+| `std::env::args()` | `cli::arg_count()` / `cli::arg(i)` / `cli::arg_opt(i)` / `cli::args()` / `cli::get(i, default)` / `cli::program_name()` | ✅ | 入口桩在 `main` 前捕获 `argc/argv`（Linux 读 `[rsp]`、macOS 由 dyld 传入、Windows 用 `GetCommandLineA`），存进运行时 `zr_args_*`；`arg` 返回 `String`（复制），`arg_opt` 越界给 `None`，`arg` / `get` 越界分别给空串 / 默认值。**没有迭代器**，`args()` 一次性收集成 `Vec<String>`。回归 `tests/cases/126_cli_args.zr` |
+| `std::env::var` / `set_var` / `remove_var` | `env::var(key)` / `env::var_or(key, default)` / `env::set_var` / `env::remove_var` / `env::has_var` | ✅ | `var` 返回 `Option<String>`；写操作进入 `std/env.zr` 的进程内覆盖表（初值来自入口 `envp` 的 `zr_env_count` / `zr_env_entry`），**不写回父进程 / 不改子进程继承块**；`remove_var` 用墓碑实现，后写优先（从后往前扫）。非法键（空串 / 含 `=`）的写操作返回假。回归 `tests/cases/127_env_vars.zr` |
+| `serde_json` / `std::json`（Rust 无内置） | `json::json_parse` / `json::json_stringify` / `json::json_stringify_pretty` | ✅ | 手写递归下降：`null` / 布尔 / 整数与浮点 / 字符串（含 `\uXXXX` 与代理对）/ 数组 / 对象；值树是递归枚举 `Json`，访问器 `len` / `at` / `get` / `as_*` / `is_null`；生成分紧凑与缩进两种。错误带字节位置。回归 `tests/cases/128_json.zr` |
+| XML（Rust 无内置） | `xml::xml_parse` / `xml::xml_stringify` / `xml::xml_stringify_pretty` | ✅ | 支持 XML 声明、注释、DOCTYPE、CDATA、自闭合标签、属性、五种实体与数字实体；`XmlNode` 带 `name` / `attrs` / `children` / `text`，访问器 `attr` / `child` / `child_named` / `child_count`；生成时转义（pretty 只序列化节点、不带声明）。错误带字节位置。回归 `tests/cases/129_xml.zr` |
+| TOML（Rust 无内置，生态用 `toml` crate） | `toml::toml_parse` / `toml::toml_stringify` | ✅ | 支持注释、`[table]`、`[table.sub]`、`[[array-of-tables]]`、点分键、基本 / 字面字符串、整数（含 `0x` / `0o` / `0b` 与 `_` 分隔）/ 浮点 / 布尔、数组（含尾逗号）、内联表；`Toml` 递归值树与 `get` / `get_path` / `at` / `len` / `as_*` 访问器。**已知限制**：不解析日期时间、浮点最多 6 位小数、重复键后写覆盖；未闭合数组 / 缺值返回带位置的 `Err`。回归 `tests/cases/130_toml.zr` |
+
 ---
 
 ## 四、与 Rust 语义有意不同的地方
@@ -221,7 +231,8 @@
 
 6. **标准库模块不带 `std::` 前缀，`Option` / `Result` 不在 prelude。**
    Rust 写 `std::option::Option`（或直接 `Option`）；zr 要写 `use core::Option;`，
-   模块名是 `core` / `io` / `string` / `collections` / `error` / `mem` / `slice` / `net` / `async`。
+   模块名是 `core` / `cli` / `collections` / `env` / `error` / `fs` / `io` / `json` /
+   `mem` / `net` / `path` / `process` / `simd` / `slice` / `string` / `thread` / `toml` / `xml`。
 
 7. **枚举的内存布局与 Rust 一致。**
    zr 的枚举是 `[判别式][载荷区]`，`Auto` 判别式按变体个数挑最小够用的整数，
@@ -305,7 +316,13 @@
    标宽，`div128(-100, 7)` 在 -O2/-Oz 直接 SIGILL）；**32 位目标仍禁用**
    （类型检查阶段报错）。回归 `tests/cases/111_i128.zr`、
    `tests/cases/113_i128_muldiv.zr`。
-7. **泛型推断的边界**：类型参数从实参、期望返回类型**和用法体**推断
+7. **标准库新增进程参数 / 环境变量 / 配置格式**：`std/cli.zr`（`arg_count` /
+   `arg` / `args`）、`std/env.zr`（`var` / `set_var` / `remove_var`）、
+   `std/json.zr`、`std/xml.zr`、`std/toml.zr`。JSON/XML/TOML 的公开入口带
+   `json_` / `xml_` / `toml_` 前缀以避开扁平符号表；解析错误都带字节位置。
+   限制：环境变量写入只影响本进程的覆盖表；TOML 不支持日期时间与 `[[array.of.tables]]`。
+
+8. **泛型推断的边界**：类型参数从实参、期望返回类型**和用法体**推断
    （`try_instantiate_call` 推不出时留推断变量，`let v = Vec::new(); v.push(1)`
    能靠 `push(1)` 定出 `T = i32`，`98_generic_infer_usage.zr`；若整个实例化
    体检查完仍停在未解析的推断变量才报 `cannot infer type parameter`，

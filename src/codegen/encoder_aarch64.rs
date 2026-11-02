@@ -1445,6 +1445,14 @@ pub fn emit_start_wrapper(target: &Target, unit: &mut CompilationUnit) {
     debug_assert_eq!(target.arch(), Arch::AArch64);
     let start = unit.code.len();
 
+    // 入口处的 (argc, argv)：Linux 在栈上（`[sp]` / `sp+8`），
+    // macOS / Windows 按 ABI 在 x0 / x1。先交给 zr_args_init。
+    if target.os().uses_syscalls() {
+        insn(unit, 0xf940_03e0); // ldr x0, [sp]
+        insn(unit, 0x9100_23e1); // add x1, sp, #8
+    }
+    emit_call(unit, "zr_args_init");
+
     if target.os().uses_syscalls() {
         // 系统调用号各家不同（Linux 93 / FreeBSD 1 / Android 94），由
         // Os::exit_syscall 按 (平台, 架构) 给出。
@@ -1871,20 +1879,35 @@ mod tests {
         let linux = Target::new(Arch::AArch64, Os::Linux);
         let mut u = empty_unit();
         emit_start_wrapper(&linux, &mut u);
-        // bl main; mov x8, #93; svc #0
-        assert_eq!(u.code.len(), 12);
+        // ldr x0,[sp]; add x1,sp,#8; bl zr_args_init; bl main; mov x8,#93; svc #0
+        assert_eq!(u.code.len(), 24);
         assert_eq!(
-            u32::from_le_bytes(u.code[0..4].try_into().unwrap()) >> 26,
+            u32::from_le_bytes(u.code[0..4].try_into().unwrap()),
+            0xf940_03e0,
+            "ldr x0, [sp]"
+        );
+        assert_eq!(
+            u32::from_le_bytes(u.code[4..8].try_into().unwrap()),
+            0x9100_23e1,
+            "add x1, sp, #8"
+        );
+        assert_eq!(
+            u32::from_le_bytes(u.code[8..12].try_into().unwrap()) >> 26,
+            0b100101,
+            "bl zr_args_init"
+        );
+        assert_eq!(
+            u32::from_le_bytes(u.code[12..16].try_into().unwrap()) >> 26,
             0b100101,
             "bl main"
         );
         assert_eq!(
-            u32::from_le_bytes(u.code[4..8].try_into().unwrap()),
+            u32::from_le_bytes(u.code[16..20].try_into().unwrap()),
             0xd280_0ba8,
             "mov x8, #93"
         );
         assert_eq!(
-            u32::from_le_bytes(u.code[8..12].try_into().unwrap()),
+            u32::from_le_bytes(u.code[20..24].try_into().unwrap()),
             0xd400_0001,
             "svc #0"
         );
@@ -1893,12 +1916,12 @@ mod tests {
         let macos = Target::new(Arch::AArch64, Os::Darwin);
         let mut u = empty_unit();
         emit_start_wrapper(&macos, &mut u);
-        // bl main; bl zr_exit; brk #0
-        assert_eq!(u.code.len(), 12);
+        // bl zr_args_init; bl main; bl zr_exit; brk #0
+        assert_eq!(u.code.len(), 16);
         let targets: Vec<&str> = u.relocations.iter().map(|r| r.symbol.as_str()).collect();
-        assert_eq!(targets, vec!["main", "zr_exit"]);
+        assert_eq!(targets, vec!["zr_args_init", "main", "zr_exit"]);
         assert_eq!(
-            u32::from_le_bytes(u.code[8..12].try_into().unwrap()),
+            u32::from_le_bytes(u.code[12..16].try_into().unwrap()),
             0xd420_0000,
             "brk #0"
         );

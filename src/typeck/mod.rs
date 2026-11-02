@@ -4884,6 +4884,39 @@ impl TypeChecker {
         Some(method)
     }
 
+    /// 识别 `size_of` / `align_of` 的**编译期定义**形状。
+    ///
+    /// 这两个名字在标准库里有两份定义：`std/core.zr` 的**无 body 声明**
+    /// （`pub fn size_of<T>() -> usize;`）与 `std/mem.zr` 的 `intrinsic!` 实现
+    /// （`pub fn size_of<T>() -> usize { intrinsic!(size_of T) }`）。
+    ///
+    /// 早先只认 `body.is_none()`，但扁平符号表让 `use core::size_of` 实际绑到
+    /// "先收集者"——std 内部拿到的是 mem 的带 body 版本，判据失配，调用落进
+    /// 普通单态化；而 `ExprKind::Intrinsic` 在 MIR 里没有任何求值分支
+    /// （落 `_ => Unit`），`size_of::<T>()` 于是恒为 0。`Vec::grow_to` 用
+    /// `size_of::<T>()` 算分配字节数，聚合元素的 Vec 只分到 0 字节、push
+    /// 越界写堆（`Vec<String>` 前几个元素变空串，`Vec<Json>` 直接 SIGABRT）。
+    ///
+    /// 现在把"声明"与"单一 `intrinsic!(size_of T)` 尾表达式"两种形状都认出来，
+    /// 统一走编译期求值。
+    fn size_intrinsic_kind(ast_fn: &ast::Function) -> Option<ast::IntrinsicKind> {
+        let kind = match ast_fn.name.as_str() {
+            "size_of" => ast::IntrinsicKind::SizeOf,
+            "align_of" => ast::IntrinsicKind::AlignOf,
+            _ => return None,
+        };
+        match &ast_fn.body {
+            // `pub fn size_of<T>() -> usize;`（std/core.zr 的声明）
+            None => Some(kind),
+            // `pub fn size_of<T>() -> usize { intrinsic!(size_of T) }`（std/mem.zr）
+            Some(b) if b.stmts.is_empty() => match b.tail.as_deref() {
+                Some(Expression::Intrinsic(k, _, _, _)) if *k == kind => Some(kind),
+                _ => None,
+            },
+            _ => None,
+        }
+    }
+
     /// 显式 turbofish 的泛型调用：`size_of::<T>()`、`Foo::<i32>::new(..)`。
     ///
     /// 返回 `None` 表示不是泛型函数，交回普通调用路径处理。
@@ -4928,12 +4961,29 @@ impl TypeChecker {
         // `const N: usize` 必须在这里报，而不是带着 `Ty::Int` 去当数组长度。
         self.check_const_arg_kinds(base, &ty_args, span)?;
         // 编译期内建：`size_of` / `align_of` 直接算成字面量。
-        if ast_fn.body.is_none() && matches!(ast_fn.name.as_str(), "size_of" | "align_of") {
+        if Self::size_intrinsic_kind(&ast_fn).is_some() {
             let ty = &ty_args[0];
+            // **不能**直接用 `self.infer.size_of`：`self.infer` 是
+            // `InferCtxt<'static>`，它的 `type_defs` 永远指向空静态表
+            // （见该字段注释），`Ty::Named` 一律落进 `None => 0`。
+            // 症状：`size_of::<Json>()` / `size_of::<String>()` 返回 0，
+            // `Vec::reserve` 用 `size_of::<T>()` 算分配字节数，聚合元素
+            // （String / Json / JsonPair）的 Vec 于是只分到 0 字节、push
+            // 越界写堆（`Vec<String>` 连续 push 后前几个元素全变空串，
+            // `Vec<Json>` 直接 SIGABRT/SIGILL）。这里临时借真实的
+            // `type_defs` 来算。
+            let mut icx: InferCtxt<'_> = InferCtxt::empty();
+            // 泛型体在声明期检查时 `T` 还是推断变量；单态实例里 `T` 虽已
+            // 绑到具体类型，也可能仍以 `Ty::Infer(id)` 的形式出现，
+            // `size_of(Ty::Infer)` 直接按 0 算。先按推断变量表解析到具体
+            // 类型再算。
+            icx.vars = self.infer.vars.clone();
+            icx.type_defs = &self.type_defs;
+            let resolved = icx.resolve(ty);
             let value = if ast_fn.name == "size_of" {
-                self.infer.size_of(ty)
+                icx.size_of(&resolved)
             } else {
-                self.infer.align_of(ty)
+                icx.align_of(&resolved)
             };
             return Ok(Some(HirExpr {
                 kind: ExprKind::Literal(hir::HirLiteral::Int(value as i128)),

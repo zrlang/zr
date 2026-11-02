@@ -1,0 +1,97 @@
+// std/xml.zr：声明 / 注释 / CDATA / 自闭合 / 实体 / 生成 / 错误路径。
+//
+// 断言用长度与首字节，避免依赖字符串内容比较。
+use xml::{xml_parse, xml_stringify, xml_stringify_pretty};
+use core::{Result, Option};
+
+fn main() -> i32 {
+    let src = "<?xml version=\"1.0\"?>\n<!-- top -->\n<root a='1' b=\"x&amp;y\">\n  <item id=\"7\">hello &lt;world&gt;</item>\n  <item id=\"8\"><![CDATA[raw <text>]]></item>\n  <empty/>\n</root>";
+    let doc = match xml_parse(src) {
+        Result::Ok(d) => d,
+        Result::Err(_) => {
+            return 1;
+        }
+    };
+    if doc.name.len != 4 || doc.name.ptr[0] != 114 { // "root"
+        return 2;
+    }
+    let b = match doc.attr("b") {
+        Option::Some(s) => s,
+        Option::None => {
+            return 3;
+        }
+    };
+    if b.len != 3 || b.ptr[0] != 120 { // "x&y"
+        return 4;
+    }
+    if doc.child_count() != 3 {
+        return 5;
+    }
+    // 第一个 <item>：文本里 `&lt;` / `&gt;` 已解码。
+    let it0 = match doc.child_named("item") {
+        Option::Some(n) => n,
+        Option::None => {
+            return 6;
+        }
+    };
+    if it0.text.len != 13 || it0.text.ptr[0] != 104 { // "hello <world>"
+        return 7;
+    }
+    let id0 = match it0.attr("id") {
+        Option::Some(s) => s,
+        Option::None => {
+            return 8;
+        }
+    };
+    if id0.len != 1 || id0.ptr[0] != 55 { // "7"
+        return 9;
+    }
+    // 第二个 <item>：CDATA 原样保留。
+    let it1 = match doc.child(1) {
+        Option::Some(n) => n,
+        Option::None => {
+            return 10;
+        }
+    };
+    if it1.text.len != 10 || it1.text.ptr[0] != 114 { // "raw <text>"
+        return 11;
+    }
+    // 自闭合元素没有子节点。
+    let empty = match doc.child_named("empty") {
+        Option::Some(n) => n,
+        Option::None => {
+            return 12;
+        }
+    };
+    if empty.child_count() != 0 {
+        return 13;
+    }
+
+    // 生成后再解析，结构与文本都保持。
+    let s = xml_stringify(&doc);
+    let doc2 = match xml_parse(s.as_bytes()) {
+        Result::Ok(d) => d,
+        Result::Err(_) => {
+            return 14;
+        }
+    };
+    if doc2.name.len != 4 || doc2.child_count() != 3 {
+        return 15;
+    }
+    let pretty = xml_stringify_pretty(&doc, 2);
+    if pretty.len <= s.len {
+        return 16;
+    }
+
+    // 错误路径：结束标签不匹配、根元素后有内容、元素未闭合。
+    if xml_parse("<a><b></a>").is_ok() {
+        return 17;
+    }
+    if xml_parse("<a/>junk").is_ok() {
+        return 18;
+    }
+    if xml_parse("<a>").is_ok() {
+        return 19;
+    }
+    return 0;
+}

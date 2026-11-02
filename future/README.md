@@ -56,6 +56,15 @@ subsystem. Each file uses the following status legend:
 | pgo.md            | ⬜     | `src/opt/pgo.rs` 未接线（`opt/mod.rs` 未声明） |
 | inline_asm.md     | ✅     | `asm!` 已实现（`27_inline_asm.zr`） |
 
+### std
+| File                | Status | Summary                    |
+|---------------------|--------|----------------------------|
+| cli.md              | ✅     | 命令行参数：入口桩捕获 `(argc, argv)` → `zr_args_init`，`std/cli.zr` 提供 `arg_count` / `arg` / `arg_opt` / `args` / `get` / `program_name`（回归 `126`） |
+| env.md              | ✅     | 环境变量：初值来自入口 `envp`（`zr_env_count` / `zr_env_entry`），写操作落在 `std/env.zr` 的覆盖表（墓碑删除，后写优先），提供 `var` / `var_or` / `set_var` / `remove_var` / `has_var`（回归 `127`） |
+| json.md             | ✅     | JSON 解析 / 生成：`Json` 递归值树，`json_parse` / `json_stringify` / `json_stringify_pretty`（回归 `128`） |
+| xml.md              | ✅     | XML 解析 / 生成：`XmlNode`（属性 / 子节点 / 文本），`xml_parse` / `xml_stringify` / `xml_stringify_pretty`（回归 `129`） |
+| toml.md             | ✅     | TOML 解析 / 生成：`Toml` 表 / 数组 / 标量，支持 `[table]`、`[[array-of-tables]]`、点分键、内联表（回归 `130`） |
+
 ### misc
 | File                | Status | Summary                    |
 |---------------------|--------|----------------------------|

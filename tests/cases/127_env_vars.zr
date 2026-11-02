@@ -1,0 +1,78 @@
+// std/env.zr：环境变量的读取 / 设置 / 删除。
+//
+// 初值来自进程入口 envp；写入落在本模块的覆盖表（不修改父进程环境）。
+// 用例只碰自己设置过的键，避免依赖宿主环境。
+use env::{has_var, remove_var, set_var, var, var_or};
+use core::Option;
+
+fn main() -> i32 {
+    // 未设置的键。
+    if has_var("ZR_TEST_UNSET_KEY") {
+        return 1;
+    }
+    match var("ZR_TEST_UNSET_KEY") {
+        Option::Some(_) => {
+            return 2;
+        }
+        Option::None => {}
+    }
+    if var_or("ZR_TEST_UNSET_KEY", "fallback").len != 8 {
+        return 3;
+    }
+
+    // 设置后可读回。
+    if !set_var("ZR_TEST_KEY", "hello") {
+        return 4;
+    }
+    match var("ZR_TEST_KEY") {
+        Option::Some(v) => {
+            if v.len != 5 || v.ptr[0] != 104 { // 'h'
+                return 5;
+            }
+        }
+        Option::None => {
+            return 6;
+        }
+    }
+    if !has_var("ZR_TEST_KEY") {
+        return 7;
+    }
+
+    // 覆盖写：后写的优先。
+    if !set_var("ZR_TEST_KEY", "world") {
+        return 8;
+    }
+    match var("ZR_TEST_KEY") {
+        Option::Some(v) => {
+            if v.len != 5 || v.ptr[0] != 119 { // 'w'
+                return 9;
+            }
+        }
+        Option::None => {
+            return 10;
+        }
+    }
+
+    // 删除后回到"不存在"。
+    if !remove_var("ZR_TEST_KEY") {
+        return 11;
+    }
+    if has_var("ZR_TEST_KEY") {
+        return 12;
+    }
+    if var_or("ZR_TEST_KEY", "gone").len != 4 {
+        return 13;
+    }
+
+    // 非法 key：空串、含 '='。
+    if set_var("", "x") {
+        return 14;
+    }
+    if set_var("A=B", "x") {
+        return 15;
+    }
+    if remove_var("") {
+        return 16;
+    }
+    return 0;
+}

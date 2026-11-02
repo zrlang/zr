@@ -3380,6 +3380,27 @@ pub fn emit_start_wrapper(target: &Target, unit: &mut CompilationUnit, run_tasks
     debug_assert_eq!(target.arch(), Arch::X86_64);
     let start = unit.code.len();
 
+    // 把入口处的 (argc, argv) 交给运行时，供 `std/cli.zr` 读取。
+    // Linux 的 `_start` 由内核直接进入，参数在栈上：`[rsp]`=argc、`rsp+8`=argv；
+    // macOS 的入口由 dyld 调用，参数按 SysV 约定在 rdi / rsi 里。
+    match target.os() {
+        Os::Linux | Os::FreeBsd | Os::Android => {
+            // mov rdi, [rsp]
+            emit1(unit, 0x48);
+            emit1(unit, 0x8b);
+            emit1(unit, 0x3c);
+            emit1(unit, 0x24);
+            // lea rsi, [rsp+8]
+            emit1(unit, 0x48);
+            emit1(unit, 0x8d);
+            emit1(unit, 0x74);
+            emit1(unit, 0x24);
+            emit1(unit, 0x08);
+        }
+        _ => {}
+    }
+    emit_call(unit, "zr_args_init");
+
     emit_call(unit, "main");
     if run_tasks {
         // 主函数返回后把剩余任务跑完；r12 是跨调用保留寄存器。
@@ -4527,8 +4548,13 @@ mod tests {
         let mut u = unit();
         let target = Target::new(Arch::X86_64, Os::Linux);
         emit_start_wrapper(&target, &mut u, false);
-        assert_eq!(u.code[0], 0xe8, "call main");
+        // mov rdi, [rsp]；lea rsi, [rsp+8]；call zr_args_init；call main
+        assert_eq!(u.code[0], 0x48, "mov rdi, [rsp]");
+        assert_eq!(u.code[9], 0xe8, "call zr_args_init");
+        assert_eq!(u.code[14], 0xe8, "call main");
         assert!(u.code.ends_with(&[0x0f, 0x05]), "以 syscall 结束");
+        let targets: Vec<&str> = u.relocations.iter().map(|r| r.symbol.as_str()).collect();
+        assert_eq!(targets, vec!["zr_args_init", "main"]);
         assert_eq!(u.entry, "_start");
     }
 
@@ -4537,11 +4563,13 @@ mod tests {
         let mut u = unit();
         let target = Target::new(Arch::X86_64, Os::Darwin);
         emit_start_wrapper(&target, &mut u, false);
-        assert_eq!(u.code[0], 0xe8, "call main");
-        assert_eq!(&u.code[5..8], &[0x48, 0x89, 0xc7], "mov rdi, rax");
-        assert_eq!(u.code[8], 0xe8, "call zr_exit");
+        // macOS 的 argc/argv 已经在 rdi/rsi 里，不需搬运，直接交给运行时。
+        assert_eq!(u.code[0], 0xe8, "call zr_args_init");
+        assert_eq!(u.code[5], 0xe8, "call main");
+        assert_eq!(&u.code[10..13], &[0x48, 0x89, 0xc7], "mov rdi, rax");
+        assert_eq!(u.code[13], 0xe8, "call zr_exit");
         let targets: Vec<&str> = u.relocations.iter().map(|r| r.symbol.as_str()).collect();
-        assert_eq!(targets, vec!["main", "zr_exit"]);
+        assert_eq!(targets, vec!["zr_args_init", "main", "zr_exit"]);
     }
 
     #[test]
@@ -4550,7 +4578,7 @@ mod tests {
         let target = Target::new(Arch::X86_64, Os::Linux);
         emit_start_wrapper(&target, &mut u, true);
         let targets: Vec<&str> = u.relocations.iter().map(|r| r.symbol.as_str()).collect();
-        assert_eq!(targets, vec!["main", "zr_run_tasks"]);
+        assert_eq!(targets, vec!["zr_args_init", "main", "zr_run_tasks"]);
         assert!(u.code.ends_with(&[0x0f, 0x05]), "仍以 syscall 结束");
     }
 
@@ -4559,7 +4587,9 @@ mod tests {
         let mut u = unit();
         let target = Target::new(Arch::X86_64, Os::Win);
         emit_start_wrapper(&target, &mut u, false);
-        assert_eq!(&u.code[5..8], &[0x48, 0x89, 0xc1], "mov rcx, rax");
-        assert_eq!(u.code[8], 0xe8, "call zr_exit");
+        assert_eq!(u.code[0], 0xe8, "call zr_args_init");
+        assert_eq!(u.code[5], 0xe8, "call main");
+        assert_eq!(&u.code[10..13], &[0x48, 0x89, 0xc1], "mov rcx, rax");
+        assert_eq!(u.code[13], 0xe8, "call zr_exit");
     }
 }

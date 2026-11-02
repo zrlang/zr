@@ -45,6 +45,11 @@
     .global zr_sleep_ms
     .global zr_time_ns
     .global zr_time_unix_ns
+    .global zr_args_init
+    .global zr_args_count
+    .global zr_args_ptr
+    .global zr_env_count
+    .global zr_env_entry
 
     .section .text
 
@@ -1383,4 +1388,102 @@ zr_execvp:
 .zre_default_path:
     .asciz  "/bin:/usr/bin"
     .text
+
+#==============================================================================
+# 进程启动参数与环境变量
+#
+# `_start` 在调用 `main` 之前调用 `zr_args_init(argc, argv)`。Linux 的入口
+# 由内核直接进入，参数在栈上：`[rsp]` = argc、`rsp+8` = argv；envp 按 ABI
+# 紧跟 argv（argv + (argc+1)*8）。这里把三者记进 bss，供 std/cli 与
+# std/env 读取。写操作由标准库自己的覆盖表实现。
+#==============================================================================
+    .bss
+    .align  8
+zr_argc_v:
+    .quad   0
+zr_argv_v:
+    .quad   0
+zr_envp_v:
+    .quad   0
+zr_envc_v:
+    .quad   0
+
+    .text
+
+#------------------------------------------------------------------------------
+# zr_args_init(argc, argv)
+#   rdi = argc, rsi = argv
+#------------------------------------------------------------------------------
+zr_args_init:
+    movq    %rdi, zr_argc_v(%rip)
+    movq    %rsi, zr_argv_v(%rip)
+    testq   %rdi, %rdi
+    jle     .zai_empty
+    testq   %rsi, %rsi
+    jz      .zai_empty
+    # envp = argv + (argc + 1) * 8
+    leaq    8(%rsi, %rdi, 8), %rax
+    movq    %rax, zr_envp_v(%rip)
+    xorq    %rcx, %rcx
+.zai_env_count:
+    movq    (%rax, %rcx, 8), %rdx
+    testq   %rdx, %rdx
+    jz      .zai_env_done
+    incq    %rcx
+    jmp     .zai_env_count
+.zai_env_done:
+    movq    %rcx, zr_envc_v(%rip)
+    ret
+.zai_empty:
+    movq    $0, zr_envp_v(%rip)
+    movq    $0, zr_envc_v(%rip)
+    ret
+
+#------------------------------------------------------------------------------
+# zr_args_count() -> usize
+#------------------------------------------------------------------------------
+zr_args_count:
+    movq    zr_argc_v(%rip), %rax
+    ret
+
+#------------------------------------------------------------------------------
+# zr_args_ptr(i) -> *const u8（越界或没有 argv 时返回 NULL）
+#   rdi = i
+#------------------------------------------------------------------------------
+zr_args_ptr:
+    movq    zr_argc_v(%rip), %rax
+    cmpq    %rax, %rdi
+    jae     .zap_none
+    movq    zr_argv_v(%rip), %rax
+    testq   %rax, %rax
+    jz      .zap_none
+    movq    (%rax, %rdi, 8), %rax
+    ret
+.zap_none:
+    xorq    %rax, %rax
+    ret
+
+#------------------------------------------------------------------------------
+# zr_env_count() -> usize
+#------------------------------------------------------------------------------
+zr_env_count:
+    movq    zr_envc_v(%rip), %rax
+    ret
+
+#------------------------------------------------------------------------------
+# zr_env_entry(i) -> *const u8（"KEY=VALUE"，越界返回 NULL）
+#   rdi = i
+#------------------------------------------------------------------------------
+zr_env_entry:
+    movq    zr_envc_v(%rip), %rax
+    cmpq    %rax, %rdi
+    jae     .zee_none
+    movq    zr_envp_v(%rip), %rax
+    testq   %rax, %rax
+    jz      .zee_none
+    movq    (%rax, %rdi, 8), %rax
+    ret
+.zee_none:
+    xorq    %rax, %rax
+    ret
 

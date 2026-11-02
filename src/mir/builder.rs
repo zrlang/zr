@@ -344,7 +344,30 @@ fn lower_expr(b: &mut Builder, expr: &HirExpr) -> MirValue {
         // 于是 `const LIMIT: i32 = 40; if LIMIT != 40 { .. }` 编出来是拿
         // unit 去比——恒不相等。`const` 是编译期已知的值，内联它是唯一正确
         // 的处理：它没有存储，也就没有"读一个全局"这种运行时操作。
-        Def(id) => match b.const_values.get(id) {
+        Def(id) => match b.const_values.get(id).cloned() {
+            // `const X: str = "..."` 这类**聚合形态**的字符串常量：值表里存
+            // 的是 `MirValue::Str`（后端把它发射成 8 字节字符串指针）。直接
+            // 当表达式值返回，写进 16 字节的 `str` 局部只会填上 ptr，`len`
+            // 留在栈上的垃圾里（`const LAST: str = "@last"; LAST.len` 实测
+            // 读出 0x666e69004e614e）。这里与字符串字面量同一套做法，在栈上
+            // 架出 `{ptr, len}`。
+            Some(MirValue::Str { content, len }) if !is_scalar_ty(&expr.ty) => {
+                let addr = b.synthetic_storage(16);
+                let ptr_at = offset_addr(b, MirValue::Var(addr.clone()), 0);
+                b.current_block_mut().instrs.push(MirInstr::Store(
+                    ptr_at,
+                    MirValue::Str { content: content, len: len },
+                    NumTy::Uint(64),
+                ));
+                let len_at = offset_addr(b, MirValue::Var(addr.clone()), 8);
+                b.current_block_mut().instrs.push(MirInstr::Store(
+                    len_at,
+                    MirValue::Int(len as i128),
+                    NumTy::Uint(64),
+                ));
+                b.register_temp(MirValue::Var(addr.clone()), &expr.ty);
+                MirValue::Var(addr)
+            }
             Some(value) => value.clone(),
             None if b.statics.contains_key(id) => {
                 let (symbol, ty) = b.statics.get(id).cloned().unwrap();

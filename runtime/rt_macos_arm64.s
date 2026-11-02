@@ -395,6 +395,111 @@ _zr_set_nonblocking:
     ldp     x29, x30, [sp], #32
     ret
 
+#==============================================================================
+# 进程启动参数与环境变量
+#
+# `_start` 在调用 `main` 之前调用 `zr_args_init(argc, argv)`（Darwin 入口
+# 由 dyld 调用，x0 = argc、x1 = argv）。envp 按 ABI 紧跟 argv
+# （argv + (argc+1)*8），这里一并记下并数出条目数。
+#==============================================================================
+    .section __DATA,__bss
+    .align 3
+_zr_argc:
+    .quad 0
+_zr_argv:
+    .quad 0
+_zr_envp:
+    .quad 0
+_zr_envc:
+    .quad 0
+
+    .section __TEXT,__text
+
+    .globl _zr_args_init
+_zr_args_init:
+    adrp    x9, _zr_argc@PAGE
+    add     x9, x9, _zr_argc@PAGEOFF
+    str     x0, [x9]
+    adrp    x9, _zr_argv@PAGE
+    add     x9, x9, _zr_argv@PAGEOFF
+    str     x1, [x9]
+    cmp     x0, #0
+    b.le    .zai_empty
+    cbz     x1, .zai_empty
+    add     x2, x0, #1
+    lsl     x2, x2, #3
+    add     x2, x1, x2
+    adrp    x9, _zr_envp@PAGE
+    add     x9, x9, _zr_envp@PAGEOFF
+    str     x2, [x9]
+    mov     x3, #0
+.zai_env_count:
+    ldr     x4, [x2, x3, lsl #3]
+    cbz     x4, .zai_env_done
+    add     x3, x3, #1
+    b       .zai_env_count
+.zai_env_done:
+    adrp    x9, _zr_envc@PAGE
+    add     x9, x9, _zr_envc@PAGEOFF
+    str     x3, [x9]
+    ret
+.zai_empty:
+    adrp    x9, _zr_envp@PAGE
+    add     x9, x9, _zr_envp@PAGEOFF
+    str     xzr, [x9]
+    adrp    x9, _zr_envc@PAGE
+    add     x9, x9, _zr_envc@PAGEOFF
+    str     xzr, [x9]
+    ret
+
+    .globl _zr_args_count
+_zr_args_count:
+    adrp    x9, _zr_argc@PAGE
+    add     x9, x9, _zr_argc@PAGEOFF
+    ldr     x0, [x9]
+    ret
+
+    .globl _zr_args_ptr
+_zr_args_ptr:
+    adrp    x9, _zr_argc@PAGE
+    add     x9, x9, _zr_argc@PAGEOFF
+    ldr     x1, [x9]
+    cmp     x0, x1
+    b.hs    .zap_none
+    adrp    x9, _zr_argv@PAGE
+    add     x9, x9, _zr_argv@PAGEOFF
+    ldr     x1, [x9]
+    cbz     x1, .zap_none
+    ldr     x0, [x1, x0, lsl #3]
+    ret
+.zap_none:
+    mov     x0, #0
+    ret
+
+    .globl _zr_env_count
+_zr_env_count:
+    adrp    x9, _zr_envc@PAGE
+    add     x9, x9, _zr_envc@PAGEOFF
+    ldr     x0, [x9]
+    ret
+
+    .globl _zr_env_entry
+_zr_env_entry:
+    adrp    x9, _zr_envc@PAGE
+    add     x9, x9, _zr_envc@PAGEOFF
+    ldr     x1, [x9]
+    cmp     x0, x1
+    b.hs    .zee_none
+    adrp    x9, _zr_envp@PAGE
+    add     x9, x9, _zr_envp@PAGEOFF
+    ldr     x1, [x9]
+    cbz     x1, .zee_none
+    ldr     x0, [x1, x0, lsl #3]
+    ret
+.zee_none:
+    mov     x0, #0
+    ret
+
 # zr_errno() -> i32
 #   macOS 的 errno 是线程局部存储，经 `__error()` 取地址；返回其值。
     .globl _zr_errno

@@ -1,0 +1,111 @@
+// std/toml.zr：表头 / 点分键 / 数组 / 内联表 / 数组表 / 生成 / 错误路径。
+//
+// 顺带钉住 `const X: str = "..."`：MIR 早先把字符串常量的值表项
+// （`MirValue::Str`，8 字节指针形态）直接当聚合值用，写进 `str` 局部只填了
+// ptr、`len` 留在栈上垃圾里。这里用常量当 `get` / `get_path` 的键。
+use toml::{toml_parse, toml_stringify};
+use core::Result;
+
+const ITEMS_KEY: str = "items";
+const SERVER_HOST: str = "server.host";
+
+fn main() -> i32 {
+    if ITEMS_KEY.len != 5 || SERVER_HOST.len != 11 {
+        return 1;
+    }
+    let src = "# top\ntitle = \"hello\"\nenabled = true\ncount = 42\nratio = 0.5\nneg = -7\nbig = 1_000\nhex = 0xff\nescaped = \"a\\tb\\nc\"\nlit = 'C:\\dir'\nlist = [1, 2, 3,]\ninline = { x = 1, y = \"z\" }\n\n[server]\nhost = \"localhost\"\nport = 8080\n\n[server.tls]\non = false\n\n[[items]]\nid = 1\n\n[[items]]\nid = 2\n";
+    let doc = match toml_parse(src) {
+        Result::Ok(d) => d,
+        Result::Err(_) => {
+            return 2;
+        }
+    };
+    if doc.get("title").unwrap().as_str().unwrap().len != 5 {
+        return 3;
+    }
+    if !doc.get("enabled").unwrap().as_bool().unwrap() {
+        return 4;
+    }
+    if doc.get("count").unwrap().as_int().unwrap() != 42 {
+        return 5;
+    }
+    let ratio = doc.get("ratio").unwrap().as_float().unwrap();
+    if ratio < 0.49 || ratio > 0.51 {
+        return 6;
+    }
+    if doc.get("neg").unwrap().as_int().unwrap() != -7 {
+        return 7;
+    }
+    if doc.get("big").unwrap().as_int().unwrap() != 1000 {
+        return 8;
+    }
+    if doc.get("hex").unwrap().as_int().unwrap() != 255 {
+        return 9;
+    }
+    // 基本字符串转义 / 字面字符串。
+    if doc.get("escaped").unwrap().as_str().unwrap().len != 5 {
+        return 10;
+    }
+    if doc.get("lit").unwrap().as_str().unwrap().len != 6 {
+        return 11;
+    }
+    // 数组。
+    if doc.get("list").unwrap().len() != 3 {
+        return 12;
+    }
+    if doc.get("list").unwrap().at(2).unwrap().as_int().unwrap() != 3 {
+        return 13;
+    }
+    // 内联表。
+    if doc.get("inline").unwrap().len() != 2 {
+        return 14;
+    }
+    if doc.get("inline").unwrap().get("x").unwrap().as_int().unwrap() != 1 {
+        return 15;
+    }
+    // 点分路径（常量键）。
+    if doc.get_path(SERVER_HOST).unwrap().as_str().unwrap().len != 9 {
+        return 16;
+    }
+    if doc.get_path("server.port").unwrap().as_int().unwrap() != 8080 {
+        return 17;
+    }
+    if doc.get_path("server.tls.on").unwrap().as_bool().unwrap() {
+        return 18;
+    }
+    // 数组表（常量键）。
+    let items = doc.get(ITEMS_KEY).unwrap();
+    if items.len() != 2 {
+        return 19;
+    }
+    if items.at(0).unwrap().get("id").unwrap().as_int().unwrap() != 1 {
+        return 20;
+    }
+    if items.at(1).unwrap().get("id").unwrap().as_int().unwrap() != 2 {
+        return 21;
+    }
+
+    // 生成 + 再解析。
+    let s = toml_stringify(&doc);
+    let doc2 = match toml_parse(s.as_bytes()) {
+        Result::Ok(d) => d,
+        Result::Err(_) => {
+            return 22;
+        }
+    };
+    if doc2.get("title").unwrap().as_str().unwrap().len != 5 {
+        return 23;
+    }
+    if doc2.get(ITEMS_KEY).unwrap().len() != 2 {
+        return 24;
+    }
+
+    // 错误路径。
+    if toml_parse("a = ").is_ok() {
+        return 25;
+    }
+    if toml_parse("a = [1, 2").is_ok() {
+        return 26;
+    }
+    return 0;
+}

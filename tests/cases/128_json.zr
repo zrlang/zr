@@ -1,0 +1,78 @@
+// std/json.zr：解析 / 访问 / 生成 / 再解析 / 错误路径。
+//
+// 覆盖 null、bool、int、float、string、array、嵌套 object 七种形态，
+// 以及 `json_stringify` / `json_stringify_pretty` 的往返。
+use json::{json_parse, json_stringify, json_stringify_pretty};
+use core::Result;
+
+fn main() -> i32 {
+    let src = "{\"name\":\"zr\",\"n\":42,\"pi\":3.5,\"ok\":true,\"nil\":null,\"list\":[1,2,3],\"obj\":{\"x\":\"y\"}}";
+    let doc = match json_parse(src) {
+        Result::Ok(d) => d,
+        Result::Err(_) => {
+            return 1;
+        }
+    };
+    if !doc.is_object() || doc.len() != 7 {
+        return 2;
+    }
+    if doc.get("name").unwrap().as_str().unwrap().len != 2 {
+        return 3;
+    }
+    if doc.get("n").unwrap().as_int().unwrap() != 42 {
+        return 4;
+    }
+    let pi = doc.get("pi").unwrap().as_float().unwrap();
+    if pi < 3.4 || pi > 3.6 {
+        return 5;
+    }
+    if !doc.get("ok").unwrap().as_bool().unwrap() {
+        return 6;
+    }
+    if !doc.get("nil").unwrap().is_null() {
+        return 7;
+    }
+    if doc.get("list").unwrap().len() != 3 {
+        return 8;
+    }
+    if doc.get("list").unwrap().at(2).unwrap().as_int().unwrap() != 3 {
+        return 9;
+    }
+    if doc.get("obj").unwrap().get("x").unwrap().as_str().unwrap().len != 1 {
+        return 10;
+    }
+
+    // 生成 + 再解析：往返后仍能取回同一个值。
+    let s = json_stringify(&doc);
+    if s.len == 0 {
+        return 11;
+    }
+    let doc2 = match json_parse(s.as_bytes()) {
+        Result::Ok(d) => d,
+        Result::Err(_) => {
+            return 12;
+        }
+    };
+    if doc2.get("name").unwrap().as_str().unwrap().len != 2 {
+        return 13;
+    }
+    if doc2.len() != 7 {
+        return 14;
+    }
+    let pretty = json_stringify_pretty(&doc, 2);
+    if pretty.len == 0 {
+        return 15;
+    }
+
+    // 错误路径。
+    if json_parse("{\"a\":}").is_ok() {
+        return 16;
+    }
+    if json_parse("[1,2").is_ok() {
+        return 17;
+    }
+    if json_parse("").is_ok() {
+        return 18;
+    }
+    return 0;
+}

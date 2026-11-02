@@ -90,7 +90,7 @@ lexer(token) → parser → typeck → mir → ssa → codegen → std/ → test
 4. **`src/mir/`、`src/ssa/`** — 降级与 SSA 构造。
 5. **`src/codegen/`** — 6 个后端都要动（x86-64/aarch64/arm/thumb/riscv/wasm），
    或用 `mod.rs` 里的 `unsupported_*` 辅助函数让其余后端明确报错。
-6. **`std/`** — 标准库 API（14 个模块，`.zr` 源文件，编译器自编译）。
+6. **`std/`** — 标准库 API（19 个模块，`.zr` 源文件，编译器自编译）。
 7. **`tests/cases/`** — 新增自检用例，编号顺延。
 
 ## 5. 避坑清单（都真实触发过）

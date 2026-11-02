@@ -607,3 +607,169 @@ zr_set_nonblocking:
 zr_errno:
     bl     WSAGetLastError
     ret
+
+#==============================================================================
+# 进程启动参数与环境变量（与 x86-64 版同语义）
+#
+# Windows 入口没有 Unix 的 argv/envp 布局，改从 kernel32 取：
+# GetCommandLineA 的命令行复制进 zr_cmdline 后原地压缩解析（空白分隔、
+# 双引号内不切分、引号不进入 argv）；GetEnvironmentStringsA 的环境块逐条
+# 记指针（块按进程生命周期有效，不释放）。
+#==============================================================================
+
+    .section .bss
+    .align 8
+zr_argc_v:
+    .zero 8
+zr_argv_arr:
+    .zero 2048
+zr_envc_v:
+    .zero 8
+zr_env_arr:
+    .zero 8192
+zr_cmdline:
+    .zero 4096
+
+    .text
+
+    .globl zr_args_init
+zr_args_init:
+    stp    x29, x30, [sp, #-16]!
+    mov    x29, sp
+    bl     GetCommandLineA
+
+    # 复制命令行到 zr_cmdline（最多 4095 字节 + 末尾 NUL）。
+    adrp   x9, zr_cmdline
+    add    x9, x9, :lo12:zr_cmdline
+    mov    x10, #0
+1:  ldrb   w11, [x0, x10]
+    strb   w11, [x9, x10]
+    cbz    w11, 2f
+    add    x10, x10, #1
+    cmp    x10, #4095
+    b.lo   1b
+    mov    w11, #0
+    strb   w11, [x9, x10]
+2:
+    # 原地解析：x9=读指针、x10=写指针、x11=argv 数组、x12=条目数、
+    # x13=quoted、x14=in_token、x15=当前字节。
+    adrp   x9, zr_cmdline
+    add    x9, x9, :lo12:zr_cmdline
+    mov    x10, x9
+    adrp   x11, zr_argv_arr
+    add    x11, x11, :lo12:zr_argv_arr
+    mov    x12, #0
+    mov    x13, #0
+    mov    x14, #0
+3:
+    ldrb   w15, [x9]
+    cbz    w15, 8f
+    add    x9, x9, #1
+    cmp    w15, #34
+    beq    5f
+    cbnz   x13, 4f
+    cmp    w15, #32
+    beq    7f
+    cmp    w15, #9
+    beq    7f
+4:  cbnz   x14, 6f
+    cmp    x12, #256
+    b.hs   9f
+    str    x10, [x11, x12, lsl #3]
+    add    x12, x12, #1
+9:  mov    x14, #1
+6:  strb   w15, [x10]
+    add    x10, x10, #1
+    b      3b
+5:  eor    x13, x13, #1
+    cbnz   x14, 3b
+    cbnz   x13, 3b
+    cmp    x12, #256
+    b.hs   10f
+    str    x10, [x11, x12, lsl #3]
+    add    x12, x12, #1
+10: mov    x14, #1
+    b      3b
+7:  cbz    x14, 3b
+    mov    w15, #0
+    strb   w15, [x10]
+    add    x10, x10, #1
+    mov    x14, #0
+    b      3b
+8:  cbz    x14, 11f
+    mov    w15, #0
+    strb   w15, [x10]
+11: adrp   x9, zr_argc_v
+    str    x12, [x9, :lo12:zr_argc_v]
+
+    # 环境块：每条以 NUL 结尾，空串结束。
+    bl     GetEnvironmentStringsA
+    cbz    x0, 20f
+    mov    x9, x0
+    adrp   x10, zr_env_arr
+    add    x10, x10, :lo12:zr_env_arr
+    mov    x12, #0
+12: ldrb   w11, [x9]
+    cbz    w11, 15f
+    str    x9, [x10, x12, lsl #3]
+    add    x12, x12, #1
+13: ldrb   w11, [x9]
+    add    x9, x9, #1
+    cbnz   w11, 13b
+    cmp    x12, #1024
+    b.lo   12b
+15: adrp   x9, zr_envc_v
+    str    x12, [x9, :lo12:zr_envc_v]
+20:
+    ldp    x29, x30, [sp], #16
+    ret
+
+#------------------------------------------------------------------------------
+# zr_args_count() -> usize
+#------------------------------------------------------------------------------
+    .globl zr_args_count
+zr_args_count:
+    adrp   x9, zr_argc_v
+    ldr    x0, [x9, :lo12:zr_argc_v]
+    ret
+
+#------------------------------------------------------------------------------
+# zr_args_ptr(i) -> *const u8（越界返回 NULL）
+#------------------------------------------------------------------------------
+    .globl zr_args_ptr
+zr_args_ptr:
+    adrp   x9, zr_argc_v
+    ldr    x9, [x9, :lo12:zr_argc_v]
+    cmp    x0, x9
+    b.hs   1f
+    adrp   x9, zr_argv_arr
+    add    x9, x9, :lo12:zr_argv_arr
+    ldr    x0, [x9, x0, lsl #3]
+    ret
+1:  mov    x0, #0
+    ret
+
+#------------------------------------------------------------------------------
+# zr_env_count() -> usize
+#------------------------------------------------------------------------------
+    .globl zr_env_count
+zr_env_count:
+    adrp   x9, zr_envc_v
+    ldr    x0, [x9, :lo12:zr_envc_v]
+    ret
+
+#------------------------------------------------------------------------------
+# zr_env_entry(i) -> *const u8（越界返回 NULL）
+#------------------------------------------------------------------------------
+    .globl zr_env_entry
+zr_env_entry:
+    adrp   x9, zr_envc_v
+    ldr    x9, [x9, :lo12:zr_envc_v]
+    cmp    x0, x9
+    b.hs   1f
+    adrp   x9, zr_env_arr
+    add    x9, x9, :lo12:zr_env_arr
+    ldr    x0, [x9, x0, lsl #3]
+    ret
+1:  mov    x0, #0
+    ret

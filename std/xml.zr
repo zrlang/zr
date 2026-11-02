@@ -1,0 +1,817 @@
+//=============================================================================
+// std/xml.zr — XML 解析与生成
+//
+// 手写游标解析器 + 两种生成形态（紧凑 / 缩进）。节点是递归结构，环由
+// `Vec` 破开：`XmlNode::children` 是 `Vec<XmlNode>`。
+//
+//   xml_parse(src)                  -> Result<XmlNode, XmlError>
+//   xml_stringify(&node)            -> String
+//   xml_stringify_pretty(&node, n)  -> String
+//
+// 入口统一带 `xml_` 前缀：模块内所有自由函数落到同一个扁平符号表，公开名
+// 必须全局唯一（`parse` / `stringify` 这种名字很容易和别的模块撞）。
+//
+// 覆盖：XML 声明 `<?xml ... ?>`、处理指令、注释 `<!-- -->`、DOCTYPE
+//（含 `[...]` 内部子集）、CDATA、自闭合标签、单/双引号属性、文本与属性里的
+// 实体（`&amp; &lt; &gt; &quot; &apos;`、`&#NN;`、`&#xHH;`）。
+//
+// 已知限制：
+// - 节点只有一个 `text` 字段（文本段按出现顺序拼接），文本与子节点的相
+//   对顺序不保留；生成时文本总在子节点之前。
+// - 不校验文档结构（不要求有 DTD / 单一根之外的规则），只要求"一个根元素
+//   + 其后没有非空白内容"。
+// - 不解析命名空间前缀，`a:b` 按原样当名字。
+//=============================================================================
+
+use core::{Result, Option};
+use string::String;
+use collections::Vec;
+
+/// 一个元素节点。
+pub struct XmlNode {
+    /// 标签名（含前缀，原样保留）。
+    pub name:     String,
+    /// 属性（出现顺序保留）。
+    pub attrs:    Vec<XmlAttr>,
+    /// 子元素。
+    pub children: Vec<XmlNode>,
+    /// 直接文本内容（含 CDATA，实体已解码）。
+    pub text:     String,
+}
+
+/// 一个属性。
+pub struct XmlAttr {
+    pub name:  String,
+    pub value: String,
+}
+
+/// 解析错误：`pos` 是出错字节位置，`msg` 是静态描述。
+pub struct XmlError {
+    pub pos: usize,
+    pub msg: str,
+}
+
+//----- 小工具 ----------------------------------------------------------------
+
+/// 两个字节切片是否相等。
+fn xml_bytes_eq(a: []const u8, b: []const u8) -> bool {
+    if a.len != b.len {
+        return false;
+    }
+    let mut i = 0;
+    while i < a.len {
+        if a.ptr[i] != b.ptr[i] {
+            return false;
+        }
+        i = i + 1;
+    }
+    return true;
+}
+
+/// 名字字符：字母、数字、`:` `_` `-` `.`（比 XML 规范宽一点，够用）。
+fn xml_is_name_char(c: u8) -> bool {
+    if c >= 65 && c <= 90 {
+        return true;
+    }
+    if c >= 97 && c <= 122 {
+        return true;
+    }
+    if c >= 48 && c <= 57 {
+        return true;
+    }
+    if c == 58 || c == 95 || c == 45 || c == 46 {
+        return true;
+    }
+    return false;
+}
+
+fn xml_is_ws(c: u8) -> bool {
+    return c == 32 || c == 9 || c == 10 || c == 13;
+}
+
+/// 整段是否只有空白（用于丢弃元素之间的缩进 / 换行）。
+fn xml_text_is_ws(s: &String) -> bool {
+    let mut i = 0;
+    while i < s.len {
+        if !xml_is_ws(s.ptr[i]) {
+            return false;
+        }
+        i = i + 1;
+    }
+    return true;
+}
+
+/// 十六进制数字的数值；非法返回 -1。
+fn xml_hex_val(c: u8) -> i32 {
+    if c >= 48 && c <= 57 {
+        return (c - 48) as i32;
+    }
+    if c >= 97 && c <= 102 {
+        return (c - 97 + 10) as i32;
+    }
+    if c >= 65 && c <= 70 {
+        return (c - 65 + 10) as i32;
+    }
+    return -1;
+}
+
+fn xml_is_dec_digit(c: u8) -> bool {
+    return c >= 48 && c <= 57;
+}
+
+/// 把一个 Unicode 码点按 UTF-8 追加进字符串。
+fn xml_push_codepoint(out: &mut String, cp: u32) {
+    if cp < 128 {
+        out.push_byte(cp as u8);
+    } else if cp < 2048 {
+        out.push_byte((192 | (cp >> 6)) as u8);
+        out.push_byte((128 | (cp & 63)) as u8);
+    } else if cp < 65536 {
+        out.push_byte((224 | (cp >> 12)) as u8);
+        out.push_byte((128 | ((cp >> 6) & 63)) as u8);
+        out.push_byte((128 | (cp & 63)) as u8);
+    } else {
+        out.push_byte((240 | (cp >> 18)) as u8);
+        out.push_byte((128 | ((cp >> 12) & 63)) as u8);
+        out.push_byte((128 | ((cp >> 6) & 63)) as u8);
+        out.push_byte((128 | (cp & 63)) as u8);
+    }
+}
+
+//----- 访问器 ----------------------------------------------------------------
+
+impl XmlNode {
+    /// 按键取属性值。
+    pub fn attr(self, name: str) -> Option<String> {
+        let mut i = 0;
+        while i < self.attrs.len() {
+            let a = self.attrs.get(i);
+            if xml_bytes_eq(a.name.as_bytes(), name) {
+                return Option::Some(a.value);
+            }
+            i = i + 1;
+        }
+        return Option::None;
+    }
+
+    /// 第 `i` 个子元素；越界返回 None。
+    pub fn child(self, i: usize) -> Option<XmlNode> {
+        if i >= self.children.len() {
+            return Option::None;
+        }
+        return Option::Some(self.children.get(i));
+    }
+
+    /// 第一个名为 `name` 的子元素。
+    pub fn child_named(self, name: str) -> Option<XmlNode> {
+        let mut i = 0;
+        while i < self.children.len() {
+            let c = self.children.get(i);
+            if xml_bytes_eq(c.name.as_bytes(), name) {
+                return Option::Some(c);
+            }
+            i = i + 1;
+        }
+        return Option::None;
+    }
+
+    /// 子元素个数。
+    pub fn child_count(self) -> usize {
+        return self.children.len();
+    }
+
+    /// 第一个名为 `name` 的子元素的文本。
+    pub fn text_of(self, name: str) -> Option<String> {
+        let c = self.child_named(name);
+        match c {
+            Option::Some(node) => {
+                return Option::Some(node.text);
+            }
+            Option::None => {
+                return Option::None;
+            }
+        }
+    }
+}
+
+//----- 游标 ------------------------------------------------------------------
+
+/// 解析游标。**必须 `pub`**：显式 `use xml::xml_parse` 时，类型检查会在
+/// crate root 解析函数签名/实现块里的类型名，私有类型会被判"不可访问"。
+pub struct XmlCursor {
+    src: str,
+    pos: usize,
+}
+
+impl XmlCursor {
+    fn peek(self) -> u8 {
+        if self.pos >= self.src.len {
+            return 0;
+        }
+        return self.src.ptr[self.pos];
+    }
+
+    fn at_end(self) -> bool {
+        return self.pos >= self.src.len;
+    }
+
+    /// 从 `pos` 起是否以 `s` 开头。
+    fn starts_with(self, s: str) -> bool {
+        if self.pos + s.len > self.src.len {
+            return false;
+        }
+        let mut i = 0;
+        while i < s.len {
+            if self.src.ptr[self.pos + i] != s.ptr[i] {
+                return false;
+            }
+            i = i + 1;
+        }
+        return true;
+    }
+
+    fn skip_ws(self: &mut XmlCursor) {
+        while self.pos < self.src.len {
+            if xml_is_ws(self.src.ptr[self.pos]) {
+                self.pos = self.pos + 1;
+            } else {
+                return;
+            }
+        }
+    }
+
+    fn expect(self: &mut XmlCursor, ch: u8, msg: str) -> Result<(), XmlError> {
+        if self.at_end() || self.src.ptr[self.pos] != ch {
+            return Result::Err(self.err(msg));
+        }
+        self.pos = self.pos + 1;
+        return Result::Ok(());
+    }
+
+    fn err(self, msg: str) -> XmlError {
+        return XmlError { pos: self.pos, msg: msg };
+    }
+}
+
+//----- 解析 ------------------------------------------------------------------
+
+/// 读一个标签名（调用方保证当前在名字首字符或会报错）。
+fn xml_parse_name(c: &mut XmlCursor) -> Result<String, XmlError> {
+    if !xml_is_name_char(c.peek()) {
+        return Result::Err(c.err("expected element or attribute name"));
+    }
+    let mut out = String::new();
+    while !c.at_end() && xml_is_name_char(c.peek()) {
+        out.push_byte(c.peek());
+        c.pos = c.pos + 1;
+    }
+    return Result::Ok(out);
+}
+
+/// 解码 `&...` 实体，返回码点。游标停在 '&'。
+fn xml_decode_entity(c: &mut XmlCursor) -> Result<u32, XmlError> {
+    if c.starts_with("&amp;") {
+        c.pos = c.pos + 5;
+        return Result::Ok(38);
+    }
+    if c.starts_with("&lt;") {
+        c.pos = c.pos + 4;
+        return Result::Ok(60);
+    }
+    if c.starts_with("&gt;") {
+        c.pos = c.pos + 4;
+        return Result::Ok(62);
+    }
+    if c.starts_with("&quot;") {
+        c.pos = c.pos + 6;
+        return Result::Ok(34);
+    }
+    if c.starts_with("&apos;") {
+        c.pos = c.pos + 6;
+        return Result::Ok(39);
+    }
+    if c.starts_with("&#") {
+        let start = c.pos;
+        c.pos = c.pos + 2;
+        let mut hex = false;
+        if c.peek() == 120 || c.peek() == 88 {
+            hex = true;
+            c.pos = c.pos + 1;
+        }
+        let mut value: u32 = 0;
+        let mut digits = 0;
+        loop {
+            if c.at_end() {
+                return Result::Err(XmlError { pos: start, msg: "unterminated character reference" });
+            }
+            let ch = c.peek();
+            if ch == 59 { // ';'
+                c.pos = c.pos + 1;
+                break;
+            }
+            let v = xml_hex_val(ch);
+            if hex {
+                if v < 0 {
+                    return Result::Err(c.err("invalid hex digit in character reference"));
+                }
+                value = value * 16 + (v as u32);
+            } else {
+                if !xml_is_dec_digit(ch) {
+                    return Result::Err(c.err("invalid digit in character reference"));
+                }
+                value = value * 10 + ((ch - 48) as u32);
+            }
+            digits = digits + 1;
+            c.pos = c.pos + 1;
+        }
+        if digits == 0 {
+            return Result::Err(XmlError { pos: start, msg: "empty character reference" });
+        }
+        if value > 1114111 {
+            return Result::Err(XmlError { pos: start, msg: "character reference out of range" });
+        }
+        return Result::Ok(value);
+    }
+    return Result::Err(c.err("unknown entity (expected `&amp;`, `&lt;`, `&gt;`, `&quot;`, `&apos;` or `&#NN;`)"));
+}
+
+/// 读文本段：一直读到 '<'（不消费它），实体解码。
+fn xml_parse_text(c: &mut XmlCursor) -> Result<String, XmlError> {
+    let mut out = String::new();
+    while !c.at_end() && c.peek() != 60 {
+        if c.peek() == 38 { // '&'
+            let r = xml_decode_entity(c);
+            match r {
+                Result::Ok(cp) => {
+                    xml_push_codepoint(&mut out, cp);
+                }
+                Result::Err(e) => {
+                    return Result::Err(e);
+                }
+            }
+        } else {
+            out.push_byte(c.peek());
+            c.pos = c.pos + 1;
+        }
+    }
+    return Result::Ok(out);
+}
+
+/// 读引号包住的属性值（调用方已消费开引号，`quote` 是 34 或 39）。
+fn xml_parse_attr_value(c: &mut XmlCursor, quote: u8) -> Result<String, XmlError> {
+    let mut out = String::new();
+    loop {
+        if c.at_end() {
+            return Result::Err(c.err("unterminated attribute value"));
+        }
+        let ch = c.peek();
+        if ch == quote {
+            c.pos = c.pos + 1;
+            return Result::Ok(out);
+        }
+        if ch == 60 {
+            return Result::Err(c.err("`<` is not allowed in attribute value"));
+        }
+        if ch == 38 { // '&'
+            let r = xml_decode_entity(c);
+            match r {
+                Result::Ok(cp) => {
+                    xml_push_codepoint(&mut out, cp);
+                }
+                Result::Err(e) => {
+                    return Result::Err(e);
+                }
+            }
+        } else {
+            out.push_byte(ch);
+            c.pos = c.pos + 1;
+        }
+    }
+}
+
+/// 读属性列表，停在 '>' 或 '/>' 之前。
+fn xml_parse_attrs(c: &mut XmlCursor) -> Result<Vec<XmlAttr>, XmlError> {
+    let mut attrs: Vec<XmlAttr> = Vec::new();
+    loop {
+        c.skip_ws();
+        if c.at_end() {
+            return Result::Err(c.err("unterminated start tag"));
+        }
+        let ch = c.peek();
+        if ch == 62 || ch == 47 { // '>' / '/'
+            return Result::Ok(attrs);
+        }
+        let rn = xml_parse_name(c);
+        match rn {
+            Result::Ok(name) => {
+                c.skip_ws();
+                let re = c.expect(61, "expected `=` after attribute name"); // '='
+                match re {
+                    Result::Ok(_) => {}
+                    Result::Err(e) => {
+                        return Result::Err(e);
+                    }
+                }
+                c.skip_ws();
+                let q = c.peek();
+                if q != 34 && q != 39 {
+                    return Result::Err(c.err("expected quoted attribute value"));
+                }
+                c.pos = c.pos + 1;
+                let rv = xml_parse_attr_value(c, q);
+                match rv {
+                    Result::Ok(value) => {
+                        attrs.push(XmlAttr { name: name, value: value });
+                    }
+                    Result::Err(e) => {
+                        return Result::Err(e);
+                    }
+                }
+            }
+            Result::Err(e) => {
+                return Result::Err(e);
+            }
+        }
+    }
+}
+
+/// 跳过 `<!-- ... -->`（游标停在 '<'）。
+fn xml_skip_comment(c: &mut XmlCursor) -> Result<(), XmlError> {
+    c.pos = c.pos + 4; // "<!--"
+    while !c.at_end() {
+        if c.starts_with("-->") {
+            c.pos = c.pos + 3;
+            return Result::Ok(());
+        }
+        c.pos = c.pos + 1;
+    }
+    return Result::Err(c.err("unterminated comment"));
+}
+
+/// 跳过 `<!...>`（DOCTYPE / 声明），把 `[...]` 内部子集当作整体。
+fn xml_skip_declaration(c: &mut XmlCursor) -> Result<(), XmlError> {
+    c.pos = c.pos + 2; // "<!"
+    let mut bracket = 0;
+    while !c.at_end() {
+        let ch = c.peek();
+        c.pos = c.pos + 1;
+        if ch == 91 { // '['
+            bracket = bracket + 1;
+        } else if ch == 93 { // ']'
+            if bracket > 0 {
+                bracket = bracket - 1;
+            }
+        } else if ch == 62 && bracket == 0 { // '>'
+            return Result::Ok(());
+        }
+    }
+    return Result::Err(c.err("unterminated declaration"));
+}
+
+/// 跳过 `<? ... ?>`（游标停在 '<'）。
+fn xml_skip_pi(c: &mut XmlCursor) -> Result<(), XmlError> {
+    c.pos = c.pos + 2; // "<?"
+    while !c.at_end() {
+        if c.starts_with("?>") {
+            c.pos = c.pos + 2;
+            return Result::Ok(());
+        }
+        c.pos = c.pos + 1;
+    }
+    return Result::Err(c.err("unterminated processing instruction"));
+}
+
+/// 读 `<![CDATA[ ... ]]>`，返回其中的原始文本（游标停在 '<'）。
+fn xml_parse_cdata(c: &mut XmlCursor) -> Result<String, XmlError> {
+    let start = c.pos;
+    c.pos = c.pos + 9; // "<![CDATA["
+    let mut out = String::new();
+    while !c.at_end() {
+        if c.starts_with("]]>") {
+            c.pos = c.pos + 3;
+            return Result::Ok(out);
+        }
+        out.push_byte(c.peek());
+        c.pos = c.pos + 1;
+    }
+    return Result::Err(XmlError { pos: start, msg: "unterminated CDATA section" });
+}
+
+/// 解析一个元素（游标停在 '<'）。
+fn xml_parse_element(c: &mut XmlCursor) -> Result<XmlNode, XmlError> {
+    c.pos = c.pos + 1; // '<'
+    let rn = xml_parse_name(c);
+    let name = match rn {
+        Result::Ok(n) => n,
+        Result::Err(e) => {
+            return Result::Err(e);
+        }
+    };
+    let ra = xml_parse_attrs(c);
+    let attrs = match ra {
+        Result::Ok(a) => a,
+        Result::Err(e) => {
+            return Result::Err(e);
+        }
+    };
+    let mut children: Vec<XmlNode> = Vec::new();
+    let mut text = String::new();
+
+    // 自闭合：`<x ... />`
+    if c.peek() == 47 { // '/'
+        c.pos = c.pos + 1;
+        let re = c.expect(62, "expected `>` after `/` in self-closing tag");
+        match re {
+            Result::Ok(_) => {}
+            Result::Err(e) => {
+                return Result::Err(e);
+            }
+        }
+        return Result::Ok(XmlNode { name: name, attrs: attrs, children: children, text: text });
+    }
+    let re = c.expect(62, "expected `>` to close start tag");
+    match re {
+        Result::Ok(_) => {}
+        Result::Err(e) => {
+            return Result::Err(e);
+        }
+    }
+
+    loop {
+        if c.at_end() {
+            return Result::Err(c.err("unterminated element (missing end tag)"));
+        }
+        if c.peek() == 60 { // '<'
+            if c.starts_with("</") {
+                c.pos = c.pos + 2;
+                let rc = xml_parse_name(c);
+                let close = match rc {
+                    Result::Ok(n) => n,
+                    Result::Err(e) => {
+                        return Result::Err(e);
+                    }
+                };
+                c.skip_ws();
+                let re2 = c.expect(62, "expected `>` in end tag");
+                match re2 {
+                    Result::Ok(_) => {}
+                    Result::Err(e) => {
+                        return Result::Err(e);
+                    }
+                }
+                if !xml_bytes_eq(close.as_bytes(), name.as_bytes()) {
+                    return Result::Err(c.err("mismatched end tag"));
+                }
+                // 元素之间的缩进 / 换行只是排版，不当作内容。
+                // 不直接 `text = String::new()`：借用检查把 `&text`（上一句
+                // 的实参）算作存活到作用域结束，赋值会报「不可变借用中」。
+                let mut keep_text = true;
+                if children.len() > 0 {
+                    if xml_text_is_ws(&text) {
+                        keep_text = false;
+                    }
+                }
+                let node_text = if keep_text { text } else { String::new() };
+                return Result::Ok(XmlNode {
+                    name: name,
+                    attrs: attrs,
+                    children: children,
+                    text: node_text,
+                });
+            }
+            if c.starts_with("<!--") {
+                let rr = xml_skip_comment(c);
+                match rr {
+                    Result::Ok(_) => {}
+                    Result::Err(e) => {
+                        return Result::Err(e);
+                    }
+                }
+                continue;
+            }
+            if c.starts_with("<![CDATA[") {
+                let rcd = xml_parse_cdata(c);
+                match rcd {
+                    Result::Ok(s) => {
+                        // String 拼接：逐字节追加（String 没有 `+`）。
+                        let mut i = 0;
+                        while i < s.len {
+                            text.push_byte(s.ptr[i]);
+                            i = i + 1;
+                        }
+                    }
+                    Result::Err(e) => {
+                        return Result::Err(e);
+                    }
+                }
+                continue;
+            }
+            if c.starts_with("<?") {
+                let rp = xml_skip_pi(c);
+                match rp {
+                    Result::Ok(_) => {}
+                    Result::Err(e) => {
+                        return Result::Err(e);
+                    }
+                }
+                continue;
+            }
+            if c.starts_with("<!") {
+                let rd = xml_skip_declaration(c);
+                match rd {
+                    Result::Ok(_) => {}
+                    Result::Err(e) => {
+                        return Result::Err(e);
+                    }
+                }
+                continue;
+            }
+            let rchild = xml_parse_element(c);
+            match rchild {
+                Result::Ok(child) => {
+                    children.push(child);
+                }
+                Result::Err(e) => {
+                    return Result::Err(e);
+                }
+            }
+            continue;
+        }
+        let rt = xml_parse_text(c);
+        match rt {
+            Result::Ok(s) => {
+                let mut i = 0;
+                while i < s.len {
+                    text.push_byte(s.ptr[i]);
+                    i = i + 1;
+                }
+            }
+            Result::Err(e) => {
+                return Result::Err(e);
+            }
+        }
+    }
+}
+
+/// 跳过根元素前后的杂项（空白 / 注释 / 处理指令 / 声明）。
+fn xml_skip_misc(c: &mut XmlCursor) -> Result<(), XmlError> {
+    loop {
+        c.skip_ws();
+        if c.at_end() {
+            return Result::Ok(());
+        }
+        if c.starts_with("<!--") {
+            let r = xml_skip_comment(c);
+            match r {
+                Result::Ok(_) => {}
+                Result::Err(e) => {
+                    return Result::Err(e);
+                }
+            }
+            continue;
+        }
+        if c.starts_with("<?") {
+            let r = xml_skip_pi(c);
+            match r {
+                Result::Ok(_) => {}
+                Result::Err(e) => {
+                    return Result::Err(e);
+                }
+            }
+            continue;
+        }
+        if c.starts_with("<!") {
+            let r = xml_skip_declaration(c);
+            match r {
+                Result::Ok(_) => {}
+                Result::Err(e) => {
+                    return Result::Err(e);
+                }
+            }
+            continue;
+        }
+        return Result::Ok(());
+    }
+}
+
+/// 解析一段 XML 文本，返回根元素。
+pub fn xml_parse(src: str) -> Result<XmlNode, XmlError> {
+    let mut c = XmlCursor { src: src, pos: 0 };
+    let rm = xml_skip_misc(&mut c);
+    match rm {
+        Result::Ok(_) => {}
+        Result::Err(e) => {
+            return Result::Err(e);
+        }
+    }
+    if c.at_end() {
+        return Result::Err(c.err("empty document (expected a root element)"));
+    }
+    if c.peek() != 60 { // '<'
+        return Result::Err(c.err("expected `<` to start root element"));
+    }
+    if c.starts_with("</") {
+        return Result::Err(c.err("unexpected end tag before root element"));
+    }
+    let root = xml_parse_element(&mut c);
+    let node = match root {
+        Result::Ok(n) => n,
+        Result::Err(e) => {
+            return Result::Err(e);
+        }
+    };
+    let rt = xml_skip_misc(&mut c);
+    match rt {
+        Result::Ok(_) => {}
+        Result::Err(e) => {
+            return Result::Err(e);
+        }
+    }
+    if !c.at_end() {
+        return Result::Err(c.err("trailing content after root element"));
+    }
+    return Result::Ok(node);
+}
+
+//----- 生成 ------------------------------------------------------------------
+
+fn xml_write_escaped(out: &mut String, s: &String, attr: bool) {
+    let mut i = 0;
+    while i < s.len {
+        let b = s.ptr[i];
+        if b == 38 { // '&'
+            out.push_bytes("&amp;");
+        } else if b == 60 { // '<'
+            out.push_bytes("&lt;");
+        } else if b == 62 { // '>'
+            out.push_bytes("&gt;");
+        } else if b == 34 && attr {
+            out.push_bytes("&quot;");
+        } else {
+            out.push_byte(b);
+        }
+        i = i + 1;
+    }
+}
+
+fn xml_write_indent(out: &mut String, depth: usize, indent: usize) {
+    out.push_byte(10);
+    let mut i = 0;
+    while i < depth * indent {
+        out.push_byte(32);
+        i = i + 1;
+    }
+}
+
+fn xml_write_node(out: &mut String, node: &XmlNode, depth: usize, pretty: bool, indent: usize) {
+    out.push_byte(60); // '<'
+    out.push_bytes(node.name.as_bytes());
+    let mut i = 0;
+    while i < node.attrs.len() {
+        let a = node.attrs.get(i);
+        out.push_byte(32);
+        out.push_bytes(a.name.as_bytes());
+        out.push_bytes("=\"");
+        xml_write_escaped(out, &a.value, true);
+        out.push_byte(34);
+        i = i + 1;
+    }
+
+    if node.children.len() == 0 && node.text.len == 0 {
+        out.push_bytes("/>");
+        return;
+    }
+
+    out.push_byte(62); // '>'
+    if node.text.len > 0 {
+        xml_write_escaped(out, &node.text, false);
+    }
+    let mut i2 = 0;
+    while i2 < node.children.len() {
+        if pretty {
+            xml_write_indent(out, depth + 1, indent);
+        }
+        xml_write_node(out, &node.children.data[i2], depth + 1, pretty, indent);
+        i2 = i2 + 1;
+    }
+    if pretty && node.children.len() > 0 {
+        xml_write_indent(out, depth, indent);
+    }
+    out.push_bytes("</");
+    out.push_bytes(node.name.as_bytes());
+    out.push_byte(62); // '>'
+}
+
+/// 紧凑生成。
+pub fn xml_stringify(value: &XmlNode) -> String {
+    let mut out = String::new();
+    xml_write_node(&mut out, value, 0, false, 0);
+    return out;
+}
+
+/// 缩进生成（每层 `indent` 个空格）。
+pub fn xml_stringify_pretty(value: &XmlNode, indent: usize) -> String {
+    let mut out = String::new();
+    xml_write_node(&mut out, value, 0, true, indent);
+    return out;
+}

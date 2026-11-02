@@ -42,6 +42,11 @@
     .global zr_sleep_ms
     .global zr_time_ns
     .global zr_time_unix_ns
+    .global zr_args_init
+    .global zr_args_count
+    .global zr_args_ptr
+    .global zr_env_count
+    .global zr_env_entry
 
     .section .text
 
@@ -416,4 +421,109 @@ zr_time_ns:
     .globl zr_time_unix_ns
 zr_time_unix_ns:
     mov     x0, #-1
+    ret
+
+#==============================================================================
+# 进程启动参数与环境变量
+#
+# `_start` 在调用 `main` 之前调用 `zr_args_init(argc, argv)`。Linux 的入口
+# 由内核直接进入，参数在栈上：`[sp]` = argc、`sp+8` = argv；envp 按 ABI
+# 紧跟 argv（argv + (argc+1)*8）。
+#==============================================================================
+    .bss
+    .align  3
+zr_argc_v:
+    .quad   0
+zr_argv_v:
+    .quad   0
+zr_envp_v:
+    .quad   0
+zr_envc_v:
+    .quad   0
+
+    .text
+
+    .globl zr_args_init
+zr_args_init:
+    adrp    x9, zr_argc_v
+    add     x9, x9, :lo12:zr_argc_v
+    str     x0, [x9]
+    adrp    x9, zr_argv_v
+    add     x9, x9, :lo12:zr_argv_v
+    str     x1, [x9]
+    cmp     x0, #0
+    b.le    .zai_empty
+    cbz     x1, .zai_empty
+    add     x2, x0, #1
+    lsl     x2, x2, #3
+    add     x2, x1, x2
+    adrp    x9, zr_envp_v
+    add     x9, x9, :lo12:zr_envp_v
+    str     x2, [x9]
+    mov     x3, #0
+.zai_env_count:
+    ldr     x4, [x2, x3, lsl #3]
+    cbz     x4, .zai_env_done
+    add     x3, x3, #1
+    b       .zai_env_count
+.zai_env_done:
+    adrp    x9, zr_envc_v
+    add     x9, x9, :lo12:zr_envc_v
+    str     x3, [x9]
+    ret
+.zai_empty:
+    adrp    x9, zr_envp_v
+    add     x9, x9, :lo12:zr_envp_v
+    str     xzr, [x9]
+    adrp    x9, zr_envc_v
+    add     x9, x9, :lo12:zr_envc_v
+    str     xzr, [x9]
+    ret
+
+    .globl zr_args_count
+zr_args_count:
+    adrp    x9, zr_argc_v
+    add     x9, x9, :lo12:zr_argc_v
+    ldr     x0, [x9]
+    ret
+
+    .globl zr_args_ptr
+zr_args_ptr:
+    adrp    x9, zr_argc_v
+    add     x9, x9, :lo12:zr_argc_v
+    ldr     x1, [x9]
+    cmp     x0, x1
+    b.hs    .zap_none
+    adrp    x9, zr_argv_v
+    add     x9, x9, :lo12:zr_argv_v
+    ldr     x1, [x9]
+    cbz     x1, .zap_none
+    ldr     x0, [x1, x0, lsl #3]
+    ret
+.zap_none:
+    mov     x0, #0
+    ret
+
+    .globl zr_env_count
+zr_env_count:
+    adrp    x9, zr_envc_v
+    add     x9, x9, :lo12:zr_envc_v
+    ldr     x0, [x9]
+    ret
+
+    .globl zr_env_entry
+zr_env_entry:
+    adrp    x9, zr_envc_v
+    add     x9, x9, :lo12:zr_envc_v
+    ldr     x1, [x9]
+    cmp     x0, x1
+    b.hs    .zee_none
+    adrp    x9, zr_envp_v
+    add     x9, x9, :lo12:zr_envp_v
+    ldr     x1, [x9]
+    cbz     x1, .zee_none
+    ldr     x0, [x1, x0, lsl #3]
+    ret
+.zee_none:
+    mov     x0, #0
     ret

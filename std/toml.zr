@@ -1,0 +1,1395 @@
+//=============================================================================
+// std/toml.zr — TOML 解析与生成
+//
+// 手写游标解析器 + 一种生成形态（分节 + 内联表）。类型是递归枚举，环由
+// `Vec` 破开：`Toml::Array(Vec<Toml>)` / `Toml::Table(Vec<TomlEntry>)`。
+//
+//   toml_parse(src)             -> Result<Toml, TomlError>
+//   toml_stringify(&value)      -> String
+//
+// 入口统一带 `toml_` 前缀：模块内所有自由函数落到同一个扁平符号表，公开名
+// 必须全局唯一（`parse` / `stringify` 这种名字很容易和别的模块撞）。
+//
+// 覆盖：注释 `# ...`、`[table]` 表头、`[[array-of-tables]]`、点分键
+// （`a.b.c = 1`）、基本字符串（含转义 `\" \\ \b \t \n \f \r \uXXXX \UXXXXXXXX`）、
+// 字面字符串 `'...'`、整数（正负号、`_` 分隔、`0x` / `0o` / `0b` 前缀）、
+// 浮点（小数点 / 指数）、布尔、跨行数组（尾逗号）、内联表。
+//
+// 已知限制：
+// - 不解析日期时间（`1979-05-27T07:32:00Z` 会当非法数字报错）。
+// - 浮点用 `f64` 存，输出最多 6 位小数（去尾零、保底一位）。
+// - 重复键不报错，后写覆盖（与多数宽松实现一致）。
+//=============================================================================
+
+use core::{Result, Option};
+use string::String;
+use collections::Vec;
+
+/// TOML 值。
+pub enum Toml {
+    Integer(i64),
+    Float(f64),
+    Bool(bool),
+    Str(String),
+    Array(Vec<Toml>),
+    Table(Vec<TomlEntry>),
+}
+
+/// 表里的一项。
+pub struct TomlEntry {
+    pub key:   String,
+    pub value: Toml,
+}
+
+/// 解析错误：`pos` 是出错字节位置，`msg` 是静态描述。
+pub struct TomlError {
+    pub pos: usize,
+    pub msg: str,
+}
+
+/// `[[array-of-tables]]` 的"最后一张表"标记。真实键里不会出现（bare key
+/// 不允许 `@`，带引号的键也可能撞上，但概率可忽略）。
+const TOML_LAST: str = "@last";
+
+//----- 小工具 ----------------------------------------------------------------
+
+fn toml_bytes_eq(a: []const u8, b: []const u8) -> bool {
+    if a.len != b.len {
+        return false;
+    }
+    let mut i = 0;
+    while i < a.len {
+        if a.ptr[i] != b.ptr[i] {
+            return false;
+        }
+        i = i + 1;
+    }
+    return true;
+}
+
+fn toml_is_last(key: &String) -> bool {
+    return toml_bytes_eq(key.as_bytes(), TOML_LAST);
+}
+
+/// bare key / 名字允许的字符。
+fn toml_is_bare_char(c: u8) -> bool {
+    if c >= 65 && c <= 90 {
+        return true;
+    }
+    if c >= 97 && c <= 122 {
+        return true;
+    }
+    if c >= 48 && c <= 57 {
+        return true;
+    }
+    if c == 95 || c == 45 {
+        return true;
+    }
+    return false;
+}
+
+/// 值的裸 token 遇到这些字符就结束。
+fn toml_is_value_delim(c: u8) -> bool {
+    return c == 32 || c == 9 || c == 10 || c == 13
+        || c == 44 || c == 93 || c == 125 || c == 35;
+}
+
+fn toml_is_ws(c: u8) -> bool {
+    return c == 32 || c == 9;
+}
+
+fn toml_hex_val(c: u8) -> i32 {
+    if c >= 48 && c <= 57 {
+        return (c - 48) as i32;
+    }
+    if c >= 97 && c <= 102 {
+        return (c - 97 + 10) as i32;
+    }
+    if c >= 65 && c <= 70 {
+        return (c - 65 + 10) as i32;
+    }
+    return -1;
+}
+
+fn toml_is_dec_digit(c: u8) -> bool {
+    return c >= 48 && c <= 57;
+}
+
+/// 空的表容器（`Vec::new()` 在枚举载荷里推不出元素类型，统一走这里）。
+fn toml_empty_table() -> Toml {
+    let entries: Vec<TomlEntry> = Vec::new();
+    return Toml::Table(entries);
+}
+
+/// 空的数组容器。
+fn toml_empty_array() -> Toml {
+    let items: Vec<Toml> = Vec::new();
+    return Toml::Array(items);
+}
+
+/// `src[start..end]` 是否恰好是 `word`。
+fn toml_range_eq(src: str, start: usize, end: usize, word: str) -> bool {
+    if end - start != word.len {
+        return false;
+    }
+    let mut i = 0;
+    while i < word.len {
+        if src.ptr[start + i] != word.ptr[i] {
+            return false;
+        }
+        i = i + 1;
+    }
+    return true;
+}
+
+/// 10 的 `e` 次方（`e` 可为负）。
+fn toml_pow10f(e: i64) -> f64 {
+    let mut result = 1.0;
+    let n = if e < 0 { 0 - e } else { e };
+    let mut i: i64 = 0;
+    while i < n {
+        result = result * 10.0;
+        i = i + 1;
+    }
+    if e < 0 {
+        return 1.0 / result;
+    }
+    return result;
+}
+
+/// 把一个 Unicode 码点按 UTF-8 追加进字符串。
+fn toml_push_codepoint(out: &mut String, cp: u32) {
+    if cp < 128 {
+        out.push_byte(cp as u8);
+    } else if cp < 2048 {
+        out.push_byte((192 | (cp >> 6)) as u8);
+        out.push_byte((128 | (cp & 63)) as u8);
+    } else if cp < 65536 {
+        out.push_byte((224 | (cp >> 12)) as u8);
+        out.push_byte((128 | ((cp >> 6) & 63)) as u8);
+        out.push_byte((128 | (cp & 63)) as u8);
+    } else {
+        out.push_byte((240 | (cp >> 18)) as u8);
+        out.push_byte((128 | ((cp >> 12) & 63)) as u8);
+        out.push_byte((128 | ((cp >> 6) & 63)) as u8);
+        out.push_byte((128 | (cp & 63)) as u8);
+    }
+}
+
+/// 把 `src[start..end]` 追加进 `out`。
+fn toml_push_range(out: &mut String, src: str, start: usize, end: usize) {
+    let mut i = start;
+    while i < end {
+        out.push_byte(src.ptr[i]);
+        i = i + 1;
+    }
+}
+
+//----- 访问器 ----------------------------------------------------------------
+
+impl Toml {
+    pub fn type_name(self) -> str {
+        match self {
+            Toml::Integer(_) => {
+                return "integer";
+            }
+            Toml::Float(_) => {
+                return "float";
+            }
+            Toml::Bool(_) => {
+                return "bool";
+            }
+            Toml::Str(_) => {
+                return "string";
+            }
+            Toml::Array(_) => {
+                return "array";
+            }
+            Toml::Table(_) => {
+                return "table";
+            }
+        }
+    }
+
+    pub fn is_table(self) -> bool {
+        match self {
+            Toml::Table(_) => {
+                return true;
+            }
+            _ => {
+                return false;
+            }
+        }
+    }
+
+    pub fn is_array(self) -> bool {
+        match self {
+            Toml::Array(_) => {
+                return true;
+            }
+            _ => {
+                return false;
+            }
+        }
+    }
+
+    pub fn as_int(self) -> Option<i64> {
+        match self {
+            Toml::Integer(n) => {
+                return Option::Some(n);
+            }
+            _ => {
+                return Option::None;
+            }
+        }
+    }
+
+    pub fn as_float(self) -> Option<f64> {
+        match self {
+            Toml::Integer(n) => {
+                return Option::Some(n as f64);
+            }
+            Toml::Float(f) => {
+                return Option::Some(f);
+            }
+            _ => {
+                return Option::None;
+            }
+        }
+    }
+
+    pub fn as_bool(self) -> Option<bool> {
+        match self {
+            Toml::Bool(b) => {
+                return Option::Some(b);
+            }
+            _ => {
+                return Option::None;
+            }
+        }
+    }
+
+    pub fn as_str(self) -> Option<String> {
+        match self {
+            Toml::Str(s) => {
+                return Option::Some(s);
+            }
+            _ => {
+                return Option::None;
+            }
+        }
+    }
+
+    /// 表 / 数组的元素个数；其它类型返回 0。
+    pub fn len(self) -> usize {
+        match self {
+            Toml::Array(items) => {
+                return items.len();
+            }
+            Toml::Table(entries) => {
+                return entries.len();
+            }
+            _ => {
+                return 0;
+            }
+        }
+    }
+
+    /// 数组下标访问；越界或非数组返回 None。
+    pub fn at(self, i: usize) -> Option<Toml> {
+        match self {
+            Toml::Array(items) => {
+                if i >= items.len() {
+                    return Option::None;
+                }
+                return Option::Some(items.get(i));
+            }
+            _ => {
+                return Option::None;
+            }
+        }
+    }
+
+    /// 表按键取值；重复键返回**最后写入**的那个。
+    pub fn get(self, key: str) -> Option<Toml> {
+        match self {
+            Toml::Table(entries) => {
+                let mut found: Option<Toml> = Option::None;
+                let mut i = 0;
+                while i < entries.len() {
+                    let e = entries.get(i);
+                    if toml_bytes_eq(e.key.as_bytes(), key) {
+                        found = Option::Some(e.value);
+                    }
+                    i = i + 1;
+                }
+                return found;
+            }
+            _ => {
+                return Option::None;
+            }
+        }
+    }
+
+    /// 按点分路径取值：`get_path("a.b.c")`。
+    pub fn get_path(self, path: str) -> Option<Toml> {
+        // `self` 是 `&Toml`（接收者语法糖），需要按值拿一份才能沿路径
+        // 逐层替换 `cur`。
+        let mut cur: Toml = *self;
+        let mut start: usize = 0;
+        let mut i: usize = 0;
+        while i <= path.len {
+            if i == path.len || path.ptr[i] == 46 { // '.'
+                let seg = toml_lookup(&cur, path, start, i);
+                match seg {
+                    Option::Some(v) => {
+                        cur = v;
+                    }
+                    Option::None => {
+                        return Option::None;
+                    }
+                }
+                start = i + 1;
+            }
+            i = i + 1;
+        }
+        return Option::Some(cur);
+    }
+}
+
+/// 在容器里按 `src[start..end]` 这个键找值。
+fn toml_lookup(container: &Toml, src: str, start: usize, end: usize) -> Option<Toml> {
+    let entries = match container {
+        Toml::Table(e) => e,
+        _ => {
+            return Option::None;
+        }
+    };
+    let want = end - start;
+    let mut found: Option<Toml> = Option::None;
+    let mut i = 0;
+    while i < entries.len() {
+        let e = entries.get(i);
+        if e.key.len == want {
+            let mut k = start;
+            let mut same = true;
+            while k < end {
+                if e.key.ptr[k - start] != src.ptr[k] {
+                    same = false;
+                    k = end;
+                } else {
+                    k = k + 1;
+                }
+            }
+            if same {
+                found = Option::Some(e.value);
+            }
+        }
+        i = i + 1;
+    }
+    return found;
+}
+
+//----- 插入（函数式重建） ----------------------------------------------------
+
+/// 往表里写一项：同名键覆盖，否则追加。
+fn toml_set(table: Vec<TomlEntry>, key: String, value: Toml) -> Vec<TomlEntry> {
+    let mut out: Vec<TomlEntry> = Vec::new();
+    let mut done = false;
+    let mut i = 0;
+    while i < table.len() {
+        let e = table.get(i);
+        if toml_bytes_eq(e.key.as_bytes(), key.as_bytes()) {
+            out.push(TomlEntry { key: e.key, value: value });
+            done = true;
+        } else {
+            out.push(e);
+        }
+        i = i + 1;
+    }
+    if !done {
+        out.push(TomlEntry { key: key, value: value });
+    }
+    return out;
+}
+
+/// 沿 `path[pi..]` 把 `value` 写进容器，返回重建后的容器。
+///
+/// 容器可以是表（普通键路径）或数组（`path[pi] == "@last"`，即
+/// `[[array-of-tables]]` 之后的新表）。
+fn toml_put(container: Toml, path: Vec<String>, pi: usize, value: Toml) -> Toml {
+    if pi >= path.len() {
+        return container;
+    }
+    let key = path.get(pi);
+    if toml_is_last(&key) {
+        // 当前容器是数组：把值写进它的最后一个元素。
+        let items = match container {
+            Toml::Array(v) => v,
+            _ => {
+                return container;
+            }
+        };
+        let n = items.len();
+        if n == 0 {
+            return container;
+        }
+        let mut out: Vec<Toml> = Vec::new();
+        let mut i = 0;
+        while i < n {
+            let el = items.get(i);
+            if i + 1 == n {
+                out.push(toml_put(el, path, pi + 1, value));
+            } else {
+                out.push(el);
+            }
+            i = i + 1;
+        }
+        return Toml::Array(out);
+    }
+    let entries: Vec<TomlEntry> = match container {
+        Toml::Table(e) => e,
+        _ => Vec::new(),
+    };
+    if pi + 1 == path.len() {
+        return Toml::Table(toml_set(entries, key, value));
+    }
+    // 子容器：下一段是 `@last` 就建数组，否则建表。
+    let next_is_last = toml_is_last(&path.get(pi + 1));
+    let mut sub: Toml = if next_is_last { toml_empty_array() } else { toml_empty_table() };
+    let mut others: Vec<TomlEntry> = Vec::new();
+    let mut i = 0;
+    while i < entries.len() {
+        let e = entries.get(i);
+        if toml_bytes_eq(e.key.as_bytes(), key.as_bytes()) {
+            sub = e.value;
+        } else {
+            others.push(e);
+        }
+        i = i + 1;
+    }
+    let new_sub = toml_put(sub, path, pi + 1, value);
+    return Toml::Table(toml_set(others, key, new_sub));
+}
+
+/// 沿 `path[pi..]` 走到数组，追加一张空表（`[[table]]`）。
+fn toml_append_table(container: Toml, path: Vec<String>, pi: usize) -> Toml {
+    if pi >= path.len() {
+        let items: Vec<Toml> = match container {
+            Toml::Array(v) => v,
+            Toml::Table(_) => Vec::new(),
+            _ => Vec::new(),
+        };
+        let mut out: Vec<Toml> = Vec::new();
+        let mut i = 0;
+        while i < items.len() {
+            out.push(items.get(i));
+            i = i + 1;
+        }
+        out.push(toml_empty_table());
+        return Toml::Array(out);
+    }
+    let key = path.get(pi);
+    let entries: Vec<TomlEntry> = match container {
+        Toml::Table(e) => e,
+        _ => Vec::new(),
+    };
+    let mut sub: Toml = toml_empty_array();
+    let mut others: Vec<TomlEntry> = Vec::new();
+    let mut i = 0;
+    while i < entries.len() {
+        let e = entries.get(i);
+        if toml_bytes_eq(e.key.as_bytes(), key.as_bytes()) {
+            sub = e.value;
+        } else {
+            others.push(e);
+        }
+        i = i + 1;
+    }
+    let new_sub = toml_append_table(sub, path, pi + 1);
+    return Toml::Table(toml_set(others, key, new_sub));
+}
+
+//----- 游标 ------------------------------------------------------------------
+
+/// 解析游标。**必须 `pub`**：显式 `use toml::toml_parse` 时，类型检查会在
+/// crate root 解析函数签名/实现块里的类型名，私有类型会被判"不可访问"。
+pub struct TomlCursor {
+    src: str,
+    pos: usize,
+}
+
+impl TomlCursor {
+    fn peek(self) -> u8 {
+        if self.pos >= self.src.len {
+            return 0;
+        }
+        return self.src.ptr[self.pos];
+    }
+
+    fn at_end(self) -> bool {
+        return self.pos >= self.src.len;
+    }
+
+    fn starts_with(self, s: str) -> bool {
+        if self.pos + s.len > self.src.len {
+            return false;
+        }
+        let mut i = 0;
+        while i < s.len {
+            if self.src.ptr[self.pos + i] != s.ptr[i] {
+                return false;
+            }
+            i = i + 1;
+        }
+        return true;
+    }
+
+    /// 只跳空格 / 制表符（键之间、值的两侧）。
+    fn skip_sp(self: &mut TomlCursor) {
+        while self.pos < self.src.len {
+            if toml_is_ws(self.src.ptr[self.pos]) {
+                self.pos = self.pos + 1;
+            } else {
+                return;
+            }
+        }
+    }
+
+    /// 跳空白、换行与注释（文档级 / 数组内部）。
+    fn skip_space(self: &mut TomlCursor) {
+        while self.pos < self.src.len {
+            let ch = self.src.ptr[self.pos];
+            if toml_is_ws(ch) || ch == 10 || ch == 13 {
+                self.pos = self.pos + 1;
+            } else if ch == 35 { // '#'
+                while self.pos < self.src.len && self.src.ptr[self.pos] != 10 {
+                    self.pos = self.pos + 1;
+                }
+            } else {
+                return;
+            }
+        }
+    }
+
+    fn expect(self: &mut TomlCursor, ch: u8, msg: str) -> Result<(), TomlError> {
+        if self.at_end() || self.src.ptr[self.pos] != ch {
+            return Result::Err(self.err(msg));
+        }
+        self.pos = self.pos + 1;
+        return Result::Ok(());
+    }
+
+    fn err(self, msg: str) -> TomlError {
+        return TomlError { pos: self.pos, msg: msg };
+    }
+}
+
+//----- 解析：键 --------------------------------------------------------------
+
+/// 读一个键段（bare / `"..."` / `'...'`）。
+fn toml_parse_key_segment(c: &mut TomlCursor) -> Result<String, TomlError> {
+    let ch = c.peek();
+    if ch == 34 { // '"'
+        c.pos = c.pos + 1;
+        return toml_parse_basic_string(c);
+    }
+    if ch == 39 { // '\''
+        c.pos = c.pos + 1;
+        return toml_parse_literal_string(c);
+    }
+    let mut out = String::new();
+    while !c.at_end() && toml_is_bare_char(c.peek()) {
+        out.push_byte(c.peek());
+        c.pos = c.pos + 1;
+    }
+    if out.len == 0 {
+        return Result::Err(c.err("expected a key"));
+    }
+    return Result::Ok(out);
+}
+
+/// 读点分键（`a.b.c`），停在 `=` / `]` / 空白 / 行尾。
+fn toml_parse_key_path(c: &mut TomlCursor) -> Result<Vec<String>, TomlError> {
+    let mut parts: Vec<String> = Vec::new();
+    loop {
+        c.skip_sp();
+        let rs = toml_parse_key_segment(c);
+        match rs {
+            Result::Ok(s) => {
+                parts.push(s);
+            }
+            Result::Err(e) => {
+                return Result::Err(e);
+            }
+        }
+        c.skip_sp();
+        if c.peek() == 46 { // '.'
+            c.pos = c.pos + 1;
+            continue;
+        }
+        return Result::Ok(parts);
+    }
+}
+
+//----- 解析：字符串 ----------------------------------------------------------
+
+/// 读基本字符串（调用方已消费开引号）。
+fn toml_parse_basic_string(c: &mut TomlCursor) -> Result<String, TomlError> {
+    let mut out = String::new();
+    while !c.at_end() {
+        let ch = c.peek();
+        c.pos = c.pos + 1;
+        if ch == 34 { // '"'
+            return Result::Ok(out);
+        }
+        if ch == 10 || ch == 13 {
+            return Result::Err(c.err("newline in basic string (use `\"\"\"` for multi-line)"));
+        }
+        if ch != 92 { // '\\'
+            out.push_byte(ch);
+            continue;
+        }
+        if c.at_end() {
+            return Result::Err(c.err("unterminated escape sequence"));
+        }
+        let esc = c.peek();
+        c.pos = c.pos + 1;
+        if esc == 34 {
+            out.push_byte(34);
+        } else if esc == 92 {
+            out.push_byte(92);
+        } else if esc == 98 {
+            out.push_byte(8);
+        } else if esc == 116 {
+            out.push_byte(9);
+        } else if esc == 110 {
+            out.push_byte(10);
+        } else if esc == 102 {
+            out.push_byte(12);
+        } else if esc == 114 {
+            out.push_byte(13);
+        } else if esc == 117 || esc == 85 { // 'u' / 'U'
+            let ndigits = if esc == 117 { 4 } else { 8 };
+            let mut cp: u32 = 0;
+            let mut i = 0;
+            while i < ndigits {
+                if c.at_end() {
+                    return Result::Err(c.err("truncated unicode escape"));
+                }
+                let v = toml_hex_val(c.peek());
+                if v < 0 {
+                    return Result::Err(c.err("invalid hex digit in unicode escape"));
+                }
+                cp = cp * 16 + (v as u32);
+                c.pos = c.pos + 1;
+                i = i + 1;
+            }
+            if cp > 1114111 {
+                return Result::Err(c.err("unicode escape out of range"));
+            }
+            toml_push_codepoint(&mut out, cp);
+        } else {
+            return Result::Err(c.err("invalid escape sequence"));
+        }
+    }
+    return Result::Err(c.err("unterminated basic string"));
+}
+
+/// 读字面字符串（调用方已消费开引号，无转义）。
+fn toml_parse_literal_string(c: &mut TomlCursor) -> Result<String, TomlError> {
+    let mut out = String::new();
+    while !c.at_end() {
+        let ch = c.peek();
+        if ch == 39 { // '\''
+            c.pos = c.pos + 1;
+            return Result::Ok(out);
+        }
+        if ch == 10 || ch == 13 {
+            return Result::Err(c.err("newline in literal string"));
+        }
+        out.push_byte(ch);
+        c.pos = c.pos + 1;
+    }
+    return Result::Err(c.err("unterminated literal string"));
+}
+
+//----- 解析：数字 / 裸值 ----------------------------------------------------
+
+/// 跳过 `_`，返回下一个有效字节位置。
+fn toml_skip_underscore(src: str, i: usize, end: usize) -> usize {
+    let mut p = i;
+    while p < end && src.ptr[p] == 95 {
+        p = p + 1;
+    }
+    return p;
+}
+
+/// 解析 `src[start..end]` 为整数（支持 0x / 0o / 0b 与 `_`）。失败返回 None。
+fn toml_parse_int(src: str, start: usize, end: usize) -> Option<i64> {
+    let mut i = start;
+    let mut neg = false;
+    if i < end && (src.ptr[i] == 43 || src.ptr[i] == 45) {
+        neg = src.ptr[i] == 45;
+        i = i + 1;
+    }
+    if i >= end {
+        return Option::None;
+    }
+    let mut base: i64 = 10;
+    if src.ptr[i] == 48 && i + 1 < end {
+        let p = src.ptr[i + 1];
+        if p == 120 || p == 88 { // x / X
+            base = 16;
+            i = i + 2;
+        } else if p == 111 || p == 79 { // o / O
+            base = 8;
+            i = i + 2;
+        } else if p == 98 || p == 66 { // b / B
+            base = 2;
+            i = i + 2;
+        }
+    }
+    let mut any = false;
+    let mut value: i64 = 0;
+    while i < end {
+        let ch = src.ptr[i];
+        if ch == 95 { // '_'
+            i = i + 1;
+            continue;
+        }
+        let d = toml_hex_val(ch);
+        if d < 0 || (d as i64) >= base {
+            return Option::None;
+        }
+        value = value * base + (d as i64);
+        any = true;
+        i = i + 1;
+    }
+    if !any {
+        return Option::None;
+    }
+    if neg {
+        return Option::Some(0 - value);
+    }
+    return Option::Some(value);
+}
+
+/// 解析 `src[start..end]` 为浮点。
+fn toml_parse_float(src: str, start: usize, end: usize) -> Option<f64> {
+    let mut i = start;
+    let mut neg = false;
+    if i < end && (src.ptr[i] == 43 || src.ptr[i] == 45) {
+        neg = src.ptr[i] == 45;
+        i = i + 1;
+    }
+    let mut value: f64 = 0.0;
+    let mut any = false;
+    while i < end {
+        let ch = src.ptr[i];
+        if ch == 95 {
+            i = i + 1;
+            continue;
+        }
+        if !toml_is_dec_digit(ch) {
+            break;
+        }
+        value = value * 10.0 + ((ch - 48) as f64);
+        any = true;
+        i = i + 1;
+    }
+    if !any {
+        return Option::None;
+    }
+    if i < end && src.ptr[i] == 46 { // '.'
+        i = i + 1;
+        let mut scale = 0.1;
+        while i < end {
+            let ch = src.ptr[i];
+            if ch == 95 {
+                i = i + 1;
+                continue;
+            }
+            if !toml_is_dec_digit(ch) {
+                return Option::None;
+            }
+            value = value + ((ch - 48) as f64) * scale;
+            scale = scale * 0.1;
+            i = i + 1;
+        }
+    }
+    if i < end && (src.ptr[i] == 101 || src.ptr[i] == 69) { // 'e' / 'E'
+        i = i + 1;
+        let mut exp_neg = false;
+        if i < end && (src.ptr[i] == 43 || src.ptr[i] == 45) {
+            exp_neg = src.ptr[i] == 45;
+            i = i + 1;
+        }
+        let mut exp: i64 = 0;
+        let mut edigits = false;
+        while i < end {
+            let ch = src.ptr[i];
+            if ch == 95 {
+                i = i + 1;
+                continue;
+            }
+            if !toml_is_dec_digit(ch) {
+                return Option::None;
+            }
+            exp = exp * 10 + ((ch - 48) as i64);
+            edigits = true;
+            i = i + 1;
+        }
+        if !edigits {
+            return Option::None;
+        }
+        if exp_neg {
+            exp = 0 - exp;
+        }
+        value = value * toml_pow10f(exp);
+    }
+    if i != end {
+        return Option::None;
+    }
+    if neg {
+        value = 0.0 - value;
+    }
+    return Option::Some(value);
+}
+
+/// 读裸值（`true` / `false` / 数字），已经消费的 token 是 `src[start..pos]`。
+fn toml_parse_bare(c: &mut TomlCursor) -> Result<Toml, TomlError> {
+    let start = c.pos;
+    while !c.at_end() && !toml_is_value_delim(c.peek()) {
+        c.pos = c.pos + 1;
+    }
+    let end = c.pos;
+    if end == start {
+        return Result::Err(c.err("expected a value"));
+    }
+    if toml_range_eq(c.src, start, end, "true") {
+        return Result::Ok(Toml::Bool(true));
+    }
+    if toml_range_eq(c.src, start, end, "false") {
+        return Result::Ok(Toml::Bool(false));
+    }
+    // 含 `.` / `e` / `E` 就当浮点——但 `0x1e` 这类进制前缀不是浮点。
+    let mut base_pos = start;
+    if base_pos < end && (c.src.ptr[base_pos] == 43 || c.src.ptr[base_pos] == 45) {
+        base_pos = base_pos + 1;
+    }
+    let mut is_base = false;
+    if base_pos + 1 < end && c.src.ptr[base_pos] == 48 {
+        let p = c.src.ptr[base_pos + 1];
+        if p == 120 || p == 88 || p == 111 || p == 79 || p == 98 || p == 66 {
+            is_base = true;
+        }
+    }
+    let mut is_float = false;
+    if !is_base {
+        let mut i = start;
+        while i < end {
+            let ch = c.src.ptr[i];
+            if ch == 46 || ch == 101 || ch == 69 {
+                is_float = true;
+            }
+            i = i + 1;
+        }
+    }
+    if is_float {
+        let rf = toml_parse_float(c.src, start, end);
+        match rf {
+            Option::Some(v) => {
+                return Result::Ok(Toml::Float(v));
+            }
+            Option::None => {
+                return Result::Err(TomlError { pos: start, msg: "invalid float" });
+            }
+        }
+    }
+    let ri = toml_parse_int(c.src, start, end);
+    match ri {
+        Option::Some(v) => {
+            return Result::Ok(Toml::Integer(v));
+        }
+        Option::None => {
+            return Result::Err(TomlError { pos: start, msg: "invalid value (expected string, number, bool, array or inline table)" });
+        }
+    }
+}
+
+//----- 解析：值 --------------------------------------------------------------
+
+fn toml_parse_value(c: &mut TomlCursor) -> Result<Toml, TomlError> {
+    c.skip_sp();
+    if c.at_end() {
+        return Result::Err(c.err("expected a value"));
+    }
+    let ch = c.peek();
+    if ch == 34 { // '"'
+        c.pos = c.pos + 1;
+        let rs = toml_parse_basic_string(c);
+        match rs {
+            Result::Ok(s) => {
+                return Result::Ok(Toml::Str(s));
+            }
+            Result::Err(e) => {
+                return Result::Err(e);
+            }
+        }
+    }
+    if ch == 39 { // '\''
+        c.pos = c.pos + 1;
+        let rs = toml_parse_literal_string(c);
+        match rs {
+            Result::Ok(s) => {
+                return Result::Ok(Toml::Str(s));
+            }
+            Result::Err(e) => {
+                return Result::Err(e);
+            }
+        }
+    }
+    if ch == 91 { // '['
+        return toml_parse_array(c);
+    }
+    if ch == 123 { // '{'
+        return toml_parse_inline_table(c);
+    }
+    return toml_parse_bare(c);
+}
+
+fn toml_parse_array(c: &mut TomlCursor) -> Result<Toml, TomlError> {
+    c.pos = c.pos + 1; // '['
+    let mut items: Vec<Toml> = Vec::new();
+    loop {
+        c.skip_space();
+        if c.at_end() {
+            return Result::Err(c.err("unterminated array"));
+        }
+        if c.peek() == 93 { // ']'
+            c.pos = c.pos + 1;
+            return Result::Ok(Toml::Array(items));
+        }
+        let rv = toml_parse_value(c);
+        match rv {
+            Result::Ok(v) => {
+                items.push(v);
+            }
+            Result::Err(e) => {
+                return Result::Err(e);
+            }
+        }
+        c.skip_space();
+        if c.at_end() {
+            return Result::Err(c.err("unterminated array"));
+        }
+        let ch = c.peek();
+        if ch == 44 { // ','
+            c.pos = c.pos + 1;
+            continue;
+        }
+        if ch == 93 {
+            c.pos = c.pos + 1;
+            return Result::Ok(Toml::Array(items));
+        }
+        return Result::Err(c.err("expected `,` or `]` in array"));
+    }
+}
+
+fn toml_parse_inline_table(c: &mut TomlCursor) -> Result<Toml, TomlError> {
+    c.pos = c.pos + 1; // '{'
+    let mut table: Vec<TomlEntry> = Vec::new();
+    loop {
+        c.skip_space();
+        if c.at_end() {
+            return Result::Err(c.err("unterminated inline table"));
+        }
+        if c.peek() == 125 { // '}'
+            c.pos = c.pos + 1;
+            return Result::Ok(Toml::Table(table));
+        }
+        let rk = toml_parse_key_path(c);
+        let path = match rk {
+            Result::Ok(p) => p,
+            Result::Err(e) => {
+                return Result::Err(e);
+            }
+        };
+        c.skip_sp();
+        let re = c.expect(61, "expected `=` after key in inline table");
+        match re {
+            Result::Ok(_) => {}
+            Result::Err(e) => {
+                return Result::Err(e);
+            }
+        }
+        let rv = toml_parse_value(c);
+        let value = match rv {
+            Result::Ok(v) => v,
+            Result::Err(e) => {
+                return Result::Err(e);
+            }
+        };
+        let placed = toml_put(Toml::Table(table), path, 0, value);
+        // `toml_put` 返回容器，这里只取表。
+        let unwrapped: Vec<TomlEntry> = match placed {
+            Toml::Table(e) => e,
+            _ => Vec::new(),
+        };
+        table = unwrapped;
+        c.skip_space();
+        if c.at_end() {
+            return Result::Err(c.err("unterminated inline table"));
+        }
+        let ch = c.peek();
+        if ch == 44 { // ','
+            c.pos = c.pos + 1;
+            continue;
+        }
+        if ch == 125 {
+            c.pos = c.pos + 1;
+            return Result::Ok(Toml::Table(table));
+        }
+        return Result::Err(c.err("expected `,` or `}` in inline table"));
+    }
+}
+
+/// 解析一段 TOML 文本，返回根表。
+pub fn toml_parse(src: str) -> Result<Toml, TomlError> {
+    let mut c = TomlCursor { src: src, pos: 0 };
+    let mut root: Toml = toml_empty_table();
+    let mut prefix: Vec<String> = Vec::new();
+    loop {
+        c.skip_space();
+        if c.at_end() {
+            return Result::Ok(root);
+        }
+        if c.peek() == 91 { // '['
+            let is_array = c.starts_with("[[");
+            c.pos = if is_array { c.pos + 2 } else { c.pos + 1 };
+            let rp = toml_parse_key_path(&mut c);
+            let path = match rp {
+                Result::Ok(p) => p,
+                Result::Err(e) => {
+                    return Result::Err(e);
+                }
+            };
+            // 表头必须以 `]` / `]]` 收尾。
+            if c.peek() != 93 {
+                return Result::Err(c.err("expected `]` to close table header"));
+            }
+            c.pos = c.pos + 1;
+            if is_array {
+                if c.peek() != 93 {
+                    return Result::Err(c.err("expected `]]` to close array-of-tables header"));
+                }
+                c.pos = c.pos + 1;
+                root = toml_append_table(root, path, 0);
+                // 后续键写进"刚才追加的那张表"。
+                let mut sub: Vec<String> = Vec::new();
+                let mut i = 0;
+                while i < path.len() {
+                    sub.push(path.get(i));
+                    i = i + 1;
+                }
+                sub.push(String::from_bytes(TOML_LAST));
+                prefix = sub;
+                continue;
+            }
+            prefix = path;
+            continue;
+        }
+        // `key = value`
+        let rk = toml_parse_key_path(&mut c);
+        let rel = match rk {
+            Result::Ok(p) => p,
+            Result::Err(e) => {
+                return Result::Err(e);
+            }
+        };
+        c.skip_sp();
+        let re = c.expect(61, "expected `=` after key");
+        match re {
+            Result::Ok(_) => {}
+            Result::Err(e) => {
+                return Result::Err(e);
+            }
+        }
+        let rv = toml_parse_value(&mut c);
+        let value = match rv {
+            Result::Ok(v) => v,
+            Result::Err(e) => {
+                return Result::Err(e);
+            }
+        };
+        // 完整路径 = 当前表头 + 相对键。
+        let mut full: Vec<String> = Vec::new();
+        let mut i = 0;
+        while i < prefix.len() {
+            full.push(prefix.get(i));
+            i = i + 1;
+        }
+        i = 0;
+        while i < rel.len() {
+            full.push(rel.get(i));
+            i = i + 1;
+        }
+        root = toml_put(root, full, 0, value);
+    }
+}
+
+//----- 生成 ------------------------------------------------------------------
+
+fn toml_write_string(out: &mut String, s: &String) {
+    out.push_byte(34);
+    let mut i = 0;
+    while i < s.len {
+        let b = s.ptr[i];
+        if b == 34 {
+            out.push_bytes("\\\"");
+        } else if b == 92 {
+            out.push_bytes("\\\\");
+        } else if b == 10 {
+            out.push_bytes("\\n");
+        } else if b == 13 {
+            out.push_bytes("\\r");
+        } else if b == 9 {
+            out.push_bytes("\\t");
+        } else {
+            out.push_byte(b);
+        }
+        i = i + 1;
+    }
+    out.push_byte(34);
+}
+
+fn toml_hex_digit(n: u8) -> u8 {
+    if n < 10 {
+        return 48 + n;
+    }
+    return 97 + n - 10;
+}
+
+/// 浮点：最多 6 位小数，去尾零，保底一位。
+fn toml_write_float(out: &mut String, v: f64) {
+    let mut val = v;
+    if val < 0.0 {
+        out.push_byte(45);
+        val = 0.0 - val;
+    }
+    let ip = val as i64;
+    out.push_int(ip);
+    let mut frac = val - (ip as f64);
+    let mut digits: [u8; 6] = [0; 6];
+    let mut n = 0;
+    while n < 6 {
+        frac = frac * 10.0;
+        let d = frac as i64;
+        digits[n] = d as u8;
+        frac = frac - (d as f64);
+        n = n + 1;
+    }
+    let mut keep = 6;
+    while keep > 1 && digits[keep - 1] == 0 {
+        keep = keep - 1;
+    }
+    out.push_byte(46); // '.'
+    let mut i = 0;
+    while i < keep {
+        out.push_byte(48 + digits[i]);
+        i = i + 1;
+    }
+}
+
+/// 键的写法：bare 字符原样，其余加双引号。
+fn toml_write_key(out: &mut String, key: &String) {
+    let mut bare = key.len > 0;
+    let mut i = 0;
+    while i < key.len {
+        if !toml_is_bare_char(key.ptr[i]) {
+            bare = false;
+        }
+        i = i + 1;
+    }
+    if bare {
+        out.push_bytes(key.as_bytes());
+        return;
+    }
+    toml_write_string(out, key);
+}
+
+fn toml_write_value(out: &mut String, v: &Toml) {
+    match v {
+        Toml::Integer(n) => {
+            out.push_int(n);
+        }
+        Toml::Float(f) => {
+            toml_write_float(out, f);
+        }
+        Toml::Bool(true) => {
+            out.push_bytes("true");
+        }
+        Toml::Bool(false) => {
+            out.push_bytes("false");
+        }
+        Toml::Str(s) => {
+            toml_write_string(out, s);
+        }
+        Toml::Array(items) => {
+            out.push_byte(91); // '['
+            let mut i = 0;
+            while i < items.len() {
+                if i > 0 {
+                    out.push_bytes(", ");
+                }
+                toml_write_value(out, &items.data[i]);
+                i = i + 1;
+            }
+            out.push_byte(93); // ']'
+        }
+        Toml::Table(entries) => {
+            out.push_bytes("{ ");
+            let mut i = 0;
+            while i < entries.len() {
+                if i > 0 {
+                    out.push_bytes(", ");
+                }
+                let e = entries.get(i);
+                toml_write_key(out, &e.key);
+                out.push_bytes(" = ");
+                toml_write_value(out, &e.value);
+                i = i + 1;
+            }
+            out.push_bytes(" }");
+        }
+    }
+}
+
+/// 把 `key` 拼进前缀，得到带点的完整键。
+fn toml_join_key(prefix: &String, key: &String) -> String {
+    let mut out = String::new();
+    if prefix.len > 0 {
+        out.push_bytes(prefix.as_bytes());
+        out.push_byte(46); // '.'
+    }
+    out.push_bytes(key.as_bytes());
+    return out;
+}
+
+/// 一组键值对是否是"数组中的表"（`[{..}, {..}]`），用于选 `[[...]]` 形态。
+fn toml_all_tables(items: &Vec<Toml>) -> bool {
+    if items.len() == 0 {
+        return false;
+    }
+    let mut i = 0;
+    while i < items.len() {
+        let v = items.get(i);
+        match v {
+            Toml::Table(_) => {}
+            _ => {
+                return false;
+            }
+        }
+        i = i + 1;
+    }
+    return true;
+}
+
+fn toml_write_entries(out: &mut String, entries: &Vec<TomlEntry>, prefix: &String, depth: usize) {
+    // 第一遍：标量 / 普通数组（直接写 `key = value`）。
+    let mut first = true;
+    let mut i = 0;
+    while i < entries.len() {
+        let e = entries.get(i);
+        let mut scalar = true;
+        match e.value {
+            Toml::Table(_) => {
+                scalar = false;
+            }
+            Toml::Array(items) => {
+                if toml_all_tables(&items) {
+                    scalar = false;
+                }
+            }
+            _ => {}
+        }
+        if scalar {
+            if !first {
+                out.push_byte(10);
+            }
+            toml_write_key(out, &e.key);
+            out.push_bytes(" = ");
+            toml_write_value(out, &e.value);
+            first = false;
+        }
+        i = i + 1;
+    }
+
+    // 第二遍：子表写成 `[section]`，表的数组写成 `[[section]]`。
+    i = 0;
+    while i < entries.len() {
+        let e = entries.get(i);
+        match e.value {
+            Toml::Table(sub) => {
+                if !first {
+                    out.push_byte(10);
+                }
+                if depth > 0 {
+                    out.push_byte(10);
+                }
+                let full = toml_join_key(prefix, &e.key);
+                out.push_byte(91); // '['
+                out.push_bytes(full.as_bytes());
+                out.push_byte(93); // ']'
+                out.push_byte(10);
+                toml_write_entries(out, &sub, &full, depth + 1);
+                first = false;
+            }
+            Toml::Array(items) => {
+                if !toml_all_tables(&items) {
+                    // 普通数组第一遍已处理。
+                } else {
+                    let full = toml_join_key(prefix, &e.key);
+                    let mut k = 0;
+                    while k < items.len() {
+                        let el = items.get(k);
+                        let sub: Vec<TomlEntry> = match el {
+                            Toml::Table(s) => s,
+                            _ => Vec::new(),
+                        };
+                        if !first {
+                            out.push_byte(10);
+                        }
+                        if depth > 0 || k > 0 {
+                            out.push_byte(10);
+                        }
+                        out.push_bytes("[[");
+                        out.push_bytes(full.as_bytes());
+                        out.push_bytes("]]");
+                        out.push_byte(10);
+                        toml_write_entries(out, &sub, &full, depth + 1);
+                        first = false;
+                        k = k + 1;
+                    }
+                }
+            }
+            _ => {}
+        }
+        i = i + 1;
+    }
+}
+
+/// 生成 TOML 文本。
+pub fn toml_stringify(value: &Toml) -> String {
+    let mut out = String::new();
+    match value {
+        Toml::Table(entries) => {
+            toml_write_entries(&mut out, entries, &String::new(), 0);
+        }
+        _ => {
+            toml_write_value(&mut out, value);
+        }
+    }
+    return out;
+}

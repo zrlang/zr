@@ -1,0 +1,51 @@
+// std/cli.zr：命令行参数。
+//
+// 用例运行时没有额外实参，所以断言集中在"接口自洽 + 越界兜底"：
+// 至少有程序名、args() 与 arg_count() 一致、越界返回空串 / None / default。
+// 编号指向失败的断言。
+use cli::{arg, arg_count, arg_opt, args, get, program_name};
+use core::Option;
+
+fn main() -> i32 {
+    let n = arg_count();
+    if n < 1 {
+        return 1;
+    }
+    // args() 必须把全部参数都装进去，下标 0 是程序名。
+    if args().len() != n {
+        return 2;
+    }
+    let p = program_name();
+    if p.len == 0 {
+        return 3;
+    }
+    if arg(0).len != p.len {
+        return 4;
+    }
+    match arg_opt(0) {
+        Option::Some(a) => {
+            if a.len != p.len {
+                return 5;
+            }
+        }
+        Option::None => {
+            return 6;
+        }
+    }
+    // 越界：arg_opt 返回 None。
+    match arg_opt(n + 10) {
+        Option::Some(_) => {
+            return 7;
+        }
+        Option::None => {}
+    }
+    // 越界：arg 返回空串，get 返回 default。
+    if arg(n + 10).len != 0 {
+        return 8;
+    }
+    let d = get(n + 10, "fallback");
+    if d.len != 8 {
+        return 9;
+    }
+    return 0;
+}

@@ -295,7 +295,125 @@ trait 默认方法（带方法体的方法 / `default fn` 拼写）已实现**�
 
 ---
 
-## 阶段 3 — 已完成的缺口（核对后归档）
+## 阶段 3 — 标准库平台能力（cli / env / json / xml / toml）
+
+> 2026-11-02 新增。五项能力全部落在 `std/`：命令行参数、环境变量、JSON、XML、TOML。
+> 不标"暂不做"——每一项都拆到可独立实现、可回归的子任务。
+>
+> 约束（来自扁平符号表）：新增模块的**公开自由函数名必须全局唯一**，因此
+> JSON/XML/TOML 的入口统一带模块前缀（`json_parse` / `xml_parse` / `toml_parse`），
+> 其余 API 用 `impl` 方法（按类型解析，不会撞名）。每个模块都必须能被
+> `use <m>::*;` + 空 `main` 全链路加载。
+
+### P3-1 命令行参数（std/cli.zr）
+
+现状：✅ `_start` 在调用 `main` 之前把 `(argc, argv)` 交给 `zr_args_init`，
+运行时把二者存进 `__DATA/__bss`，`std/cli.zr` 只做薄封装（把 C 字符串复制成
+`String`）。各平台入口约定：
+
+| 平台 | 入口处参数位置 | 入口桩动作 |
+|---|---|---|
+| Linux x86-64 | `[rsp]`=argc、`rsp+8`=argv | `mov rdi,[rsp]` / `lea rsi,[rsp+8]` 后 `call zr_args_init` |
+| macOS x86-64 | `rdi`=argc、`rsi`=argv（dyld 传入） | 直接 `call zr_args_init` |
+| Linux aarch64 | `[sp]`=argc、`sp+8`=argv | `ldr x0,[sp]` / `add x1,sp,#8` 后 `bl zr_args_init` |
+| macOS arm64 | `x0`=argc、`x1`=argv | 直接 `bl zr_args_init` |
+| Windows | 无 CRT 参数；运行时用 `GetCommandLineA` 解析 | `zr_args_init` 忽略实参，惰性解析命令行 |
+
+`envp` 不需要单独传递：按 ABI 它紧跟 `argv`（`argv + (argc+1)*8`），
+由 `zr_args_init` 一并记下，供 P3-2 使用。
+
+| 子任务 | 内容 | 状态 |
+|---|---|---|
+| P3-1a | 运行时就绪：`zr_args_init(argc, argv)` + `zr_args_count()` / `zr_args_ptr(i)`（越界返回 null） | ✅ |
+| P3-1b | 六个 `_start` 入口桩按上表捕获参数（x86-64 / aarch64，Linux / macOS / Windows） | ✅ |
+| P3-1c | `std/cli.zr`：`arg_count()`、`arg(i) -> String`、`arg_opt(i) -> Option<String>`、`args() -> Vec<String>`、`program_name() -> String` | ✅ |
+| P3-1d | 回归 `tests/cases/126_cli_args.zr`：`arg_count() >= 1`、`arg(0)` 非空、越界返回空串 / `None`（运行器传入额外参数时不崩溃） | ✅ |
+
+**验收**：编译出的二进制被运行时，`arg_count()` 与真实 `argc` 一致；
+`arg(0)` 是程序路径；`use cli::*; fn main(){}` 可全链路编译链接。
+
+### P3-2 环境变量（std/env.zr）
+
+现状：✅ 环境变量初值来自 P3-1a 一并记下的入口 `envp`，读取经运行时
+`zr_env_count()` / `zr_env_entry(i)` 返回只读条目；写操作不碰运行时，
+统一落在 `std/env.zr` 自己的**覆盖表**里。
+
+实现：覆盖表是堆上的 `*const u8` 数组，每项一条 C 字符串——`"KEY=VALUE"`
+表示设置，只有 `"KEY"`（没有 `=`）表示删除（墓碑）。查找**从后往前**扫
+覆盖表（后写优先），命中墓碑即视为未设置；没有覆盖时才扫入口 `envp`。
+`std/env.zr` 负责 `str` → NUL 结尾缓冲与结果 → `String` 的复制。
+
+| 子任务 | 内容 | 状态 |
+|---|---|---|
+| P3-2a | 运行时 `zr_env_count() -> usize`、`zr_env_entry(i) -> *const u8`（六平台汇编）；覆盖表在 `std/env.zr` 内实现 | ✅ |
+| P3-2b | `std/env.zr`：`var(key) -> Option<String>`、`var_or(key, default) -> String`、`set_var(key, value) -> bool`、`remove_var(key) -> bool`、`has_var(key) -> bool` | ✅ |
+| P3-2c | 回归 `tests/cases/127_env_vars.zr`：设置 → 读取 → 覆盖 → 删除；不存在的键返回 `None` / 默认值 | ✅ |
+
+**验收**：同一进程内 `set_var("ZR_TEST_X","1")` 后 `var` 立即读到 `"1"`，
+覆盖后读到新值，`remove_var` 后回到 `None`；未设置时 `var_or` 返回默认值。
+
+### P3-3 JSON（std/json.zr）
+
+现状：✅ `std/json.zr` 已实现，解析 / 访问 / 生成全部可用。
+
+类型：`Json`（`Null` / `Bool` / `Int` / `Float` / `Str` / `Array` / `Object`，
+递归经 `Vec` 破环）、`JsonPair { key, value }`、`JsonError { pos, msg }`。
+解析是手写游标，出错带字节位置；生成分紧凑与两空格缩进两种。
+
+| 子任务 | 内容 | 状态 |
+|---|---|---|
+| P3-3a | 类型 + 访问器：`as_bool` / `as_int` / `as_float` / `as_str` / `at(i)` / `get(key)` / `len` / `type_name` | ✅ |
+| P3-3b | `json_parse(str) -> Result<Json, JsonError>`：空白、`null`/`true`/`false`、整数与浮点（含指数）、字符串转义（`\" \\ \/ \b \f \n \r \t` 与 `\uXXXX`，代理对）、数组、对象；重复键保留后写 | ✅ |
+| P3-3c | `json_stringify(&Json) -> String`、`json_stringify_pretty(&Json, indent) -> String`（转义 `"` `\` 与 <0x20 控制字符） | ✅ |
+| P3-3d | 回归 `tests/cases/128_json.zr`：解析嵌套对象/数组/转义/数字，再生成并逐字节断言；负向不合法输入返回 `Err` | ✅ |
+
+**验收**：`json_parse` 对嵌套样例返回正确树；`json_stringify` 的输出可被
+再次 `json_parse` 解析且内容一致；空输入 / 截断输入返回 `Err` 而非崩溃。
+
+### P3-4 XML（std/xml.zr）
+
+现状：✅ `std/xml.zr` 已实现，解析 / 访问 / 生成全部可用。
+
+类型：`XmlNode { name, attrs, children, text }`、`XmlAttr { name, value }`、
+`XmlError { pos, msg }`。解析支持 XML 声明、注释、DOCTYPE、CDATA、自闭合
+标签、属性（单/双引号）、实体（`&amp; &lt; &gt; &quot; &apos;` 与
+`&#NN;` / `&#xHH;`）；生成时转义 `& < > " '`。
+
+| 子任务 | 内容 | 状态 |
+|---|---|---|
+| P3-4a | 类型 + 访问器：`attr(name)` / `child(i)` / `child_named(name)` / `text_of(name)` | ✅ |
+| P3-4b | `xml_parse(str) -> Result<XmlNode, XmlError>`：单根校验、标签配对、属性、文本、CDATA、注释、DOCTYPE、实体解码 | ✅ |
+| P3-4c | `xml_stringify(&XmlNode) -> String`（只序列化节点，不带 XML 声明）与 `xml_stringify_pretty(&XmlNode, indent) -> String` | ✅ |
+| P3-4d | 回归 `tests/cases/129_xml.zr`：带属性/嵌套/实体/CDATA 的样例；生成后重新解析一致；未闭合标签返回 `Err` | ✅ |
+
+**验收**：解析 → 生成 → 再解析得到同样的树；自闭合标签与文本混排正确；
+不匹配的结束标签返回带位置的 `Err`。
+
+### P3-5 TOML（std/toml.zr）
+
+现状：✅ `std/toml.zr` 已实现，解析 / 访问 / 生成全部可用。
+
+类型：`Toml`（`Integer` / `Float` / `Bool` / `Str` / `Array` / `Table`）+ 
+`TomlEntry { key, value }` + `TomlError { pos, msg }`。解析覆盖配置文件的
+常用子集：注释、`[table]` 与点分键（`a.b = 1`）、`[[array-of-tables]]`、
+基本字符串（含转义）与字面字符串（`'...'`）、整数（`+/-`、下划线、
+`0x/0o/0b`）、浮点（小数点 / 指数）、布尔、数组（可跨行、可尾逗号）、
+内联表 `{ a = 1 }`。已知限制：不解析日期时间；浮点输出最多 6 位小数；
+重复键后写覆盖（不报错）。
+
+| 子任务 | 内容 | 状态 |
+|---|---|---|
+| P3-5a | 类型 + 访问器：`get(key)` / `get_path("a.b")` / `at(i)` / `len` / `is_table` / `is_array` / `as_int` / `as_float` / `as_bool` / `as_str` | ✅ |
+| P3-5b | `toml_parse(str) -> Result<Toml, TomlError>`：注释 / 表头 / 点分键 / 字符串 / 数字 / 布尔 / 数组 / 内联表；非法值返回 `Err` | ✅ |
+| P3-5c | `toml_stringify(&Toml) -> String`：先输出标量键，再按层输出 `[table]` 与 `[[array-of-tables]]`；字符串转义 | ✅ |
+| P3-5d | 回归 `tests/cases/130_toml.zr`：多表 + 点分键 + 数组 + 内联表 + 数组表；生成后重新解析一致；语法错误返回 `Err` | ✅ |
+
+**验收**：解析 → 生成 → 再解析得到同样的树；`a.b = 1` 等价于 `[a] b = 1`；
+未闭合数组 / 缺值返回带位置的 `Err`。
+
+---
+
+## 阶段 4 — 已完成的缺口（核对后归档）
 
 > 以下为已提交并全绿验证的项，留档便于查证。
 

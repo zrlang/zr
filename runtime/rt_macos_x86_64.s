@@ -266,6 +266,115 @@ _zr_realloc:
     .globl _zr_sleep_ms
     .globl _zr_time_ns
     .globl _zr_time_unix_ns
+    .globl _zr_args_init
+    .globl _zr_args_count
+    .globl _zr_args_ptr
+    .globl _zr_env_count
+    .globl _zr_env_entry
+
+#==============================================================================
+# 进程启动参数与环境变量
+#
+# `_start` 在调用 `main` 之前调用 `zr_args_init(argc, argv)`。这里把 argv
+# 存下来；envp 按 ABI 紧跟在 argv 之后（argv + (argc+1)*8），一并记下并
+# 数出条目数。`std/cli.zr` / `std/env.zr` 只通过这些只读接口取值，写操作
+# 由标准库自己的覆盖表实现。
+#------------------------------------------------------------------------------
+    .section __DATA,__bss
+    .align 3
+_zr_argc:
+    .quad 0
+_zr_argv:
+    .quad 0
+_zr_envp:
+    .quad 0
+_zr_envc:
+    .quad 0
+
+    .section __TEXT,__text
+
+#------------------------------------------------------------------------------
+# zr_args_init(argc, argv)
+#   rdi = argc, rsi = argv
+#------------------------------------------------------------------------------
+    .globl _zr_args_init
+_zr_args_init:
+    mov     [rip + _zr_argc], rdi
+    mov     [rip + _zr_argv], rsi
+    test    rdi, rdi
+    jle     .args_init_empty
+    test    rsi, rsi
+    jz      .args_init_empty
+    // envp = argv + (argc + 1) * 8
+    lea     rax, [rsi + rdi*8 + 8]
+    mov     [rip + _zr_envp], rax
+    // 数出 envp 里的条目数（NULL 结尾）
+    xor     rcx, rcx
+.args_env_count:
+    mov     rdx, [rax + rcx*8]
+    test    rdx, rdx
+    jz      .args_env_done
+    inc     rcx
+    jmp     .args_env_count
+.args_env_done:
+    mov     [rip + _zr_envc], rcx
+    ret
+.args_init_empty:
+    mov     qword ptr [rip + _zr_envp], 0
+    mov     qword ptr [rip + _zr_envc], 0
+    ret
+
+#------------------------------------------------------------------------------
+# zr_args_count() -> usize
+#------------------------------------------------------------------------------
+    .globl _zr_args_count
+_zr_args_count:
+    mov     rax, [rip + _zr_argc]
+    ret
+
+#------------------------------------------------------------------------------
+# zr_args_ptr(i) -> *const u8（越界或没有 argv 时返回 NULL）
+#   rdi = i
+#------------------------------------------------------------------------------
+    .globl _zr_args_ptr
+_zr_args_ptr:
+    mov     rax, [rip + _zr_argc]
+    cmp     rdi, rax
+    jae     .args_ptr_none
+    mov     rax, [rip + _zr_argv]
+    test    rax, rax
+    jz      .args_ptr_none
+    mov     rax, [rax + rdi*8]
+    ret
+.args_ptr_none:
+    xor     eax, eax
+    ret
+
+#------------------------------------------------------------------------------
+# zr_env_count() -> usize
+#------------------------------------------------------------------------------
+    .globl _zr_env_count
+_zr_env_count:
+    mov     rax, [rip + _zr_envc]
+    ret
+
+#------------------------------------------------------------------------------
+# zr_env_entry(i) -> *const u8（"KEY=VALUE"，越界返回 NULL）
+#   rdi = i
+#------------------------------------------------------------------------------
+    .globl _zr_env_entry
+_zr_env_entry:
+    mov     rax, [rip + _zr_envc]
+    cmp     rdi, rax
+    jae     .env_entry_none
+    mov     rax, [rip + _zr_envp]
+    test    rax, rax
+    jz      .env_entry_none
+    mov     rax, [rax + rdi*8]
+    ret
+.env_entry_none:
+    xor     eax, eax
+    ret
 
 #==============================================================================
 # 函数指针表：用于间接调用外部函数，避免符号存根问题
