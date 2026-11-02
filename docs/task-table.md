@@ -254,7 +254,7 @@ zr 的做法是让被调方是**泛型**函数（`fn apply<F>(f: F, ..)`）：`F
 
 | 子任务 | 内容 | 状态 |
 |---|---|---|
-| P2-2a | 评估是否接线（先确认 pipeline 是否需要多模块，再决定）；当前单模块下 LTO 是 no-op | ⬜ |
+| P2-2a | 评估是否接线（先确认 pipeline 是否需要多模块，再决定）；当前单模块下 LTO 是 no-op | ✅ 评估完成：**不接线**。理由：(1) `modules.rs` 把全部源文件扁平成**一个**编译单元，整个程序只有一个 `SsaModule`，`run_lto(Vec<SsaModule>)` 永远只收一个模块，跨模块内联无对象可并——要让 LTO 有意义得先把流水线改成"每模块一个 codegen unit + 链接时合并"，属 v0.13 的架构改动；(2) PGO 需要 `-C profile-generate` 插桩、运行时计数器落盘、`pgomerge` 合并、`-C profile-use` 二次编译的完整闭环，CLI 连 `-C` 开关都不存在，插桩还要改 MIR 降级路径；(3) roadmap 明确把 LTO/PGO 排在 v0.13（性能阶段），当前语言特性阶段提前接线只会多出两条无人验证的代码路径。`src/opt/lto.rs` / `src/opt/pgo.rs` 保持不声明，留待 v0.13 重新评估 |
 
 ### P2-3 `--emit-llvm` 真 IR / 删伪 IR
 

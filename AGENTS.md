@@ -113,8 +113,8 @@ lexer → parser(ast) → typeck(hir, infer) → mir → ssa → opt → codegen
 |---|---|
 | `src/zr0/` | `main.rs` 未 `mod` 声明 |
 | `src/macro_system/` | `main.rs` 未 `mod` 声明（`macro_rules!` 走的是 `src/macros.rs`） |
-| `src/opt/lto.rs` | `opt/mod.rs` 未声明 |
-| `src/opt/pgo.rs` | `opt/mod.rs` 未声明 |
+| `src/opt/lto.rs` | `opt/mod.rs` 未声明。**P2-2a 已评估：不接线**——单模块流水线下 `run_lto` 只收一个 `SsaModule`，跨模块内联无对象可并；留待 v0.13 重评 |
+| `src/opt/pgo.rs` | `opt/mod.rs` 未声明。**P2-2a 已评估：不接线**——PGO 需要插桩 + profile 落盘 + 二次编译的完整闭环，CLI 连 `-C` 开关都没有；留待 v0.13 重评 |
 
 **不要在这几个目录里"修 bug"——先确认它们该不该接线。**
 （`src/codegen/c_backend.rs` 已由 `--emit-c` 接线，不属于此表。）
