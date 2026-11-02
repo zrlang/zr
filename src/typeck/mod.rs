@@ -67,6 +67,36 @@ struct LiftedClosure {
     span: Span,
 }
 
+/// 待生成的函数值 shim（`finalize_lifted_closures` 之后统一构造）。
+///
+/// 统一函数值表示是 16 字节记录 `{code, env}`，`code` 恒指向一个"末尾多收
+/// 一个 env 参数"的 shim。两种来源：
+/// - **普通函数**（`Plain`）：`shim(args..., env) { return func(args..); }`；
+/// - **带捕获闭包**（`Captured`）：`shim(args..., env) { 闭包体（捕获→env.__cN） }`。
+///
+/// 之所以延后到收尾再建：闭包形参 / 返回类型此时可能还停在推断变量上
+/// （`let f: fn(i32)->i32 = |x| x + n;` 里 `x` 的类型要等上下文统一），
+/// 而且普通函数 shim 只在"函数名真的被当值取走"时才该生成——`f(x)` 这种
+/// 具名调用不进本表（`check_call` 直接落成 `ExprKind::Call`），否则给泛型
+/// 函数生成 shim 会撞上未实例化的类型参数。
+#[derive(Debug, Clone)]
+struct PendingShim {
+    /// 生成的 shim 函数 DefId。
+    shim: DefId,
+    /// 来源。
+    kind: ShimKind,
+    /// 引用处源码 span（报错用）。
+    span: Span,
+}
+
+#[derive(Debug, Clone)]
+enum ShimKind {
+    /// 普通函数：转发到 `func`。
+    Plain(DefId),
+    /// 带捕获闭包：按环境结构体 `env_id` 取闭包体生成 thunk。
+    Captured(DefId),
+}
+
 /// 带捕获闭包的值模型登记项（环境结构体 DefId → 签名与内联体）。
 ///
 /// 捕获闭包作为值传递时，表达式类型是环境结构体 `__env_N`；这张表让
@@ -438,6 +468,18 @@ struct GenericImplAssoc {
     /// 声明里的类型（`usize` / `i32` …）给，避免永远是 `u64` 让宽度核验
     /// 误报。同名参数在不同作用域（嵌套泛型）会互相覆盖，取最后登记者。
     const_param_tys: HashMap<String, Ty>,
+    /// 普通函数的目标 DefId → 它的函数值转发 shim。
+    ///
+    /// 函数名被当**值**取走时才需要 shim（`let f = foo;` / `apply(foo, ..)`）。
+    /// `finalize_fn_value_shims` 建表并生成 shim 函数体。
+    fn_value_shims: HashMap<DefId, DefId>,
+    /// 带捕获闭包的环境结构体 DefId → 转 `fn(..)` 用的 thunk。
+    ///
+    /// thunk 形参是「闭包形参 + 末尾一个 env」，体内捕获 local 换成
+    /// `env.__cN`；运行期由调用方把环境复制到堆再传进来。
+    closure_thunks: HashMap<DefId, DefId>,
+    /// 待生成的 shim / thunk 列表（`finalize_fn_value_shims` 统一构造）。
+    pending_shims: Vec<PendingShim>,
 }
 
 /// 一次泛型单态化：用 `subst` 里的具体类型替换泛型参数。
@@ -525,6 +567,9 @@ impl Default for TypeChecker {
             mono_pending: Vec::new(),
             type_generic_params: HashMap::new(),
             const_param_tys: HashMap::new(),
+            fn_value_shims: HashMap::new(),
+            closure_thunks: HashMap::new(),
+            pending_shims: Vec::new(),
         }
     }
 }
@@ -2313,6 +2358,12 @@ impl TypeChecker {
         // （`let id = |x| x; id(7)` 里 `x` 靠调用反推）。所有函数体检查完
         // 再统一 resolve，把仍停着的推断变量明确报错，并回填函数体。
         self.finalize_lifted_closures()?;
+        // 函数值 shim：把 `fn` 名当值取走的地方（`let f: fn(..) = g;`）、
+        // 带捕获闭包转 `fn(..)` 的地方（`f: fn(..) = |x| x + n;`）都在这
+        // 里统一生成"末尾多收一个 env"的转发 shim / thunk，并把已经检查完的
+        // 函数体里的 `ExprKind::Def` / 环境值改写成 `FnValue` / `ClosureToFn`。
+        // 必须放在闭包收尾之后：thunk 要拿闭包体的最终类型。
+        self.finalize_fn_value_shims();
         // 函数顺序必须确定：按 DefId 排序（保证可复现产物）。
         let mut funcs: Vec<_> = self.functions.iter().collect();
         funcs.sort_by_key(|(id, _)| id.0);
@@ -2673,7 +2724,81 @@ impl TypeChecker {
 
     fn check_expr(&mut self, e: &Expression, expected: &Ty) -> Result<HirExpr> {
         let h = self.check_expr_raw(e, expected)?;
-        Ok(self.coerce_array_to_slice(h, expected))
+        let h = self.coerce_array_to_slice(h, expected);
+        Ok(self.coerce_closure_to_fn(h, expected))
+    }
+
+    /// 上下文要求 `fn(..)` 时，把带捕获闭包（值模型是环境结构体 `__env_N`）
+    /// 就地转成函数值记录（`ClosureToFn`）。
+    ///
+    /// 带捕获闭包作为值传递时，HIR 值是环境结构体字面量（字段 = 捕获局部）。
+    /// 早先它在传给 `fn(..)` 形参 / 作为返回值时报
+    /// `captured closure cannot be passed/returned as a plain fn value`——
+    /// 环境结构体不是函数地址，跨函数也拿不到捕获 local。
+    ///
+    /// 现在函数值统一是 16 字节记录 `{code, env}`（见 `ExprKind::FnValue`）：
+    /// 这里把环境值按值搬进记录，`code` 指向一个特殊化的 thunk
+    /// （`ensure_closure_thunk` 生成，形参末尾多收一个 env、体内捕获 local
+    /// 换成 `env.__cN`），`env` 是环境在堆上的副本（调用方可能马上返回，
+    /// 栈上的环境值活不到被调方使用它的时刻）。
+    ///
+    /// 只在期望类型**已经是** `Ty::Function` 时生效：`let f = |x| x + n;`
+    /// 的期望是推断变量，那种情况仍是"环境结构体值 + 调用点内联"，语义不变。
+    fn coerce_closure_to_fn(&mut self, e: HirExpr, expected: &Ty) -> HirExpr {
+        let Ty::Function { .. } = self.infer.resolve(expected) else {
+            return e;
+        };
+        let Ty::Named(env_id, _) = self.infer.resolve(&e.ty) else {
+            return e;
+        };
+        if !self.closures_by_env.contains_key(&env_id) {
+            return e;
+        }
+        let span = e.span;
+        let fn_ty = self.infer.resolve(expected);
+        let thunk = self.ensure_closure_thunk(env_id, span);
+        HirExpr {
+            kind: ExprKind::ClosureToFn {
+                env: Box::new(e),
+                thunk,
+            },
+            ty: fn_ty,
+            span,
+        }
+    }
+
+    /// 取（或首次登记）带捕获闭包环境 `env_id` 对应的函数值 thunk。
+    fn ensure_closure_thunk(&mut self, env_id: DefId, span: Span) -> DefId {
+        if let Some(id) = self.closure_thunks.get(&env_id) {
+            return *id;
+        }
+        let thunk = self.alloc_def(format!("__closure_fn_{}", self.next_def));
+        self.closure_thunks.insert(env_id, thunk);
+        self.pending_shims.push(PendingShim {
+            shim: thunk,
+            kind: ShimKind::Captured(env_id),
+            span,
+        });
+        thunk
+    }
+
+    /// 取（或首次登记）普通函数 `func` 的函数值转发 shim。
+    ///
+    /// 普通函数的函数值同样是 16 字节记录，`code` 指向一个"末尾多收一个
+    /// `env`"的转发 shim（env 忽略），这样间接调用点不必区分"普通函数"
+    /// 与"带捕获闭包"——两者的 code 字段都遵循同一个 ABI。
+    fn ensure_plain_shim(&mut self, func: DefId, span: Span) -> DefId {
+        if let Some(id) = self.fn_value_shims.get(&func) {
+            return *id;
+        }
+        let shim = self.alloc_def(format!("__fn_shim_{}", self.next_def));
+        self.fn_value_shims.insert(func, shim);
+        self.pending_shims.push(PendingShim {
+            shim,
+            kind: ShimKind::Plain(func),
+            span,
+        });
+        shim
     }
 
     /// 隐式把定长数组转成切片。只在期望类型已经是 `[]T` 时生效。
@@ -3604,28 +3729,11 @@ impl TypeChecker {
                 let v = if let Some(val) = value {
                     let e = self.check_expr(val, &ret_ty)?;
                     self.check_partial_move(&e, val.span())?;
-                    // 带捕获闭包（环境结构体 `__env_N`）当作 `fn(..)` 返回值：
-                    // 与"传给 `fn(..)` 形参"同一个坑（见 `check_call` 的实参检查
-                    // 与 `closure_env_id` 注释）。闭包的 HIR 值此时已经降级成环境
-                    // 结构体字面量，不是函数指针；跨函数环境传递机制不存在，
-                    // 被调方（调用返回值的那个调用点）在**另一个函数**里按环境
-                    // DefId 查 `closures_by_env` 也查不到（该表按单文件收集，但
-                    // 返回值已被强转成函数类型，MIR 把结构体当函数地址 `call`），
-                    // 运行必崩（实测 `fn make(base){ return |x| x + base; }`
-                    // SIGSEGV）。明确报错而不是发射必崩的代码。
-                    if let Ty::Named(env_id, _) = self.infer.resolve(&e.ty) {
-                        if self.closures_by_env.contains_key(&env_id) {
-                            let ret = self.infer.resolve(&ret_ty);
-                            if matches!(ret, Ty::Function { .. } | Ty::Infer(_)) {
-                                return Err(CompileError::type_error(
-                                    "captured closure cannot be returned as a plain `fn` \
-                                     value; a closure that captures variables carries its \
-                                     environment and cannot be converted to a function pointer",
-                                )
-                                .with_span(val.span()));
-                            }
-                        }
-                    }
+                    // 带捕获闭包（环境结构体 `__env_N`）当 `fn(..)` 返回值时，
+                    // `check_expr` 的 `coerce_closure_to_fn` 已经把它转成函数值
+                    // 记录（`ClosureToFn`：环境复制到堆、code 指向特殊化 thunk），
+                    // 这里只剩普通统一。早先这里直接报
+                    // `captured closure cannot be returned as a plain fn value`。
                     self.infer.unify(&e.ty, &ret_ty, span).ok();
                     Some(Box::new(e))
                 } else {
@@ -5271,6 +5379,18 @@ impl TypeChecker {
             }
         };
         let mut hir_args = Vec::with_capacity(args.len());
+        // 被调方是 `extern "C"` 声明时，`fn(..)` 类型的实参必须在边界上退化成
+        // 裸代码地址：C 侧只接受函数地址，不认 zr 的 16 字节函数值记录
+        // （`thread_entry_impl` 传给 `zr_thread_create` 正是这种）。zr 内部
+        // 调用不解构记录——间接调用点自己读 `{code, env}`。
+        let callee_is_extern = matches!(
+            &callee_hir.kind,
+            ExprKind::Def(id)
+                if self
+                    .functions
+                    .get(id)
+                    .is_some_and(|f| f.abi == hir::Abi::C && f.body.is_none())
+        );
         for (i, arg) in args.iter().enumerate() {
             let a = match arg {
                 ast::Argument::Pos(e) => e,
@@ -5296,26 +5416,9 @@ impl TypeChecker {
                 .cloned()
                 .unwrap_or_else(|| self.infer.fresh_infer(span));
             let arg = self.with_value_pos(false, |s| s.check_expr(a, &param_ty))?;
-            // 带捕获闭包（环境结构体 `__env_N`）传给 `fn(..)` 形参：环境值
-            // 不是函数指针，被调方拿不到捕获 local，跨函数环境传递机制
-            // 不存在，明确报错而不是把环境值当函数地址调用（运行必崩）。
-            if let Ty::Named(arg_id, _) = self.infer.resolve(&arg.ty) {
-                if self.closures_by_env.contains_key(&arg_id) {
-                    let param = self.infer.resolve(&param_ty);
-                    // 环境结构体传给 `fn(..)` 形参：被调方拿不到捕获 local，
-                    // 跨函数环境传递不存在，运行必崩。形参停在 Infer 也一样
-                    // 拒绝——它要么被绑成函数类型（上面），要么被绑成环境类型
-                    // 却仍被当函数指针调用，两者都错。
-                    if matches!(param, Ty::Function { .. } | Ty::Infer(_)) {
-                        return Err(CompileError::type_error(
-                        "captured closure cannot be passed as a plain `fn` value; \
-                         a closure that captures variables carries its environment and \
-                         cannot be converted to a function pointer",
-                    )
-                    .with_span(a.span()));
-                    }
-                }
-            }
+            // 带捕获闭包（环境结构体 `__env_N`）传给 `fn(..)` 形参：`check_expr`
+            // 已经按期望类型把它转成函数值记录（`ClosureToFn`），这里不再需要
+            // 早先那条 `captured closure cannot be passed as a plain fn value` 报错。
             // 形参类型是推断变量（提升闭包的未标注形参，如 `let id = |x| x;`
             // 里 `x` 的类型要靠 `id(7)` 反推）：`check_literal` 对 `Infer`
             // 期望只给字面量默认类型（`Int(32)`），不会主动绑定推断变量。
@@ -5343,6 +5446,19 @@ impl TypeChecker {
             ) {
                 self.check_partial_move(&arg, a.span())?;
             }
+            // `extern "C"` 边界：`fn(..)` 实参退化成裸代码地址（`FnToCodePtr`）。
+            // 节点类型标成 `*const void`（8 字节标量），MIR 才不会把它当 16 字节
+            // 聚合值再复制一遍——值本身已经是指向代码的地址。
+            let arg = if callee_is_extern && matches!(self.infer.resolve(&param_ty), Ty::Function { .. })
+            {
+                HirExpr {
+                    kind: ExprKind::FnToCodePtr(Box::new(arg)),
+                    ty: Ty::Pointer(Box::new(Ty::Unit), hir::Mutability::Immutable),
+                    span: a.span(),
+                }
+            } else {
+                arg
+            };
             hir_args.push(arg);
         }
         // 具名函数走直接调用；其余函数类型表达式走运行期函数指针调用。
@@ -8669,6 +8785,349 @@ impl TypeChecker {
         Ok(())
     }
 
+    /// 收尾生成所有函数值 shim / thunk。
+    ///
+    /// 两件事：
+    /// 1. **把所有函数体里"函数名当值"的 `ExprKind::Def(id)` 改写成
+    ///    `ExprKind::FnValue { func, shim }`**。函数值在运行期是 16 字节记录
+    ///    `{code, env}`，直接取符号地址（早先的 `Def` 降级）只得到 8 字节代码
+    ///    地址，装不进记录、间接调用也拿不到 env。这一步放在收尾做，是因为
+    ///    `f(x)` 这种**具名直调**在 `check_call` 里已经把 callee 节点丢掉、
+    ///    落成 `ExprKind::Call { callee: DefId }`——留在函数体里的 `Def(函数)`
+    ///    一定都是"当值用"，不会给用不到的泛型函数白造 shim。
+    /// 2. 统一构造 `pending_shims` 里的普通函数转发 shim 与带捕获闭包 thunk。
+    ///    延后到收尾才能拿到已解析的形参 / 返回类型（闭包形参可能一直是推断
+    ///    变量，靠调用点反推）。
+    fn finalize_fn_value_shims(&mut self) {
+        // 函数表先取出来：遍历函数体时 `self` 还要记新 shim（双借用会冲突）。
+        let mut fns = std::mem::take(&mut self.functions);
+        let ids: HashSet<DefId> = fns.keys().copied().collect();
+        for f in fns.values_mut() {
+            if let Some(body) = &mut f.body {
+                self.rewrite_fn_values_block(body, &ids);
+            }
+        }
+        let pending = std::mem::take(&mut self.pending_shims);
+        for p in pending {
+            let made = match p.kind {
+                ShimKind::Plain(func) => self.make_plain_shim(&fns, func, p.shim, p.span),
+                ShimKind::Captured(env_id) => self.make_closure_thunk(env_id, p.shim, p.span),
+            };
+            if let Some(f) = made {
+                fns.insert(p.shim, f);
+            }
+        }
+        self.functions = fns;
+    }
+
+    /// 遍历块，把 `Def(函数)` 改写成 `FnValue`。
+    fn rewrite_fn_values_block(&mut self, b: &mut hir::HirBlock, fns: &HashSet<DefId>) {
+        for stmt in &mut b.stmts {
+            match stmt {
+                HirStmt::Expr(e) => self.rewrite_fn_values_expr(e, fns),
+                HirStmt::Let { init, .. } | HirStmt::Var { init, .. } => {
+                    if let Some(i) = init {
+                        self.rewrite_fn_values_expr(i, fns);
+                    }
+                }
+                HirStmt::Item => {}
+            }
+        }
+        if let Some(t) = &mut b.tail {
+            self.rewrite_fn_values_expr(t, fns);
+        }
+    }
+
+    fn rewrite_fn_values_expr(&mut self, e: &mut HirExpr, fns: &HashSet<DefId>) {
+        match &mut e.kind {
+            ExprKind::Def(id) => {
+                let id = *id;
+                if !fns.contains(&id) {
+                    // 常量 / static 引用，保持原样。
+                    return;
+                }
+                if self.generic_asts.contains_key(&id) {
+                    // 泛型函数当值需要按上下文实例化，当前单态化只在具名调用点
+                    // 做（`f(x)`）。当值取走会生成一个调用未实例化泛型体的 shim，
+                    // 链接期才炸——这里明确报错。
+                    self.errors.push(
+                        CompileError::type_error(
+                            "cannot use a generic function as a value: generic functions are \
+                             monomorphized at named call sites only",
+                        )
+                        .with_span(e.span),
+                    );
+                    return;
+                }
+                let shim = self.ensure_plain_shim(id, e.span);
+                e.kind = ExprKind::FnValue { func: id, shim };
+            }
+            ExprKind::Binary(_, l, r) => {
+                self.rewrite_fn_values_expr(l, fns);
+                self.rewrite_fn_values_expr(r, fns);
+            }
+            ExprKind::Assign(l, r) => {
+                self.rewrite_fn_values_expr(l, fns);
+                self.rewrite_fn_values_expr(r, fns);
+            }
+            ExprKind::Unary(_, v)
+            | ExprKind::Field(v, _)
+            | ExprKind::Deref(v)
+            | ExprKind::AddrOf(v)
+            | ExprKind::Await(v)
+            | ExprKind::Cast(v)
+            | ExprKind::EnumField { value: v, .. }
+            | ExprKind::EnumTag(v)
+            | ExprKind::ArrayToSlice(v)
+            | ExprKind::Spawn(v)
+            | ExprKind::FnToCodePtr(v) => self.rewrite_fn_values_expr(v, fns),
+            ExprKind::IndexRange(v, start, end, _) => {
+                self.rewrite_fn_values_expr(v, fns);
+                if let Some(s) = start {
+                    self.rewrite_fn_values_expr(s, fns);
+                }
+                if let Some(x) = end {
+                    self.rewrite_fn_values_expr(x, fns);
+                }
+            }
+            ExprKind::Return(v) => {
+                if let Some(v) = v {
+                    self.rewrite_fn_values_expr(v, fns);
+                }
+            }
+            ExprKind::Call { args, .. } => {
+                for arg in args {
+                    self.rewrite_fn_values_expr(arg, fns);
+                }
+            }
+            ExprKind::EnumVariant { args, .. } => {
+                for arg in args {
+                    self.rewrite_fn_values_expr(arg, fns);
+                }
+            }
+            ExprKind::CallIndirect { callee, args, .. } => {
+                self.rewrite_fn_values_expr(callee, fns);
+                for arg in args {
+                    self.rewrite_fn_values_expr(arg, fns);
+                }
+            }
+            ExprKind::ClosureToFn { env, .. } => self.rewrite_fn_values_expr(env, fns),
+            ExprKind::If(cond, then, els) => {
+                self.rewrite_fn_values_expr(cond, fns);
+                self.rewrite_fn_values_block(then, fns);
+                if let Some(els) = els {
+                    self.rewrite_fn_values_block(els, fns);
+                }
+            }
+            ExprKind::While(_, cond, body) => {
+                self.rewrite_fn_values_expr(cond, fns);
+                self.rewrite_fn_values_block(body, fns);
+            }
+            ExprKind::Loop(_, body) => self.rewrite_fn_values_block(body, fns),
+            ExprKind::Block(b) | ExprKind::Defer(b) => self.rewrite_fn_values_block(b, fns),
+            ExprKind::Index(recv, idx) => {
+                self.rewrite_fn_values_expr(recv, fns);
+                self.rewrite_fn_values_expr(idx, fns);
+            }
+            ExprKind::Array(elems) | ExprKind::Tuple(elems) => {
+                for el in elems {
+                    self.rewrite_fn_values_expr(el, fns);
+                }
+            }
+            ExprKind::Struct(fields) => {
+                for (_, f) in fields {
+                    self.rewrite_fn_values_expr(f, fns);
+                }
+            }
+            ExprKind::Yield(v) => self.rewrite_fn_values_expr(v, fns),
+            ExprKind::Closure { body, .. } => {
+                if let Some(b) = body {
+                    self.rewrite_fn_values_block(b, fns);
+                }
+            }
+            ExprKind::Comptime(_)
+            | ExprKind::Literal(_)
+            | ExprKind::Local(_)
+            | ExprKind::FnValue { .. }
+            | ExprKind::Match
+            | ExprKind::Break(_, _)
+            | ExprKind::Continue(_)
+            | ExprKind::Unreachable
+            | ExprKind::Try { .. }
+            | ExprKind::Throw(_)
+            | ExprKind::Asm { .. }
+            | ExprKind::Intrinsic => {}
+        }
+    }
+
+    /// 生成普通函数的函数值转发 shim：`shim(args..., env) { return func(args..); }`。
+    ///
+    /// `env` 恒被忽略——普通函数没有环境。之所以也收这一个多余参数，是为了
+    /// 让**所有**函数值的 `code` 字段遵循同一个 ABI：间接调用点统一传
+    /// `(用户实参..., env, [隐藏返回槽])`，不必在运行期区分"普通函数"与
+    /// "带捕获闭包"。
+    fn make_plain_shim(
+        &mut self,
+        fns: &HashMap<DefId, hir::HirFunction>,
+        func: DefId,
+        shim: DefId,
+        span: Span,
+    ) -> Option<hir::HirFunction> {
+        let target = fns.get(&func)?.clone();
+        if target.is_async {
+            self.errors.push(
+                CompileError::type_error(
+                    "cannot use an async function as a value: async functions return a \
+                     future frame and have no plain call address",
+                )
+                .with_span(span),
+            );
+            return None;
+        }
+        let mut params = Vec::with_capacity(target.params.len() + 1);
+        let mut args = Vec::with_capacity(target.params.len());
+        for p in &target.params {
+            let local = self.alloc_local();
+            params.push(hir::HirParam {
+                local,
+                ty: p.ty.clone(),
+            });
+            args.push(HirExpr {
+                kind: ExprKind::Local(local),
+                ty: p.ty.clone(),
+                span,
+            });
+        }
+        // 末尾的 env 形参：普通函数忽略它。
+        let env_local = self.alloc_local();
+        params.push(hir::HirParam {
+            local: env_local,
+            ty: Ty::Uint(64),
+        });
+        let result = self.alloc_local();
+        let call = HirExpr {
+            kind: ExprKind::Call {
+                callee: func,
+                args,
+                result,
+            },
+            ty: target.return_type.clone(),
+            span,
+        };
+        Some(hir::HirFunction {
+            name: self
+                .def_names
+                .get(&shim)
+                .cloned()
+                .unwrap_or_else(|| format!("__fn_shim_{}", shim.0)),
+            params,
+            return_type: target.return_type,
+            body: Some(hir::HirBlock {
+                stmts: Vec::new(),
+                tail: Some(Box::new(call)),
+            }),
+            is_async: false,
+            async_output: None,
+            is_comptime: false,
+            abi: Abi::Zr,
+            attrs: Vec::new(),
+        })
+    }
+
+    /// 生成带捕获闭包的函数值 thunk：`thunk(params..., env: __env_N) { 闭包体 }`。
+    ///
+    /// 闭包体里对捕获 local 的引用换成 `env.__cN`（与 `apply_capture_body`
+    /// 同一套替换），尾部 `return e` 摘成块尾（否则 MIR 把它当成从**thunk**
+    /// 返回——那恰好就是 thunk 的语义，但块尾更直接、也避免把后面的语句跳过）。
+    fn make_closure_thunk(
+        &mut self,
+        env_id: DefId,
+        shim: DefId,
+        span: Span,
+    ) -> Option<hir::HirFunction> {
+        let rec = self.closures_by_env.get(&env_id)?.clone();
+        let env_ty = Ty::Named(env_id, Vec::new());
+        let mut map: HashMap<LocalId, LocalId> = HashMap::new();
+        let mut params = Vec::with_capacity(rec.params.len() + 1);
+        for (pat, ty) in &rec.params {
+            let ty = ty_resolve_deep(ty, &self.infer.vars);
+            if ty_has_unresolved_infer(&ty, &self.infer.vars) {
+                self.errors.push(
+                    CompileError::type_error("type annotations needed for closure parameter type")
+                        .with_span(span),
+                );
+                return None;
+            }
+            let local = self.alloc_local();
+            if let hir::HirPattern::Binding(old) = pat {
+                map.insert(*old, local);
+            }
+            params.push(hir::HirParam { local, ty });
+        }
+        let env_local = self.alloc_local();
+        params.push(hir::HirParam {
+            local: env_local,
+            ty: env_ty.clone(),
+        });
+        // env 这个局部量不能被重编号（形参已经指向它）。
+        map.insert(env_local, env_local);
+        let mut body = rec.body.clone();
+        for (i, (cap_local, cap_ty)) in rec.captures.iter().enumerate() {
+            let cap_ty = ty_resolve_deep(cap_ty, &self.infer.vars);
+            let with = HirExpr {
+                kind: ExprKind::Field(
+                    Box::new(HirExpr {
+                        kind: ExprKind::Local(env_local),
+                        ty: env_ty.clone(),
+                        span: rec.span,
+                    }),
+                    format!("__c{i}"),
+                ),
+                ty: cap_ty,
+                span: rec.span,
+            };
+            walk_block(&mut body, *cap_local, &with);
+        }
+        // 尾部 `return e` → 块尾 `e`（与 `apply_capture_body` 同一处理）。
+        if body.tail.is_none() {
+            let tail_ret = match body.stmts.last() {
+                Some(HirStmt::Expr(last)) => match &last.kind {
+                    ExprKind::Return(Some(v)) => Some(v.clone()),
+                    _ => None,
+                },
+                _ => None,
+            };
+            if let Some(v) = tail_ret {
+                body.stmts.pop();
+                body.tail = Some(v);
+            }
+        }
+        remap_lifted_body(&mut body, &mut map, &mut self.next_local);
+        let ret = ty_resolve_deep(&rec.ret, &self.infer.vars);
+        if ty_has_unresolved_infer(&ret, &self.infer.vars) {
+            self.errors.push(
+                CompileError::type_error("type annotations needed for closure return type")
+                    .with_span(span),
+            );
+            return None;
+        }
+        Some(hir::HirFunction {
+            name: self
+                .def_names
+                .get(&shim)
+                .cloned()
+                .unwrap_or_else(|| format!("__closure_fn_{}", shim.0)),
+            params,
+            return_type: ret,
+            body: Some(body),
+            is_async: false,
+            async_output: None,
+            is_comptime: false,
+            abi: Abi::Zr,
+            attrs: Vec::new(),
+        })
+    }
+
     /// 闭包立即调用的单态化内联：`(|x| x + 1)(5)`、`(|x| x + n)(5)`。
     ///
     /// 在调用点把闭包体展开：为每个形参新建一个局部变量绑定实参（避免带
@@ -10981,10 +11440,16 @@ fn substitute_local(e: &mut hir::HirExpr, target: LocalId, with: &hir::HirExpr) 
         // `yield foo(x)` 的操作数里可能有捕获的局部量，跨函数内联时必须
         // 一起替换（与 `Index` / 数组 / 元组同一原因）。
         ExprKind::Yield(e) => substitute_local(e, target, with),
+        // 带捕获闭包转函数值：环境里的捕获局部同样要替换（跨函数内联时）。
+        ExprKind::ClosureToFn { env, .. } => substitute_local(env, target, with),
+        // 函数值退化成裸代码地址：内层的 `FnValue` / `ClosureToFn` 不需要替换，
+        // 但 `FnToCodePtr` 也可能包着别的东西，统一下沉。
+        ExprKind::FnToCodePtr(e) => substitute_local(e, target, with),
         ExprKind::Comptime(_)
         | ExprKind::Literal(_)
         | ExprKind::Local(_)
         | ExprKind::Def(_)
+        | ExprKind::FnValue { .. }
         | ExprKind::Match
         | ExprKind::Break(_, _)
         | ExprKind::Continue(_)
@@ -11135,9 +11600,12 @@ fn remap_lifted_body(
                 }
             }
             ExprKind::Yield(e) => remap_expr(e, map, next),
+            ExprKind::ClosureToFn { env, .. } => remap_expr(env, map, next),
+            ExprKind::FnToCodePtr(e) => remap_expr(e, map, next),
             ExprKind::Comptime(_)
             | ExprKind::Literal(_)
             | ExprKind::Def(_)
+            | ExprKind::FnValue { .. }
             | ExprKind::Match
             | ExprKind::Break(_, _)
             | ExprKind::Continue(_)

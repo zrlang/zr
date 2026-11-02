@@ -16,7 +16,7 @@ cargo test --test zr_language
 属性、断言内建这些设施编译器目前还不支持（闭包已可用，见 `83_closure_fnptr.zr`
 与 `84_closure_capture_value.zr`；见下方"尚未覆盖"）。
 
-`tests/cases/` 现有 124 个用例，每个在 `-O0/-O1/-O2/-O3/-Oz` 各跑一遍。
+`tests/cases/` 现有 125 个用例，每个在 `-O0/-O1/-O2/-O3/-Oz` 各跑一遍。
 
 "该报错的还在报错"由另一半套件补上：`tests/negative/*.zr`（37 个）每个都必须
 **编译失败**，且报错文本要含文件里 `// expect: <子串>` 标注的期望子串
@@ -132,8 +132,8 @@ cargo test --test zr_negative
 | `97_loop_value.zr` | `loop` 表达式带值 `break`：`let x = loop { break 7; }` = 7、累加器 = 0+1+2+3、嵌套 break 值只外层生效、`while`/`for` break 作语句、发散循环（早先 `Break` 只记标签丢弃值、`Loop` 恒 `Never`，全静默得 0）。**聚合 break 值在 `-O3`/`-Oz` 有已知 codegen 缺陷** |
 | `107_string_push_bytes_reserve.zr` | `String::push_bytes` 扩容算错：早先传 `reserve(new_len - capacity)`（只在 `len == capacity` 时够），其余情况少 reserve、拷贝循环越界写堆，可能覆写相邻对象/`SIGABRT`；本用例在循环里 `push_byte` 触发 realloc 后再 `push_bytes` 多字节字面量，断言字节完整、无 NUL |
 | `108_debug_pretty.zr` | `#[derive(Debug)]` 生成的多行 `.debug_pretty()`（Rust `{:#?}` 风格）：命名结构体/结构体变体每字段一行、元组结构体/元组变体逐元素一行、单元变体与空结构体只打名字；嵌套命名类型递归 `Inner__debug_pretty_at(e, ind)`，`__ind` 是**运行期**参数（同一类型出现在深度 0 与深度 2 都对齐 Rust）。期望串逐个对照 `rustc {:#?}` |
-| `109_closure_env_cross_fn.zr` | 带捕获闭包**跨函数**传递：把环境结构体 `__env_N` 按值当实参传给**泛型**形参（`fn apply<F>(f: F, ..)`，`F` 单态化到 `__env_N`），被调函数体的 `f(x)` 同样按环境 DefId 内联展开。覆盖单元/多捕获、同一闭包传给两个泛型函数、重复调用、**数组捕获 + 变量下标**（早先 `substitute_local` 的 `Index` 分支只替换下标不替换数组基址，跨函数内联读到别的栈帧、SIGSEGV）、元组捕获、闭包体内数组字面量（`Array` 子表达式含捕获）与 `return`。`fn(..)` 形参仍拒绝（见负向 `07_closure_capture.zr`） |
-| `110_closure_env_generic_passthrough.zr` | 带捕获闭包的**值传递**穿函数边界与结构体字段：泛型透传返回（`fn idf<F>(f: F) -> F`）、存进泛型结构体字段并调用 `h.f(x)`、把结构体传给泛型函数再调用字段、数组捕获穿过字段 + 泛型函数（变量下标）、捕获的值拷贝语义（捕获后改外层不影响闭包）。这些形态在泛型路径下本就可用；做不到的只是转裸 `fn(..)` 指针 |
+| `109_closure_env_cross_fn.zr` | 带捕获闭包**跨函数**传递：把环境结构体 `__env_N` 按值当实参传给**泛型**形参（`fn apply<F>(f: F, ..)`，`F` 单态化到 `__env_N`），被调函数体的 `f(x)` 同样按环境 DefId 内联展开。覆盖单元/多捕获、同一闭包传给两个泛型函数、重复调用、**数组捕获 + 变量下标**（早先 `substitute_local` 的 `Index` 分支只替换下标不替换数组基址，跨函数内联读到别的栈帧、SIGSEGV）、元组捕获、闭包体内数组字面量（`Array` 子表达式含捕获）与 `return` |
+| `110_closure_env_generic_passthrough.zr` | 带捕获闭包的**值传递**穿函数边界与结构体字段：泛型透传返回（`fn idf<F>(f: F) -> F`）、存进泛型结构体字段并调用 `h.f(x)`、把结构体传给泛型函数再调用字段、数组捕获穿过字段 + 泛型函数（变量下标）、捕获的值拷贝语义（捕获后改外层不影响闭包）。这些形态走泛型路径（`F` 单态化到环境 DefId、调用点内联展开） |
 | `111_i128.zr` | x86-64 上的 `i128`/`u128`：拆成两个连续 8 字节栈槽（lo/hi），加减 `adc`/`sbb`、位运算逐字、移位 `shld`/`shrd`、比较按高位优先定序，传参/返回走 `rdx:rax`，字面量/拷贝/转换；32 位目标仍禁用（乘 / 除 / 取模见 `113`） |
 | `112_fmt_debug.zr` | 格式引擎接自定义类型 Debug（P1-5c）：`FormatArg` 加 `kind = 7` 类型化值通道（`obj_ptr` + `debug_fn`），`#[derive(Debug)]` 生成 `Type__debug_fmt(*const void, bool, *mut u8, usize) -> usize`，`io::fmt_debug` 组装参数。断言单行/多行两态逐字符对齐 Rust、超容量按容量截断且返回所需总长度、嵌套结构体递归渲染，并经 `println_fmt` 端到端冒烟 |
 | `113_i128_muldiv.zr` | `i128`/`u128` 的乘 / 除 / 取模：乘拆四段 64 位部分积（跨 64 位边界、`2^128` 截断为 0、负负得正），除 / 取模走 128 轮软件长除（有符号商向零截断、余数符号跟随被除数、两负数相除商为正）；**每个宽运算都同时走"就地算"与"函数调用"两条路径**——`SsaInstr::Call` 不带实参类型，宽实参的宽度靠 `regalloc::CalleeParams` 查被调方声明，早先漏标只送 2 个字，-O2/-Oz 直接 SIGILL |
@@ -148,6 +148,7 @@ cargo test --test zr_negative
 | `122_const_generic.zr` | `const` 泛型 `<const N: usize>`：泛型函数 / 结构体 / `impl` 方法上的 const 参数、数组长度按参数名延迟替换、值位置使用（`while i < N`、`N as i32`、`[0; N]`）、从实参数组长度与结构体字面量反推 const 实参。种类核验（类型当 const、值当类型、`N` 当类型用）在注解处报错（负向 `32` / `33` / `34`） |
 | `123_yield_cooperative.zr` | `yield` 协作让出点：spawn 两个带 `yield` 的 worker 交错执行（顺序 1,2,3,4）、`yield foo(p)` 的操作数副作用必须发生、循环里多轮让出且结构体/元组活跃值跨挂起点存活、tail 位置 `yield`。早先 `yield` 是类型占位（`Ty::Infer(InferId(0))`），操作数被 `let _ = inner;` 整体丢弃（`foo` 从不被调用），同步函数里静默空操作；现在同步函数与闭包体里的 `yield` 报错（负向 `35` / `36`） |
 | `124_trait_default_methods.zr` | trait 默认方法与 `default fn`：带方法体的 trait 方法在 impl 未覆盖时合成到目标类型（`A__m`）；覆盖默认方法、默认体读字段 / 调另一个默认体（`self.base()` 的 `&Self` 接收者核验）、trait 体与 impl 体两侧的 `default fn`。早先默认体等于没写，`s.m()` 报 `no field m on type S`；没有默认体的必需方法缺失现在在 impl 块报 `not all trait items implemented`（负向 `37`） |
+| `125_closure_to_fn.zr` | 带捕获闭包转裸 `fn(..)` 值（P1-2c）：函数值 = 16 字节聚合记录 `{code, env}`，`code` 指向统一 shim（末尾恒多收一个 `env` 形参，普通函数 shim 忽略它、带捕获闭包 thunk 把捕获 local 换成 `env.__cN`），间接调用统一按 `(用户实参..., env, [隐藏返回槽])` 传参。覆盖闭包直传 `fn(..)` 形参、作返回值（`make(10)(5)`）、`let g: fn(..) = |x| ..` 后跨函数调用、普通函数当值、返回的闭包再传出、循环里反复取带捕获闭包、函数值存结构体字段、捕获数组/元组。泛型函数 / 异步函数当值明确报错（负向 `38` / `39`）；带捕获闭包经 `extern "C"` 传给 C 侧回调仍不支持（`FnToCodePtr` 只把记录退化成裸代码地址，C 侧没有地方放 env） |
 
 ## 尚未覆盖（编译器还不支持）
 
@@ -170,7 +171,7 @@ Rust Book 的其余章节目前一个都测不了，因为对应特性尚未实�
 | 集合（Vector / String / HashMap） | 🟡 `std/collections` 与 `std/string` 已加载，但 `String` 无 `BufRead::read_line` 形态的 API；无 `HashMap` |
 | 错误处理（`panic!` / `Result` / `?`） | ✅ `69_question.zr`：`?` 对 `Result`/`Option` 生效；`Option`/`Result`（含变体）已在 prelude（`89_prelude_variant.zr`）。`panic!` 未实现 |
 | 泛型 / Trait / 生命周期 | ✅ 泛型函数/impl 与 `T: Trait` 边界校验已实现（`66_generics.zr`、`74_generic_alias.zr`）；trait 方法/关联类型/`Self` 可用。**生命周期标注 `'a` 解析后丢弃**，无借用/存活检查 |
-| 函数式（闭包 / 迭代器） | 🟡 **无捕获**闭包已可存进变量/当实参/返回（`83_closure_fnptr.zr`）；**带捕获**闭包已可存进变量/嵌套/多次调用（`84_closure_capture_value.zr`）；**跨函数传 env 未实现**，但两条路径都明确报错而不是静默出错——传给 `fn(..)` 形参报 `captured closure cannot be passed as a plain `fn` value`（负向 `07_closure_capture.zr`），作为 `fn(..)` 返回值报 `captured closure cannot be returned as a plain `fn` value`（负向 `25_closure_return.zr`；早先编译通过、运行 SIGSEGV） |
+| 函数式（闭包 / 迭代器） | 🟡 **无捕获**闭包已可存进变量/当实参/返回（`83_closure_fnptr.zr`）；**带捕获**闭包已可存进变量/嵌套/多次调用（`84_closure_capture_value.zr`）、按值传给泛型形参 / 从泛型返回值透传（`109` / `110`）；**带捕获闭包也能转成裸 `fn(..)` 值**——传给 `fn(..)` 形参、作 `fn(..)` 返回值、`let f: fn(..) = |..|` 都可用（`125_closure_to_fn.zr`：函数值 = 16 字节记录 `{code, env}`，统一 shim 多传一个 env）。泛型 / 异步函数当值明确报错（负向 `38` / `39`）；迭代器未实现 |
 | 智能指针（`Box` / `Rc` / `RefCell`） | ❌ 未实现 |
 | 并发（线程 / 通道 / `Mutex` / `Send`） | 🟡 线程已覆盖（`59_threads.zr`）；无通道 / `Mutex` / `Send` |
 | 面向对象 / 状态模式 | ✅ `trait` 与 `enum` 都已实现；trait 对象 `dyn` 骨架已搭（`88_dyn_keyword.zr`），vtable 分派未完工 |

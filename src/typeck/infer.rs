@@ -146,7 +146,8 @@ impl<'a> InferCtxt<'a> {
                 }
                 sz
             }
-            Ty::Function { .. } => 8,
+            // 函数值是 `{code, env}` 记录——两个机器字（与 MIR 布局一致）。
+            Ty::Function { .. } => 16,
             Ty::Optional(inner) => self.size_of(inner) + 1,
             Ty::ErrorUnion(ok, _) => self.size_of(ok) + 1,
             Ty::Named(def_id, _) => match self.type_defs.get(def_id) {

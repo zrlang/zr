@@ -7,7 +7,9 @@ zr 是一门系统编程语言（Rust/Zig 混合取向），编译器用 Rust �
 > 最近更新：2026-11-02。工作树在 `feat/lang-features`；调用实参 / 字段值的类型
 > 核验已落地（`check_call_arg` / `check_field_value`），`std/error` 因此可加载；
 > `yield` 已从类型占位升级为可执行的协作让出点（非生成器）；trait 默认方法
-> （带方法体的 trait 方法 / `default fn` 拼写）已合成到 impl 目标类型。清单见 §5。
+> （带方法体的 trait 方法 / `default fn` 拼写）已合成到 impl 目标类型；
+> 带捕获闭包已能转成裸 `fn(..)` 值（函数值 = 16 字节记录 `{code, env}` + 统一
+> shim ABI，P1-2c）。清单见 §5。
 
 ---
 
@@ -57,8 +59,8 @@ target/debug/zr prog.zr -O1 -o /tmp/prog   # 编译单个程序
   `ld` 直接断言崩溃（`atomShouldReplaceExisting`）。先 `nm` 看目标文件有没有
   重复符号，再下结论。已修复（提交 `1ef4a02`：MIR 按最终符号名去重，保留首个
   用户定义）。
-- 测试：`tests/zr_language.rs` 把 124 个 `tests/cases/*.zr` 各在
-  `-O0/-O1/-O2/-O3/-Oz` 跑一遍（620 次编译+运行）。退出码 0 = 过，非 0 = 失败（编号指向失败的断言）。
+- 测试：`tests/zr_language.rs` 把 125 个 `tests/cases/*.zr` 各在
+  `-O0/-O1/-O2/-O3/-Oz` 跑一遍（625 次编译+运行）。退出码 0 = 过，非 0 = 失败（编号指向失败的断言）。
   宿主端另有 `io_print_matches_rust` 等 Rust 对照用例。
 - **负向测试机制是 `tests/zr_negative.rs`**（`cargo test --test zr_negative`，
   37 个用例）。`tests/negative/*.zr` 每个都必须**编译失败**，且报错文本里含
@@ -278,7 +280,7 @@ README 里"指针与 unsafe"一节目前是**愿景**：
 ### `cargo test` 当前基线（2026-11-02，全绿）
 
 - `cargo test --bin zr`：267 项。
-- `cargo test --test zr_language`：124 个用例 × 5 个优化等级 = 620 项，另有 3 个宿主端
+- `cargo test --test zr_language`：125 个用例 × 5 个优化等级 = 625 项，另有 3 个宿主端
   对照用例（`io_print_matches_rust`——逐字符对比 Rust 的格式化输出，含 `{:e}` / `{:E}`
   与大浮点 Display（`|v| ≥ 2⁶⁴` 不带 `.0`）的回归；`extern_c_write_prints_string_literal`；
   `toolchain_subcommands_emit`——`zr fmt` / `zr fmt --check` / `zr pkg init` / `zr lsp`
@@ -293,7 +295,8 @@ README 里"指针与 unsafe"一节目前是**愿景**：
   `32_const_arg_kind.zr` / `33_const_param_as_type.zr` / `34_const_arg_mismatch.zr`、
   同步函数与闭包体里的 `yield` 上下文校验
   `35_yield_sync.zr` / `36_yield_closure.zr`、impl 缺必需 trait 方法
-  `37_trait_missing_method.zr`）。
+  `37_trait_missing_method.zr`、泛型函数 / 异步函数当值
+  `38_generic_fn_as_value.zr` / `39_async_fn_as_value.zr`）。
 
 ### 最近修掉的静默 bug（都在 `tests/` 里留了钉子）
 
@@ -558,7 +561,15 @@ README 里"指针与 unsafe"一节目前是**愿景**：
   支持规格（`{x:>5}`、`{x:x}`）与重复使用同一个名字（`{x}..{x}`）。
   `io_print_matches_rust` 已加 `{x}+{y}={x}` / `nmiss={unknown} {x}` / `spec=[{x:>5}] 0x{x:x}`
   三组钉住。
-- **闭包**：**无捕获**闭包已可存进变量/当实参/返回（提升成 `__closure_N` 顶层函数指针）；**带捕获**闭包已可存进变量/嵌套/多次调用（`tests/cases/84_closure_capture_value.zr`）；**跨函数传 env 已支持**——把环境结构体按值当实参传给**泛型**形参（`fn apply<F>(f: F, ..)`，`F` 单态化到 `__env_N`，被调函数体的 `f(x)` 按环境 DefId 内联展开，`tests/cases/109_closure_env_cross_fn.zr`）。**`fn(..)` 形参/返回值两条路径仍明确报错**——传给 `fn(..)` 形参报 `captured closure cannot be passed as a plain `fn` value`（负向 `07_closure_capture.zr`），作为 `fn(..)` 返回值报 `captured closure cannot be returned as a plain `fn` value`（负向 `25_closure_return.zr`；早先编译通过、运行 SIGSEGV）；要支持需 `Fn` 边界 / 胖指针，属独立大工程。返回路径的检查在 `check_expr` 的 `Expression::Return` 分支，与实参检查（`check_call`）对称。跨函数内联靠 `substitute_local` 把捕获 local 替换成形参 `f.__cN`——**该函数必须递归进 `Index` 的基址、`Array`/`Tuple` 元素**，早先 `Index(_, v)` 只替换下标，数组捕获跨函数内联读到别的栈帧直接 SIGSEGV（同函数内联因外层 local 还在而"碰巧"对）。
+- **闭包**：**无捕获**闭包已可存进变量/当实参/返回（提升成 `__closure_N` 顶层函数指针）；**带捕获**闭包已可存进变量/嵌套/多次调用（`tests/cases/84_closure_capture_value.zr`）；**跨函数传 env 已支持**——把环境结构体按值当实参传给**泛型**形参（`fn apply<F>(f: F, ..)`，`F` 单态化到 `__env_N`，被调函数体的 `f(x)` 按环境 DefId 内联展开，`tests/cases/109_closure_env_cross_fn.zr`）。跨函数内联靠 `substitute_local` 把捕获 local 替换成形参 `f.__cN`——**该函数必须递归进 `Index` 的基址、`Array`/`Tuple` 元素**，早先 `Index(_, v)` 只替换下标，数组捕获跨函数内联读到别的栈帧直接 SIGSEGV（同函数内联因外层 local 还在而"碰巧"对）。
+  **P1-2c：带捕获闭包转裸 `fn(..)` 值** ✅ 已实现（2026-11-02）。早先传给 `fn(..)` 形参报 `captured closure cannot be passed as a plain `fn` value`（负向 `07`）、作 `fn(..)` 返回值报 `captured closure cannot be returned as a plain `fn` value`（负向 `25`；早先编译通过、运行 SIGSEGV），两个负向用例已随实现删除。现在**函数值 = 16 字节聚合记录 `{code, env}`**：
+  (1) `Ty::Function` 从标量改成聚合（MIR 里聚合以地址表示），`type_size_align = (16, 8)`、`struct_layout` 返回 `code`@0 / `env`@8、`is_scalar_ty` 移除 Function、`element_size = 16`、`infer.rs::size_of = 16`；`std/thread.zr::size_of_thread_handle` 随之 16 → **24**。
+  (2) **统一 shim（thunk）ABI**：`code` 恒指向「末尾多收一个 `env`」的 shim，间接调用统一按 `(用户实参..., env, [隐藏返回槽])` 传参。**env 必须在 retptr 之前**——MIR 给聚合返回函数追加隐藏返回槽的位次正是 `params.len()`，而 shim 声明的形参就是 `(用户形参..., env)`，两边自动对齐。
+  (3) 新 HIR 节点（`src/typeck/hir.rs`）：`ExprKind::FnValue { func, shim }`（函数名作一等值）、`ClosureToFn { env, thunk }`（带捕获闭包转函数值）、`FnToCodePtr(Box<HirExpr>)`（记录退化裸代码地址）。`check_expr` 末尾 `coerce_closure_to_fn` 在期望类型 resolve 成 `Ty::Function` 且实参是 `__env_N` 时生成 `ClosureToFn`；`Expression::Return` 与 `check_call` 两处原有的「不能当函数值」报错删除。
+  (4) `finalize_fn_value_shims`（`src/typeck/mod.rs`，`check_function_bodies` 收尾在 `finalize_lifted_closures` 之后调用）：`std::mem::take(&mut self.functions)` → 所有函数体跑 `rewrite_fn_values_block`（把 `ExprKind::Def(id)` 就地改成 `FnValue`）→ 逐个 `pending_shims` 落成 shim。普通函数 shim = `shim(args..., env) { return func(args..); }`（env 忽略）；带捕获闭包 thunk 把捕获 local 换成 `env.__cN`；**环境在 MIR 降级时用 `zr_alloc` 复制到堆**（调用方可能立刻返回，栈上环境活不到被调方使用它的时刻）。
+  (5) `FnToCodePtr` 只用于 `extern "C"` 边界：内层是 `FnValue` 时直接取 `FuncAddr(func)`（**绕开 shim**，否则 C 侧传的实参会被当成 env、整体错位），否则读记录 +0；节点类型刻意标 `Ty::Pointer(Unit, Immutable)`（`*const void`），避免 MIR 按 16 字节聚合再复制一遍。
+  (6) 明确报错：泛型函数当值报 `cannot use a generic function as a value: generic functions are monomorphized at named call sites only`（负向 `38_generic_fn_as_value.zr`）、async 函数当值报 `cannot use an async function as a value: async functions return a future frame and have no plain call address`（负向 `39_async_fn_as_value.zr`）。普通函数值**不做 `zr_alloc`**（`FormatArg.debug_fn` 每次格式化都会构造，会泄漏）。
+  回归 `tests/cases/125_closure_to_fn.zr`（闭包直传 `fn(..)` 形参 / 作返回值 / `let f: fn(..) = |..|` 跨函数调用 / 普通函数当值 / 返回的闭包再传出 / 循环里反复取带捕获闭包 / 函数值存结构体字段 / 捕获数组与元组）。**仍不支持**：带捕获闭包经 `extern "C"` 传给 C 侧回调（C 侧没有地方放 env）。
 - **`i128`/`u128`**：✅ 已在 64 位目标（x86-64）上打通——拆成两个连续 8 字节栈槽
   （lo / hi），加减 `adc`/`sbb`、位运算逐字、移位 `shld`/`shrd`、比较按高位优先
   定序，传参 / 返回走 `rdx:rax`，字面量 / 拷贝 / 转换可用；**乘 / 除 / 取模也已

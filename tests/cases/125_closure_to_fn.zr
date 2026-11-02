@@ -1,0 +1,118 @@
+// 覆盖 P1-2c：**带捕获**闭包转成裸 `fn(..)` 值（函数值 = 16 字节记录 `{code, env}`）。
+//
+// 早先这是明确报错的两条路径——传给 `fn(..)` 形参报
+// `captured closure cannot be passed as a plain fn value`，作为 `fn(..)` 返回值报
+// `captured closure cannot be returned as a plain fn value`（负向 07 / 25）。
+// 原因是带捕获闭包的值模型是环境结构体 `__env_N`（字段 = 捕获 local 的值拷贝），
+// 它不是函数地址，跨函数也拿不到捕获 local。
+//
+// 现在函数值统一是 16 字节记录 `{code, env}`：
+//   - `code` 恒指向一个"末尾多收一个 `env`"的 shim —— 普通函数是转发 shim
+//     （env 忽略），带捕获闭包是特化 thunk（体内捕获 local 换成 `env.__cN`）；
+//   - `env` 对普通函数是 0，对带捕获闭包是**环境在堆上的副本**（调用方可能
+//     马上返回，栈上的环境值活不到被调方使用它的时刻）。
+// 间接调用统一按 `(用户实参..., env, [隐藏返回槽])` 传参，因此同一段代码既能
+// 调普通函数也能调闭包，不必在运行期区分。
+//
+// 探针见提交说明；五档（-O0/-O1/-O2/-O3/-Oz）都应 exit 0。
+fn apply(f: fn(i32) -> i32, x: i32) -> i32 {
+    return f(x);
+}
+
+fn twice(f: fn(i32) -> i32, x: i32) -> i32 {
+    return f(f(x));
+}
+
+fn make(base: i32) -> fn(i32) -> i32 {
+    return |x| x + base;
+}
+
+fn add1(x: i32) -> i32 {
+    return x + 1;
+}
+
+/// 函数值也是普通字段类型：结构体里存 `fn(..)`（16 字节记录）要按值复制，
+/// 且**跨函数**从字段里取出来间接调用。
+struct Holder {
+    f: fn(i32) -> i32,
+    tag: i32,
+}
+
+fn call_holder(h: Holder, x: i32) -> i32 {
+    return h.f(x) + h.tag;
+}
+
+fn main() -> i32 {
+    let base: i32 = 40;
+
+    // 1. 带捕获闭包直接传给 `fn(..)` 形参（早先负向 07 的形态）。
+    if apply(|x| x + base, 2) != 42 {
+        return 1;
+    }
+
+    // 2. 带捕获闭包作为 `fn(..)` 返回值（早先负向 25 的形态）。
+    let f = make(10);
+    if f(5) != 15 {
+        return 2;
+    }
+
+    // 3. 带类型标注的绑定（`let f: fn(..) = 闭包`），再跨函数间接调用。
+    let g: fn(i32) -> i32 = |x| x * 2 + base;
+    if apply(g, 1) != 42 {
+        return 3;
+    }
+    // 同一个闭包被调两次（每次经 thunk 从堆上环境取捕获值）。
+    if twice(g, 0) != 120 {
+        return 4;
+    }
+
+    // 4. 普通函数当值：走同一个 `fn(..)` 形参路径（转发 shim 忽略 env）。
+    if apply(add1, 41) != 42 {
+        return 5;
+    }
+    let h: fn(i32) -> i32 = add1;
+    if h(1) != 2 {
+        return 6;
+    }
+
+    // 5. 返回出来的闭包再当实参传出去。
+    if twice(make(3), 0) != 6 {
+        return 7;
+    }
+
+    // 6. 多捕获 + 在循环里反复取同一个带捕获闭包（每轮捕获不同）。
+    let mut total: i32 = 0;
+    let mut i: i32 = 0;
+    while i < 3 {
+        total = total + apply(|x| x + base + i, 0);
+        i = i + 1;
+    }
+    if total != 123 {
+        return 8;
+    }
+
+    // 7. 函数值存进结构体字段，跨函数取出调用；普通函数与闭包同一个字段类型。
+    let a = Holder { f: add1, tag: 1 };
+    if call_holder(a, 0) != 2 {
+        return 9;
+    }
+    let b = Holder { f: |x| x * 3 + base, tag: 2 };
+    if call_holder(b, 0) != 42 {
+        return 10;
+    }
+
+    // 8. 闭包捕获结构体字段 / 数组（跨 thunk 后捕获值要来自堆上环境）。
+    let arr = [10, 20, 30];
+    let pick = |k: i32| arr[k];
+    let f2: fn(i32) -> i32 = pick;
+    if f2(2) != 30 {
+        return 11;
+    }
+    let t = (7, 8);
+    let tup = |k: i32| t.0 * 10 + t.1 + k;
+    if apply(tup, 1) != 79 {
+        return 12;
+    }
+
+    return 0;
+}

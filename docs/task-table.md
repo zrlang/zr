@@ -131,21 +131,23 @@ zr 的做法是让被调方是**泛型**函数（`fn apply<F>(f: F, ..)`）：`F
 `apply_capture_body` 把捕获 local 替换成形参 `f.__cN` 后内联展开
 （`109_closure_env_cross_fn.zr`）。
 
-仍**明确报错**（不是静默出错）的两条路径，都是"环境值不是函数指针"的直接后果：
+仍**明确报错**（不是静默出错）的两条路径，由 P1-2c 解决（函数值 = 16 字节
+记录 `{code, env}`）：
 
-- 带捕获闭包作为**实参**传给 `fn(..)` 形参 → 报
-  `captured closure cannot be passed as a plain `fn` value`（负向 `07_closure_capture.zr`）。
-  要支持它需要 `Fn` 边界 / 胖指针（`{code, env}`）与配套调用约定，属**独立大工程**，
-  与 zr 的"单态化优先、不做默认动态分发"取向相悖，暂不做；泛型形参是当前正解。
-- 带捕获闭包作为 `fn(..)` 的**返回值** → 早先**编译通过、运行 SIGSEGV**（环境结构体
-  被 MIR 当函数地址 `call`），现报
-  `captured closure cannot be returned as a plain `fn` value`（负向 `25_closure_return.zr`）。
+- ~~带捕获闭包作为**实参**传给 `fn(..)` 形参 → 报 `captured closure cannot be
+  passed as a plain `fn` value`（负向 `07_closure_capture.zr`）~~：已支持，
+  `coerce_closure_to_fn` 把环境值搬进记录（env 复制到堆）、`code` 指向特化
+  thunk。原负向用例因此删除。
+- ~~带捕获闭包作为 `fn(..)` 的**返回值** → 早先**编译通过、运行 SIGSEGV**
+  （环境结构体被 MIR 当函数地址 `call`），现报 `captured closure cannot be
+  returned as a plain `fn` value`（负向 `25_closure_return.zr`）~~：已支持，
+  同一套 `ClosureToFn` 降级。原负向用例删除。
 
 | 子任务 | 内容 | 状态 |
 |---|---|---|
 | P1-2a | 带捕获闭包作为**函数实参**传递给**泛型**形参（env 打包成栈上结构体按值传入，被调方内联展开）——✅。连带修掉 `substitute_local` 的 `Index` 分支只替换下标、不替换数组基址的静默 bug（数组捕获跨函数内联读别的栈帧、SIGSEGV；`Array`/`Tuple` 字面量子表达式同因），回归 `109_closure_env_cross_fn.zr` | ✅ |
 | P1-2b | 带捕获闭包作为**返回值** / 存进结构体字段——✅（泛型路径）。环境值就是普通值：`fn idf<F>(f: F) -> F { return f; }` 透传返回、`struct Holder<F> { f: F }` 存字段，单态化把 `F` 定到 `__env_N`，之后 `f(x)` / `h.f(x)` 照常按环境 DefId 内联展开；捕获是值拷贝（改外层不影响闭包）。回归 `110_closure_env_generic_passthrough.zr`。**裸 `fn(..)` 返回值**这条仍是明确报错（负向 `25_closure_return.zr`），归 P1-2c | ✅ |
-| P1-2c | `fn(..)` 形参 / 返回值接收带捕获闭包（`Fn` 边界 / 胖指针 `{code, env}` + 调用约定）——需独立设计，暂不做（与 zr"单态化优先、不做默认动态分发"取向相悖） | ⬜ |
+| P1-2c | `fn(..)` 形参 / 返回值接收带捕获闭包——✅ 已实现：函数值统一是 **16 字节记录 `{code, env}`**（MIR 里按聚合值处理，表达式的值是它的存储地址），`code` 恒指向一个"末尾多收一个 `env`"的 shim（普通函数是转发 shim，env 忽略；带捕获闭包是特化 thunk，体内捕获 local 换成 `env.__cN`，环境在 MIR 降级时用 `zr_alloc` 复制到堆），间接调用统一按 `(用户实参..., env, [隐藏返回槽])` 传参。`extern "C"` 边界由 `FnToCodePtr` 退化回裸代码地址（普通函数直接取真实符号，绕开多一个形参的 shim）。回归 `125_closure_to_fn.zr`；负向 `38_generic_fn_as_value.zr` / `39_async_fn_as_value.zr`（泛型 / 异步函数当值明确报错）。**仍不支持**：带捕获闭包经 `extern "C"` 传给 C 侧回调（env 无处安放，除非 C 侧原样回传环境指针） | ✅ |
 
 
 ### P1-3 `i128` / `u128` 64 位目标——拆 2 个子任务

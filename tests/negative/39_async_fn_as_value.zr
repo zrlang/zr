@@ -1,0 +1,15 @@
+// 负向用例：`async fn` 不能当值取走。
+//
+// 异步函数对外返回的是堆上的 future 帧（`Ty::Opaque`），没有一个"照常传参
+// 再返回结果"的调用地址——它的调用协议是"建帧 + poll"，与函数值记录的
+// 间接调用 ABI 完全不同。P1-2c 的转发 shim 只能包同步函数，这里明确报错。
+//
+// expect: cannot use an async function as a value
+async fn work() -> i32 {
+    return 7;
+}
+
+fn main() -> i32 {
+    let f = work;
+    return 0;
+}

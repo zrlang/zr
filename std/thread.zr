@@ -21,9 +21,9 @@ extern "C" {
     fn zr_dealloc(ptr: *mut void, size: usize, align: usize);
 }
 
-/// ThreadHandle 的大小：一个函数指针（8 字节）+ 一个 i32（4 字节）。
+/// ThreadHandle 的大小：一个函数值（16 字节 `{code, env}` 记录）+ 一个 i32（4 字节）。
 fn size_of_thread_handle() -> usize {
-    16
+    24
 }
 
 /// 线程句柄

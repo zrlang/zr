@@ -249,6 +249,54 @@ pub enum ExprKind {
         args: Vec<HirExpr>,
         result: LocalId,
     },
+    /// 函数名作为**一等值**：`let f = foo;`、`apply(foo, ..)`、`return foo;`。
+    ///
+    /// zr 的函数值在运行期是 16 字节记录 `{code, env}`（见 `Ty::Function`
+    /// 与 `mir::builder::struct_layout`）：
+    /// - `code` 指向一个 shim（统一签名的转发函数，末尾多收一个 `env` 参数），
+    /// - `env` 是环境指针（普通函数为 0）。
+    ///
+    /// `func` 是真正的目标函数（shim 体里直接调它），`shim` 是
+    /// `finalize_fn_value_shims` 为它生成的转发函数。**调用点**
+    /// （`ExprKind::Call`）不经过本变体：具名调用在 `check_call` 里直接落成
+    /// `Call { callee: func }`，本变体只在函数名被当值取走时出现。
+    ///
+    /// 早先函数名就是裸代码地址（8 字节标量），所以「普通函数」与「带捕获
+    /// 闭包」（环境结构体）无法用同一套存储表示——把带捕获闭包转成
+    /// `fn(..)` 只能明确报错。统一成记录之后两者布局一致，`fn(..)` 形参 /
+    /// 返回值 / 变量都能同时容纳。
+    FnValue {
+        /// 目标函数（shim 体内直接调它）。
+        func: DefId,
+        /// 目标函数的转发 shim（`code` 字段指向它）。
+        shim: DefId,
+    },
+    /// 带捕获闭包转成 `fn(..)`：把环境结构体搬进记录。
+    ///
+    /// `env` 是环境结构体值（捕获局部按值拷贝，`Ty::Named(env_id)`），
+    /// `thunk` 是为该环境生成的特殊化函数：形参 = 闭包形参 + 末尾的
+    /// `env: __env_N`，体内把捕获 local 的引用替换成 `env.__cN`。
+    /// MIR 把环境复制到堆上（闭包值可能活过当前栈帧），再填
+    /// `{code: thunk, env: 堆指针}`。
+    ///
+    /// 早先带捕获闭包传给 `fn(..)` 形参 / 作为 `fn(..)` 返回值都直接报错
+    /// （「captured closure cannot be ... as a plain `fn` value」）：环境结构体
+    /// 不是代码地址，跨函数传递后调用点无从拿到捕获 local。生成 thunk 后
+    /// 环境跟着记录一起走，问题消失。
+    ClosureToFn {
+        /// 环境结构体值。
+        env: Box<HirExpr>,
+        /// 特殊化 thunk（`code` 字段指向它）。
+        thunk: DefId,
+    },
+    /// 把函数值记录退化成裸代码地址（只在 `extern "C"` 边界使用）。
+    ///
+    /// C 函数指针是 8 字节代码地址，容不下 `{code, env}` 记录。`std/thread`
+    /// 的 `zr_thread_create(start: fn(*mut void), ..)` 这类外部声明需要它。
+    /// 内层若是 `FnValue { func, .. }` 就直接取目标函数符号；否则读记录的
+    /// `code` 字段（此时指向 shim，末尾多一个 `env` 参数——真实 ABI 上多传
+    /// 一个参数是无害的，C 侧按自己的签名调用即可）。
+    FnToCodePtr(Box<HirExpr>),
     /// 字段访问（含元组索引）。字段名在类型检查时解析，编译期求值靠它取值。
     Field(Box<HirExpr>, String),
     /// 解引用。

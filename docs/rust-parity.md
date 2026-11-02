@@ -116,7 +116,7 @@
 |------|------|------|------|
 | 块表达式 | 可用 | ✅ | `let v = { let a = 1; a + 1 };` |
 | 函数指针 `fn(T) -> R` | 可用 | ✅ | 取址、传参、返回值、存进结构体字段都行（x86-64 专属，其它后端明确报错） |
-| 闭包 `\|x\| x * factor` | 基本可用 | 🟡 | 无捕获闭包可存变量 / 当实参 / 返回；带捕获闭包也可存变量 / 嵌套 / 多次调用、按值传给**泛型**形参 / 从泛型返回值透传（`84_closure_capture_value.zr`、`109_closure_env_cross_fn.zr`、`110_closure_env_generic_passthrough.zr`）。**带捕获闭包传给裸 `fn(..)` 形参 / 作为 `fn(..)` 返回值仍明确报错**（负向 `07_closure_capture.zr` / `25_closure_return.zr`） |
+| 闭包 `\|x\| x * factor` | 基本可用 | 🟡 | 无捕获闭包可存变量 / 当实参 / 返回；带捕获闭包也可存变量 / 嵌套 / 多次调用、按值传给**泛型**形参 / 从泛型返回值透传（`84_closure_capture_value.zr`、`109_closure_env_cross_fn.zr`、`110_closure_env_generic_passthrough.zr`）。**带捕获闭包也能转成裸 `fn(..)` 值**（传给 `fn(..)` 形参 / 作 `fn(..)` 返回值 / `let f: fn(..) = |..|`）：函数值 = 16 字节记录 `{code, env}`，调用统一多传一个 env（`125_closure_to_fn.zr`）；泛型 / 异步函数当值明确报错（负向 `38` / `39`） |
 | `impl Trait` 参数位置（APIT） | 可用 | ✅ | `fn f(x: impl Trait)` 在声明收集前脱糖成匿名泛型参数（`fn f<__apit_1: Trait>(x: __apit_1)`），按实参单态化、边界真的被校验（`120_apit.zr`，负向 `30_apit_bound.zr`）。`&impl Trait` 绑**内层**类型（`&T`），`Vec<impl Trait>` 是 `Vec<T>`，支持 `impl A + B` 多边界、与显式泛型参数共存。trait **声明**里的方法签名不做这个改写（声明本身不参与单态化） |
 | `impl Trait` 返回值（RPIT） | 仅语法骨架 | ❌ | `-> impl Trait` 能解析、能构造返回值，但返回的类型是 `opaque(impl_trait_N)`——任何字段访问 / 方法调用都报 `cannot access field ... on type opaque(impl_trait_N)`，实质不可用（异步用例 `29`/`49`/`50` 只把它当 Future 句柄轮询，不走字段访问）；`impl Fn(T) -> T` 这种带括号的 trait 路径仍解析失败（`expected RParen, found LParen`） |
 | `?` 运算符 | 可用 | ✅ | 对 `Result<T, E>` / `Option<T>` 生效：成功取载荷，失败从当前函数 `return Err(e)` / `return None`。返回类型必须是同一种枚举，错误类型必须一致（没有 `From` 转换） |
@@ -287,13 +287,16 @@
    `{:1$}`、动态精度 `{:.*}` / `{:.1$}`）已与 Rust 逐字符对齐。**未覆盖**：
    泛型类型上的 derive；`{:#?}` 对浮点 / 指针 / 数组 / 元组字段（derive 侧显式报错）；
    标量的 `{:#?}` 仍只输出一行。
-5. **闭包：`fn(..)` 形参 / 返回值两条路径明确报错**。无捕获闭包可存变量 / 当实参 /
-   返回；带捕获闭包也可存变量 / 嵌套 / 多次调用，并能按值传给**泛型**形参、从
-   泛型返回值透传（`109_closure_env_cross_fn.zr`、
-   `110_closure_env_generic_passthrough.zr`）。但带捕获闭包传给裸 `fn(..)` 形参
-   报 `captured closure cannot be passed as a plain `fn` value`、作为 `fn(..)`
-   返回值报 `captured closure cannot be returned as a plain `fn` value`——要支持
-   需 `Fn` 边界 / 胖指针，属独立大工程。
+5. **闭包：`fn(..)` 形参 / 返回值两条路径都已支持**（P1-2c，2026-11-02）。无捕获闭包
+   可存变量 / 当实参 / 返回；带捕获闭包也可存变量 / 嵌套 / 多次调用，并能按值传给
+   **泛型**形参、从泛型返回值透传（`109_closure_env_cross_fn.zr`、
+   `110_closure_env_generic_passthrough.zr`）；**还能转成裸 `fn(..)` 值**——函数值
+   统一是 16 字节记录 `{code, env}`，`code` 指向末尾多收一个 `env` 的 shim（普通
+   函数是转发 shim、带捕获闭包是特化 thunk，环境在降级时复制到堆），间接调用统一按
+   `(实参..., env, [隐藏返回槽])` 传参；`extern "C"` 边界退化回裸代码地址
+   （`125_closure_to_fn.zr`，负向 `38_generic_fn_as_value.zr` / `39_async_fn_as_value.zr`）。
+   **仍不支持**：带捕获闭包经 `extern "C"` 交给 C 侧回调（env 无处安放）；泛型 /
+   异步函数当值（明确报错）。
 6. **`i128` / `u128` 只在 64 位目标上可用**（拆成两个连续 8 字节栈槽，加减
    走 `adc`/`sbb`、移位走 `shld`/`shrd`、比较按高位优先定序、传参 / 返回用
    `rdx:rax`；源码见 `src/codegen/encoder.rs`）。**乘 / 除 / 取模已实现**

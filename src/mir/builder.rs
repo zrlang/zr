@@ -1032,9 +1032,20 @@ fn lower_expr(b: &mut Builder, expr: &HirExpr) -> MirValue {
             args,
             result,
         } => {
-            let callee = lower_expr(b, callee);
+            // 函数值是 16 字节记录 `{code, env}`：`callee` 求值得到的是**记录的
+            // 地址**，不是代码地址。代码在 +0、环境指针在 +8。
+            let rec = lower_expr(b, callee);
+            let code = b.temp();
+            b.current_block_mut()
+                .instrs
+                .push(MirInstr::Load(code.clone(), rec.clone(), NumTy::Uint(64)));
+            let env_at = offset_addr(b, rec, 8);
+            let env = b.temp();
+            b.current_block_mut()
+                .instrs
+                .push(MirInstr::Load(env.clone(), env_at, NumTy::Uint(64)));
             let name = format!("v{}", result.0);
-            let mut mir_args = Vec::with_capacity(args.len() + 1);
+            let mut mir_args = Vec::with_capacity(args.len() + 2);
             for a in args {
                 let moved = if let hir::ExprKind::Local(src) = a.kind {
                     if b.is_drop_ty(&a.ty) {
@@ -1058,6 +1069,11 @@ fn lower_expr(b: &mut Builder, expr: &HirExpr) -> MirValue {
                 };
                 mir_args.push(v);
             }
+            // 统一 shim ABI：用户实参之后恒追加 `env`（普通函数转发 shim
+            // 忽略它，带捕获闭包 thunk 拿它取捕获值）。它必须在返回槽
+            // **之前**——MIR 给聚合返回值追加隐藏返回槽的位次是
+            // `params.len()`，shim 声明的形参正是 `(用户形参..., env)`。
+            mir_args.push(MirValue::Var(env));
             let mut dest = None;
             if let Some((_elem, n, size)) = array_info(b, &expr.ty) {
                 let dst = b.synthetic_storage(n * size);
@@ -1077,13 +1093,109 @@ fn lower_expr(b: &mut Builder, expr: &HirExpr) -> MirValue {
             let ty = num_ty_of(&expr.ty);
             b.current_block_mut().instrs.push(MirInstr::CallIndirect(
                 name.clone(),
-                callee,
+                MirValue::Var(code),
                 mir_args,
                 ty,
             ));
             let value = dest.unwrap_or(MirValue::Var(name));
             b.register_temp(value.clone(), &expr.ty);
             value
+        }
+        // 普通函数的名字当值取走：构造 16 字节记录 `{code: shim, env: 0}`。
+        //
+        // `code` 指向**转发 shim**（末尾多收一个 env、内部直接调真实函数），
+        // 不是真实函数本身——间接调用一律按"实参 + env"的 ABI 传参，若指向
+        // 真实函数，那一份多出来的 env 会让它的形参整体错位。
+        FnValue { shim, .. } => {
+            let fn_name = b
+                .functions
+                .get(shim)
+                .cloned()
+                .unwrap_or_else(|| "<unknown>".to_string());
+            let storage = b.synthetic_storage(16);
+            let code = b.temp();
+            b.current_block_mut()
+                .instrs
+                .push(MirInstr::FuncAddr(code.clone(), fn_name));
+            let rec = MirValue::Var(storage.clone());
+            b.current_block_mut()
+                .instrs
+                .push(MirInstr::Store(rec.clone(), MirValue::Var(code), NumTy::Uint(64)));
+            let env_at = offset_addr(b, rec, 8);
+            b.current_block_mut()
+                .instrs
+                .push(MirInstr::Store(env_at, MirValue::Int(0), NumTy::Uint(64)));
+            b.register_temp(MirValue::Var(storage.clone()), &expr.ty);
+            MirValue::Var(storage)
+        }
+        // 带捕获闭包转函数值：环境结构体复制到堆上，记录填 `{code: thunk, env: 堆地址}`。
+        //
+        // 环境必须搬离栈：`return |x| x + base;` 返回后调用方栈帧就没了，
+        // 记录里的 env 若指着它，被调方读捕获值直接读到垃圾。堆副本在记录
+        // 存活期一直有效（目前不做回收——函数值这种小对象按 GC 缺失的现状
+        // 先泄漏，与 `async` 堆帧同一取舍）。
+        ClosureToFn { env, thunk } => {
+            let env_val = lower_expr(b, env);
+            let env_ty = env.ty.clone();
+            let (size, align) = type_size_align(b, &env_ty, 0).unwrap_or((8, 8));
+            let size = size.max(8);
+            let heap = b.temp();
+            b.current_block_mut().instrs.push(MirInstr::Call(
+                heap.clone(),
+                "zr_alloc".to_string(),
+                vec![MirValue::Int(size), MirValue::Int(align.max(1))],
+                NumTy::Uint(64),
+            ));
+            copy_bytes_into(b, env_val, MirValue::Var(heap.clone()), size, align.max(1));
+            let fn_name = b
+                .functions
+                .get(thunk)
+                .cloned()
+                .unwrap_or_else(|| "<unknown>".to_string());
+            let storage = b.synthetic_storage(16);
+            let code = b.temp();
+            b.current_block_mut()
+                .instrs
+                .push(MirInstr::FuncAddr(code.clone(), fn_name));
+            let rec = MirValue::Var(storage.clone());
+            b.current_block_mut()
+                .instrs
+                .push(MirInstr::Store(rec.clone(), MirValue::Var(code), NumTy::Uint(64)));
+            let env_at = offset_addr(b, rec, 8);
+            b.current_block_mut().instrs.push(MirInstr::Store(
+                env_at,
+                MirValue::Var(heap),
+                NumTy::Uint(64),
+            ));
+            b.register_temp(MirValue::Var(storage.clone()), &expr.ty);
+            MirValue::Var(storage)
+        }
+        // `extern "C"` 边界：函数值退化成裸代码地址（C 侧只认一个函数指针）。
+        //
+        // 若内层就是"普通函数当值"，直接取**真实函数**的符号，不必读记录——
+        // 记录里的 code 是转发 shim（多一个 env 形参），交给 C 调用会把 C
+        // 传的实参当成 env、整体错位。
+        FnToCodePtr(inner) => {
+            if let hir::ExprKind::FnValue { func, .. } = &inner.kind {
+                let func = *func;
+                let fn_name = b
+                    .functions
+                    .get(&func)
+                    .cloned()
+                    .unwrap_or_else(|| "<unknown>".to_string());
+                let name = b.temp();
+                b.current_block_mut()
+                    .instrs
+                    .push(MirInstr::FuncAddr(name.clone(), fn_name));
+                MirValue::Var(name)
+            } else {
+                let rec = lower_expr(b, inner);
+                let name = b.temp();
+                b.current_block_mut()
+                    .instrs
+                    .push(MirInstr::Load(name.clone(), rec, NumTy::Uint(64)));
+                MirValue::Var(name)
+            }
         }
         Cast(inner) => {
             // 源类型取自内层表达式，目标类型是节点的 ty。
@@ -2227,6 +2339,9 @@ fn is_float_arith(op: hir::BinaryOp) -> bool {
 }
 
 /// 标量（有固定寄存器宽度），与聚合值（运行期是地址）相对。
+///
+/// `Ty::Function` **不在**此列：函数值是 16 字节记录 `{code, env}`，MIR 里
+/// 按聚合值处理（表达式求值结果是它的存储地址，按值传递时整块复制）。
 fn is_scalar_ty(ty: &hir::Ty) -> bool {
     matches!(
         ty,
@@ -2237,7 +2352,6 @@ fn is_scalar_ty(ty: &hir::Ty) -> bool {
             | hir::Ty::Char
             | hir::Ty::Pointer(..)
             | hir::Ty::Reference(..)
-            | hir::Ty::Function { .. }
     )
 }
 
@@ -2360,7 +2474,9 @@ fn element_size(ty: &hir::Ty) -> i128 {
         Ty::Bool | Ty::Char => 1,
         // 切片 / 字符串是 (ptr, len) 一对——16 字节。
         Ty::Str | Ty::Slice(..) => 16,
-        Ty::Pointer(..) | Ty::Reference(..) | Ty::Function { .. } => 8,
+        // 函数值是 `{code, env}` 记录——16 字节（与 `type_size_align` 一致）。
+        Ty::Function { .. } => 16,
+        Ty::Pointer(..) | Ty::Reference(..) => 8,
         _ => 1,
     }
 }
@@ -2503,7 +2619,9 @@ fn type_size_align(b: &Builder, ty: &hir::Ty, depth: usize) -> Option<(i128, i12
         }
         Ty::Bool | Ty::Char => (1, 1),
         Ty::Unit | Ty::Never => (0, 1),
-        Ty::Pointer(..) | Ty::Reference(..) | Ty::Function { .. } => (8, 8),
+        // 函数值是 `{code, env}` 记录：两个机器字，8 字节对齐。
+        Ty::Function { .. } => (16, 8),
+        Ty::Pointer(..) | Ty::Reference(..) => (8, 8),
         // `str` / 切片是 `{ptr, len}` 的 16 字节聚合，**不是**一个瘦指针。
         // `struct_layout` 早就按 16 字节算（`size: 16, fields: [(0, ptr), (8, u64)]`），
         // 这里却返回 8——结构体里 `str` 字段后面的字段会落在偏移 8，盖住 `len`，
@@ -2583,6 +2701,21 @@ fn struct_layout(b: &Builder, ty: &hir::Ty) -> Option<StructLayout> {
             names,
         });
     }
+    // 函数值在运行期是 `{code, env}` 记录——16 字节，与 `str` / 切片同布局
+    // （两个机器字）。字段名 `code` / `env` 对齐 MIR 侧读记录的偏移。
+    if matches!(ty, hir::Ty::Function { .. }) {
+        let mut names = HashMap::new();
+        names.insert("code".to_string(), 0usize);
+        names.insert("env".to_string(), 1usize);
+        return Some(StructLayout {
+            size: 16,
+            fields: vec![
+                (0, hir::Ty::Uint(64)),
+                (8, hir::Ty::Uint(64)),
+            ],
+            names,
+        });
+    }
     let (id, args) = match ty {
         hir::Ty::Named(id, args) => (*id, args.clone()),
         hir::Ty::Reference(inner, _) | hir::Ty::Pointer(inner, _) => {
@@ -2643,7 +2776,7 @@ fn struct_layout(b: &Builder, ty: &hir::Ty) -> Option<StructLayout> {
 /// 都必须用本函数，否则 `*mut T` 会被错当成 `T` 整块拷贝。
 fn aggregate_layout(b: &Builder, ty: &hir::Ty) -> Option<StructLayout> {
     match ty {
-        hir::Ty::Pointer(..) | hir::Ty::Reference(..) | hir::Ty::Function { .. } => None,
+        hir::Ty::Pointer(..) | hir::Ty::Reference(..) => None,
         _ => struct_layout(b, ty),
     }
 }
