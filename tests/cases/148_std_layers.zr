@@ -1,0 +1,36 @@
+// std 门面：`use std::*` 应同时拿到 core / alloc / std 三层的名字。
+//
+// 这是三层重组（core ⊂ alloc ⊂ std）的端到端用例：
+//   core  → min / max / size_of
+//   alloc → Vec / String
+//   std   → io 的 println、path 的 join
+// 若门面的传递性再导出失效，下面任一名字都会解析失败。
+
+use std::*;
+
+fn main() -> i32 {
+    // ---- core 层 ----
+    let m: i32 = min(3, 7);
+    let x: i32 = max(3, 7);
+    let sz: usize = size_of::<i32>();
+
+    // ---- alloc 层 ----
+    let mut v: Vec<i32> = Vec::new();
+    v.push(m);
+    v.push(x);
+    let s = String::from_bytes("layers");
+
+    // ---- std 层 ----
+    let mut buf: [u8; 64] = [0; 64];
+    let n: usize = join("a", "b", &mut buf[0] as *mut u8, 64);
+
+    if m != 3 { return 1; }
+    if x != 7 { return 2; }
+    if sz != 4 { return 3; }
+    if v.len != 2 { return 4; }
+    if s.len != 6 { return 5; }
+    if n != 3 { return 6; }
+
+    println("std layers ok");
+    return 0;
+}

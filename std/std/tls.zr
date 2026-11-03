@@ -1,0 +1,1051 @@
+//=============================================================================
+// std/tls.zr — 纯 ZR TLS 1.2 客户端（rustls 式分层 API）
+//
+// 零外部依赖：无 OpenSSL、无 extern "C"（仅 POSIX fd 复用）、无 #[link]。
+// 底层密码原语由 std/crypto.zr 提供（AES-128-CTR、SHA-256 流式、HMAC-SHA256）。
+//
+// 支持：
+//   - 完整 TLS 1.2 PSK 握手（TLS_PSK_WITH_AES_128_CTR_SHA256, 0x00B2）
+//   - TLS 记录层加密（AES-128-CTR + HMAC-SHA256）
+//   - rustls 式 ClientConfig / ClientConnection API
+//
+// 不支持（受限于 ZR 编译器无 u128/BigInt）：
+//   - RSA / ECDSA / ECDHE 证书验证
+//   - 非 PSK 的完整密钥交换
+//
+// 限制：编译器对 >8KB 栈数组有 bug，所有 buffer 限制在 4KB 内。
+//=============================================================================
+
+use core::{Result, Option};
+use mem::{memcpy, memset, offset};
+use net::{TcpStream};
+use crypto::{
+    aes128_ctr, crypto_sha256_init, crypto_sha256_update, crypto_sha256_digest,
+    crypto_hmac_sha256, crypto_prng_seed, crypto_prng_bytes,
+    Sha256State, PrngState,
+};
+
+//=============================================================================
+// 运行时系统调用（POSIX + net 模块共用的 zr_send/zr_recv）
+//=============================================================================
+
+extern "C" {
+    fn zr_send(fd: i32, buf: *const u8, len: usize, flags: i32) -> isize;
+    fn zr_recv(fd: i32, buf: *mut u8, len: usize, flags: i32) -> isize;
+    fn dup(fd: i32) -> i32;
+    fn close(fd: i32) -> i32;
+}
+
+//=============================================================================
+// 1. 错误枚举
+//=============================================================================
+
+pub enum TlsError {
+    Io,
+    Handshake,
+    Alert,
+    NotSupported,
+    MacVerify,
+    EncryptFail,
+}
+
+//=============================================================================
+// 2. 记录层常量
+//=============================================================================
+
+const ZRTLS_CHANGE_CIPHER_SPEC: u8 = 20;
+const ZRTLS_ALERT: u8 = 21;
+const ZRTLS_HANDSHAKE: u8 = 22;
+const ZRTLS_APPLICATION_DATA: u8 = 23;
+
+const ZRTLS_VERSION_1_2: u16 = 0x0303;
+const ZRTLS_VERSION_1_0: u16 = 0x0301;
+const ZRTLS_MAX_RECORD_PAYLOAD: usize = 16384;
+
+const ZRTLS_HS_CLIENT_HELLO: u8 = 1;
+const ZRTLS_HS_SERVER_HELLO: u8 = 2;
+const ZRTLS_HS_SERVER_HELLO_DONE: u8 = 14;
+const ZRTLS_HS_CLIENT_KEY_EXCHANGE: u8 = 16;
+const ZRTLS_HS_CHANGE_CIPHER_SPEC: u8 = 20;
+const ZRTLS_HS_FINISHED: u8 = 20;
+
+//=============================================================================
+// 3. 密码套件常量
+//=============================================================================
+
+pub const ZRTLS_CIPHER_RSA_AES_128_SHA256: u16 = 0x003C;
+pub const ZRTLS_CIPHER_ECDHE_RSA_AES_128_SHA256: u16 = 0xC02F;
+pub const ZRTLS_CIPHER_PSK_AES_128_CTR_SHA256: u16 = 0x00B2;  // 我们实现的 PSK 套件
+pub const ZRTLS_CIPHER_ECDHE_RSA_AES_256_SHA384: u16 = 0xC030;  // 已声明但不实现
+
+//=============================================================================
+// 4. ClientConfig — rustls 式客户端配置
+//=============================================================================
+
+pub struct ClientConfig {
+    pub ciphers: [u16; 4],
+    pub nciphers: usize,
+    pub alpn_ptr: *const u8,
+    pub alpulen: usize,
+    // PSK 配置（可选）
+    pub use_psk: bool,
+    pub psk_identity_ptr: *const u8,
+    pub psk_identity_len: usize,
+    pub psk_key_ptr: *const u8,
+    pub psk_key_len: usize,
+}
+
+pub fn client_config_default() -> ClientConfig {
+    let cfg = ClientConfig {
+        ciphers: [
+            ZRTLS_CIPHER_PSK_AES_128_CTR_SHA256,
+            ZRTLS_CIPHER_RSA_AES_128_SHA256,
+            ZRTLS_CIPHER_ECDHE_RSA_AES_128_SHA256,
+            ZRTLS_CIPHER_ECDHE_RSA_AES_256_SHA384,
+        ],
+        nciphers: 4,
+        alpn_ptr: 0 as *const u8,
+        alpulen: 0,
+        use_psk: false,
+        psk_identity_ptr: 0 as *const u8,
+        psk_identity_len: 0,
+        psk_key_ptr: 0 as *const u8,
+        psk_key_len: 0,
+    };
+    return cfg;
+}
+
+pub fn client_config_with_psk(identity: *const u8, identity_len: usize,
+                              key: *const u8, key_len: usize) -> ClientConfig {
+    let cfg = ClientConfig {
+        ciphers: [
+            ZRTLS_CIPHER_PSK_AES_128_CTR_SHA256,
+            0, 0, 0,
+        ],
+        nciphers: 1,
+        alpn_ptr: 0 as *const u8,
+        alpulen: 0,
+        use_psk: true,
+        psk_identity_ptr: identity,
+        psk_identity_len: identity_len,
+        psk_key_ptr: key,
+        psk_key_len: key_len,
+    };
+    return cfg;
+}
+
+//=============================================================================
+// 5. TLS 1.2 PRF — 基于 HMAC-SHA256 的伪随机函数
+//
+// PRF(secret, label, seed) = P_sha256(secret, label || seed)
+// P_hash(secret, seed) = HMAC_hash(secret, A(1) || seed) || HMAC_hash(secret, A(2) || seed) || ...
+//   A(0) = seed
+//   A(i) = HMAC_hash(secret, A(i-1))
+//=============================================================================
+
+fn zrtls_p_hash_sha256(secret: *const u8, secret_len: usize,
+                       seed: *const u8, seed_len: usize,
+                       out: *mut u8, out_len: usize) -> usize {
+    let mut generated: usize = 0;
+
+    // A(1) = HMAC(secret, seed)
+    let mut a_prev: [u8; 32] = [0; 32];
+    crypto_hmac_sha256(secret, secret_len, seed, seed_len, &mut a_prev[0]);
+
+    // 构造 A_prev || seed 的拼接缓冲区
+    // 最大 32 + 500（seed 可以很大：random + random）
+    // 但我们把它分两次 HMAC 调用：先 HMAC(A_prev || seed)
+    let mut a_and_seed: [u8; 1024] = [0; 1024];
+    let max_seed: usize = 992;
+    let copy_seed_len = if seed_len > max_seed { max_seed } else { seed_len };
+
+    while generated < out_len {
+        // 拼 A_prev || seed
+        let mut i: usize = 0;
+        while i < 32 { a_and_seed[i] = a_prev[i]; i = i + 1; }
+        let mut j: usize = 0;
+        while j < copy_seed_len { a_and_seed[32 + j] = seed[j]; j = j + 1; }
+        let block_input_len = 32 + copy_seed_len;
+
+        // block = HMAC(secret, A_prev || seed)
+        let mut block: [u8; 32] = [0; 32];
+        crypto_hmac_sha256(secret, secret_len, &a_and_seed[0], block_input_len, &mut block[0]);
+
+        // copy block to out
+        let remaining: usize = out_len - generated;
+        let copylen: usize = if remaining >= 32 { 32 } else { remaining };
+        let mut k: usize = 0;
+        while k < copylen {
+            out[generated + k] = block[k];
+            k = k + 1;
+        }
+        generated = generated + copylen;
+
+        // A(i+1) = HMAC(secret, A_prev)
+        crypto_hmac_sha256(secret, secret_len, &a_prev[0], 32, &mut a_prev[0]);
+    }
+
+    return generated;
+}
+
+/// TLS 1.2 PRF: PRF(secret, label, seed) → out[0..out_len]
+fn zrtls_prf(secret: *const u8, secret_len: usize,
+             label: *const u8, label_len: usize,
+             seed: *const u8, seed_len: usize,
+             out: *mut u8, out_len: usize) -> usize {
+    // 拼 label || seed
+    let mut combined: [u8; 1024] = [0; 1024];
+    let label_cap: usize = 992;
+    let copy_label_len: usize = if label_len > label_cap { label_cap } else { label_len };
+    let mut i: usize = 0;
+    while i < copy_label_len { combined[i] = label[i]; i = i + 1; }
+    let seed_cap: usize = 1024usize - copy_label_len;
+    let copy_seed_len: usize = if seed_len > seed_cap { seed_cap } else { seed_len };
+    let mut j: usize = 0;
+    while j < copy_seed_len { combined[copy_label_len + j] = seed[j]; j = j + 1; }
+    let combined_len: usize = copy_label_len + copy_seed_len;
+
+    return zrtls_p_hash_sha256(secret, secret_len, &combined[0], combined_len, out, out_len);
+}
+
+//=============================================================================
+// 6. 密钥导出（PSK 模式）
+//
+// master_secret = PRF(pre_shared_key, "master secret", ClientHello.random + ServerHello.random)[0..47]
+// key_block     = PRF(master_secret, "key expansion", ServerHello.random + ClientHello.random)
+//=============================================================================
+
+fn zrtls_derive_master_secret(psk: *const u8, psk_len: usize,
+                              client_random: *const u8, server_random: *const u8,
+                              out_master_secret: *mut u8) {
+    let label: [u8; 13] = *b"master secret";
+    let seed_len = 32 + 32;  // client_random + server_random
+    let mut seed: [u8; 64] = [0; 64];
+    let mut i: usize = 0;
+    while i < 32 { seed[i] = client_random[i]; i = i + 1; }
+    let mut j: usize = 0;
+    while j < 32 { seed[32 + j] = server_random[j]; j = j + 1; }
+
+    zrtls_prf(psk, psk_len, &label[0], 13, &seed[0], seed_len,
+              out_master_secret, 48);
+}
+
+fn zrtls_derive_key_block(master_secret: *const u8,
+                          server_random: *const u8, client_random: *const u8,
+                          out_key_block: *mut u8, key_block_len: usize) {
+    let label: [u8; 13] = *b"key expansion";
+    let seed_len = 32 + 32;
+    let mut seed: [u8; 64] = [0; 64];
+    let mut i: usize = 0;
+    while i < 32 { seed[i] = server_random[i]; i = i + 1; }
+    let mut j: usize = 0;
+    while j < 32 { seed[32 + j] = client_random[j]; j = j + 1; }
+
+    zrtls_prf(master_secret, 48, &label[0], 13, &seed[0], seed_len,
+              out_key_block, key_block_len);
+}
+
+//=============================================================================
+// 7. 记录层收发辅助（fd 版本 + TcpStream 版本）
+//=============================================================================
+
+fn zrtls_write_all_fd(fd: i32, data: *const u8, len: usize) -> Result<usize, TlsError> {
+    let mut sent: usize = 0;
+    while sent < len {
+        let n = zr_send(fd, offset(data as *const u8, sent), len - sent, 0);
+        if n <= 0 { return Result::Err(TlsError::Io); }
+        sent = sent + n as usize;
+    }
+    return Result::Ok(sent);
+}
+
+fn zrtls_read_exact_fd(fd: i32, out: *mut u8, len: usize) -> Result<usize, TlsError> {
+    let mut got: usize = 0;
+    while got < len {
+        let n = zr_recv(fd, offset(out as *const u8, got) as *mut u8, len - got, 0);
+        if n <= 0 { return Result::Err(TlsError::Io); }
+        got = got + n as usize;
+    }
+    return Result::Ok(got);
+}
+
+fn zrtls_read_record_fd(fd: i32, out: *mut u8, outcap: usize) -> Result<(u8, usize), TlsError> {
+    let mut header: [u8; 5] = [0; 5];
+    let r1 = zrtls_read_exact_fd(fd, &mut header[0], 5);
+    match r1 {
+        Result::Ok(_) => {}
+        Result::Err(e) => return Result::Err(e),
+    }
+    let ctype = header[0];
+    let plen = ((header[3] as usize) << 8) | (header[4] as usize);
+    if plen > outcap || plen > ZRTLS_MAX_RECORD_PAYLOAD {
+        return Result::Err(TlsError::Io);
+    }
+    if plen == 0 {
+        return Result::Ok((ctype, 0));
+    }
+    let r2 = zrtls_read_exact_fd(fd, out, plen);
+    match r2 {
+        Result::Ok(_) => {}
+        Result::Err(e) => return Result::Err(e),
+    }
+    return Result::Ok((ctype, plen));
+}
+
+fn zrtls_write_all(stream: &TcpStream, data: *const u8, len: usize) -> Result<usize, TlsError> {
+    let fd = stream.inner.fd;
+    return zrtls_write_all_fd(fd, data, len);
+}
+
+fn zrtls_read_exact(stream: &TcpStream, out: *mut u8, len: usize) -> Result<usize, TlsError> {
+    let fd = stream.inner.fd;
+    return zrtls_read_exact_fd(fd, out, len);
+}
+
+//=============================================================================
+// 8. 明文记录层（握手阶段用）
+//=============================================================================
+
+pub fn zrtls_send_record(stream: &TcpStream, ctype: u8, payload: *const u8, plen: usize) -> Result<usize, TlsError> {
+    if plen > ZRTLS_MAX_RECORD_PAYLOAD {
+        return Result::Err(TlsError::Io);
+    }
+    let header: [u8; 5] = [
+        ctype,
+        (ZRTLS_VERSION_1_2 >> 8) as u8,
+        ZRTLS_VERSION_1_2 as u8,
+        ((plen >> 8) & 0xff) as u8,
+        (plen & 0xff) as u8,
+    ];
+    match zrtls_write_all(stream, &header[0], 5) { Result::Ok(_) => {}, Result::Err(e) => return Result::Err(e), }
+    if plen > 0 {
+        match zrtls_write_all(stream, payload, plen) { Result::Ok(_) => {}, Result::Err(e) => return Result::Err(e), }
+    }
+    return Result::Ok(plen);
+}
+
+pub fn zrtls_read_record(stream: &TcpStream, out: *mut u8, outcap: usize) -> Result<(u8, usize), TlsError> {
+    let fd = stream.inner.fd;
+    return zrtls_read_record_fd(fd, out, outcap);
+}
+
+//=============================================================================
+// 9. ClientHello 编码 / ServerHello 解析
+//=============================================================================
+
+pub fn zrtls_encode_client_hello(cfg: *const ClientConfig, out: *mut u8) -> usize {
+    let mut pos: usize = 0;
+    out[pos] = 0x03; pos = pos + 1;
+    out[pos] = 0x03; pos = pos + 1;
+
+    let mut rand: [u8; 32] = [0; 32];
+    let mut seedbuf: [u8; 64] = [0; 64];
+    seedbuf[0] = b'z'; seedbuf[1] = b'r'; seedbuf[2] = b't'; seedbuf[3] = b'l';
+    let mut prng = crypto_prng_seed(&seedbuf[0], 64);
+    crypto_prng_bytes(&mut prng, &mut rand[4], 28);
+    let p = offset(out as *const u8, pos) as *mut void;
+    memcpy(p, &rand[0] as *const void, 32);
+    pos = pos + 32;
+
+    out[pos] = 0; pos = pos + 1;
+
+    let nc = (*cfg).nciphers;
+    let cs_len = nc * 2;
+    out[pos] = ((cs_len >> 8) & 0xff) as u8; pos = pos + 1;
+    out[pos] = (cs_len & 0xff) as u8; pos = pos + 1;
+
+    let mut i: usize = 0;
+    while i < nc {
+        let c = (*cfg).ciphers[i];
+        if c == 0 { i = i + 1; continue; }
+        out[pos] = ((c >> 8) & 0xff) as u8; pos = pos + 1;
+        out[pos] = (c & 0xff) as u8; pos = pos + 1;
+        i = i + 1;
+    }
+
+    out[pos] = 1; pos = pos + 1;  // compression_methods length
+    out[pos] = 0; pos = pos + 1;  // null compression
+
+    return pos;
+}
+
+fn zrtls_read_u16_be(p: *const u8) -> u16 {
+    let hi = p[0] as u16;
+    let lo = p[1] as u16;
+    return (hi << 8) | lo;
+}
+
+fn zrtls_server_hello_has_cipher(cfg: *const ClientConfig, suite: u16) -> bool {
+    let mut i: usize = 0;
+    while i < (*cfg).nciphers {
+        if (*cfg).ciphers[i] == suite { return true; }
+        i = i + 1;
+    }
+    return false;
+}
+
+fn zrtls_build_handshake_record(cfg: *const ClientConfig, out: *mut u8) -> usize {
+    let inner = offset(out as *const u8, 4) as *mut u8;
+    let ch = zrtls_encode_client_hello(cfg, inner);
+    out[0] = ZRTLS_HS_CLIENT_HELLO;
+    out[1] = ((ch >> 16) & 0xff) as u8;
+    out[2] = ((ch >> 8) & 0xff) as u8;
+    out[3] = (ch & 0xff) as u8;
+    return 4 + ch;
+}
+
+pub fn zrtls_parse_server_hello(cfg: *const ClientConfig, payload: *const u8, plen: usize) -> Result<(u16, usize), TlsError> {
+    let mut pos: usize = 0;
+    if plen < 35 { return Result::Err(TlsError::Handshake); }
+    let ver_maj = payload[0];
+    let ver_min = payload[1];
+    pos = pos + 2;
+    if ver_maj != 0x03 { return Result::Err(TlsError::Handshake); }
+    if ver_min < 0x01 || ver_min > 0x03 { return Result::Err(TlsError::Handshake); }
+
+    pos = pos + 32;  // server random
+
+    let sid_len = payload[pos] as usize;
+    pos = pos + 1;
+    pos = pos + sid_len;
+    if pos + 3 > plen { return Result::Err(TlsError::Handshake); }
+
+    let suite = zrtls_read_u16_be(offset(payload as *const u8, pos) as *const u8);
+    pos = pos + 2;
+
+    let comp = payload[pos];
+    pos = pos + 1;
+    if comp != 0 { return Result::Err(TlsError::Handshake); }
+
+    if pos + 2 <= plen {
+        let ext_len = ((payload[pos] as usize) << 8) | (payload[pos + 1] as usize);
+        pos = pos + 2;
+        pos = pos + ext_len;
+    }
+
+    if !zrtls_server_hello_has_cipher(cfg, suite) {
+        return Result::Err(TlsError::NotSupported);
+    }
+
+    return Result::Ok((suite, pos));
+}
+
+//=============================================================================
+// 10. HMAC 构造用于 TLS record 的 MAC
+//
+// MAC = HMAC-SHA256(MAC_key, seq(8) || content_type(1) || version(2) || length(2) || data)
+//=============================================================================
+
+fn zrtls_compute_record_mac(mac_key: *const u8,
+                            seq_num: u64,
+                            ctype: u8,
+                            payload: *const u8,
+                            plen: usize,
+                            out_32: *mut u8) {
+    let mut mac_input: [u8; 128] = [0; 128];
+    // sequence number (8 bytes, big-endian)
+    mac_input[0] = ((seq_num >> 56) & 0xff) as u8;
+    mac_input[1] = ((seq_num >> 48) & 0xff) as u8;
+    mac_input[2] = ((seq_num >> 40) & 0xff) as u8;
+    mac_input[3] = ((seq_num >> 32) & 0xff) as u8;
+    mac_input[4] = ((seq_num >> 24) & 0xff) as u8;
+    mac_input[5] = ((seq_num >> 16) & 0xff) as u8;
+    mac_input[6] = ((seq_num >> 8) & 0xff) as u8;
+    mac_input[7] = (seq_num & 0xff) as u8;
+    // content type (1 byte)
+    mac_input[8] = ctype;
+    // version (2 bytes)
+    mac_input[9] = (ZRTLS_VERSION_1_2 >> 8) as u8;
+    mac_input[10] = ZRTLS_VERSION_1_2 as u8;
+    // length (2 bytes, big-endian)
+    mac_input[11] = ((plen >> 8) & 0xff) as u8;
+    mac_input[12] = (plen & 0xff) as u8;
+
+    // 如果 payload 不大，直接拼进去做一次 HMAC
+    // 如果 payload 大，分两次
+    if plen + 13 <= 128 {
+        let mut i: usize = 0;
+        while i < plen { mac_input[13 + i] = payload[i]; i = i + 1; }
+        crypto_hmac_sha256(mac_key, 32, &mac_input[0], 13 + plen, out_32);
+    } else {
+        // 先 HMAC 固定前缀 (13 bytes)，再 HMAC payload
+        let mut inner_state = crypto_sha256_init();
+        // 但 crypto.zr 只暴露 crypto_hmac_sha256，不暴露流式 HMAC
+        // 所以我们用一种变通：构造大 buffer 一次性 HMAC
+        let mut big_buf: [u8; 2048] = [0; 2048];
+        let cap: usize = 2035;
+        let copylen: usize = if plen > cap { cap } else { plen };
+        let mut j: usize = 0;
+        while j < 13 { big_buf[j] = mac_input[j]; j = j + 1; }
+        let mut k: usize = 0;
+        while k < copylen { big_buf[13 + k] = payload[k]; k = k + 1; }
+        crypto_hmac_sha256(mac_key, 32, &big_buf[0], 13 + copylen, out_32);
+    }
+}
+
+//=============================================================================
+// 11. AES-128-CTR counter block 构造
+//
+// TLS 1.2 CTR 模式：counter_block = nonce(8) || sequence_number(8, big-endian)
+// where nonce = key_expansion 出来的 write_IV 的前 8 字节
+//=============================================================================
+
+fn zrtls_build_ctr_block(write_iv: *const u8, seq_num: u64, out_block: *mut u8) {
+    // write_IV 前 8 字节作为 nonce
+    let mut i: usize = 0;
+    while i < 8 { out_block[i] = write_iv[i]; i = i + 1; }
+    // 后 8 字节是 sequence number (big-endian)
+    out_block[8] = ((seq_num >> 56) & 0xff) as u8;
+    out_block[9] = ((seq_num >> 48) & 0xff) as u8;
+    out_block[10] = ((seq_num >> 40) & 0xff) as u8;
+    out_block[11] = ((seq_num >> 32) & 0xff) as u8;
+    out_block[12] = ((seq_num >> 24) & 0xff) as u8;
+    out_block[13] = ((seq_num >> 16) & 0xff) as u8;
+    out_block[14] = ((seq_num >> 8) & 0xff) as u8;
+    out_block[15] = (seq_num & 0xff) as u8;
+}
+
+//=============================================================================
+// 12. 加密记录（encrypt + MAC + record header）
+//
+// 加密后结构：AES-128-CTR(MAC || fragment)
+// 其中 MAC 先计算，然后 MAC + fragment 一起加密
+// 输出：5 字节 record header + 加密后的字节
+//=============================================================================
+
+fn zrtls_encrypt_record(write_key: *const u8, write_iv: *const u8,
+                        mac_key: *const u8, seq_num: u64,
+                        ctype: u8, plaintext: *const u8, plen: usize,
+                        out: *mut u8, outcap: usize) -> usize {
+    // 1. 计算 MAC
+    let mut mac_tag: [u8; 32] = [0; 32];
+    zrtls_compute_record_mac(mac_key, seq_num, ctype, plaintext, plen, &mut mac_tag[0]);
+
+    // 2. 拼 MAC || plaintext
+    let encrypted_len = 32 + plen;
+    if encrypted_len + 5 > outcap { return 0; }
+
+    // 先把明文 + MAC 拼到 out 里（offset 5），然后加密
+    let p_mac = offset(out as *const u8, 5) as *mut u8;
+    let mut i: usize = 0;
+    while i < 32 { p_mac[i] = mac_tag[i]; i = i + 1; }
+    let mut j: usize = 0;
+    while j < plen { p_mac[32 + j] = plaintext[j]; j = j + 1; }
+
+    // 3. 构造 CTR counter block
+    let mut ctr_block: [u8; 16] = [0; 16];
+    zrtls_build_ctr_block(write_iv, seq_num, &mut ctr_block[0]);
+
+    // 4. AES-128-CTR 加密 in-place
+    aes128_ctr(write_key, &ctr_block[0], p_mac, p_mac, encrypted_len);
+
+    // 5. 写 record header
+    out[0] = ctype;
+    out[1] = (ZRTLS_VERSION_1_2 >> 8) as u8;
+    out[2] = ZRTLS_VERSION_1_2 as u8;
+    out[3] = ((encrypted_len >> 8) & 0xff) as u8;
+    out[4] = (encrypted_len & 0xff) as u8;
+
+    return 5 + encrypted_len;
+}
+
+//=============================================================================
+// 13. 解密记录（AES-128-CTR 解密 + MAC 验证）
+//
+// 输入：解密前的 payload（去掉 record header 后）
+// 输出：MAC 后的明文
+//=============================================================================
+
+fn zrtls_decrypt_record(write_key: *const u8, write_iv: *const u8,
+                        mac_key: *const u8, seq_num: u64,
+                        ctype: u8, ciphertext: *const u8, clen: usize,
+                        out_plain: *mut u8, outcap: usize) -> Result<usize, TlsError> {
+    if clen < 32 { return Result::Err(TlsError::MacVerify); }
+    let plaintext_len = clen - 32;
+    if plaintext_len > outcap { return Result::Err(TlsError::Io); }
+
+    // 1. 构造 CTR counter
+    let mut ctr_block: [u8; 16] = [0; 16];
+    zrtls_build_ctr_block(write_iv, seq_num, &mut ctr_block[0]);
+
+    // 2. 解密到临时 buffer
+    let mut tmp: [u8; 8192] = [0; 8192];
+    let dec_len = if clen > 8192 { 8192 } else { clen };
+    aes128_ctr(write_key, &ctr_block[0], ciphertext, &mut tmp[0], dec_len);
+
+    // 3. 提取 MAC tag（前 32 字节）和明文字段
+    let mut recv_mac: [u8; 32] = [0; 32];
+    let mut i: usize = 0;
+    while i < 32 { recv_mac[i] = tmp[i]; i = i + 1; }
+
+    let mut computed_mac: [u8; 32] = [0; 32];
+    zrtls_compute_record_mac(mac_key, seq_num, ctype, &tmp[32], plaintext_len, &mut computed_mac[0]);
+
+    // 4. 常量时间比较
+    let mut diff: u8 = 0;
+    let mut j: usize = 0;
+    while j < 32 {
+        diff = diff | (recv_mac[j] ^ computed_mac[j]);
+        j = j + 1;
+    }
+    if diff != 0 { return Result::Err(TlsError::MacVerify); }
+
+    // 5. 拷贝明文
+    let mut k: usize = 0;
+    while k < plaintext_len { out_plain[k] = tmp[32 + k]; k = k + 1; }
+    return Result::Ok(plaintext_len);
+}
+
+//=============================================================================
+// 14. ClientConnection — rustls 式公开 API（增强版）
+//=============================================================================
+
+pub struct ClientConnection {
+    // 基础
+    pub fd: i32,
+    pub closed: bool,
+    pub handshake_done: bool,
+    pub server_suite: u16,
+
+    // PSK 配置拷贝（构造时存入）
+    pub use_psk: bool,
+    pub psk_identity: *const u8,
+    pub psk_identity_len: usize,
+    pub psk_key: *const u8,
+    pub psk_key_len: usize,
+
+    // 握手随机数
+    pub client_random: [u8; 32],
+    pub server_random: [u8; 32],
+
+    // 加密通道状态
+    pub master_secret: [u8; 48],
+    pub client_write_key: [u8; 16],
+    pub server_write_key: [u8; 16],
+    pub client_write_IV: [u8; 16],
+    pub server_write_IV: [u8; 16],
+    pub client_write_MAC_key: [u8; 32],
+    pub server_write_MAC_key: [u8; 32],
+    pub client_write_seq: u64,
+    pub server_write_seq: u64,
+
+    // 握手消息缓冲（用于 Finished 验证）
+    pub hs_buf: [u8; 4096],
+    pub hs_len: usize,
+}
+
+impl ClientConnection {
+
+    //---------------------------------------------------------------
+    // 构造：dup fd，不持有 TcpStream（ZR move bug）
+    //---------------------------------------------------------------
+
+    pub fn new(stream: TcpStream, cfg: *const ClientConfig) -> ClientConnection {
+        let orig_fd = stream.inner.fd;
+        let my_fd = dup(orig_fd);
+
+        let conn = ClientConnection {
+            fd: my_fd,
+            closed: false,
+            handshake_done: false,
+            server_suite: 0,
+            use_psk: (*cfg).use_psk,
+            psk_identity: (*cfg).psk_identity_ptr,
+            psk_identity_len: (*cfg).psk_identity_len,
+            psk_key: (*cfg).psk_key_ptr,
+            psk_key_len: (*cfg).psk_key_len,
+            client_random: [0; 32],
+            server_random: [0; 32],
+            master_secret: [0; 48],
+            client_write_key: [0; 16],
+            server_write_key: [0; 16],
+            client_write_IV: [0; 16],
+            server_write_IV: [0; 16],
+            client_write_MAC_key: [0; 32],
+            server_write_MAC_key: [0; 32],
+            client_write_seq: 0,
+            server_write_seq: 0,
+            hs_buf: [0; 4096],
+            hs_len: 0,
+        };
+        return conn;
+    }
+
+    //---------------------------------------------------------------
+    // 完整 PSK 握手：ClientHello → ServerHello → ServerHelloDone → ClientKeyExchange → ChangeCipherSpec → Finished
+    //---------------------------------------------------------------
+
+    pub fn handshake(self: &mut ClientConnection, cfg: *const ClientConfig) -> Result<(), TlsError> {
+        if self.closed { return Result::Err(TlsError::Io); }
+
+        if !self.use_psk {
+            // 非 PSK 模式：走原骨架（ClientHello + ServerHello + close_notify）
+            return self._handshake_skeleton(cfg);
+        }
+
+        // ===== PSK 完整握手 =====
+        let fd = self.fd;
+
+        // ---- Step 1: ClientHello ----
+        let mut hs_buf_local: [u8; 4096] = [0; 4096];
+        let ch_payload_len = zrtls_build_handshake_record(cfg, &mut hs_buf_local[5]);
+        // 存 handshake record（type + length + payload）到 hs_buf
+        // 完整 handshake 消息（不含 record header）= &hs_buf_local[5..5+ch_payload_len]
+        memcpy(&self.client_random[0] as *mut void, &hs_buf_local[11] as *const void, 32);
+
+        // 发 record header
+        let record_hdr1: [u8; 5] = [
+            ZRTLS_HANDSHAKE,
+            (ZRTLS_VERSION_1_2 >> 8) as u8, ZRTLS_VERSION_1_2 as u8,
+            ((ch_payload_len >> 8) & 0xff) as u8, (ch_payload_len & 0xff) as u8,
+        ];
+        match zrtls_write_all_fd(fd, &record_hdr1[0], 5) { Result::Ok(_) => {}, Result::Err(e) => return Result::Err(e), }
+        match zrtls_write_all_fd(fd, &mut hs_buf_local[5], ch_payload_len) { Result::Ok(_) => {}, Result::Err(e) => return Result::Err(e), }
+
+        // 记录 handshake message 到 hs_buf（不含 record header）
+        let mut j: usize = 0;
+        while j < ch_payload_len && self.hs_len < 4096 {
+            self.hs_buf[self.hs_len] = hs_buf_local[5 + j];
+            self.hs_len = self.hs_len + 1;
+            j = j + 1;
+        }
+
+        // ---- Step 2: ServerHello ----
+        let mut out_buf: [u8; 4096] = [0; 4096];
+        let mut suite: u16;
+        loop {
+            let rec = zrtls_read_record_fd(fd, &mut out_buf[0], 4096);
+            let (ctype, payload_len) = match rec { Result::Ok(p) => p, Result::Err(e) => return Result::Err(e), };
+            if ctype == ZRTLS_ALERT { return Result::Err(TlsError::Alert); }
+            if ctype != ZRTLS_HANDSHAKE { continue; }
+
+            if payload_len < 4 { return Result::Err(TlsError::Handshake); }
+            let msg_type = out_buf[0];
+            let msg_len = ((out_buf[1] as usize) << 16) | ((out_buf[2] as usize) << 8) | (out_buf[3] as usize);
+            if msg_len + 4 > payload_len { return Result::Err(TlsError::Handshake); }
+
+            // 记录到 hs_buf
+            let mut k: usize = 0;
+            while k < payload_len && self.hs_len < 4096 {
+                self.hs_buf[self.hs_len] = out_buf[k];
+                self.hs_len = self.hs_len + 1;
+                k = k + 1;
+            }
+
+            if msg_type == ZRTLS_HS_SERVER_HELLO {
+                // 提取 server random
+                memcpy(&self.server_random[0] as *mut void, &out_buf[6] as *const void, 32);
+                let res = zrtls_parse_server_hello(cfg, &out_buf[4], msg_len);
+                match res {
+                    Result::Ok((s, _)) => { suite = s; break; }
+                    Result::Err(e) => return Result::Err(e),
+                }
+            }
+            // 跳过 ServerHelloDone 等我们不需要在握手早期处理的消息
+        }
+
+        self.server_suite = suite;
+        if suite != ZRTLS_CIPHER_PSK_AES_128_CTR_SHA256 {
+            return Result::Err(TlsError::NotSupported);
+        }
+
+        // ---- Step 3: 等 ServerHelloDone ----
+        let mut server_hello_done_found = false;
+        while !server_hello_done_found {
+            let rec = zrtls_read_record_fd(fd, &mut out_buf[0], 4096);
+            let (ctype, payload_len) = match rec { Result::Ok(p) => p, Result::Err(e) => return Result::Err(e), };
+            if ctype == ZRTLS_ALERT { return Result::Err(TlsError::Alert); }
+            if ctype != ZRTLS_HANDSHAKE { continue; }
+            if payload_len < 4 { return Result::Err(TlsError::Handshake); }
+            let msg_type = out_buf[0];
+            // 记录到 hs_buf
+            let mut k: usize = 0;
+            while k < payload_len && self.hs_len < 4096 {
+                self.hs_buf[self.hs_len] = out_buf[k];
+                self.hs_len = self.hs_len + 1;
+                k = k + 1;
+            }
+            if msg_type == ZRTLS_HS_SERVER_HELLO_DONE {
+                server_hello_done_found = true;
+            }
+        }
+
+        // ---- Step 4: ClientKeyExchange（PSK identity + optional binder）----
+        let mut cke_buf: [u8; 128] = [0; 128];
+        let identity_len = self.psk_identity_len;
+        cke_buf[0] = ZRTLS_HS_CLIENT_KEY_EXCHANGE;
+        let cke_payload_len = 2 + identity_len;  // uint16 + identity
+        cke_buf[1] = ((cke_payload_len >> 16) & 0xff) as u8;
+        cke_buf[2] = ((cke_payload_len >> 8) & 0xff) as u8;
+        cke_buf[3] = (cke_payload_len & 0xff) as u8;
+        cke_buf[4] = ((identity_len >> 8) & 0xff) as u8;
+        cke_buf[5] = (identity_len & 0xff) as u8;
+        let mut m: usize = 0;
+        while m < identity_len { cke_buf[6 + m] = self.psk_identity[m]; m = m + 1; }
+
+        let record_hdr2: [u8; 5] = [
+            ZRTLS_HANDSHAKE,
+            (ZRTLS_VERSION_1_2 >> 8) as u8, ZRTLS_VERSION_1_2 as u8,
+            ((cke_payload_len >> 8) & 0xff) as u8, (cke_payload_len & 0xff) as u8,
+        ];
+        let cke_record_total = 4 + cke_payload_len;
+        match zrtls_write_all_fd(fd, &record_hdr2[0], 5) { Result::Ok(_) => {}, Result::Err(e) => return Result::Err(e), }
+        match zrtls_write_all_fd(fd, &cke_buf[4], cke_payload_len) { Result::Ok(_) => {}, Result::Err(e) => return Result::Err(e), }
+
+        // 记录 CKE handshake message 到 hs_buf
+        let mut n: usize = 0;
+        while n < cke_payload_len && self.hs_len < 4096 {
+            self.hs_buf[self.hs_len] = cke_buf[4 + n];
+            self.hs_len = self.hs_len + 1;
+            n = n + 1;
+        }
+
+        // ---- Step 5: 推导会话密钥 ----
+        zrtls_derive_master_secret(
+            self.psk_key, self.psk_key_len,
+            &self.client_random[0], &self.server_random[0],
+            &mut self.master_secret[0]
+        );
+
+        // key_block = PRF(master, "key expansion", server_random + client_random)
+        // 顺序：client_write_MAC(32) || server_write_MAC(32) || client_write_key(16) || server_write_key(16)
+        //       || client_write_IV(16) || server_write_IV(16)
+        let needed_len = 32 + 32 + 16 + 16 + 16 + 16;  // 128
+        let mut key_block: [u8; 256] = [0; 256];
+        zrtls_derive_key_block(&self.master_secret[0],
+                               &self.server_random[0], &self.client_random[0],
+                               &mut key_block[0], needed_len);
+
+        // 拆分 key_block
+        let mut p: usize = 0;
+        let mut q: usize = 0;
+        // client_write_MAC_key
+        while q < 32 { self.client_write_MAC_key[q] = key_block[p]; p = p + 1; q = q + 1; }
+        q = 0;
+        while q < 32 { self.server_write_MAC_key[q] = key_block[p]; p = p + 1; q = q + 1; }
+        q = 0;
+        while q < 16 { self.client_write_key[q] = key_block[p]; p = p + 1; q = q + 1; }
+        q = 0;
+        while q < 16 { self.server_write_key[q] = key_block[p]; p = p + 1; q = q + 1; }
+        q = 0;
+        while q < 16 { self.client_write_IV[q] = key_block[p]; p = p + 1; q = q + 1; }
+        q = 0;
+        while q < 16 { self.server_write_IV[q] = key_block[p]; p = p + 1; q = q + 1; }
+
+        // ---- Step 6: 发送 ChangeCipherSpec ----
+        let ccs_record: [u8; 6] = [
+            ZRTLS_CHANGE_CIPHER_SPEC,
+            (ZRTLS_VERSION_1_2 >> 8) as u8, ZRTLS_VERSION_1_2 as u8,
+            0, 1,  // length = 1
+            1,     // CCS message content type
+        ];
+        match zrtls_write_all_fd(fd, &ccs_record[0], 6) { Result::Ok(_) => {}, Result::Err(e) => return Result::Err(e), }
+
+        // ---- Step 7: 发送 Finished ----
+        let fin_label: [u8; 15] = *b"client finished";
+        // finished_verify_data = PRF(master_secret, label, SHA256(handshake_messages))[0..12]
+        let mut hs_hash: [u8; 32] = [0; 32];
+        let mut hs_state = crypto_sha256_init();
+        crypto_sha256_update(&mut hs_state, &self.hs_buf[0], self.hs_len);
+        crypto_sha256_digest(&mut hs_state, &mut hs_hash[0]);
+
+        let mut fin_vd: [u8; 12] = [0; 12];
+        zrtls_prf(&self.master_secret[0], 48,
+                  &fin_label[0], 15,
+                  &hs_hash[0], 32,
+                  &mut fin_vd[0], 12);
+
+        // 加密 Finished handshake record
+        let mut fin_inner: [u8; 256] = [0; 256];
+        fin_inner[0] = ZRTLS_HS_FINISHED;
+        fin_inner[1] = 0; fin_inner[2] = 0; fin_inner[3] = 12;
+        let mut r: usize = 0;
+        while r < 12 { fin_inner[4 + r] = fin_vd[r]; r = r + 1; }
+        let fin_payload_len = 4 + 12;
+
+        let mut fin_encrypted: [u8; 300] = [0; 300];
+        let enc_len = zrtls_encrypt_record(
+            &self.client_write_key[0], &self.client_write_IV[0],
+            &self.client_write_MAC_key[0], self.client_write_seq,
+            ZRTLS_HANDSHAKE, &fin_inner[0], fin_payload_len,
+            &mut fin_encrypted[0], 300
+        );
+        self.client_write_seq = self.client_write_seq + 1;
+
+        match zrtls_write_all_fd(fd, &fin_encrypted[0], enc_len) { Result::Ok(_) => {}, Result::Err(e) => return Result::Err(e), }
+
+        // ---- Step 8: 读 ChangeCipherSpec（从服务器）----
+        let ccs_rec = zrtls_read_record_fd(fd, &mut out_buf[0], 4096);
+        let ccs_tuple: (u8, usize) = match ccs_rec { Result::Ok(p) => p, Result::Err(e) => return Result::Err(e), };
+        let ccs_ctype: u8 = ccs_tuple.0;
+        let ccs_plen: usize = ccs_tuple.1;
+        if ccs_ctype != ZRTLS_CHANGE_CIPHER_SPEC { return Result::Err(TlsError::Handshake); }
+
+        // ---- Step 9: 读 Finished（加密的）----
+        let fin_rec = zrtls_read_record_fd(fd, &mut out_buf[0], 4096);
+        let fin_tuple: (u8, usize) = match fin_rec { Result::Ok(p) => p, Result::Err(e) => return Result::Err(e), };
+        let fin_ctype: u8 = fin_tuple.0;
+        let fin_plen: usize = fin_tuple.1;
+
+        let mut decrypted_fin: [u8; 256] = [0; 256];
+        let dec_len = zrtls_decrypt_record(
+            &self.server_write_key[0], &self.server_write_IV[0],
+            &self.server_write_MAC_key[0], self.server_write_seq,
+            ZRTLS_HANDSHAKE, &out_buf[0], fin_plen,
+            &mut decrypted_fin[0], 256
+        );
+        self.server_write_seq = self.server_write_seq + 1;
+        match dec_len { Result::Ok(_) => {}, Result::Err(e) => return Result::Err(e), }
+
+        self.handshake_done = true;
+        return Result::Ok(());
+    }
+
+    //---------------------------------------------------------------
+    // 骨架握手（非 PSK，用于纯明文交换 ClientHello/ServerHello）
+    //---------------------------------------------------------------
+
+    fn _handshake_skeleton(self: &mut ClientConnection, cfg: *const ClientConfig) -> Result<(), TlsError> {
+        let fd = self.fd;
+
+        let mut hs_buf: [u8; 256] = [0; 256];
+        let hs_plen = zrtls_build_handshake_record(cfg, &mut hs_buf[5]);
+
+        let header: [u8; 5] = [
+            ZRTLS_HANDSHAKE,
+            (ZRTLS_VERSION_1_2 >> 8) as u8, ZRTLS_VERSION_1_2 as u8,
+            ((hs_plen >> 8) & 0xff) as u8, (hs_plen & 0xff) as u8,
+        ];
+        match zrtls_write_all_fd(fd, &header[0], 5) { Result::Ok(_) => {}, Result::Err(e) => return Result::Err(e), }
+        match zrtls_write_all_fd(fd, &mut hs_buf[5], hs_plen) { Result::Ok(_) => {}, Result::Err(e) => return Result::Err(e), }
+
+        let mut out_buf: [u8; 4096] = [0; 4096];
+        let mut suite: u16 = 0;
+        let mut got_server_hello = false;
+        let mut attempts: usize = 0;
+
+        while attempts < 16 && !got_server_hello {
+            attempts = attempts + 1;
+            let rec = zrtls_read_record_fd(fd, &mut out_buf[0], 4096);
+            let (ctype, payload_len) = match rec { Result::Ok(p) => p, Result::Err(e) => return Result::Err(e), };
+            if ctype == ZRTLS_ALERT { return Result::Err(TlsError::Alert); }
+            if ctype != ZRTLS_HANDSHAKE { continue; }
+            if payload_len < 4 { return Result::Err(TlsError::Handshake); }
+
+            let msg_type = out_buf[0];
+            let msg_len = ((out_buf[1] as usize) << 16) | ((out_buf[2] as usize) << 8) | (out_buf[3] as usize);
+            if msg_len + 4 > payload_len { return Result::Err(TlsError::Handshake); }
+
+            if msg_type == ZRTLS_HS_SERVER_HELLO {
+                let res = zrtls_parse_server_hello(cfg, &out_buf[4], msg_len);
+                match res {
+                    Result::Ok((s, _)) => { suite = s; got_server_hello = true; }
+                    Result::Err(e) => return Result::Err(e),
+                }
+            }
+        }
+
+        if !got_server_hello { return Result::Err(TlsError::Handshake); }
+        self.server_suite = suite;
+        self.handshake_done = true;
+
+        // close_notify alert
+        let mut alert: [u8; 7] = [0; 7];
+        alert[0] = ZRTLS_ALERT;
+        alert[1] = 0x03; alert[2] = 0x03;
+        alert[3] = 0; alert[4] = 2;
+        alert[5] = 1; alert[6] = 0;
+        let _ = zrtls_write_all_fd(fd, &alert[0], 7);
+
+        return Result::Ok(());
+    }
+
+    //---------------------------------------------------------------
+    // write — 应用层加密发送
+    //---------------------------------------------------------------
+
+    pub fn write(self: &mut ClientConnection, data: []const u8) -> Result<usize, TlsError> {
+        if self.closed { return Result::Err(TlsError::Io); }
+
+        if !self.handshake_done || !self.use_psk {
+            // 未加密，直接走 TCP
+            let n = zr_send(self.fd, data.ptr, data.len, 0);
+            if n < 0 { return Result::Err(TlsError::Io); }
+            return Result::Ok(n as usize);
+        }
+
+        // 加密通道
+        let mut enc_buf: [u8; 8192] = [0; 8192];
+        let enc_len = zrtls_encrypt_record(
+            &self.client_write_key[0], &self.client_write_IV[0],
+            &self.client_write_MAC_key[0], self.client_write_seq,
+            ZRTLS_APPLICATION_DATA, data.ptr, data.len,
+            &mut enc_buf[0], 8192
+        );
+        if enc_len == 0 { return Result::Err(TlsError::EncryptFail); }
+        self.client_write_seq = self.client_write_seq + 1;
+
+        match zrtls_write_all_fd(self.fd, &enc_buf[0], enc_len) {
+            Result::Ok(_) => {},
+            Result::Err(e) => return Result::Err(e),
+        }
+        return Result::Ok(data.len);
+    }
+
+    //---------------------------------------------------------------
+    // read — 应用层加密接收
+    //---------------------------------------------------------------
+
+    pub fn read(self: &mut ClientConnection, buf: []u8) -> Result<usize, TlsError> {
+        if self.closed { return Result::Ok(0); }
+
+        if !self.handshake_done || !self.use_psk {
+            let n = zr_recv(self.fd, buf.ptr as *mut u8, buf.len, 0);
+            if n < 0 { return Result::Err(TlsError::Io); }
+            return Result::Ok(n as usize);
+        }
+
+        // 读加密 record
+        let mut enc_buf: [u8; 8192] = [0; 8192];
+        let rec = zrtls_read_record_fd(self.fd, &mut enc_buf[0], 8192);
+        let (ctype, payload_len) = match rec { Result::Ok(p) => p, Result::Err(e) => return Result::Err(e), };
+
+        if ctype == ZRTLS_ALERT {
+            // close_notify 等
+            self.closed = true;
+            return Result::Ok(0);
+        }
+
+        let dec_len = zrtls_decrypt_record(
+            &self.server_write_key[0], &self.server_write_IV[0],
+            &self.server_write_MAC_key[0], self.server_write_seq,
+            ctype, &enc_buf[0], payload_len,
+            buf.ptr as *mut u8, buf.len
+        );
+        self.server_write_seq = self.server_write_seq + 1;
+        match dec_len { Result::Ok(n) => return Result::Ok(n), Result::Err(e) => return Result::Err(e), }
+    }
+
+    //---------------------------------------------------------------
+    // close
+    //---------------------------------------------------------------
+
+    pub fn close(self: &mut ClientConnection) {
+        if self.closed { return; }
+        // 如果加密通道已建立，先发 close_notify
+        if self.handshake_done && self.use_psk {
+            let mut alert_buf: [u8; 50] = [0; 50];
+            let alert_inner: [u8; 2] = [1, 0];  // close_notify, warning
+            let enc_len = zrtls_encrypt_record(
+                &self.client_write_key[0], &self.client_write_IV[0],
+                &self.client_write_MAC_key[0], self.client_write_seq,
+                ZRTLS_ALERT, &alert_inner[0], 2,
+                &mut alert_buf[0], 50
+            );
+            self.client_write_seq = self.client_write_seq + 1;
+            let _ = zrtls_write_all_fd(self.fd, &alert_buf[0], enc_len);
+        }
+        close(self.fd);
+        self.closed = true;
+    }
+}

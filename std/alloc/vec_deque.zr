@@ -1,0 +1,144 @@
+//==============================================================================
+// std/alloc/vec_deque.zr — 双端队列（对应 Rust `alloc::collections::VecDeque`）
+//
+// 环形缓冲区实现：`head` 指向第一个元素，容量为 2 的幂时取模可用位与，
+// 这里保持通用取模以便任意初始容量。
+//==============================================================================
+
+use core::{Option, panic, size_of};
+use collections::Vec;
+use mem::{zr_alloc, zr_dealloc};
+
+pub struct VecDeque<T> {
+    pub data:     *mut T,
+    pub size:     usize,
+    pub capac:    usize,
+    pub head:     usize,
+}
+
+impl<T> VecDeque<T> {
+    pub fn new() -> VecDeque<T> {
+        return VecDeque::with_capacity(8);
+    }
+
+    pub fn with_capacity(cap: usize) -> VecDeque<T> {
+        let c = if cap == 0 { 1 } else { cap };
+        let data = zr_alloc(size_of::<T>() * c, 8) as *mut T;
+        if data == 0 as *mut T { panic("VecDeque: out of memory"); }
+        return VecDeque { data, size: 0, capac: c, head: 0 };
+    }
+
+    pub fn len(self) -> usize { return self.size; }
+    pub fn capacity(self) -> usize { return self.capac; }
+    pub fn is_empty(self) -> bool { return self.size == 0; }
+
+    fn grow(self: &mut VecDeque<T>) {
+        let new_cap = self.capac * 2;
+        let new_data = zr_alloc(size_of::<T>() * new_cap, 8) as *mut T;
+        if new_data == 0 as *mut T { panic("VecDeque: out of memory"); }
+        // 按逻辑顺序把元素搬到新缓冲区。
+        let mut i = 0;
+        while i < self.size {
+            new_data[i] = self.data[(self.head + i) % self.capac];
+            i = i + 1;
+        }
+        zr_dealloc(
+            self.data as *mut void,
+            size_of::<T>() * self.capac,
+            8,
+        );
+        self.data = new_data;
+        self.capac = new_cap;
+        self.head = 0;
+    }
+
+    /// 尾部入队。
+    pub fn push_back(self: &mut VecDeque<T>, value: T) {
+        if self.size + 1 > self.capac { self.grow(); }
+        let idx = (self.head + self.size) % self.capac;
+        self.data[idx] = value;
+        self.size = self.size + 1;
+    }
+
+    /// 头部入队。
+    pub fn push_front(self: &mut VecDeque<T>, value: T) {
+        if self.size + 1 > self.capac { self.grow(); }
+        self.head = (self.head + self.capac - 1) % self.capac;
+        self.data[self.head] = value;
+        self.size = self.size + 1;
+    }
+
+    /// 头部出队。
+    pub fn pop_front(self: &mut VecDeque<T>) -> Option<T> {
+        if self.size == 0 { return Option::None; }
+        let v = self.data[self.head];
+        self.head = (self.head + 1) % self.capac;
+        self.size = self.size - 1;
+        return Option::Some(v);
+    }
+
+    /// 尾部出队。
+    pub fn pop_back(self: &mut VecDeque<T>) -> Option<T> {
+        if self.size == 0 { return Option::None; }
+        let idx = (self.head + self.size - 1) % self.capac;
+        let v = self.data[idx];
+        self.size = self.size - 1;
+        return Option::Some(v);
+    }
+
+    /// 头部元素。
+    pub fn front(self) -> Option<T> {
+        if self.size == 0 { return Option::None; }
+        return Option::Some(self.data[self.head]);
+    }
+
+    /// 尾部元素。
+    pub fn back(self) -> Option<T> {
+        if self.size == 0 { return Option::None; }
+        return Option::Some(self.data[(self.head + self.size - 1) % self.capac]);
+    }
+
+    /// 按逻辑下标取值。
+    pub fn get(self, index: usize) -> T {
+        if index >= self.size { panic("VecDeque: index out of range"); }
+        return self.data[(self.head + index) % self.capac];
+    }
+
+    /// 按逻辑下标写值。
+    pub fn set(self: &mut VecDeque<T>, index: usize, value: T) {
+        if index >= self.size { panic("VecDeque: index out of range"); }
+        let idx = (self.head + index) % self.capac;
+        self.data[idx] = value;
+    }
+
+    pub fn clear(self: &mut VecDeque<T>) {
+        self.size = 0;
+        self.head = 0;
+    }
+
+    /// 释放内存。
+    pub fn destroy(self: &mut VecDeque<T>) {
+        if self.data != 0 as *mut T {
+            zr_dealloc(
+                self.data as *mut void,
+                size_of::<T>() * self.capac,
+                8,
+            );
+            self.data = 0 as *mut T;
+            self.size = 0;
+            self.capac = 0;
+            self.head = 0;
+        }
+    }
+
+    /// 转成普通 `Vec`（按逻辑顺序）。
+    pub fn into_vec(self) -> Vec<T> {
+        let mut v: Vec<T> = Vec::with_capacity(self.size);
+        let mut i = 0;
+        while i < self.size {
+            v.push(self.data[(self.head + i) % self.capac]);
+            i = i + 1;
+        }
+        return v;
+    }
+}

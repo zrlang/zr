@@ -1,0 +1,102 @@
+//=============================================================================
+// tests/cases/132_format.zr — 字符串格式化拼成新 String
+//
+// `io::format` 把格式串与 `io::FormatArg` 参数组合成**新的 String**（不写
+// stdout）；`string::join_parts` 把若干 `str` 用分隔符拼成新 String。
+//
+// 覆盖：普通替换 / 位置参数 / 字面花括号 / 十六进制与大小写 / 二进制 / 八进制 /
+// 浮点 Display 与 Debug / 字符串 Display 与 Debug / 布尔 / 空格式串 / 多段拼接 /
+// join。编号指向失败的断言。
+//=============================================================================
+
+use string::{String, join_parts};
+use io::{FormatArg, format, fmt_bool, fmt_float, fmt_int, fmt_str};
+
+fn bytes_eq(s: &String, want: str) -> bool {
+    if s.len != want.len { return false; }
+    let mut i: usize = 0;
+    while i < s.len {
+        if s.ptr[i] != want.ptr[i] { return false; }
+        i = i + 1;
+    }
+    return true;
+}
+
+fn main() -> i32 {
+    // 1. 顺序替换
+    let a = format("x = {}, y = {}", &[fmt_int(1), fmt_int(2)], 2);
+    if !bytes_eq(&a, "x = 1, y = 2") { return 1; }
+
+    // 2. 位置参数可以重复使用，且不推进隐式下标
+    let b = format("{0}-{0}-{1}", &[fmt_int(7), fmt_int(8)], 2);
+    if !bytes_eq(&b, "7-7-8") { return 2; }
+
+    // 3. 字面花括号（`{{` / `}}`）
+    let c = format("{{}}", 0 as *const FormatArg, 0);
+    if !bytes_eq(&c, "{}") { return 3; }
+
+    // 4. 十六进制小写 / 大写
+    let d = format("{:x}", &[fmt_int(255)], 1);
+    if !bytes_eq(&d, "ff") { return 4; }
+    let e = format("{:X}", &[fmt_int(255)], 1);
+    if !bytes_eq(&e, "FF") { return 5; }
+
+    // 5. 二进制 / 八进制
+    let f = format("{:b}", &[fmt_int(255)], 1);
+    if !bytes_eq(&f, "11111111") { return 6; }
+    let g = format("{:o}", &[fmt_int(255)], 1);
+    if !bytes_eq(&g, "377") { return 7; }
+
+    // 6. 浮点 Display：整数值不带 `.0`，小数去尾零
+    let h = format("{}", &[fmt_float(3.5)], 1);
+    if !bytes_eq(&h, "3.5") { return 8; }
+    let i = format("{}", &[fmt_float(2.0)], 1);
+    if !bytes_eq(&i, "2") { return 9; }
+    let j = format("{}", &[fmt_float(0.75)], 1);
+    if !bytes_eq(&j, "0.75") { return 10; }
+
+    // 7. 浮点 Debug：整数值补 `.0`
+    let k = format("{:?}", &[fmt_float(2.0)], 1);
+    if !bytes_eq(&k, "2.0") { return 11; }
+
+    // 8. 字符串 Display 原样 / Debug 加引号
+    let l = format("{}", &[fmt_str("zr")], 1);
+    if !bytes_eq(&l, "zr") { return 12; }
+    let m = format("{:?}", &[fmt_str("zr")], 1);
+    if !bytes_eq(&m, "\"zr\"") { return 13; }
+
+    // 9. 布尔
+    let n = format("{}", &[fmt_bool(true)], 1);
+    if !bytes_eq(&n, "true") { return 14; }
+
+    // 10. 空格式串得到空 String
+    let o = format("", 0 as *const FormatArg, 0);
+    if o.len != 0 { return 15; }
+
+    // 11. 没有对应的参数下标时按原样跳过（不崩）
+    let p = format("{}", 0 as *const FormatArg, 0);
+    if p.len != 0 { return 16; }
+
+    // 12. 拼接出来的确实是独立的新 String（长度按字节算）
+    let q = format("{}{}", &[fmt_int(12), fmt_str("ab")], 2);
+    if q.len != 4 { return 17; }
+    if q.ptr[0] != b'1' || q.ptr[1] != b'2' || q.ptr[2] != b'a' || q.ptr[3] != b'b' {
+        return 18;
+    }
+
+    // 13. join_parts：分隔符夹在元素之间
+    let parts: [str; 3] = ["a", "b", "c"];
+    let r = join_parts(&parts[0], 3, "-");
+    if !bytes_eq(&r, "a-b-c") { return 19; }
+
+    // 14. join_parts 只有一个元素时不加分隔符
+    let one: [str; 1] = ["solo"];
+    let s = join_parts(&one[0], 1, ",");
+    if !bytes_eq(&s, "solo") { return 20; }
+
+    // 15. join_parts 零个元素得到空串
+    let t = join_parts(0 as *const str, 0, ",");
+    if t.len != 0 { return 21; }
+
+    return 0;
+}

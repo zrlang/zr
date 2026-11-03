@@ -1,0 +1,79 @@
+//=============================================================================
+// std/posix.zr — POSIX 常量与少量系统调用封装
+//
+//   posix::isatty(fd)        -> bool
+//   posix::getpid()          -> i32
+//   posix::kill(pid, sig)    -> bool
+//   posix::getcwd(buf, cap)  -> i64
+//
+// 另有退出状态解码：wifexited / wexitstatus / wifsignaled / wtermsig。
+// 状态位布局（Linux / macOS 的 16 位 wait status）：
+//   低 7 位 = 终止信号（0 表示正常退出），第 8-15 位 = 退出码。
+//=============================================================================
+
+extern "C" {
+    fn zr_isatty(fd: i32) -> i32;
+    fn zr_kill(pid: i64, sig: i32) -> i32;
+    fn zr_getcwd(buf: *mut u8, cap: usize) -> i64;
+    fn zr_process_getpid() -> i32;
+}
+
+//----- 常量 -------------------------------------------------------------------
+
+pub const EXIT_SUCCESS: i32 = 0;
+pub const EXIT_FAILURE: i32 = 1;
+
+pub const SIGHUP:  i32 = 1;
+pub const SIGINT:  i32 = 2;
+pub const SIGKILL: i32 = 9;
+pub const SIGTERM: i32 = 15;
+pub const SIGSTOP: i32 = 19;
+pub const SIGCONT: i32 = 18;
+
+pub const STDIN_FILENO:  i32 = 0;
+pub const STDOUT_FILENO: i32 = 1;
+pub const STDERR_FILENO: i32 = 2;
+
+//----- 系统调用 ---------------------------------------------------------------
+
+/// fd 是否连接在终端上。
+pub fn isatty(fd: i32) -> bool {
+    return zr_isatty(fd) != 0;
+}
+
+/// 当前进程 ID。
+pub fn getpid() -> i32 {
+    return zr_process_getpid();
+}
+
+/// 给进程发信号；成功返回 true。
+pub fn kill(pid: i32, sig: i32) -> bool {
+    return zr_kill(pid as i64, sig) == 0;
+}
+
+/// 把当前工作目录写进 `buf`，返回长度（不含 NUL）；失败返回 -1。
+pub fn getcwd(buf: *mut u8, cap: usize) -> i64 {
+    return zr_getcwd(buf, cap);
+}
+
+//----- 退出状态解码 -----------------------------------------------------------
+
+/// 是否正常退出（未被信号终止）。
+pub fn wifexited(status: i32) -> bool {
+    return (status & 0x7f) == 0;
+}
+
+/// 正常退出时的退出码。
+pub fn wexitstatus(status: i32) -> i32 {
+    return (status >> 8) & 0xff;
+}
+
+/// 是否被信号终止。
+pub fn wifsignaled(status: i32) -> bool {
+    return (status & 0x7f) != 0;
+}
+
+/// 终止进程的信号编号。
+pub fn wtermsig(status: i32) -> i32 {
+    return status & 0x7f;
+}

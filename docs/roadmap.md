@@ -165,16 +165,17 @@ Rust 的借用检查是**线性化 + 借用区间 + 生命周期子类型**三�
 
 按优先级：
 
-1. **`HashMap<K, V>` / `HashSet<T>`**：现在 `std/collections.zr` 只有 `Vec` / `Array`，没有哈希表——这是标准库不完整的第一块短板。
-2. **`Iterator` combinator**：`filter_map / zip / chain / rev / enumerate / partition / collect`。`std/core.zr:629` 现在只有 `next`。
+1. ~~**`HashMap<K, V>`**~~ ✅ 已完成：`std/alloc/hashmap.zr`（开放寻址 + 装载因子 1/2 扩容 rehash，回归 `tests/cases/150_std_alloc_ext.zr`）。**`HashSet<T>` 还没做**。
+2. **`Iterator` combinator**：`filter_map / zip / chain / rev / enumerate / partition / collect`。`std/core/core.zr:629` 现在只有 `next`。
 3. **`From / Into` blanket impl**：现在没有，`Result<T, E>` 的 `?` 只能做同类型错误，不能自动转换。
 4. **`Arc<T>` / `Mutex<T>` / `OnceCell<T>` / `Lazy<T>`**：并发原语从 `thread` 提到标准库顶层。
 5. **文件元数据 / `tempfile`**：`fs::metadata` 返回 `{ len, mode, mtime, ctime, inode }`；`tempfile::temp_dir()` / `temp_dir_file()`。
-6. **类型化时间**：`Duration` / `Instant` / `SystemTime`，`zr_time_ns` 藏起来。
+6. **类型化时间**：`Duration` / `Instant` ✅ 已补（`std/std/time.zr`，回归 `tests/cases/151_std_fs_time.zr`）；**`SystemTime` 还没做**（墙钟仍是 `unix_ns` / `unix_secs` / `now_ms`）。
 7. **`panic!` / `assert!` / `assert_eq!`**：三个宏，配合 `#[test]` 桩（`src/mir/test_harness.rs` 已有）。
-8. **`f16` / `f8` 的 `Display` 修复**：|v| ≥ 2⁶⁴ 时输出 `.0` 的 bug（`std/io.zr` 的 `write_float`）。
+8. **`f16` / `f8` 的 `Display` 修复**：|v| ≥ 2⁶⁴ 时输出 `.0` 的 bug（`std/std/io.zr` 的 `write_float`）。
 9. **`Iterator` 对 slice 的 `iter / iter_mut` 实现**：现在 slice 没有迭代器。
-10. **`Option / Result` 的方法**：`map_or / map_err / and_then / or_else / filter / zip`。
+10. **`Option / Result` 的方法**：`map_or` / `map_err` / `and_then` / `filter` / `ok_or` ✅ 已补；**`or_else` / `zip` 还没做**。
+11. **HTTP/2 客户端** ✅ 已补（`std/std/http2.zr`，明文 h2c + HPACK，回归 `tests/cases/152_http2.zr`）。**还没做**：TLS + ALPN（`https://` 直接走 h2，需要先给 `tls.zr` 加 ALPN 扩展）、服务端推送、PRIORITY 帧、请求体 > 65535 的边发边等流式发送。
 
 ### 4.4 宏系统（阶段 J）
 
@@ -294,7 +295,7 @@ zr 0.8.0 shell — :help 查看元命令，Ctrl-D 退出
 现状：6 个后端已接线（`encoder.rs / encoder_aarch64.rs / encoder_arm.rs / encoder_thumb.rs / encoder_riscv.rs / wasm.rs`）；4 种对象格式（ELF / Mach-O / PE / wasm）。
 
 - **x86_64**：补 SSE2 / AVX2 指令选择（`SimdBinary` 现在报 `unsupported_simd`）；补寄存器分配的 spill reload 优化。
-- **aarch64**：补 SVE（`std/simd.zr` 已经预留了接口）。
+- **aarch64**：补 SVE（`std/core/simd.zr` 已经预留了接口）。
 - **RISC-V**：补 RV64GC 的 C 扩展（压缩指令）、M 扩展的除法优化。
 - **WASM**：补 wasm64 提案的稳定支持（现在指针宽度靠 `addr64` 判断）；补 simd128 提案。
 - **DWARF 补齐**：`.zdebug_info` / `.zdebug_line` / `.zdebug_str` / `.zdebug_abbrev` / `.zdebug_ranges` 全上；`-g` 打开。现在 `src/codegen/dwarf.rs` 只覆盖字符串表和最小 DIE。
@@ -366,7 +367,7 @@ zr 0.8.0 shell — :help 查看元命令，Ctrl-D 退出
 - 移动记账 + use-after-move 检测（§2.2）。
 - 切片 / 数组边界检查默认开启（`-C debug-assertions=yes`）。
 - ✅ `#[derive]` 支持 `PartialEq / Eq / Hash / Default`（v0.9.0 已提前完成，见 §6）。
-- `HashMap` / `HashSet` 进 `std/collections.zr`。
+- ✅ `HashMap` 已进 `std/alloc/hashmap.zr`（`tests/cases/150_std_alloc_ext.zr`）；`HashSet` 仍未做。
 - **目标**：`tests/cases` 全绿，新加 `tests/cases/unsafe_*` / `borrow_*` / `move_*` 三个系列。
 
 ### v0.11.0 — 类型系统（3 周）

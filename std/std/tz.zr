@@ -1,0 +1,196 @@
+//=============================================================================
+// std/tz.zr — 时区
+//
+// 在 `time::DateTime`（UTC）之上做时区换算。时区名用 `str` 传入，内部
+// 按名字匹配到固定的一组区域：
+//
+//   UTC / Asia/Shanghai / Asia/Tokyo / Asia/Kolkata
+//   Europe/London / Europe/Berlin
+//   America/New_York / America/Los_Angeles
+//   Australia/Sydney
+//
+// 未知时区按 UTC 处理（偏移 0、不做夏令时）。DST 规则接近真实：
+//
+//   EU     3 月最后一个周日 01:00 UTC 起 +1；10 月最后一个周日 01:00 UTC 止
+//   US     3 月第二个周日 02:00 本地起；11 月第一个周日 02:00 本地止
+//   Sydney 10 月第一个周日 02:00 本地起；次年 4 月第一个周日 03:00 本地止
+//
+// 「本地」边界要按**当时的**偏移反推 UTC：开始时用标准时偏移，结束时用
+// 夏令时偏移。内部辅助一律 `tz_` 前缀（扁平命名空间）。
+//=============================================================================
+
+use time::{DateTime, civil_from_unix, unix_from_civil, days_in_month};
+
+//----- 时区识别 ---------------------------------------------------------------
+
+const TZ_ID_UTC: i32 = 1;
+const TZ_ID_SHANGHAI: i32 = 2;
+const TZ_ID_TOKYO: i32 = 3;
+const TZ_ID_KOLKATA: i32 = 4;
+const TZ_ID_LONDON: i32 = 5;
+const TZ_ID_BERLIN: i32 = 6;
+const TZ_ID_NEW_YORK: i32 = 7;
+const TZ_ID_LOS_ANGELES: i32 = 8;
+const TZ_ID_SYDNEY: i32 = 9;
+
+/// 两个 `str` 是否逐字节相等。
+fn tz_str_eq(a: str, b: str) -> bool {
+    if a.len != b.len { return false; }
+    let mut i = 0;
+    while i < a.len {
+        if a.ptr[i] != b.ptr[i] { return false; }
+        i = i + 1;
+    }
+    return true;
+}
+
+/// 时区名 → 内部 id；不认识的返回 0。
+fn tz_zone_id(name: str) -> i32 {
+    if tz_str_eq(name, "UTC") { return TZ_ID_UTC; }
+    if tz_str_eq(name, "Asia/Shanghai") { return TZ_ID_SHANGHAI; }
+    if tz_str_eq(name, "Asia/Tokyo") { return TZ_ID_TOKYO; }
+    if tz_str_eq(name, "Asia/Kolkata") { return TZ_ID_KOLKATA; }
+    if tz_str_eq(name, "Europe/London") { return TZ_ID_LONDON; }
+    if tz_str_eq(name, "Europe/Berlin") { return TZ_ID_BERLIN; }
+    if tz_str_eq(name, "America/New_York") { return TZ_ID_NEW_YORK; }
+    if tz_str_eq(name, "America/Los_Angeles") { return TZ_ID_LOS_ANGELES; }
+    if tz_str_eq(name, "Australia/Sydney") { return TZ_ID_SYDNEY; }
+    return 0;
+}
+
+/// 标准时（非夏令时）偏移，秒。
+fn tz_base_offset(id: i32) -> i32 {
+    if id == TZ_ID_SHANGHAI { return 28800; }
+    if id == TZ_ID_TOKYO { return 32400; }
+    if id == TZ_ID_KOLKATA { return 19800; }
+    if id == TZ_ID_BERLIN { return 3600; }
+    if id == TZ_ID_NEW_YORK { return -18000; }
+    if id == TZ_ID_LOS_ANGELES { return -28800; }
+    if id == TZ_ID_SYDNEY { return 36000; }
+    return 0;   // UTC / London / 未知
+}
+
+/// 夏令时规则类别：0 无，1 EU，2 US，3 Sydney。
+fn tz_dst_kind(id: i32) -> i32 {
+    if id == TZ_ID_LONDON || id == TZ_ID_BERLIN { return 1; }
+    if id == TZ_ID_NEW_YORK || id == TZ_ID_LOS_ANGELES { return 2; }
+    if id == TZ_ID_SYDNEY { return 3; }
+    return 0;
+}
+
+/// 时区名是否受支持。
+pub fn zone_exists(name: str) -> bool {
+    return tz_zone_id(name) != 0;
+}
+
+//----- 日历辅助 ---------------------------------------------------------------
+
+/// 构造一个 UTC 的 `DateTime`（时刻字段给定时分秒）。
+fn tz_utc_dt(year: i32, month: u8, day: u8, hour: u8) -> DateTime {
+    return DateTime {
+        year: year,
+        month: month,
+        day: day,
+        hour: hour,
+        minute: 0,
+        second: 0,
+        weekday: 0,
+        nanos: 0,
+    };
+}
+
+/// `year/month/day` 是星期几（0 = 周日）。
+fn tz_weekday(year: i32, month: u8, day: u8) -> i32 {
+    let secs = unix_from_civil(tz_utc_dt(year, month, day, 0));
+    return civil_from_unix(secs).weekday as i32;
+}
+
+/// 某月第 `n` 个周日（`n` 从 1 起）。
+fn tz_nth_sunday(year: i32, month: u8, n: i32) -> u8 {
+    let wd = tz_weekday(year, month, 1);
+    let day = 1 + ((7 - wd) % 7) + (n - 1) * 7;
+    return day as u8;
+}
+
+/// 某月最后一个周日。
+fn tz_last_sunday(year: i32, month: u8) -> u8 {
+    let last = days_in_month(year, month) as i32;
+    let wd = tz_weekday(year, month, last as u8);
+    return (last - wd) as u8;
+}
+
+//----- 夏令时判定 -------------------------------------------------------------
+
+/// EU：3 月最后一个周日 01:00 UTC 起，10 月最后一个周日 01:00 UTC 止。
+fn tz_eu_dst_active(t: i64) -> bool {
+    let dt = civil_from_unix(t);
+    let y = dt.year;
+    let start = unix_from_civil(tz_utc_dt(y, 3, tz_last_sunday(y, 3), 1));
+    let end = unix_from_civil(tz_utc_dt(y, 10, tz_last_sunday(y, 10), 1));
+    return t >= start && t < end;
+}
+
+/// US：3 月第二个周日 02:00 标准时起，11 月第一个周日 02:00 夏令时止。
+/// `base` 是该区的标准时偏移（负值），用来把本地时刻反推成 UTC。
+fn tz_us_dst_active(t: i64, base: i32) -> bool {
+    let dt = civil_from_unix(t);
+    let y = dt.year;
+    let start = unix_from_civil(tz_utc_dt(y, 3, tz_nth_sunday(y, 3, 2), 2))
+        - base as i64;
+    let end = unix_from_civil(tz_utc_dt(y, 11, tz_nth_sunday(y, 11, 1), 2))
+        - (base + 3600) as i64;
+    return t >= start && t < end;
+}
+
+/// Sydney（南半球）：10 月第一个周日 02:00 标准时起，
+/// 次年 4 月第一个周日 03:00 夏令时止。跨年，所以判据是「或」。
+fn tz_sydney_dst_active(t: i64, base: i32) -> bool {
+    let dt = civil_from_unix(t);
+    let y = dt.year;
+    let start = unix_from_civil(tz_utc_dt(y, 10, tz_nth_sunday(y, 10, 1), 2))
+        - base as i64;
+    let end = unix_from_civil(tz_utc_dt(y, 4, tz_nth_sunday(y, 4, 1), 3))
+        - (base + 3600) as i64;
+    return t >= start || t < end;
+}
+
+/// 某时区在某个 UTC 时刻的偏移（秒）。未知时区按 UTC 处理。
+pub fn utc_offset_seconds(name: str, unix_secs: i64) -> i32 {
+    let id = tz_zone_id(name);
+    let base = tz_base_offset(id);
+    let kind = tz_dst_kind(id);
+    if kind == 1 {
+        if tz_eu_dst_active(unix_secs) { return base + 3600; }
+    } else if kind == 2 {
+        if tz_us_dst_active(unix_secs, base) { return base + 3600; }
+    } else if kind == 3 {
+        if tz_sydney_dst_active(unix_secs, base) { return base + 3600; }
+    }
+    return base;
+}
+
+//----- 换算 -------------------------------------------------------------------
+
+/// UTC `DateTime` → 该区当地时间。
+pub fn to_local(dt: DateTime, zone: str) -> DateTime {
+    let secs = unix_from_civil(dt);
+    let off = utc_offset_seconds(zone, secs);
+    let mut local = civil_from_unix(secs + off as i64);
+    local.nanos = dt.nanos;
+    return local;
+}
+
+/// 该区当地时间 → UTC `DateTime`。
+///
+/// 先用「本地墙钟当 UTC」估一个偏移，再用估计值附近查一次真实偏移修正，
+/// 这样跨夏令时边界附近也能落在正确的偏移上（重叠 / 空档时刻取先命中者）。
+pub fn from_local(dt: DateTime, zone: str) -> DateTime {
+    let local_secs = unix_from_civil(dt);
+    let off1 = utc_offset_seconds(zone, local_secs);
+    let mut guess = local_secs - off1 as i64;
+    let off2 = utc_offset_seconds(zone, guess);
+    guess = local_secs - off2 as i64;
+    let mut utc = civil_from_unix(guess);
+    utc.nanos = dt.nanos;
+    return utc;
+}

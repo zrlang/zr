@@ -90,7 +90,7 @@ impl Parser {
         // `impl` / `dyn` 这些前缀之前吃掉：早先这行在基础类型分派前、
         // `dyn` 分支之后，于是 `&'static dyn Error` 先跳过 `'static`、
         // 再落到基础类型分派，`dyn` 不是基础类型——报 `expected type,
-        // found KwDyn`，整个 `std/error.zr` 解析不了。
+        // found KwDyn`，整个 `std/std/error.zr` 解析不了。
         if let TokenKind::Lifetime(_) = self.peek().kind {
             self.advance();
         }
@@ -358,7 +358,7 @@ impl Parser {
     /// 没有生命周期变体，类型检查也把它们整体丢弃。早先这里直接调
     /// `parse_type()`，`'a` 被前缀吃掉后撞上 `>`，报 `expected type, found
     /// Gt`——于是 `struct Ctx<'a>` 的 `impl<'a> Ctx<'a>` 头、以及任何带
-    /// 生命周期的类型引用都解析不了（`std/async.zr` 因此整模块加载不了）。
+    /// 生命周期的类型引用都解析不了（`std/alloc/async.zr` 因此整模块加载不了）。
     pub(crate) fn parse_generic_args(&mut self) -> Result<Vec<Type>, crate::error::CompileError> {
         let mut args = Vec::new();
         // `>>` / `<<` 拆分：这里正要解析第一个实参，而它可能以 `<` 开头
@@ -385,7 +385,7 @@ impl Parser {
     /// 关联类型绑定 `Output = O1`（`Future<Output = O1>`）：解析 LHS 类型名、
     /// 消费 `=` 与 RHS 类型，**整体丢弃**——zr 的 `Type::Named` 不记录关联
     /// 类型绑定，且 where 子句本身也不强制。早先这里直接把 LHS 推进 args，
-    /// 遇到 `=` 报 `expected '>' to close generic arguments`，`std/async.zr`
+    /// 遇到 `=` 报 `expected '>' to close generic arguments`，`std/alloc/async.zr`
     /// 的 `F1: Future<Output = O1>` 解析不了。
     fn parse_one_generic_arg(
         &mut self,

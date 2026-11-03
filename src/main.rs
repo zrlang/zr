@@ -663,7 +663,7 @@ fn compile(input: &str, cmd: &Cli) -> Result<std::path::PathBuf, String> {
         "core::Result::Err",
         // `#[derive(Debug)]` 生成的 `Type__debug(self) -> String` 直接用
         // `String` 构造/拼接，用户不必在用到 derive 的模块里手写
-        // `use string::String`。`std/string.zr` 只依赖 `core`/`mem`
+        // `use string::String`。`std/alloc/string.zr` 只依赖 `core`/`mem`
         // （早先那条 `use io::..` 是死导入，会把 `io.zr` 拖进每个程序），
         // 所以无条件注入的代价可忽略。
         "string::String",
@@ -699,7 +699,7 @@ fn compile(input: &str, cmd: &Cli) -> Result<std::path::PathBuf, String> {
         .parent()
         .map(|p| p.to_path_buf())
         .unwrap_or_else(|| std::path::PathBuf::from("."));
-    let loaded = modules::load(&mut ast, &root_dir);
+    let loaded = modules::load_with_root(&mut ast, &root_dir, Some(std::path::Path::new(input)));
     if let Some(e) = loaded.error {
         return Err(e);
     }

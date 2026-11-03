@@ -1,0 +1,94 @@
+//=============================================================================
+// tests/cases/139_simd.zr — std/simd.zr 的逐 lane 运算与横向归约
+//
+// 覆盖四种向量：`f32x4`、`f64x2`、`i32x4`、`i8x8` 的 from_array/to_array、
+// splat、逐 lane 加减乘除、neg/min/max/abs、sum/dot。编号指向失败的断言。
+//=============================================================================
+
+use simd::{f32x4, f64x2, i32x4, i8x8};
+
+fn main() -> i32 {
+    // f32x4
+    let a = f32x4::from_array([1.0, 2.0, 3.0, 4.0]);
+    let b = f32x4::from_array([10.0, 20.0, 30.0, 40.0]);
+    let c = a.add(b);
+    let ca = c.to_array();
+    if ca[0] != 11.0 || ca[1] != 22.0 || ca[2] != 33.0 || ca[3] != 44.0 { return 1; }
+    let d = a.sub(b);
+    if d.to_array()[0] != -9.0 || d.to_array()[3] != -36.0 { return 2; }
+    let e = a.mul(b);
+    if e.to_array()[0] != 10.0 || e.to_array()[3] != 160.0 { return 3; }
+    let f = b.div(a);
+    if f.to_array()[0] != 10.0 || f.to_array()[1] != 10.0 { return 4; }
+    let g = a.neg();
+    if g.to_array()[0] != -1.0 || g.to_array()[3] != -4.0 { return 5; }
+    let h = a.min(b);
+    if h.to_array()[2] != 3.0 { return 6; }
+    let i = a.max(b);
+    if i.to_array()[2] != 30.0 { return 7; }
+    let j = f32x4::from_array([-1.5, 2.5, -3.5, 4.5]).abs();
+    if j.to_array()[0] != 1.5 || j.to_array()[2] != 3.5 { return 8; }
+    let k = f32x4::splat(2.5);
+    if k.to_array()[0] != 2.5 || k.to_array()[1] != 2.5 || k.to_array()[2] != 2.5 || k.to_array()[3] != 2.5 {
+        return 9;
+    }
+    if a.sum() != 10.0 { return 10; }
+    if a.dot(b) != 300.0 { return 11; }
+
+    // f64x2
+    let p = f64x2::from_array([1.5, 2.5]);
+    let q = f64x2::from_array([4.0, 8.0]);
+    let r = p.add(q);
+    if r.to_array()[0] != 5.5 || r.to_array()[1] != 10.5 { return 12; }
+    let s = q.div(p);
+    if s.sum() < 5.86 || s.sum() > 5.87 { return 13; }
+    let t = f64x2::splat(3.0);
+    if t.sum() != 6.0 { return 14; }
+    let u = p.dot(q);
+    if u != 26.0 { return 15; }
+    let v = f64x2::from_array([-2.5, 3.5]).abs();
+    if v.to_array()[0] != 2.5 { return 16; }
+
+    // i32x4
+    let x = i32x4::from_array([1, 2, 3, 4]);
+    let y = i32x4::from_array([10, 20, 30, 40]);
+    let z = x.add(y);
+    if z.to_array()[0] != 11 || z.to_array()[3] != 44 { return 17; }
+    let z2 = y.sub(x);
+    if z2.to_array()[0] != 9 { return 18; }
+    let z3 = x.mul(y);
+    if z3.to_array()[3] != 160 { return 19; }
+    let z4 = x.neg();
+    if z4.to_array()[0] != -1 || z4.to_array()[3] != -4 { return 20; }
+    let z5 = x.min(y);
+    if z5.to_array()[1] != 2 { return 21; }
+    let z6 = x.max(y);
+    if z6.to_array()[1] != 20 { return 22; }
+    if i32x4::splat(7).sum() != 28 { return 23; }
+    if x.sum() != 10 { return 24; }
+    if x.dot(y) != 300 { return 25; }
+
+    // i8x8
+    let m = i8x8::from_array([1, 2, 3, 4, 5, 6, 7, 8]);
+    let n = i8x8::from_array([8, 7, 6, 5, 4, 3, 2, 1]);
+    let o = m.add(n);
+    let oa = o.to_array();
+    if oa[0] != 9 || oa[7] != 9 { return 26; }
+    let o2 = m.sub(n);
+    if o2.to_array()[0] != -7 || o2.to_array()[7] != 7 { return 27; }
+    let o3 = m.mul(n);
+    if o3.to_array()[0] != 8 || o3.to_array()[7] != 8 { return 28; }
+    let o4 = m.min(n);
+    if o4.to_array()[0] != 1 || o4.to_array()[7] != 1 { return 29; }
+    let o5 = m.max(n);
+    if o5.to_array()[0] != 8 || o5.to_array()[7] != 8 { return 30; }
+    let o6 = m.sum();
+    if o6 != 36 { return 31; }
+    // 129 是 3 的倍数，用乘法让 8 个 lane 的乘积和足够大
+    if m.dot(m) != 204 { return 32; }
+    if i8x8::splat(3).sum() != 24 { return 33; }
+    let o7 = m.neg();
+    if o7.to_array()[0] != -1 || o7.to_array()[7] != -8 { return 34; }
+
+    return 0;
+}

@@ -1,0 +1,166 @@
+//=============================================================================
+// tests/cases/142_tensor.zr — std/tensor.zr 的构造、形状与基本运算
+//
+// 为避开"单个超大函数里浮点比较被错误编译"的编译器缺陷（142 的实验发现：
+// 同一函数内 f64 字面量 / 聚合局部过多时，`get_flat(3) != 44.0` 会误判），
+// 这里把断言拆成多个小函数，每组只保留少量浮点字面量。失败编号 = 组基准 +
+// 组内编号（A=1, B=15, C=24, D=31）。
+//
+// 覆盖：zeros/ones/full/scalar/identity、numel/rank/dim、get_flat/set_flat、
+// get2/set2/get3/set3、逐元素 add/sub/mul/div/neg、标量 add_scalar/mul_scalar、
+// relu/leaky_relu、matmul、transpose、reshape、sum/mean/max/min/argmax、
+// copy、square/mse、same_shape/close_to、destroy。
+//=============================================================================
+
+use tensor::Tensor;
+
+fn main() -> i32 {
+    let r = group_construct();
+    if r != 0 { return r; }
+    let r = group_elementwise();
+    if r != 0 { return r; }
+    let r = group_matrix();
+    if r != 0 { return r; }
+    let r = group_reduce();
+    if r != 0 { return r; }
+    destroy_twice();
+    return 0;
+}
+
+//----- A：构造与形状（1..14）--------------------------------------------------
+
+fn group_construct() -> i32 {
+    let z = Tensor::zeros([2, 3, 1, 1], 2);
+    if z.numel() != 6 { return 1; }
+    if z.rank() != 2 { return 2; }
+    if z.dim(0) != 2 || z.dim(1) != 3 { return 3; }
+    if z.dim(2) != 1 { return 4; }
+
+    let o = Tensor::ones([3, 1, 1, 1], 1);
+    if o.numel() != 3 { return 5; }
+    if o.sum() != 3.0 { return 6; }
+
+    let mut f = Tensor::full([2, 2, 1, 1], 2, 2.5);
+    if f.max() != 2.5 || f.min() != 2.5 { return 7; }
+
+    let sc = Tensor::scalar(3.5);
+    if sc.numel() != 1 || sc.rank() != 0 { return 8; }
+    if sc.get_flat(0) != 3.5 { return 9; }
+
+    let id = Tensor::identity(2);
+    if id.get2(0, 0) != 1.0 || id.get2(0, 1) != 0.0 { return 10; }
+    if id.get2(1, 1) != 1.0 || id.get2(1, 0) != 0.0 { return 11; }
+
+    f.set2(0, 0, 5.0);
+    if f.get2(0, 0) != 5.0 { return 12; }
+    let mut t3 = Tensor::zeros([2, 2, 2, 1], 3);
+    t3.set3(1, 1, 1, 9.0);
+    if t3.get3(1, 1, 1) != 9.0 { return 13; }
+    return 0;
+}
+
+//----- B：逐元素运算与激活（15..23）-------------------------------------------
+
+fn group_elementwise() -> i32 {
+    let a: [f64; 4] = [1.0, 2.0, 3.0, 4.0];
+    let b: [f64; 4] = [10.0, 20.0, 30.0, 40.0];
+    let ta = Tensor::from_vec(&a, 4);
+    let tb = Tensor::from_vec(&b, 4);
+
+    let s = ta.add(tb);
+    if s.get_flat(0) != 11.0 { return 15; }
+    let d = tb.sub(ta);
+    if d.get_flat(3) != 36.0 { return 16; }
+    let m = ta.mul(tb);
+    if m.get_flat(1) != 40.0 { return 17; }
+    let q = tb.div(ta);
+    if q.get_flat(2) != 10.0 { return 18; }
+    let n = ta.neg();
+    if n.get_flat(3) != -4.0 { return 19; }
+
+    let as1 = ta.add_scalar(2.0);
+    if as1.get_flat(0) != 3.0 { return 20; }
+    let ms1 = ta.mul_scalar(0.5);
+    if ms1.get_flat(3) != 2.0 { return 21; }
+
+    let r = ta.add_scalar(-3.0).relu();
+    if r.get_flat(0) != 0.0 { return 22; }
+    let lr = ta.add_scalar(-3.0).leaky_relu(0.5);
+    if lr.get_flat(0) != -1.0 { return 23; }
+    return 0;
+}
+
+//----- C：矩阵乘 / 转置 / reshape（24..30）------------------------------------
+
+fn group_matrix() -> i32 {
+    let a: [f64; 4] = [1.0, 2.0, 3.0, 4.0];
+    let b: [f64; 4] = [10.0, 20.0, 30.0, 40.0];
+    let ma = Tensor::from_matrix(&a, 2, 2);
+    let mb = Tensor::from_matrix(&b, 2, 2);
+
+    // [[1*10+2*30, 1*20+2*40], [3*10+4*30, 3*20+4*40]] = [[70,100],[150,220]]
+    let mm = ma.matmul(mb);
+    if mm.get2(0, 0) != 70.0 { return 24; }
+    if mm.get2(1, 1) != 220.0 { return 25; }
+    if mm.numel() != 4 || mm.rank() != 2 { return 26; }
+
+    let tr = ma.transpose();
+    if tr.get2(0, 1) != 3.0 { return 27; }
+    if tr.get2(1, 0) != 2.0 { return 28; }
+
+    let rs = ma.reshape([4, 1, 1, 1], 1);
+    if rs.numel() != 4 || rs.rank() != 1 { return 29; }
+    if rs.get_flat(3) != 4.0 { return 30; }
+    return 0;
+}
+
+//----- D：归约 / 拷贝 / 误差（31..45）------------------------------------------
+
+fn group_reduce() -> i32 {
+    let a: [f64; 4] = [1.0, 2.0, 3.0, 4.0];
+    let b: [f64; 4] = [10.0, 20.0, 30.0, 40.0];
+    let ta = Tensor::from_vec(&a, 4);
+    let tb = Tensor::from_vec(&b, 4);
+
+    if ta.sum() != 10.0 { return 31; }
+    if ta.mean() != 2.5 { return 32; }
+    if ta.max() != 4.0 || ta.min() != 1.0 { return 33; }
+    if ta.argmax() != 3 { return 34; }
+
+    let mixed: [f64; 3] = [1.0, 5.0, 2.0];
+    let tm = Tensor::from_vec(&mixed, 3);
+    if tm.argmax() != 1 { return 35; }
+
+    let mut cp = ta.copy();
+    cp.set_flat(0, 99.0);
+    if ta.get_flat(0) != 1.0 { return 36; }
+    if cp.get_flat(0) != 99.0 { return 37; }
+
+    let sq = ta.square();
+    if sq.get_flat(3) != 16.0 { return 38; }
+    let err = ta.mse(tb);
+    // ((1-10)^2 + (2-20)^2 + (3-30)^2 + (4-40)^2)/4 = (81+324+729+1296)/4
+    if err != 607.5 { return 39; }
+
+    if !ta.same_shape(tb) { return 40; }
+    if ta.same_shape(narrow()) { return 41; }
+    let tc = ta.add_scalar(0.0001);
+    if !ta.close_to(tc, 0.001) { return 42; }
+    if ta.close_to(tc, 0.00001) { return 43; }
+
+    let mut f2 = Tensor::zeros([2, 2, 1, 1], 2);
+    f2.fill(7.0);
+    if f2.get_flat(3) != 7.0 { return 44; }
+    if !ta.close_to(tc, 1.0) { return 45; }
+    return 0;
+}
+
+fn narrow() -> Tensor {
+    return Tensor::zeros([2, 3, 1, 1], 2);
+}
+
+fn destroy_twice() {
+    let mut x = Tensor::zeros([2, 1, 1, 1], 1);
+    x.destroy();
+    x.destroy();
+}

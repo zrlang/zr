@@ -1,0 +1,193 @@
+//=============================================================================
+// std/md5.zr — MD5 消息摘要（RFC 1321）
+//
+// 输出 128 位摘要的小写十六进制串（32 字符）。实现按 RFC 1321 的伪代码：
+// 64 字节分组、小端读入 16 个 32 位字、四轮 64 步、小端输出。
+//
+// zr 的 u32 算术实际按 64 位计算（`a << 7`、`c + d` 都可能带出第 32 位以上
+// 的高位，`as u32` 不做截断），所以每次加法 / 左移 / 取反后都用
+// `md5_wrap`（`% 2^32`）显式回绕到 32 位。
+//=============================================================================
+
+use string::String;
+use collections::Vec;
+
+//-----------------------------------------------------------------------------
+// 内部辅助（统一 `md5_` 前缀，避免与其它标准库模块的扁平命名空间撞名）
+//-----------------------------------------------------------------------------
+
+/// 把 64 位中间结果回绕到 32 位。
+fn md5_wrap(x: u64) -> u32 {
+    return (x % 4294967296) as u32;
+}
+
+/// 32 位按位取反。
+fn md5_not(x: u32) -> u32 {
+    return md5_wrap((x as u64) ^ 4294967295);
+}
+
+/// 32 位循环左移 `n` 位（0 < n < 32）。
+fn md5_rotl(x: u32, n: usize) -> u32 {
+    let hi = ((x as u64) << n) % 4294967296;
+    let lo = (x as u64) >> (32 - n);
+    return md5_wrap(hi | lo);
+}
+
+/// 四个 32 位值相加并回绕（MD5 每步都是这种四路加法）。
+fn md5_add4(a: u32, b: u32, c: u32, d: u32) -> u32 {
+    return md5_wrap((a as u64) + (b as u64) + (c as u64) + (d as u64));
+}
+
+/// 小写十六进制数字。
+fn md5_hex_digit(x: u8) -> u8 {
+    if x < 10 {
+        return b'0' + x;
+    }
+    return b'a' + (x - 10);
+}
+
+/// 生成 32 字符的小写十六进制摘要。
+fn md5_hex_from_state(state: [u32; 4]) -> String {
+    let mut out = String::with_capacity(32);
+    let mut w: usize = 0;
+    while w < 4 {
+        let word = state[w];
+        let mut k: usize = 0;
+        while k < 4 {
+            let v = ((word >> (8 * k)) & 255) as u8;
+            out.push_byte(md5_hex_digit(v >> 4));
+            out.push_byte(md5_hex_digit(v & 15));
+            k = k + 1;
+        }
+        w = w + 1;
+    }
+    return out;
+}
+
+//-----------------------------------------------------------------------------
+// 公开 API
+//-----------------------------------------------------------------------------
+
+/// 计算 MD5 的四个 32 位状态字（压缩完成后的 a/b/c/d）。
+fn md5_state(bytes: []const u8) -> [u32; 4] {
+    // 先补齐消息：0x80 + 若干 0x00，使长度 ≡ 56 (mod 64)，再补 8 字节
+    // 小端的原始位长（bit length）。
+    let mut buf: Vec<u8> = Vec::with_capacity(bytes.len + 72);
+    let mut i: usize = 0;
+    while i < bytes.len {
+        buf.push(bytes[i]);
+        i = i + 1;
+    }
+    let bit_len = (bytes.len as u64) * 8;
+    buf.push(128 as u8);
+    while buf.len % 64 != 56 {
+        buf.push(0 as u8);
+    }
+    let mut k: usize = 0;
+    while k < 8 {
+        buf.push(((bit_len >> (8 * k)) & 255) as u8);
+        k = k + 1;
+    }
+
+    // RFC 1321 的 64 个常数（floor(|sin(i+1)| * 2^32)）。
+    let md5_k: [u32; 64] = [
+        0xd76aa478, 0xe8c7b756, 0x242070db, 0xc1bdceee,
+        0xf57c0faf, 0x4787c62a, 0xa8304613, 0xfd469501,
+        0x698098d8, 0x8b44f7af, 0xffff5bb1, 0x895cd7be,
+        0x6b901122, 0xfd987193, 0xa679438e, 0x49b40821,
+        0xf61e2562, 0xc040b340, 0x265e5a51, 0xe9b6c7aa,
+        0xd62f105d, 0x02441453, 0xd8a1e681, 0xe7d3fbc8,
+        0x21e1cde6, 0xc33707d6, 0xf4d50d87, 0x455a14ed,
+        0xa9e3e905, 0xfcefa3f8, 0x676f02d9, 0x8d2a4c8a,
+        0xfffa3942, 0x8771f681, 0x6d9d6122, 0xfde5380c,
+        0xa4beea44, 0x4bdecfa9, 0xf6bb4b60, 0xbebfbc70,
+        0x289b7ec6, 0xeaa127fa, 0xd4ef3085, 0x04881d05,
+        0xd9d4d039, 0xe6db99e5, 0x1fa27cf8, 0xc4ac5665,
+        0xf4292244, 0x432aff97, 0xab9423a7, 0xfc93a039,
+        0x655b59c3, 0x8f0ccc92, 0xffeff47d, 0x85845dd1,
+        0x6fa87e4f, 0xfe2ce6e0, 0xa3014314, 0x4e0811a1,
+        0xf7537e82, 0xbd3af235, 0x2ad7d2bb, 0xeb86d391,
+    ];
+    // 每步的循环左移量：四轮各按 4 个值循环。
+    let md5_s: [usize; 64] = [
+        7, 12, 17, 22, 7, 12, 17, 22, 7, 12, 17, 22, 7, 12, 17, 22,
+        5, 9, 14, 20, 5, 9, 14, 20, 5, 9, 14, 20, 5, 9, 14, 20,
+        4, 11, 16, 23, 4, 11, 16, 23, 4, 11, 16, 23, 4, 11, 16, 23,
+        6, 10, 15, 21, 6, 10, 15, 21, 6, 10, 15, 21, 6, 10, 15, 21,
+    ];
+
+    let mut a: u32 = 0x67452301;
+    let mut b: u32 = 0xefcdab89;
+    let mut c: u32 = 0x98badcfe;
+    let mut d: u32 = 0x10325476;
+
+    let mut off: usize = 0;
+    while off < buf.len {
+        // 小端读入 16 个字。
+        let mut m: [u32; 16] = [0; 16];
+        let mut j: usize = 0;
+        while j < 16 {
+            let p = off + 4 * j;
+            m[j] = md5_wrap(
+                (buf[p] as u64)
+                | ((buf[p + 1] as u64) << 8)
+                | ((buf[p + 2] as u64) << 16)
+                | ((buf[p + 3] as u64) << 24)
+            );
+            j = j + 1;
+        }
+
+        let aa = a;
+        let bb = b;
+        let cc = c;
+        let dd = d;
+
+        let mut r: usize = 0;
+        while r < 64 {
+            let mut f: u32 = 0;
+            let mut g: usize = 0;
+            if r < 16 {
+                f = (b & c) | (md5_not(b) & d);
+                g = r;
+            } else if r < 32 {
+                f = (d & b) | (md5_not(d) & c);
+                g = (5 * r + 1) % 16;
+            } else if r < 48 {
+                f = b ^ c ^ d;
+                g = (3 * r + 5) % 16;
+            } else {
+                f = c ^ (b | md5_not(d));
+                g = (7 * r) % 16;
+            }
+
+            let tmp = d;
+            d = c;
+            c = b;
+            let t = md5_add4(a, f, md5_k[r], m[g]);
+            let rot = md5_rotl(t, md5_s[r]);
+            b = md5_wrap((b as u64) + (rot as u64));
+            a = tmp;
+            r = r + 1;
+        }
+
+        a = md5_wrap((a as u64) + (aa as u64));
+        b = md5_wrap((b as u64) + (bb as u64));
+        c = md5_wrap((c as u64) + (cc as u64));
+        d = md5_wrap((d as u64) + (dd as u64));
+        off = off + 64;
+    }
+
+    let state: [u32; 4] = [a, b, c, d];
+    return state;
+}
+
+/// 计算任意字节切片的 MD5，返回 32 字符小写十六进制串。
+pub fn md5_hex(bytes: []const u8) -> String {
+    let state = md5_state(bytes);
+    return md5_hex_from_state(state);
+}
+
+/// 对字符串（`str`）计算 MD5。
+pub fn md5_hex_str(s: str) -> String {
+    return md5_hex(s);
+}

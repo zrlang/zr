@@ -1,9 +1,10 @@
-// std/cli.zr：命令行参数。
+// std/argparse.zr：命令行参数（按索引读取 + 按名字读取的进程侧接口）。
 //
 // 用例运行时没有额外实参，所以断言集中在"接口自洽 + 越界兜底"：
-// 至少有程序名、args() 与 arg_count() 一致、越界返回空串 / None / default。
+// 至少有程序名、args() 与 arg_count() 一致、越界返回空串 / None / default；
+// 名字读取在没有对应选项时一律 None / false / 空位置参数。
 // 编号指向失败的断言。
-use cli::{arg, arg_count, arg_opt, args, get, program_name};
+use argparse::{arg, arg_count, arg_opt, args, flag, get, has, positionals, program_name, value, value_or};
 use core::Option;
 
 fn main() -> i32 {
@@ -46,6 +47,25 @@ fn main() -> i32 {
     let d = get(n + 10, "fallback");
     if d.len != 8 {
         return 9;
+    }
+    // 名字读取：没有传入任何选项时应当是 None / false / 空。
+    match value("name") {
+        Option::Some(_) => {
+            return 10;
+        }
+        Option::None => {}
+    }
+    if value_or("name", "none").len != 4 {
+        return 11;
+    }
+    if has("name") {
+        return 12;
+    }
+    if flag("name") {
+        return 13;
+    }
+    if positionals().len != n - 1 {
+        return 14;
     }
     return 0;
 }

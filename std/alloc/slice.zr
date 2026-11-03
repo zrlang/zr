@@ -5,11 +5,8 @@
 // 以及完整的迭代器协议实现。
 //=============================================================================
 
-use core::{
-    zr_alloc, zr_dealloc,
-    Option, Result, panic,
-    size_of, memcmp,
-};
+use core::{Option, Result, panic, size_of};
+use mem::{zr_alloc, zr_dealloc, memcmp};
 
 //=============================================================================
 // 切片上的通用算法

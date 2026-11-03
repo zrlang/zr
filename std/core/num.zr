@@ -1,0 +1,198 @@
+//==============================================================================
+// std/core/num.zr — 数值工具（对应 Rust `core::num`）
+//
+// Rust 把这些做成整数类型的方法（`i64::abs` / `checked_add` …），但 zr
+// 不支持给内建类型写固有 impl（orphan rule 会拒绝），所以统一做成
+// 带类型后缀的自由函数：`abs_i64` / `checked_add_i64` …
+//
+// 溢出语义与 Rust 对应方法一致：
+//   * `saturating_*` 溢出时夹到 MIN / MAX；
+//   * `checked_*`   溢出时返回 `Option::None`；
+//   * `wrapping_*`  溢出时按补码回绕（与 zr 默认算术一致）。
+//==============================================================================
+
+use core::Option;
+
+/// i64 最小值 / 最大值。
+///
+/// 做成函数而不是 `pub const`：跨模块引用 i64 大整数字面量常量时，
+/// 常量折叠没有生效，目标文件会留下未定义的 `_I64_MIN` 符号，
+/// 链接阶段直接失败。函数返回字面量则能正常内联。
+pub fn i64_min() -> i64 { return -9223372036854775807 - 1; }
+pub fn i64_max() -> i64 { return 9223372036854775807; }
+
+pub fn abs_i64(v: i64) -> i64 {
+    if v < 0 { return -v; }
+    return v;
+}
+
+pub fn abs_i32(v: i32) -> i32 {
+    if v < 0 { return -v; }
+    return v;
+}
+
+/// 符号函数：负返回 -1，正返回 1，零返回 0。
+pub fn sign_i64(v: i64) -> i64 {
+    if v < 0 { return -1; }
+    if v > 0 { return 1; }
+    return 0;
+}
+
+pub fn sign_i32(v: i32) -> i32 {
+    if v < 0 { return -1; }
+    if v > 0 { return 1; }
+    return 0;
+}
+
+/// 无符号快速幂（对应 `u64::pow`；指数用 u32 足够表达常规场景）。
+pub fn pow_u64(base: u64, exp: u32) -> u64 {
+    let mut result: u64 = 1;
+    let mut b: u64 = base;
+    let mut e: u32 = exp;
+    while e > 0 {
+        if e % 2 == 1 { result = result * b; }
+        b = b * b;
+        e = e / 2;
+    }
+    return result;
+}
+
+pub fn pow_i64(base: i64, exp: u32) -> i64 {
+    return pow_u64(base as u64, exp) as i64;
+}
+
+//------------------------------------------------------------------------------
+// 饱和算术
+//------------------------------------------------------------------------------
+
+pub fn saturating_add_i64(a: i64, b: i64) -> i64 {
+    let r: i64 = a + b;
+    if b > 0 && r < a { return i64_max(); }
+    if b < 0 && r > a { return i64_min(); }
+    return r;
+}
+
+pub fn saturating_sub_i64(a: i64, b: i64) -> i64 {
+    let r: i64 = a - b;
+    if b < 0 && r < a { return i64_max(); }
+    if b > 0 && r > a { return i64_min(); }
+    return r;
+}
+
+pub fn saturating_mul_i64(a: i64, b: i64) -> i64 {
+    if a == 0 || b == 0 { return 0; }
+    let r: i64 = a * b;
+    // 乘回除法校验：`r / b == a` 说明没有溢出（除 MIN/-1 外安全）。
+    if r / b == a { return r; }
+    if (a > 0 && b > 0) || (a < 0 && b < 0) { return i64_max(); }
+    return i64_min();
+}
+
+//------------------------------------------------------------------------------
+// 检查算术
+//------------------------------------------------------------------------------
+
+pub fn checked_add_i64(a: i64, b: i64) -> Option<i64> {
+    let r: i64 = a + b;
+    if b > 0 && r < a { return Option::None; }
+    if b < 0 && r > a { return Option::None; }
+    return Option::Some(r);
+}
+
+pub fn checked_sub_i64(a: i64, b: i64) -> Option<i64> {
+    let r: i64 = a - b;
+    if b < 0 && r < a { return Option::None; }
+    if b > 0 && r > a { return Option::None; }
+    return Option::Some(r);
+}
+
+pub fn checked_mul_i64(a: i64, b: i64) -> Option<i64> {
+    if a == 0 || b == 0 { return Option::Some(0); }
+    let r: i64 = a * b;
+    if r / b != a { return Option::None; }
+    return Option::Some(r);
+}
+
+pub fn checked_add_i32(a: i32, b: i32) -> Option<i32> {
+    // zr 的 i32 中间运算不按 32 位回绕，直接用 i64 中间值判断范围。
+    let r: i64 = (a as i64) + (b as i64);
+    if r > 2147483647 || r < -2147483647 - 1 { return Option::None; }
+    return Option::Some(r as i32);
+}
+
+pub fn checked_mul_i32(a: i32, b: i32) -> Option<i32> {
+    let r: i64 = (a as i64) * (b as i64);
+    if r > 2147483647 || r < -2147483647 - 1 { return Option::None; }
+    return Option::Some(r as i32);
+}
+
+//------------------------------------------------------------------------------
+// 回绕算术（zr 默认算术本来就是回绕，这里显式命名以防误用）
+//------------------------------------------------------------------------------
+
+pub fn wrapping_add_i64(a: i64, b: i64) -> i64 { return a + b; }
+pub fn wrapping_sub_i64(a: i64, b: i64) -> i64 { return a - b; }
+pub fn wrapping_mul_i64(a: i64, b: i64) -> i64 { return a * b; }
+
+//------------------------------------------------------------------------------
+// 位计数
+//------------------------------------------------------------------------------
+
+pub fn count_ones_u64(v: u64) -> u32 {
+    let mut x: u64 = v;
+    let mut n: u32 = 0;
+    while x != 0 {
+        if x % 2 == 1 { n = n + 1; }
+        x = x / 2;
+    }
+    return n;
+}
+
+pub fn leading_zeros_u64(v: u64) -> u32 {
+    if v == 0 { return 64; }
+    let mut x: u64 = v;
+    let mut n: u32 = 0;
+    while x < 9223372036854775808 {
+        x = x * 2;
+        n = n + 1;
+    }
+    return n;
+}
+
+pub fn trailing_zeros_u64(v: u64) -> u32 {
+    if v == 0 { return 64; }
+    let mut x: u64 = v;
+    let mut n: u32 = 0;
+    while x % 2 == 0 {
+        x = x / 2;
+        n = n + 1;
+    }
+    return n;
+}
+
+//------------------------------------------------------------------------------
+// 数论
+//------------------------------------------------------------------------------
+
+pub fn gcd_u64(a: u64, b: u64) -> u64 {
+    let mut x: u64 = a;
+    let mut y: u64 = b;
+    while y != 0 {
+        let t: u64 = y;
+        y = x % y;
+        x = t;
+    }
+    return x;
+}
+
+pub fn lcm_u64(a: u64, b: u64) -> u64 {
+    if a == 0 || b == 0 { return 0; }
+    return (a / gcd_u64(a, b)) * b;
+}
+
+/// 把 `v` 夹在 `[lo, hi]` 内（对应 Rust `Ord::clamp`）。
+pub fn clamp_i64(v: i64, lo: i64, hi: i64) -> i64 {
+    if v < lo { return lo; }
+    if v > hi { return hi; }
+    return v;
+}

@@ -1,0 +1,130 @@
+// 149_std_core_ext.zr — core 层补充（Option / Result / cmp / char / num / Hash）
+//
+// 对照 Rust `core` 的方法语义：
+//   Option::{expect, unwrap_or_else, map_or, ok_or, filter, or}
+//   Result::{unwrap_or, unwrap_or_else, ok, err, map_err}
+//   cmp::{Ordering, cmp}
+//   char ascii 分类 / 转换
+//   num::{abs, pow, saturating, checked, wrapping, count_ones, gcd, clamp …}
+
+use std::*;
+
+fn five() -> i32 { return 5; }
+
+fn main() -> i32 {
+    //----- Option -------------------------------------------------------------
+    let a: Option<i32> = Option::Some(3);
+    let b: Option<i32> = Option::None;
+
+    if a.unwrap_or(9) != 3 { return 1; }
+    if b.unwrap_or(9) != 9 { return 2; }
+    if b.unwrap_or_else(five) != 5 { return 3; }
+    if b.map_or(0, |v| v + 1) != 0 { return 4; }
+    if a.map_or(0, |v| v + 1) != 4 { return 5; }
+
+    match a.ok_or(7) {
+        Result::Ok(v) => { if v != 3 { return 6; } }
+        Result::Err(_) => { return 7; }
+    }
+    match b.ok_or(7) {
+        Result::Ok(_) => { return 8; }
+        Result::Err(e) => { if e != 7 { return 9; } }
+    }
+
+    match a.filter(|v| v > 2) {
+        Option::Some(v) => { if v != 3 { return 10; } }
+        Option::None => { return 11; }
+    }
+    match a.filter(|v| v > 5) {
+        Option::Some(_) => { return 12; }
+        Option::None => {}
+    }
+    match b.or(a) {
+        Option::Some(v) => { if v != 3 { return 13; } }
+        Option::None => { return 14; }
+    }
+
+    //----- Result -------------------------------------------------------------
+    let r: Result<i32, i32> = Result::Ok(4);
+    let e: Result<i32, i32> = Result::Err(5);
+
+    if r.unwrap_or(0) != 4 { return 15; }
+    if e.unwrap_or(0) != 0 { return 16; }
+    if e.unwrap_or_else(|x| x * 2) != 10 { return 17; }
+
+    match r.ok() {
+        Option::Some(v) => { if v != 4 { return 18; } }
+        Option::None => { return 19; }
+    }
+    match e.err() {
+        Option::Some(v) => { if v != 5 { return 20; } }
+        Option::None => { return 21; }
+    }
+    match e.map_err(|x| x + 1).err() {
+        Option::Some(v) => { if v != 6 { return 22; } }
+        Option::None => { return 23; }
+    }
+
+    //----- cmp ----------------------------------------------------------------
+    if !cmp(2, 3).is_lt() { return 24; }
+    if !cmp(3, 3).is_eq() { return 25; }
+    if !cmp(5, 1).is_gt() { return 26; }
+    if !cmp(2, 3).reverse().is_gt() { return 27; }
+    if cmp_min(9, 4) != 4 { return 28; }
+    if cmp_max(9, 4) != 9 { return 29; }
+
+    //----- char（ASCII）-------------------------------------------------------
+    if !is_ascii_digit('7') { return 30; }
+    if is_ascii_digit('x') { return 31; }
+    if !is_ascii_alphabetic('Q') { return 32; }
+    if !is_ascii_alphanumeric('8') { return 33; }
+    if !is_ascii_whitespace('\t') { return 34; }
+    if is_ascii_whitespace('z') { return 35; }
+    if to_ascii_uppercase('a') != 'A' { return 36; }
+    if to_ascii_lowercase('Z') != 'z' { return 37; }
+    if ascii_to_digit('f') != 15 { return 38; }
+    if ascii_to_digit('9') != 9 { return 39; }
+    if ascii_from_digit(15) != 'f' { return 40; }
+
+    //----- num ----------------------------------------------------------------
+    if abs_i64(-77i64) != 77 { return 41; }
+    if abs_i32(-3) != 3 { return 42; }
+    if sign_i64(-9i64) != -1 { return 43; }
+    if pow_u64(2u64, 10u32) != 1024 { return 44; }
+    if pow_i64(-2i64, 3u32) != -8 { return 45; }
+
+    if saturating_add_i64(i64_max(), 1) != i64_max() { return 46; }
+    if saturating_sub_i64(i64_min(), 1) != i64_min() { return 47; }
+    if saturating_mul_i64(i64_max(), 2) != i64_max() { return 48; }
+
+    match checked_add_i64(i64_max(), 1) {
+        Option::Some(_) => { return 49; }
+        Option::None => {}
+    }
+    match checked_add_i64(2, 3) {
+        Option::Some(v) => { if v != 5 { return 50; } }
+        Option::None => { return 51; }
+    }
+    match checked_mul_i32(2000000000, 2) {
+        Option::Some(_) => { return 52; }
+        Option::None => {}
+    }
+
+    if wrapping_add_i64(i64_max(), 1) != i64_min() { return 53; }
+
+    if count_ones_u64(7u64) != 3 { return 54; }
+    if leading_zeros_u64(1u64) != 63 { return 55; }
+    if trailing_zeros_u64(8u64) != 3 { return 56; }
+    if gcd_u64(12u64, 18u64) != 6 { return 57; }
+    if lcm_u64(4u64, 6u64) != 12 { return 58; }
+    if clamp_i64(10, 0, 5) != 5 { return 59; }
+    if clamp_i64(-3, 0, 5) != 0 { return 60; }
+
+    //----- Hash（供 HashMap 用；此处直接验证取值稳定）-----------------------
+    if 7i32.hash() != 7u64 { return 61; }
+    if true.hash() != 1u64 { return 62; }
+    if 'A'.hash() != 65u64 { return 63; }
+
+    println("149 core ext ok");
+    return 0;
+}

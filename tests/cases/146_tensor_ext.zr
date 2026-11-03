@@ -1,0 +1,189 @@
+//=============================================================================
+// tests/cases/146_tensor_ext.zr — tensor.zr 扩展 API 钉住
+//
+// 覆盖：gpu_available（stub）、broadcast / broadcast_add / broadcast_mul 形状、
+// conv2d 形状、autograd（track_inplace + add/mul 反向传播）、sum_tensor。
+//
+// 每个 group 返回 0 表示通过，失败返回该组的偏移编号。
+//=============================================================================
+
+use tensor::{Tensor, gpu_available};
+
+fn main() -> i32 {
+    let r = test_gpu();
+    if r != 0 { return r; }
+    let r = test_const();
+    if r != 0 { return r; }
+    let r = test_broadcast();
+    if r != 0 { return r; }
+    let r = test_conv2d();
+    if r != 0 { return r; }
+    let r = test_autograd();
+    if r != 0 { return r; }
+    let r = test_sum_tensor();
+    if r != 0 { return r; }
+    return 0;
+}
+
+//----- 01..03: GPU stub ------------------------------------------------------
+
+fn test_gpu() -> i32 {
+    if gpu_available() { return 1; }
+    return 0;
+}
+
+//----- 04..12: 构造器 + 新字段不破坏老 API ------------------------------------
+
+fn test_const() -> i32 {
+    let z = Tensor::zeros([2, 3, 1, 1], 2);
+    if z.numel() != 6 { return 4; }
+    if z.rank() != 2 { return 5; }
+    // grad 初始 null
+    if z.grad != 0 as *mut f64 { return 6; }
+    if z.ctx != 0 as *mut void { return 7; }
+
+    let sc = Tensor::scalar(5.0);
+    if sc.numel() != 1 { return 8; }
+    if sc.get_flat(0) != 5.0 { return 9; }
+
+    let v: [f64; 6] = [1.0, 2.0, 3.0, 4.0, 5.0, 6.0];
+    let m = Tensor::from_matrix(&v, 2, 3);
+    if m.dim(0) != 2 || m.dim(1) != 3 { return 10; }
+    if m.get2(0, 1) != 2.0 { return 11; }
+    if m.get2(1, 2) != 6.0 { return 12; }
+    return 0;
+}
+
+//----- 13..20: broadcast 形状 ------------------------------------------------
+
+fn test_broadcast() -> i32 {
+    // a:[3,1] + b:[1,4] -> [3,4]
+    let av: [f64; 3] = [1.0, 2.0, 3.0];
+    let bv: [f64; 4] = [10.0, 20.0, 30.0, 40.0];
+    let a = Tensor::from_slice(&av, [3, 1, 1, 1], 2);
+    let b = Tensor::from_slice(&bv, [1, 4, 1, 1], 2);
+
+    let bs = a.broadcast([3, 4, 1, 1], 2);
+    if bs.numel() != 12 { return 13; }
+    if bs.dim(0) != 3 || bs.dim(1) != 4 { return 14; }
+    // 广播后数据应正确复制: a 的第一行 [1,1,1,1]
+    if bs.get2(0, 0) != 1.0 || bs.get2(0, 3) != 1.0 { return 15; }
+    if bs.get2(2, 3) != 3.0 { return 16; }
+
+    let s = a.broadcast_add(&b);
+    if s.numel() != 12 { return 17; }
+    if s.get2(0, 0) != 11.0 { return 18; }
+    if s.get2(2, 3) != 43.0 { return 19; }
+
+    let p = a.broadcast_mul(&b);
+    if p.get2(1, 2) != 60.0 { return 20; }
+    return 0;
+}
+
+//----- 21..28: conv2d 形状 + 计算 --------------------------------------------
+
+fn test_conv2d() -> i32 {
+    // input [1,1,4,4] 全 1；weight [1,1,2,2] 全 1；bias [1]=0
+    // stride=1 pad=0 → OH=3 OW=3；每个位置 = 4.0
+    let mut iv: [f64; 16] = [0.0; 16];
+    let mut i: usize = 0;
+    while i < 16 { iv[i] = 1.0; i = i + 1; }
+    let mut wv: [f64; 4] = [1.0, 1.0, 1.0, 1.0];
+    let bv: [f64; 1] = [0.0];
+    let inp = Tensor::from_slice(&iv, [1, 1, 4, 4], 4);
+    let wei = Tensor::from_slice(&wv, [1, 1, 2, 2], 4);
+    let bis = Tensor::from_vec(&bv, 1);
+
+    let out = inp.conv2d(&wei, &bis, 1, 1, 0, 0);
+    if out.ndim != 4 { return 21; }
+    if out.dim(0) != 1 || out.dim(1) != 1 { return 22; }
+    if out.dim(2) != 3 || out.dim(3) != 3 { return 23; }
+    if out.numel() != 9 { return 24; }
+    let mut j: usize = 0;
+    while j < 9 {
+        if out.data[j] != 4.0 { return 25; }
+        j = j + 1;
+    }
+
+    // 带 bias
+    let b2: [f64; 1] = [1.5];
+    let bi2 = Tensor::from_vec(&b2, 1);
+    let out2 = inp.conv2d(&wei, &bi2, 1, 1, 0, 0);
+    if out2.get_flat(0) != 5.5 { return 26; }
+
+    // 带 padding: input[1,1,3,3] pad=1 → 5x5 等效边界补 0；weight[1,1,3,3]
+    let mut iv2: [f64; 9] = [1.0; 9];
+    let inp2 = Tensor::from_slice(&iv2, [1, 1, 3, 3], 4);
+    let mut wv3: [f64; 9] = [1.0; 9];
+    let wei2 = Tensor::from_slice(&wv3, [1, 1, 3, 3], 4);
+    let bz: [f64; 1] = [0.0];
+    let biz = Tensor::from_vec(&bz, 1);
+    let out3 = inp2.conv2d(&wei2, &biz, 1, 1, 1, 1);
+    if out3.dim(2) != 3 || out3.dim(3) != 3 { return 27; }
+    if out3.get_flat(0) != 4.0 { return 28; }
+    return 0;
+}
+
+//----- 29..36: autograd — y = a*x + b 反向 ------------------------------------
+
+fn test_autograd() -> i32 {
+    // a=2.0, x=3.0, b=4.0 → y=10.0
+    // 对 y.backward() → 从 y=1.0 出发
+    //   da = x = 3.0, dx = a = 2.0, db = 1.0
+    let a_v: [f64; 1] = [2.0];
+    let x_v: [f64; 1] = [3.0];
+    let b_v: [f64; 1] = [4.0];
+    let mut a = Tensor::from_slice(&a_v, [1, 1, 1, 1], 0);
+    let mut x = Tensor::from_slice(&x_v, [1, 1, 1, 1], 0);
+    let mut b = Tensor::from_slice(&b_v, [1, 1, 1, 1], 0);
+
+    a.track_inplace();
+    x.track_inplace();
+    b.track_inplace();
+
+    let mut y = a.mul(x).add(b);
+    if y.get_flat(0) != 10.0 { return 29; }
+    if y.ctx == 0 as *mut void { return 30; }
+
+    y.backward();
+
+    // a.grad 应 == 3.0 (dx)
+    if a.grad == 0 as *mut f64 { return 31; }
+    if !feq(a.grad[0], 3.0) { return 32; }
+    if !feq(x.grad[0], 2.0) { return 33; }
+    if !feq(b.grad[0], 1.0) { return 34; }
+
+    // zero_grad 后所有 grad 为 0
+    a.zero_grad();
+    x.zero_grad();
+    b.zero_grad();
+    if !feq(a.grad[0], 0.0) { return 35; }
+    if !feq(x.grad[0], 0.0) { return 36; }
+    return 0;
+}
+
+//----- 37..40: sum_tensor + sum backward --------------------------------------
+
+fn test_sum_tensor() -> i32 {
+    let v: [f64; 3] = [7.0, 11.0, 13.0];
+    let mut t = Tensor::from_vec(&v, 3);
+    t.track_inplace();
+
+    let s = t.sum_tensor();
+    if s.get_flat(0) != 31.0 { return 37; }
+    if s.numel() != 1 { return 38; }
+
+    s.backward();
+    // 标量 backward 默认根 dy=1；sum 把 1 广播到每个输入
+    if !feq(t.grad[0], 1.0) { return 39; }
+    if !feq(t.grad[2], 1.0) { return 40; }
+    return 0;
+}
+
+//----- 小浮点比较（< 1e-10 认为相等）------------------------------------------
+
+fn feq(a: f64, b: f64) -> bool {
+    let d = a - b;
+    let ad = if d < 0.0 { -d } else { d };
+    return ad < 0.0000000001;
+}

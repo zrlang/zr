@@ -1,0 +1,68 @@
+//==============================================================================
+// std/core/char.zr — ASCII 字符分类与转换（对应 Rust `char` 的 ascii 方法）
+//
+// zr 不能给内建类型加固有 impl（`impl i64 { .. }` 会报 orphan rule），
+// 所以这里按自由函数提供，与 `core::char` 的方法一一对应。
+// 只覆盖 ASCII；非 ASCII 字符一律返回 false / 原样返回。
+//==============================================================================
+
+/// 是否为 ASCII 数字 `0`–`9`。
+pub fn is_ascii_digit(c: char) -> bool {
+    return c >= '0' && c <= '9';
+}
+
+/// 是否为 ASCII 字母 `a`–`z` / `A`–`Z`。
+pub fn is_ascii_alphabetic(c: char) -> bool {
+    return is_ascii_lowercase(c) || is_ascii_uppercase(c);
+}
+
+/// 是否为 ASCII 字母或数字。
+pub fn is_ascii_alphanumeric(c: char) -> bool {
+    return is_ascii_alphabetic(c) || is_ascii_digit(c);
+}
+
+pub fn is_ascii_uppercase(c: char) -> bool {
+    return c >= 'A' && c <= 'Z';
+}
+
+pub fn is_ascii_lowercase(c: char) -> bool {
+    return c >= 'a' && c <= 'z';
+}
+
+/// 是否为 ASCII 空白：空格、\t、\n、\r、\x0b、\x0c。
+pub fn is_ascii_whitespace(c: char) -> bool {
+    if c == ' ' || c == '\t' || c == '\n' || c == '\r' { return true; }
+    return c == '\x0b' || c == '\x0c';
+}
+
+/// 是否为可打印 ASCII（0x20–0x7e）。
+pub fn is_ascii_graphic(c: char) -> bool {
+    return c >= ' ' && c <= '~';
+}
+
+/// ASCII 大写转小写；其它字符原样返回。
+pub fn to_ascii_lowercase(c: char) -> char {
+    if is_ascii_uppercase(c) { return ((c as u8) + 32) as char; }
+    return c;
+}
+
+/// ASCII 小写转大写；其它字符原样返回。
+pub fn to_ascii_uppercase(c: char) -> char {
+    if is_ascii_lowercase(c) { return ((c as u8) - 32) as char; }
+    return c;
+}
+
+/// 数字字符转数值；非数字返回 `-1`（对应 Rust `char::to_digit` 的失败路径）。
+pub fn ascii_to_digit(c: char) -> i32 {
+    if is_ascii_digit(c) { return (c as i32) - 48; }
+    if c >= 'a' && c <= 'f' { return (c as i32) - 87; }
+    if c >= 'A' && c <= 'F' { return (c as i32) - 55; }
+    return -1;
+}
+
+/// 数值（0–15）转小写十六进制字符；越界返回 `?`。
+pub fn ascii_from_digit(v: i32) -> char {
+    if v >= 0 && v <= 9 { return ((v + 48) as u8) as char; }
+    if v >= 10 && v <= 15 { return ((v + 87) as u8) as char; }
+    return '?';
+}

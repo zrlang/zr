@@ -1,0 +1,257 @@
+//=============================================================================
+// tests/cases/140_http.zr — HTTP 纯解析层
+//
+// 覆盖：
+//   - url_parse：默认端口 / 显式端口 / 带路径 / 坏 URL
+//   - http_build_request：请求行、Host、自定义头、Content-Length（含 0）
+//   - http_parse_response：3 个头的 200、chunked（含块扩展）、404、坏响应
+//
+// 本用例**不发起真实网络请求**；http_get 由模块编译覆盖（不调用）。
+// 所有响应文本都放在 String 里，保证 HttpResponse 的切片借用有效。
+//=============================================================================
+
+use http::{url_parse, http_build_request, http_parse_response, HttpHeader};
+use core::Result;
+use string::String;
+use collections::Vec;
+
+/// `hay` 是否包含 `needle`（区分大小写）。
+fn t_has(hay: []const u8, needle: []const u8) -> bool {
+    if needle.len > hay.len {
+        return false;
+    }
+    let mut i = 0;
+    while i <= hay.len - needle.len {
+        let mut j = 0;
+        let mut same = true;
+        while j < needle.len {
+            if hay.ptr[i + j] != needle.ptr[j] {
+                same = false;
+                break;
+            }
+            j = j + 1;
+        }
+        if same {
+            return true;
+        }
+        i = i + 1;
+    }
+    return false;
+}
+
+/// `hay` 是否以 `prefix` 开头。
+fn t_starts(hay: []const u8, prefix: []const u8) -> bool {
+    if prefix.len > hay.len {
+        return false;
+    }
+    let mut i = 0;
+    while i < prefix.len {
+        if hay.ptr[i] != prefix.ptr[i] {
+            return false;
+        }
+        i = i + 1;
+    }
+    return true;
+}
+
+fn main() -> i32 {
+    //=========================================================================
+    // url_parse
+    //=========================================================================
+    // 默认端口、无路径
+    let u0 = match url_parse("http://example.com") {
+        Result::Ok(u) => u,
+        Result::Err(_) => {
+            return 1;
+        }
+    };
+    if u0.scheme.len != 4 || u0.port != 80 {
+        return 2;
+    }
+    if u0.host.len != 11 || u0.host.ptr[0] != 101 { // 'e'
+        return 3;
+    }
+    if u0.path.len != 1 || u0.path.ptr[0] != 47 { // '/'
+        return 4;
+    }
+
+    // 显式端口 + 路径
+    let u1 = match url_parse("http://127.0.0.1:8080/a/b") {
+        Result::Ok(u) => u,
+        Result::Err(_) => {
+            return 5;
+        }
+    };
+    if u1.port != 8080 {
+        return 6;
+    }
+    if u1.host.len != 9 || u1.host.ptr[0] != 49 { // '1'
+        return 7;
+    }
+    if u1.path.len != 4 || u1.path.ptr[0] != 47 || u1.path.ptr[1] != 97 { // "/a/b"
+        return 8;
+    }
+
+    // 坏 URL：非 http 协议 / 空主机 / 非数字端口
+    // https:// 现在也合法（tls 支持），验证 scheme 和默认端口 443
+    let u_https = url_parse("https://example.com");
+    match u_https {
+        Result::Ok(h) => {
+            if h.port != 443 || h.scheme.len != 5 || h.scheme.ptr[0] != 104 { return 9; } // h
+        }
+        Result::Err(_) => { return 9; }
+    }
+    if !url_parse("http://").is_err() {
+        return 10;
+    }
+    if !url_parse("http://:80/x").is_err() {
+        return 11;
+    }
+    if !url_parse("http://host:abc/x").is_err() {
+        return 12;
+    }
+
+    //=========================================================================
+    // http_build_request
+    //=========================================================================
+    let mut body_src = String::from_bytes("abc");
+    let hs: [HttpHeader; 1] = [HttpHeader { name: "X-Test", value: "yes" }];
+    let req = http_build_request("POST", "example.com", "/submit", hs[..], body_src.as_bytes());
+    let rb = req.as_bytes();
+    if !t_starts(rb, "POST /submit HTTP/1.1\r\n") {
+        return 13;
+    }
+    if !t_has(rb, "Host: example.com\r\n") {
+        return 14;
+    }
+    if !t_has(rb, "X-Test: yes\r\n") {
+        return 15;
+    }
+    if !t_has(rb, "Content-Length: 3\r\n") {
+        return 16;
+    }
+    if !t_has(rb, "\r\n\r\nabc") {
+        return 17;
+    }
+
+    // 空体也输出 Content-Length: 0
+    let mut no_headers: Vec<HttpHeader> = Vec::new();
+    let mut no_body: Vec<u8> = Vec::new();
+    let req0 = http_build_request(
+        "GET",
+        "127.0.0.1",
+        "/",
+        no_headers.as_slice(),
+        no_body.as_slice(),
+    );
+    if !t_starts(req0.as_bytes(), "GET / HTTP/1.1\r\n") {
+        return 18;
+    }
+    if !t_has(req0.as_bytes(), "Host: 127.0.0.1\r\n") {
+        return 19;
+    }
+    if !t_has(req0.as_bytes(), "Content-Length: 0\r\n") {
+        return 20;
+    }
+
+    //=========================================================================
+    // http_parse_response：200 + 3 个头 + Content-Length
+    //=========================================================================
+    let s200 = String::from_bytes(
+        "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 5\r\nX-Trace: abc\r\n\r\nhello",
+    );
+    let r200 = match http_parse_response(s200.as_bytes()) {
+        Result::Ok(r) => r,
+        Result::Err(_) => {
+            return 21;
+        }
+    };
+    if r200.code != 200 {
+        return 22;
+    }
+    if r200.reason.len != 2 || r200.reason.ptr[0] != 79 { // "OK"
+        return 23;
+    }
+    if r200.headers.len != 3 {
+        return 24;
+    }
+    let h0 = r200.headers.get(0);
+    if h0.name.len != 12 || h0.value.len != 10 { // Content-Type: text/plain
+        return 25;
+    }
+    let h1 = r200.headers.get(1);
+    if h1.name.len != 14 || h1.value.len != 1 { // Content-Length: 5
+        return 26;
+    }
+    let h2 = r200.headers.get(2);
+    if h2.name.len != 7 || h2.value.len != 3 { // X-Trace: abc
+        return 27;
+    }
+    if r200.body.len != 5 || r200.body.get(0) != 104 { // 'h'
+        return 28;
+    }
+    if r200.body.get(4) != 111 { // 'o'
+        return 29;
+    }
+
+    //=========================================================================
+    // http_parse_response：chunked（第一块带扩展参数）
+    //=========================================================================
+    let s_chunked = String::from_bytes(
+        "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nContent-Type: text/plain\r\n\r\n4;ext=1\r\nWiki\r\n5\r\npedia\r\n0\r\n\r\n",
+    );
+    let rc = match http_parse_response(s_chunked.as_bytes()) {
+        Result::Ok(r) => r,
+        Result::Err(_) => {
+            return 30;
+        }
+    };
+    if rc.code != 200 || rc.body.len != 9 {
+        return 31;
+    }
+    if rc.body.get(0) != 87 { // 'W'
+        return 32;
+    }
+    if rc.body.get(4) != 112 { // 'p'
+        return 33;
+    }
+    if rc.body.get(8) != 97 { // 'a'
+        return 34;
+    }
+
+    //=========================================================================
+    // http_parse_response：404
+    //=========================================================================
+    let s404 = String::from_bytes(
+        "HTTP/1.1 404 Not Found\r\nContent-Length: 2\r\n\r\nno",
+    );
+    let r404 = match http_parse_response(s404.as_bytes()) {
+        Result::Ok(r) => r,
+        Result::Err(_) => {
+            return 35;
+        }
+    };
+    if r404.code != 404 {
+        return 36;
+    }
+    if r404.reason.len != 9 || r404.reason.ptr[0] != 78 { // "Not Found"
+        return 37;
+    }
+    if r404.body.len != 2 || r404.body.get(0) != 110 { // 'n'
+        return 38;
+    }
+
+    //=========================================================================
+    // 坏响应：没有状态行 / 头块未闭合
+    //=========================================================================
+    let bad = String::from_bytes("garbage");
+    if !http_parse_response(bad.as_bytes()).is_err() {
+        return 39;
+    }
+    let trunc = String::from_bytes("HTTP/1.1 200 OK\r\nContent-Length: 9\r\n\r\nhi");
+    if !http_parse_response(trunc.as_bytes()).is_err() {
+        return 40;
+    }
+
+    return 0;
+}

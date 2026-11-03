@@ -1,0 +1,70 @@
+// 测试 argparse 的子命令/帮助函数：
+//   subcommand_in, subcommand, print_help, help_requested_in, help_requested
+//
+// 编号指向失败的断言；全 0 通过。
+use argparse::{subcommand_in, print_help, help_requested_in};
+use collections::Vec;
+use mem::Slice;
+use string::String;
+
+fn main() -> i32 {
+    //--- 测试 1: subcommand_in 取第一个非选项 ---
+    // argv = [prog, "--verbose", "install", "pkg"]
+    let mut v1: Vec<String> = Vec::with_capacity(8);
+    v1.push(String::from_bytes("prog"));
+    v1.push(String::from_bytes("--verbose"));
+    v1.push(String::from_bytes("install"));
+    v1.push(String::from_bytes("pkg"));
+    let s1 = subcommand_in(&v1);
+    if s1.len != 7 || s1.ptr[0] != b'i' { return 1; }
+
+    //--- 测试 2: subcommand_in 全是选项时返回空串 ---
+    let mut v2: Vec<String> = Vec::with_capacity(8);
+    v2.push(String::from_bytes("prog"));
+    v2.push(String::from_bytes("-v"));
+    v2.push(String::from_bytes("--help"));
+    let s2 = subcommand_in(&v2);
+    if s2.len != 0 { return 2; }
+
+    //--- 测试 3: help_requested_in 识别 --help ---
+    let mut v3: Vec<String> = Vec::with_capacity(8);
+    v3.push(String::from_bytes("prog"));
+    v3.push(String::from_bytes("--help"));
+    v3.push(String::from_bytes("install"));
+    if !help_requested_in(&v3) { return 3; }
+
+    //--- 测试 4: help_requested_in 识别 -h ---
+    let mut v4: Vec<String> = Vec::with_capacity(8);
+    v4.push(String::from_bytes("prog"));
+    v4.push(String::from_bytes("-h"));
+    if !help_requested_in(&v4) { return 4; }
+
+    //--- 测试 5: print_help 生成含 SUBCOMMANDS 的非空字符串 ---
+    let names: [str; 2] = ["install", "remove"];
+    let descs: [str; 2] = ["Install packages", "Remove packages"];
+    let ns = Slice { ptr: &names[0], len: 2 };
+    let ds = Slice { ptr: &descs[0], len: 2 };
+    let h = print_help("pkg", "Package manager", ns, ds, 2);
+    if h.len < 40 { return 5; }
+    // 搜索 "SUB" 字节序列（ASCII 83, 85, 66）
+    let mut found = false;
+    let mut i: usize = 0;
+    while i + 11 < h.len {
+        if h.ptr[i] == 83 && h.ptr[i+1] == 85 && h.ptr[i+2] == 66 {
+            found = true;
+            break;
+        }
+        i = i + 1;
+    }
+    if !found { return 6; }
+
+    //--- 测试 6: print_help 0 个子命令仍工作 ---
+    let empty_names: [str; 1] = [""];
+    let empty_descs: [str; 1] = [""];
+    let ens = Slice { ptr: &empty_names[0], len: 0 };
+    let eds = Slice { ptr: &empty_descs[0], len: 0 };
+    let h0 = print_help("tool", "Desc", ens, eds, 0);
+    if h0.len < 20 { return 7; }
+
+    return 0;
+}

@@ -594,6 +594,66 @@ fn lower_expr(b: &mut Builder, expr: &HirExpr) -> MirValue {
             b.register_temp(MirValue::Var(addr.clone()), &expr.ty);
             MirValue::Var(addr)
         }
+        ArrayRepeat { init, len } => {
+            // `[init; N]`：N 可能上万（`[0; 65536]`），不能在编译期展开成
+            // N 条 Store（HIR 节点数 O(N)，编译退化到分钟级）。这里分配一块
+            // 合成栈槽，发一个运行期填槽循环：`i` 从 0 跑到 N，每轮把
+            // `init`（只求值一次）写进 `addr + i * elem_size`。
+            let elem_ty = match &expr.ty {
+                hir::Ty::Array(inner, _) => (**inner).clone(),
+                _ => return MirValue::Unit,
+            };
+            let size = type_size(b, &elem_ty);
+            let bytes = (*len as i128) * size;
+            let addr = b.synthetic_storage(bytes);
+            let init_v = lower_expr(b, init);
+
+            if *len == 0 {
+                b.register_temp(MirValue::Var(addr.clone()), &expr.ty);
+                return MirValue::Var(addr);
+            }
+
+            let idx = b.synthetic_storage(8);
+            b.current_block_mut()
+                .instrs
+                .push(MirInstr::Store(MirValue::Var(idx.clone()), MirValue::Int(0), NumTy::Int(64)));
+
+            let header = b.new_block();
+            let body = b.new_block();
+            let exit = b.new_block();
+            b.terminate_if_open(MirTerminator::Goto(header));
+
+            // header: i < len ? body : exit
+            b.current = header;
+            let i_val = {
+                let t = b.temp();
+                b.current_block_mut()
+                    .instrs
+                    .push(MirInstr::Load(t.clone(), MirValue::Var(idx.clone()), NumTy::Int(64)));
+                MirValue::Var(t)
+            };
+            let cond = binary_into(b, i_val.clone(), MirBinaryOp::Lt, MirValue::Int(*len as i128));
+            b.current_block_mut().term = Some(MirTerminator::Branch {
+                cond,
+                then_block: body,
+                else_block: exit,
+            });
+
+            // body: *(addr + i * size) = init; i += 1; goto header
+            b.current = body;
+            let scaled = binary_into(b, i_val.clone(), MirBinaryOp::Mul, MirValue::Int(size));
+            let slot = binary_into(b, MirValue::Var(addr.clone()), MirBinaryOp::Add, scaled);
+            store_value(b, slot, init_v.clone(), &elem_ty);
+            let next = binary_into(b, i_val.clone(), MirBinaryOp::Add, MirValue::Int(1));
+            b.current_block_mut()
+                .instrs
+                .push(MirInstr::Store(MirValue::Var(idx.clone()), next, NumTy::Int(64)));
+            b.terminate_if_open(MirTerminator::Goto(header));
+
+            b.current = exit;
+            b.register_temp(MirValue::Var(addr.clone()), &expr.ty);
+            MirValue::Var(addr)
+        }
         Struct(fields) => {
             // 结构体值在运行期是“指向字段存储的地址”。每个字段按布局
             // 写入；嵌套结构体/数组递归复制，保证值语义。
@@ -605,6 +665,7 @@ fn lower_expr(b: &mut Builder, expr: &HirExpr) -> MirValue {
                 let Some((off, field_ty)) = layout.offset(name) else {
                     continue;
                 };
+                b.mark_aggregate_move(e);
                 let v = lower_expr(b, e);
                 let at = offset_addr(b, MirValue::Var(addr.clone()), off);
                 store_value(b, at, v, field_ty);
@@ -622,6 +683,7 @@ fn lower_expr(b: &mut Builder, expr: &HirExpr) -> MirValue {
                 let Some((off, elem_ty)) = layout.offset(&idx.to_string()) else {
                     continue;
                 };
+                b.mark_aggregate_move(e);
                 let v = lower_expr(b, e);
                 let at = offset_addr(b, MirValue::Var(addr.clone()), off);
                 store_value(b, at, v, elem_ty);
@@ -663,6 +725,7 @@ fn lower_expr(b: &mut Builder, expr: &HirExpr) -> MirValue {
                 let Some(field_ty) = field_tys.get(i) else {
                     continue;
                 };
+                b.mark_aggregate_move(arg);
                 let v = lower_expr(b, arg);
                 let at = offset_addr(b, MirValue::Var(addr.clone()), layout.payload_off + off);
                 store_value(b, at, v, field_ty);
@@ -1884,6 +1947,17 @@ impl Builder {
                 moved_paths: Vec::new(),
                 flags,
             });
+        }
+    }
+
+    /// 聚合字面量（结构体 / 元组 / 枚举变体）把字段表达式的值**移动**进新
+    /// 聚合里。源位置若带析构义务，移动之后就不能在作用域结束时再析构一次：
+    /// `let sock = Socket::new(..)?; let s = Wrap { inner: sock };` 早先只做位
+    /// 拷贝、不标记源已移动，于是 `sock` 的 drop glue 仍然发射，fd 被提前关掉
+    /// （`TcpStream::connect` 返回后 `write` 拿到 EBADF）。
+    fn mark_aggregate_move(&mut self, e: &HirExpr) {
+        if self.is_drop_ty(&e.ty) {
+            self.mark_place_moved(e);
         }
     }
 
@@ -3196,11 +3270,85 @@ fn copy_array_value(b: &mut Builder, src: MirValue, ty: &hir::Ty) -> MirValue {
 }
 
 /// 把源数组逐元素复制到指定返回槽/存储地址。
+/// 小数组（<= 16 元素）展开成内联 load-store；大数组用运行期循环，避免
+/// `[0; 65536]` 这类字面量在编译期展开出上万条 MIR 指令导致编译退化。
 fn copy_array_into(b: &mut Builder, src: MirValue, elem_ty: &hir::Ty, len: i128, dst: MirValue) {
     if len <= 0 {
         return;
     }
     let size = type_size(b, elem_ty);
+    const COPY_UNROLL_THRESHOLD: i128 = 16;
+    if len <= COPY_UNROLL_THRESHOLD {
+        copy_array_into_unrolled(b, src, elem_ty, len, dst, size);
+        return;
+    }
+    // 运行期循环：`for i in 0..len { dst[i] = src[i]; }`
+    let idx = b.synthetic_storage(8);
+    b.current_block_mut()
+        .instrs
+        .push(MirInstr::Store(MirValue::Var(idx.clone()), MirValue::Int(0), NumTy::Int(64)));
+    let header = b.new_block();
+    let body = b.new_block();
+    let exit = b.new_block();
+    b.terminate_if_open(MirTerminator::Goto(header));
+    // header: i < len ? body : exit
+    b.current = header;
+    let i_val = {
+        let t = b.temp();
+        b.current_block_mut()
+            .instrs
+            .push(MirInstr::Load(t.clone(), MirValue::Var(idx.clone()), NumTy::Int(64)));
+        MirValue::Var(t)
+    };
+    let cond = binary_into(b, i_val.clone(), MirBinaryOp::Lt, MirValue::Int(len));
+    b.current_block_mut().term = Some(MirTerminator::Branch {
+        cond,
+        then_block: body,
+        else_block: exit,
+    });
+    // body: dst[i] = src[i]; i += 1; goto header
+    b.current = body;
+    let scaled = binary_into(b, i_val.clone(), MirBinaryOp::Mul, MirValue::Int(size));
+    let src_at = binary_into(b, src.clone(), MirBinaryOp::Add, scaled.clone());
+    let dst_at = binary_into(b, dst.clone(), MirBinaryOp::Add, scaled);
+    if let Some(layout) = struct_layout(b, elem_ty) {
+        copy_struct_into(b, src_at, &layout, dst_at);
+    } else if let Some((inner, inner_len, _)) = array_info(b, elem_ty) {
+        copy_array_into(b, src_at, &inner, inner_len, dst_at);
+    } else {
+        let v = match narrow_bits_of(elem_ty) {
+            Some(bits) => load_narrow(b, src_at, bits),
+            None => {
+                let elem = b.temp();
+                b.current_block_mut().instrs.push(MirInstr::Load(
+                    elem.clone(),
+                    src_at,
+                    reg_ty_of(elem_ty),
+                ));
+                MirValue::Var(elem)
+            }
+        };
+        match narrow_bits_of(elem_ty) {
+            Some(bits) => store_narrow(b, dst_at, v, bits),
+            None => {
+                b.current_block_mut().instrs.push(MirInstr::Store(
+                    dst_at,
+                    v,
+                    reg_ty_of(elem_ty),
+                ));
+            }
+        }
+    }
+    let next = binary_into(b, i_val.clone(), MirBinaryOp::Add, MirValue::Int(1));
+    b.current_block_mut()
+        .instrs
+        .push(MirInstr::Store(MirValue::Var(idx.clone()), next, NumTy::Int(64)));
+    b.terminate_if_open(MirTerminator::Goto(header));
+    b.current = exit;
+}
+
+/// 小数组的展开复制（len <= 16）。
+fn copy_array_into_unrolled(b: &mut Builder, src: MirValue, elem_ty: &hir::Ty, len: i128, dst: MirValue, size: i128) {
     for i in 0..len {
         let off = i * size;
         let src_at = if off == 0 {
@@ -3654,6 +3802,7 @@ fn collect_addr_taken_expr(e: &HirExpr, out: &mut HashSet<u32>) {
                 collect_addr_taken_expr(e, out);
             }
         }
+        ArrayRepeat { init, .. } => collect_addr_taken_expr(init, out),
         Struct(fields) => {
             for (_, e) in fields {
                 collect_addr_taken_expr(e, out);

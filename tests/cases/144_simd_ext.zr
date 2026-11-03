@@ -1,0 +1,128 @@
+//=============================================================================
+// tests/cases/144_simd_ext.zr — std/simd.zr 的新增类型与 best_width()
+//
+// 覆盖：`f64x4` / `f32x8` / `i64x2` 的 from_array / to_array / splat /
+// 逐 lane 运算（add / sub / mul / div / neg / min / max / abs）/ sum / dot，
+// 以及 `best_width()`。
+//
+// 失败编号：返回非零 N 表示第 N 条断言失败。
+//=============================================================================
+
+use simd::{f64x4, f32x8, i64x2, best_width};
+
+fn main() -> i32 {
+    // ---- f64x4：4 × f64，256 位 -------------------------------------------
+    let a = f64x4::from_array([1.0, 2.0, 3.0, 4.0]);
+    let b = f64x4::from_array([5.0, 6.0, 7.0, 8.0]);
+
+    // 1. add
+    let c = a.add(b);
+    let arr = c.to_array();
+    if arr[0] != 6.0 || arr[1] != 8.0 || arr[2] != 10.0 || arr[3] != 12.0 {
+        return 1;
+    }
+
+    // 2. sub
+    let d = b.sub(a);
+    let da = d.to_array();
+    if da[0] != 4.0 || da[3] != 4.0 { return 2; }
+
+    // 3. mul
+    let e = a.mul(b);
+    let ea = e.to_array();
+    if ea[0] != 5.0 || ea[3] != 32.0 { return 3; }
+
+    // 4. div
+    let f = b.div(a);
+    let fa = f.to_array();
+    if fa[0] != 5.0 || fa[3] != 2.0 { return 4; }
+
+    // 5. neg
+    let g = a.neg();
+    let ga = g.to_array();
+    if ga[0] != -1.0 || ga[3] != -4.0 { return 5; }
+
+    // 6. min / max
+    let h = a.min(b);
+    if h.to_array()[2] != 3.0 { return 6; }
+    let i = a.max(b);
+    if i.to_array()[2] != 7.0 { return 7; }
+
+    // 7. abs
+    let j = f64x4::from_array([-1.5, 2.5, -3.5, 4.5]).abs();
+    let ja = j.to_array();
+    if ja[0] != 1.5 || ja[2] != 3.5 { return 8; }
+
+    // 8. splat
+    let k = f64x4::splat(2.5);
+    let ka = k.to_array();
+    if ka[0] != 2.5 || ka[3] != 2.5 { return 9; }
+
+    // 9. sum
+    if a.sum() != 10.0 { return 10; }
+
+    // 10. dot
+    if a.dot(b) != 70.0 { return 11; }
+
+    // ---- f32x8：8 × f32，256 位 -------------------------------------------
+    let x = f32x8::from_array([1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0]);
+    let y = f32x8::splat(2.0);
+
+    // 11. mul + lane check
+    let z = x.mul(y);
+    let za = z.to_array();
+    if za[0] != 2.0 || za[7] != 16.0 { return 12; }
+
+    // 12. sum
+    if z.sum() != 72.0 { return 13; }
+
+    // 13. dot
+    if x.dot(y) != 72.0 { return 14; }
+
+    // 14. add + splat sum
+    let w = x.add(x);
+    if w.sum() != 72.0 { return 15; }
+
+    // 15. min / max
+    let m1 = x.min(y);
+    let m1a = m1.to_array();
+    if m1a[2] != 2.0 { return 16; }
+    let m2 = x.max(y);
+    let m2a = m2.to_array();
+    if m2a[2] != 3.0 { return 17; }
+
+    // ---- i64x2：2 × i64，128 位 -------------------------------------------
+    let p = i64x2::from_array([3, 7]);
+    let q = i64x2::from_array([5, 11]);
+
+    // 16. mul
+    let r = p.mul(q);
+    let ra = r.to_array();
+    if ra[0] != 15 || ra[1] != 77 { return 18; }
+
+    // 17. add + sum
+    let s = p.add(q);
+    if s.sum() != 26 { return 19; }
+
+    // 18. dot
+    if p.dot(q) != 92 { return 20; }
+
+    // 19. neg
+    let n = p.neg();
+    let na = n.to_array();
+    if na[0] != -3 || na[1] != -7 { return 21; }
+
+    // 20. min / max
+    let mn = p.min(q);
+    if mn.to_array()[1] != 7 { return 22; }
+    let mx = p.max(q);
+    if mx.to_array()[1] != 11 { return 23; }
+
+    // ---- best_width() -----------------------------------------------------
+    // 21. >= 2 且 <= 64（合理的 SIMD 宽度）
+    let bw = best_width();
+    if bw < 2 { return 24; }
+    if bw > 64 { return 25; }
+
+    return 0;
+}

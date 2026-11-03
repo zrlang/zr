@@ -1,0 +1,106 @@
+//=============================================================================
+// std/os.zr — 跨平台操作系统信息与常用路径
+//
+// 运行时探测操作系统，不依赖编译期 cfg：
+//   os::pid()          -> i32    当前进程 ID
+//   os::cwd_len(buf, cap) -> i64 当前工作目录长度（写入调用方缓冲区）
+//   os::temp_dir()     -> String 临时目录（TMPDIR / TEMP / TMP，兜底 "/tmp"）
+//   os::home_dir()     -> Option<String> 家目录（HOME，Windows 再试 USERPROFILE）
+//   os::os_name()      -> str    "macos" / "windows" / "linux"
+//   os::pointer_bits() -> usize  指针宽度（位）
+//   os::exit(code)     -> !      退出进程
+//
+// `temp_dir` 返回 `String`：环境变量的值在堆上，若返回 `str` 视图就必须
+// 保证它比调用方活得更久；返回拥有所有权的 `String` 更不容易踩悬垂指针。
+//=============================================================================
+
+use core::{Option, size_of};
+use string::String;
+use env::var;
+use fs::exists;
+
+//----- 外部运行时符号（与 std/process.zr / std/fs.zr 的声明一致）--------------
+
+extern "C" {
+    fn zr_process_getpid() -> i32;
+    fn zr_getcwd(buf: *mut u8, cap: usize) -> i64;
+    fn zr_exit(code: i32) -> !;
+}
+
+//----- 内部辅助 ---------------------------------------------------------------
+
+/// 读环境变量，值为空视同未设置。
+fn os_env_nonempty(key: str) -> Option<String> {
+    match var(key) {
+        Option::Some(v) => {
+            if v.len > 0 {
+                return Option::Some(v);
+            }
+            return Option::None;
+        }
+        Option::None => {
+            return Option::None;
+        }
+    }
+}
+
+//----- 公开 API ---------------------------------------------------------------
+
+/// 当前进程 ID。
+pub fn pid() -> i32 {
+    return zr_process_getpid();
+}
+
+/// 把当前工作目录写进 `buf`，返回长度（不含 NUL）；失败返回 -1。
+pub fn cwd_len(buf: *mut u8, cap: usize) -> i64 {
+    return zr_getcwd(buf, cap);
+}
+
+/// 临时目录：依次取 `TMPDIR` / `TEMP` / `TMP`（空值跳过），都没有用 `/tmp`。
+pub fn temp_dir() -> String {
+    let mut r: Option<String> = os_env_nonempty("TMPDIR");
+    if r.is_none() {
+        r = os_env_nonempty("TEMP");
+    }
+    if r.is_none() {
+        r = os_env_nonempty("TMP");
+    }
+    match r {
+        Option::Some(v) => {
+            return v;
+        }
+        Option::None => {
+            return String::from_bytes("/tmp");
+        }
+    }
+}
+
+/// 家目录：Unix 读 `HOME`，Windows 读 `USERPROFILE`；都没有返回 None。
+pub fn home_dir() -> Option<String> {
+    let mut r: Option<String> = os_env_nonempty("HOME");
+    if r.is_none() {
+        r = os_env_nonempty("USERPROFILE");
+    }
+    return r;
+}
+
+/// 操作系统名。用文件系统探测（运行时判断，不受编译宿主影响）。
+pub fn os_name() -> str {
+    if exists("/System/Library/CoreServices") {
+        return "macos";
+    }
+    if exists("C:\\Windows") {
+        return "windows";
+    }
+    return "linux";
+}
+
+/// 指针宽度（位）。
+pub fn pointer_bits() -> usize {
+    return size_of::<*mut u8>() * 8;
+}
+
+/// 退出进程，不返回。
+pub fn exit(code: i32) -> ! {
+    zr_exit(code)
+}

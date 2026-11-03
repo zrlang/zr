@@ -1,17 +1,44 @@
 //=============================================================================
-// std/mem.zr — 内存管理、指针与手动内存操作
+// std/alloc/mem.zr — alloc 层：内存管理、指针与手动内存操作
 //
 // 提供 safe 的内存抽象（Box、切片视图）与 unsafe 的底层原语
 //（memcpy / memset / transmute 等），以及全局分配器接口。
+// 依赖 core，但不依赖任何 OS 能力（对齐 Rust 的 alloc crate）。
 //=============================================================================
 
-use core::{zr_alloc, zr_dealloc, zr_realloc};
+//----- 分配器运行时符号（由运行时提供）---------------------------------------
+
+extern "C" {
+    fn zr_alloc(size: usize, align: usize) -> *mut void;
+    fn zr_dealloc(ptr: *mut void, size: usize, align: usize);
+    fn zr_realloc(ptr: *mut void, old_size: usize, new_size: usize, align: usize) -> *mut void;
+}
+
+/// 分配 `size` 字节、按 `align` 对齐的内存块。
+pub fn alloc(size: usize, align: usize) -> *mut void {
+    zr_alloc(size, align)
+}
+
+/// 释放 `alloc` / `realloc` 得到的内存块。
+pub fn dealloc(ptr: *mut void, size: usize, align: usize) {
+    zr_dealloc(ptr, size, align);
+}
+
+/// 把内存块调整到 `new_size` 字节。
+pub fn realloc(ptr: *mut void, old_size: usize, new_size: usize, align: usize) -> *mut void {
+    zr_realloc(ptr, old_size, new_size, align)
+}
 
 //=============================================================================
 // 内存序（用于原子与 fence）
 //=============================================================================
 
-pub enum Ordering {
+/// 原子内存序（对应 Rust `core::sync::atomic::Ordering`）。
+///
+/// 之所以不叫 `Ordering`：`std/core/cmp.zr` 里有同名类型（三值比较结果，
+/// 对应 Rust `core::cmp::Ordering`），而 zr 的模块符号表是扁平的，
+/// 同名类型会互相覆盖。
+pub enum AtomicOrdering {
     Relaxed,
     Acquire,
     Release,

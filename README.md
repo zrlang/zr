@@ -931,33 +931,56 @@ zr 的标准库完全用 zr 自身编写（自举），通过 `extern "C"` 链�
 
 ### 模块组织
 
+标准库按 Rust 的三层架构组织：**core ⊂ alloc ⊂ std**。
+
 ```
 std/
-├── core.zr         // 基础类型：Option/Result/trait/panic/数值工具
-├── mem.zr          // 内存管理：alloc/dealloc/memcpy/memmove/Layout
-├── io.zr           // 格式化输出与基础 IO
-├── string.zr       // 可增长 UTF-8 字符串
-├── slice.zr        // 切片工具、迭代器、高阶函数
-├── collections.zr  // Vec<T> 动态数组
-├── async.zr        // 协程、Future、Executor、通道
-├── net.zr          // TCP / UDP 套接字
-├── simd.zr         // 向量类型与内建函数
-└── error.zr        // 错误处理、回溯、断言
+├── std.zr              // 门面：把三层名字再导出（use std::* 即可）
+├── core/               // 零依赖：无堆、无 OS、无 I/O
+│   ├── core.zr         // Option/Result/trait/panic/assert/数值工具/size_of
+│   └── simd.zr         // 向量类型与内建函数
+├── alloc/              // 只依赖 core：带堆分配，无 OS 依赖
+│   ├── mem.zr          // 分配器接口、memcpy/memset、Box、Slice
+│   ├── string.zr       // 可增长 UTF-8 字符串
+│   ├── slice.zr        // 切片工具、迭代器、高阶函数
+│   ├── collections.zr  // Vec<T> 动态数组
+│   ├── json/xml/toml/  // 纯解析库（无 OS）
+│   ├── base64/md5/sha256/crypto/  // 纯密码学原语
+│   ├── tensor.zr       // 多维数组、autograd、conv2d
+│   └── pdb.zr          // PDB 结构解析
+└── std/                // 依赖 OS
+    ├── sys.zr          // write/read/exit 等 OS 原语
+    ├── io.zr           // 格式化输出与基础 IO
+    ├── fs.zr           // 文件系统
+    ├── net.zr          // TCP / UDP 套接字
+    ├── http.zr         // HTTP/1.1 客户端
+    ├── http2.zr        // HTTP/2 (h2c) 客户端 + HPACK
+    ├── tls.zr          // 纯 zr TLS 1.2 客户端
+    ├── env/os/posix/   // 环境变量、平台信息、POSIX 调用
+    ├── process/thread/ // 进程与线程
+    ├── time/tz/path/   // 时间、时区、路径
+    ├── argparse.zr     // 命令行解析
+    └── error.zr        // 错误处理、回溯、断言
 ```
+
+依赖方向只允许 `core → core`、`alloc → {core, alloc}`、`std → 任意层`；
+越界（例如 `alloc` 依赖 `std`）会在加载阶段报 `layering violation`。
+模块名仍是扁平的，`use core::Option`、`use io::File` 照旧可用；
+`use std::io::File` 或 `use std::*` 走门面即可。
 
 ### 使用标准库
 
 ```rust
-// 引入整个模块
+// 引入整个门面（等价于同时拿到 core / alloc / std 三层）
+use std::*;
+
+// 引入单个模块（扁平名，与 Rust 目录结构无关）
 use std::io;
 io::println("hello");
 
 // 选择性导入
 use std::collections::Vec;
 use std::string::String;
-
-// 通配符导入
-use std::math::*;
 ```
 
 ### `std::core` — 基础类型
@@ -1325,7 +1348,7 @@ zr 编译器采用经典的多阶段架构：
 - [x] `extern "C"` 声明接通运行时（`zr_write` / `zr_read` / `zr_exit` …）
   - [x] 外部函数声明并入函数表，参与类型检查与名称解析，调用点发未定义符号给平台链接器
   - [x] 可把字符串字面量交给 `zr_write` 输出（宿主目标经 `clang`+`libzrrt.a`）
-  - [x] std 里的 `extern`（`std/core.zr`）随标准库编译接通
+  - [x] std 里的 `extern`（`std/core/core.zr`）随标准库编译接通
 - [x] 指针 / 字符串的取址、解引用与索引（最小 SSA 内存模型）
   - [x] 新指令 `Load` / `Store` / `SlotAddr`（MIR + SSA），按位宽区分有无符号
         （x86-64 `movzx`/`movsx`/`movsxd`，AArch64 `ldrb`/`ldrsb`/`ldr`…）

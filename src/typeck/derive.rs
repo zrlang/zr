@@ -11,7 +11,7 @@
 //! 再走后续全部阶段的（`impl_targets` 记录目标类型），derive 只需要产出
 //! 同样形状的 `ast::Function`，类型检查 / MIR / 后端都无需知道它来自 derive。
 //!
-//! 生成的函数与 `std/core.zr` 里的 trait 声明签名一致（注意那些 trait 的
+//! 生成的函数与 `std/core/core.zr` 里的 trait 声明签名一致（注意那些 trait 的
 //! receiver 是**按值**的 `self`，不是 `&self`）：
 //!
 //! | derive | 方法 |
@@ -1064,7 +1064,7 @@ fn make_fn(
 /// 按值接收者。
 ///
 /// `Receiver::ty` 为 `None` 在 `receiver_ty` 里表示 `&self`（自动套一层引用），
-/// 而 `std/core.zr` 的 trait 方法要的是按值的 `self`，所以这里**必须**显式
+/// 而 `std/core/core.zr` 的 trait 方法要的是按值的 `self`，所以这里**必须**显式
 /// 写出 `Some(Self类型)`。
 fn receiver(self_ty: &Type) -> Receiver {
     Receiver {
@@ -1178,7 +1178,7 @@ fn is_named_like(ty: &Type) -> bool {
 /// `fn Type__debug(self) -> String`：把值渲染成 Rust 风格的 Debug 字符串。
 ///
 /// 生成的 `Type__debug` 是**自由函数**（与 `__eq` / `__hash` 一致），调用方
-/// 通过 `impl_targets` 路由到 `.debug()` 方法。返回 `String`（`std/string.zr`），
+/// 通过 `impl_targets` 路由到 `.debug()` 方法。返回 `String`（`std/alloc/string.zr`），
 /// 调用方用 `s.ptr` / `s.len` 读字节，或再交给 `String` 的其它方法。
 ///
 /// 字段渲染规则（与 Rust `{:?}` 对齐的常见形态）：
@@ -1599,8 +1599,8 @@ fn debug_pretty_value(e: Expression, ty: &Type, ind: Expression, span: Span) -> 
 ///   所以要在这里解引用还原（`*(__p as *const Type)`）；
 /// - `{:?}` 还是 `{:#?}` 是**运行期**由格式串里的 `#` 决定的，因此必须把
 ///   "走哪条"当参数传进来，不能在校验时写死；
-/// - 返回所需长度、由调用方提供缓冲区（而不是返回 `String`）：`std/io.zr`
-///   刻意保持"自足"（不依赖 `std/string.zr`），收发 `String` 会引入一条新依赖。
+/// - 返回所需长度、由调用方提供缓冲区（而不是返回 `String`）：`std/std/io.zr`
+///   刻意保持"自足"（不依赖 `std/alloc/string.zr`），收发 `String` 会引入一条新依赖。
 fn debug_fmt_fn(type_name: &str, self_ty: &Type, span: Span) -> Function {
     // `*(__p as *const Type)`：把传入的值指针还原成值。
     let deref_value = || {

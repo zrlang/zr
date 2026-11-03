@@ -5,10 +5,11 @@
 // 以及统一的错误报告机制。
 //=============================================================================
 
-use core::{Option, exit, panic};
+use core::{Option, panic};
 use collections::Vec;
 use string::String;
 use io::eprintln;
+use sys::exit;
 
 //=============================================================================
 // Error trait — 所有错误类型都应实现

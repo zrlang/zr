@@ -378,6 +378,13 @@ pub enum ExprKind {
     Throw(Box<HirExpr>),
     /// 数组字面量（元素按源码顺序保存）。
     Array(Vec<HirExpr>),
+    /// `[init; N]` 重复数组：保留重复形式而不展开成 N 个元素，避免大数组
+    /// （`[0; 65536]`）在类型检查阶段把 HIR 节点数爆到 O(N)、编译退化到
+    /// 分钟级。MIR 降级时按 `len` 发一个运行期循环填槽。
+    ArrayRepeat {
+        init: Box<HirExpr>,
+        len: usize,
+    },
     /// 元组字面量：各元素按源码顺序保存。
     Tuple(Vec<HirExpr>),
     /// 枚举变体构造：`Shape::Circle(5)`。

@@ -1,0 +1,141 @@
+//=============================================================================
+// tests/cases/137_tz.zr — std/tz：固定偏移 + 真实夏令时规则
+//
+// 钉住：
+//   - Asia/Shanghai 全年 +28800；Asia/Kolkata +19800
+//   - Europe/London 冬 0 / 夏 +3600；America/New_York 冬 -18000 / 夏 -14400
+//   - Australia/Sydney 1 月 +39600（南半球夏令时）/ 7 月 +36000
+//   - DST 边界的分钟级精度（EU 01:00 UTC、US 02:00 本地、Sydney 02:00/03:00 本地）
+//   - to_local / from_local 往返；未知时区按 UTC
+//
+// 全部必须在 -O0..-O3/-Oz 下编译并返回 0。
+//=============================================================================
+
+use time::{DateTime, civil_from_unix, unix_from_civil};
+use tz::{zone_exists, utc_offset_seconds, to_local, from_local};
+
+/// 构造一个 UTC 时刻的 Unix 秒。
+fn utc_at(y: i32, m: u8, d: u8, h: u8, mi: u8, s: u8) -> i64 {
+    return unix_from_civil(DateTime {
+        year: y, month: m, day: d,
+        hour: h, minute: mi, second: s,
+        weekday: 0, nanos: 0,
+    });
+}
+
+fn utc(y: i32, m: u8, d: u8) -> i64 {
+    return utc_at(y, m, d, 0, 0, 0);
+}
+
+fn main() -> i32 {
+    // 1) 已知时区名。
+    if !zone_exists("UTC") { return 1; }
+    if !zone_exists("Asia/Shanghai") { return 2; }
+    if !zone_exists("Europe/London") { return 3; }
+    if !zone_exists("Australia/Sydney") { return 4; }
+    if zone_exists("Mars/Base") { return 5; }
+
+    // 2) 无夏令时的固定偏移。
+    if utc_offset_seconds("Asia/Shanghai", utc(2024, 1, 15)) != 28800 { return 6; }
+    if utc_offset_seconds("Asia/Shanghai", utc(2024, 7, 15)) != 28800 { return 7; }
+    if utc_offset_seconds("Asia/Kolkata", utc(2024, 1, 15)) != 19800 { return 8; }
+    if utc_offset_seconds("Asia/Kolkata", utc(2024, 7, 15)) != 19800 { return 9; }
+    if utc_offset_seconds("Asia/Tokyo", utc(2024, 7, 15)) != 32400 { return 10; }
+
+    // 3) 北半球夏令时。
+    if utc_offset_seconds("Europe/London", utc(2024, 1, 15)) != 0 { return 11; }
+    if utc_offset_seconds("Europe/London", utc(2024, 7, 15)) != 3600 { return 12; }
+    if utc_offset_seconds("Europe/Berlin", utc(2024, 1, 15)) != 3600 { return 13; }
+    if utc_offset_seconds("Europe/Berlin", utc(2024, 7, 15)) != 7200 { return 14; }
+    if utc_offset_seconds("America/New_York", utc(2024, 1, 15)) != -18000 { return 15; }
+    if utc_offset_seconds("America/New_York", utc(2024, 7, 15)) != -14400 { return 16; }
+    if utc_offset_seconds("America/Los_Angeles", utc(2024, 1, 15)) != -28800 { return 17; }
+    if utc_offset_seconds("America/Los_Angeles", utc(2024, 7, 15)) != -25200 { return 18; }
+
+    // 4) 南半球夏令时（悉尼）。
+    if utc_offset_seconds("Australia/Sydney", utc(2024, 1, 15)) != 39600 { return 19; }
+    if utc_offset_seconds("Australia/Sydney", utc(2024, 7, 15)) != 36000 { return 20; }
+
+    // 5) EU 边界：3 月最后一个周日（2024-03-31）01:00 UTC 起切换。
+    if utc_offset_seconds("Europe/London", utc_at(2024, 3, 31, 0, 59, 59)) != 0 {
+        return 21;
+    }
+    if utc_offset_seconds("Europe/London", utc_at(2024, 3, 31, 1, 0, 0)) != 3600 {
+        return 22;
+    }
+    // 10 月最后一个周日（2024-10-27）01:00 UTC 止。
+    if utc_offset_seconds("Europe/London", utc_at(2024, 10, 27, 0, 59, 59)) != 3600 {
+        return 23;
+    }
+    if utc_offset_seconds("Europe/London", utc_at(2024, 10, 27, 1, 0, 0)) != 0 {
+        return 24;
+    }
+
+    // 6) US 边界：3 月第二个周日（2024-03-10）02:00 EST = 07:00 UTC 起。
+    if utc_offset_seconds("America/New_York", utc_at(2024, 3, 10, 6, 59, 59)) != -18000 {
+        return 25;
+    }
+    if utc_offset_seconds("America/New_York", utc_at(2024, 3, 10, 7, 0, 0)) != -14400 {
+        return 26;
+    }
+    // 11 月第一个周日（2024-11-03）02:00 EDT = 06:00 UTC 止。
+    if utc_offset_seconds("America/New_York", utc_at(2024, 11, 3, 5, 59, 59)) != -14400 {
+        return 27;
+    }
+    if utc_offset_seconds("America/New_York", utc_at(2024, 11, 3, 6, 0, 0)) != -18000 {
+        return 28;
+    }
+
+    // 7) Sydney 边界：10 月第一个周日（2024-10-06）02:00 AEST = 前一日 16:00 UTC 起。
+    if utc_offset_seconds("Australia/Sydney", utc_at(2024, 10, 5, 15, 59, 59)) != 36000 {
+        return 29;
+    }
+    if utc_offset_seconds("Australia/Sydney", utc_at(2024, 10, 5, 16, 0, 0)) != 39600 {
+        return 30;
+    }
+    // 4 月第一个周日（2024-04-07）03:00 AEDT = 前一日 16:00 UTC 止。
+    if utc_offset_seconds("Australia/Sydney", utc_at(2024, 4, 6, 15, 59, 59)) != 39600 {
+        return 31;
+    }
+    if utc_offset_seconds("Australia/Sydney", utc_at(2024, 4, 6, 16, 0, 0)) != 36000 {
+        return 32;
+    }
+
+    // 8) to_local：纪元时刻在上海是 1970-01-01 08:00。
+    let epoch = civil_from_unix(0);
+    let sh = to_local(epoch, "Asia/Shanghai");
+    if sh.year != 1970 || sh.month != 1 || sh.day != 1 { return 33; }
+    if sh.hour != 8 || sh.minute != 0 || sh.second != 0 { return 34; }
+    if unix_from_civil(sh) != 28800 { return 35; }
+
+    // 9) from_local 往返：Berlin 2024-07-15 00:00 UTC → 02:00 当地 → 回到原时刻。
+    let u = utc(2024, 7, 15);
+    let local = to_local(civil_from_unix(u), "Europe/Berlin");
+    if local.hour != 2 { return 36; }
+    let back = from_local(local, "Europe/Berlin");
+    if unix_from_civil(back) != u { return 37; }
+    if back.hour != 0 || back.day != 15 { return 38; }
+
+    // 上海往返（固定偏移）。
+    let sh_local = to_local(civil_from_unix(utc(2024, 7, 15)), "Asia/Shanghai");
+    if sh_local.hour != 8 { return 39; }
+    let sh_back = from_local(sh_local, "Asia/Shanghai");
+    if unix_from_civil(sh_back) != utc(2024, 7, 15) { return 40; }
+
+    // 纽约夏令时往返。
+    let ny_local = to_local(civil_from_unix(utc(2024, 7, 15)), "America/New_York");
+    if ny_local.hour != 20 || ny_local.day != 14 { return 41; }
+    let ny_back = from_local(ny_local, "America/New_York");
+    if unix_from_civil(ny_back) != utc(2024, 7, 15) { return 42; }
+
+    // 10) 未知时区按 UTC：偏移 0，转换是恒等。
+    let t = utc(2024, 7, 15);
+    let dt = civil_from_unix(t);
+    if utc_offset_seconds("Mars/Base", t) != 0 { return 43; }
+    let same = to_local(dt, "Mars/Base");
+    if unix_from_civil(same) != t { return 44; }
+    let same2 = from_local(dt, "Mars/Base");
+    if unix_from_civil(same2) != t { return 45; }
+
+    return 0;
+}

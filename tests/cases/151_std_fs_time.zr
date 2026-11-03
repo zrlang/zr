@@ -1,0 +1,129 @@
+// 151_std_fs_time.zr — std 层的 OS 抽象补充（fs / io / time）
+//
+// 对照 Rust `std`：
+//   fs::{create_dir_all, exists, is_dir, write_string, append_string,
+//        read_to_string, read_bytes, copy_file, read_dir, file_size}
+//   io::{File::read_line, File::read_to_string, File::write_string,
+//        stdout(), stdin(), stderr()}
+//   time::{Duration, Instant, sleep, DateTime 换算}
+
+use std::*;
+
+fn main() -> i32 {
+    //----- fs：目录与文件 -----------------------------------------------------
+    // 固定路径 + 先清理：若上一次运行留下残留，断言会被脏状态污染。
+    let base = "/tmp/zr_t151";
+    let sub = "/tmp/zr_t151/a/b";
+    let f1 = "/tmp/zr_t151/a/b/f.txt";
+    let f2 = "/tmp/zr_t151/a/b/c.txt";
+    remove_file(f1);
+    remove_file(f2);
+    remove_dir(sub);
+    remove_dir("/tmp/zr_t151/a");
+    remove_dir(base);
+
+    if !create_dir_all(sub) { return 1; }
+    if !exists(sub) { return 2; }
+    if !is_dir(sub) { return 3; }
+    if exists("/tmp/zr_t151/a/b/nope.txt") { return 4; }
+
+    if !write_string(f1, "hello") { return 5; }
+    if file_size(f1) != 5 { return 6; }
+    if !append_string(f1, "world") { return 7; }
+    if file_size(f1) != 10 { return 8; }
+
+    match read_to_string(f1) {
+        Option::Some(s) => { if s.len != 10 { return 9; } }
+        Option::None => { return 10; }
+    }
+    match read_bytes(f1) {
+        Option::Some(b) => { if b.len != 10 { return 11; } }
+        Option::None => { return 12; }
+    }
+
+    if !copy_file(f1, f2) { return 13; }
+    if file_size(f2) != 10 { return 14; }
+    let entries = read_dir(sub);
+    if entries.len != 2 { return 15; }
+    if read_dir_count(sub) != 2 { return 16; }
+
+    //----- io：按行读 / 写 String ---------------------------------------------
+    let mut f = File::open(f1, FILE_READ);
+    if !f.is_ok() { return 17; }
+    let mut buf: [u8; 64] = [0; 64];
+    let n = f.read_line(&mut buf[0] as *mut u8, 64);
+    if n != 10 { return 18; }
+    f.close();
+
+    let mut f2h = File::open(f1, FILE_READ);
+    if !f2h.is_ok() { return 19; }
+    let s = f2h.read_to_string();
+    if s.len != 10 { return 20; }
+    f2h.close();
+
+    let out = stdout();
+    let msg = String::from_bytes("stdout ok\n");
+    if out.write_string(&msg) != 10 { return 21; }
+
+    // stdin()/stderr() 只验证句柄可构造（读 stdin 会阻塞，不在此触发）。
+    let _in = stdin();
+    let _err = stderr();
+
+    //----- time：Duration / Instant -------------------------------------------
+    let d = Duration::from_secs(2);
+    if d.as_secs() != 2 { return 22; }
+    if d.subsec_nanos() != 0 { return 23; }
+    if d.as_millis() != 2000 { return 24; }
+    if d.as_micros() != 2000000 { return 25; }
+    if d.as_nanos() != 2000000000 { return 26; }
+    if d.is_zero() { return 27; }
+
+    let dm = Duration::from_millis(1500);
+    if dm.as_secs() != 1 { return 28; }
+    if dm.subsec_nanos() != 500000000 { return 29; }
+    let du = Duration::from_micros(250000);
+    if du.as_millis() != 250 { return 30; }
+    if !Duration::from_nanos(0).is_zero() { return 31; }
+
+    let start = Instant::now();
+    sleep(Duration::from_millis(3));
+    let spent = start.elapsed();
+    if spent.as_millis() < 3 { return 32; }
+    if spent.as_nanos() < 3000000 { return 33; }
+
+    //----- time：日历换算 -----------------------------------------------------
+    let dt = civil_from_unix(0);
+    if dt.year != 1970 { return 34; }
+    if dt.month != 1 { return 35; }
+    if dt.day != 1 { return 36; }
+    if dt.weekday != 4 { return 37; } // 1970-01-01 是周四
+    if unix_from_civil(dt) != 0 { return 38; }
+
+    let iso = format_iso(dt);
+    if iso.len != 20 { return 39; }
+    match parse_iso("1970-01-01T00:00:00Z") {
+        Option::Some(p) => {
+            if p.year != 1970 || p.month != 1 || p.day != 1 { return 40; }
+        }
+        Option::None => { return 41; }
+    }
+    match parse_iso("not-a-timestamp") {
+        Option::Some(_) => { return 42; }
+        Option::None => {}
+    }
+    if !is_leap(2000) { return 43; }
+    if is_leap(1900) { return 44; }
+    if days_in_month(2000, 2) != 29 { return 45; }
+    if days_in_month(1900, 2) != 28 { return 46; }
+    if civil_from_unix(-86400).year != 1969 { return 47; }
+
+    //----- 清理 ---------------------------------------------------------------
+    if !remove_file(f1) { return 48; }
+    if !remove_file(f2) { return 49; }
+    if !remove_dir(sub) { return 50; }
+    if !remove_dir("/tmp/zr_t151/a") { return 51; }
+    if !remove_dir(base) { return 52; }
+
+    println("151 fs time ok");
+    return 0;
+}

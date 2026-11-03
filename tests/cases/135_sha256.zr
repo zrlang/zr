@@ -1,0 +1,50 @@
+//=============================================================================
+// tests/cases/135_sha256.zr — SHA-256 正向回归（FIPS 180-4 向量）
+//
+// 覆盖：空串、单分组短串、"abc"、两分组长串（56 字节以上），以及
+// `sha256_hex_str` 与 `sha256_hex` 的一致性。
+//=============================================================================
+
+use sha256::{sha256_hex, sha256_hex_str};
+use string::String;
+
+/// 逐字节比较摘要与期望字面量。
+fn sha256_same(s: String, want: []const u8) -> bool {
+    if s.len != want.len { return false; }
+    let mut i: usize = 0;
+    while i < s.len {
+        if s.ptr[i] != want[i] { return false; }
+        i = i + 1;
+    }
+    return true;
+}
+
+fn main() -> i32 {
+    // --- 1) 标准向量 ---
+    if !sha256_same(sha256_hex(""), "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855") {
+        return 1;
+    }
+    if !sha256_same(sha256_hex("abc"), "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad") {
+        return 2;
+    }
+    if !sha256_same(
+        sha256_hex("abcdbcdecdefdefgefghfghighijhijkijkljklmklmnlmnomnopnopq"),
+        "248d6a61d20638b8e5c026930c3e6039a33ce45964ff2167f6ecedd419db06c1",
+    ) {
+        return 3;
+    }
+
+    // --- 2) 摘要长度固定为 64 字符 ---
+    if sha256_hex("").len != 64 { return 4; }
+    if sha256_hex("abc").len != 64 { return 5; }
+
+    // --- 3) `sha256_hex_str` 与 `sha256_hex` 一致 ---
+    if !sha256_same(sha256_hex_str("abc"), "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad") {
+        return 6;
+    }
+    if !sha256_same(sha256_hex_str(""), "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855") {
+        return 7;
+    }
+
+    return 0;
+}

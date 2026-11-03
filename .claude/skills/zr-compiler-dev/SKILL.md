@@ -90,14 +90,14 @@ lexer(token) → parser → typeck → mir → ssa → codegen → std/ → test
 4. **`src/mir/`、`src/ssa/`** — 降级与 SSA 构造。
 5. **`src/codegen/`** — 6 个后端都要动（x86-64/aarch64/arm/thumb/riscv/wasm），
    或用 `mod.rs` 里的 `unsupported_*` 辅助函数让其余后端明确报错。
-6. **`std/`** — 标准库 API（19 个模块，`.zr` 源文件，编译器自编译）。
+6. **`std/`** — 标准库 API（29 个模块，`.zr` 源文件，编译器自编译）。
 7. **`tests/cases/`** — 新增自检用例，编号顺延。
 
 ## 5. 避坑清单（都真实触发过）
 
 **`Ty::Infer(InferId(0))` 不是哨兵，是活的推断变量。**
 大文件里它会被绑定掉，拿它当"未知类型"返回值会让 `subtype` resolve 出旧值，
-报出完全无中生有的错。曾导致 `std/io.zr` 报 `expected (), found u8`，
+报出完全无中生有的错。曾导致 `std/std/io.zr` 报 `expected (), found u8`，
 且报错位置与真实问题无关。类型不一致时返回 `Unit` 或显式报错，
 **绝不复用已有 InferId。**
 

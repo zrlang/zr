@@ -1,0 +1,124 @@
+//=============================================================================
+// tests/cases/136_time.zr — std/time：日历换算 / 格式化 / 时钟
+//
+// 钉住：
+//   - `civil_from_unix(0)` = 1970-01-01（周四），`unix_from_civil` 往返
+//   - `civil_from_unix(1700000000)` = 2023-11-14T22:13:20Z
+//   - 负秒（纪元之前）也正确：-1 → 1969-12-31T23:59:59（周三）
+//   - 闰年判定（2000/2024 闰，1900 不闰）与每月天数
+//   - `format_iso` 长度 20、首字节 '1' / '2'
+//   - `parse_iso` 往返、月份 / 日期越界返回 None
+//   - `sleep_ms` 后 `monotonic_ns` 递增；`unix_secs` 是合理的当前时间
+//
+// 全部必须在 -O0..-O3/-Oz 下编译并返回 0。
+//=============================================================================
+
+use core::Option;
+use time::{civil_from_unix, unix_from_civil, is_leap, days_in_month,
+           format_iso, parse_iso, monotonic_ns, sleep_ms, unix_secs, unix_ns, now_ms};
+
+fn main() -> i32 {
+    // 1) 纪元：1970-01-01 00:00:00 UTC，周四。
+    let dt0 = civil_from_unix(0);
+    if dt0.year != 1970 { return 1; }
+    if dt0.month != 1 { return 2; }
+    if dt0.day != 1 { return 3; }
+    if dt0.hour != 0 { return 4; }
+    if dt0.minute != 0 { return 5; }
+    if dt0.second != 0 { return 6; }
+    if dt0.weekday != 4 { return 7; }       // 0 = 周日，4 = 周四
+    if unix_from_civil(dt0) != 0 { return 8; }
+
+    // 2) 已知时刻：1700000000 = 2023-11-14T22:13:20Z（周二）。
+    let dt1 = civil_from_unix(1700000000);
+    if dt1.year != 2023 { return 9; }
+    if dt1.month != 11 { return 10; }
+    if dt1.day != 14 { return 11; }
+    if dt1.hour != 22 { return 12; }
+    if dt1.minute != 13 { return 13; }
+    if dt1.second != 20 { return 14; }
+    if dt1.weekday != 2 { return 15; }
+    if unix_from_civil(dt1) != 1700000000 { return 16; }
+
+    // 3) 负秒：1969-12-31T23:59:59（周三）。
+    let dtneg = civil_from_unix(-1);
+    if dtneg.year != 1969 { return 17; }
+    if dtneg.month != 12 { return 18; }
+    if dtneg.day != 31 { return 19; }
+    if dtneg.hour != 23 { return 20; }
+    if dtneg.minute != 59 { return 21; }
+    if dtneg.second != 59 { return 22; }
+    if dtneg.weekday != 3 { return 23; }
+    if unix_from_civil(dtneg) != -1 { return 24; }
+    let dtneg2 = civil_from_unix(-86400);
+    if dtneg2.year != 1969 || dtneg2.month != 12 || dtneg2.day != 31 {
+        return 25;
+    }
+    if unix_from_civil(dtneg2) != -86400 { return 26; }
+
+    // 4) 闰年与每月天数。
+    if !is_leap(2000) { return 27; }
+    if !is_leap(2024) { return 28; }
+    if is_leap(1900) { return 29; }
+    if is_leap(2023) { return 30; }
+    if days_in_month(2024, 2) != 29 { return 31; }
+    if days_in_month(2000, 2) != 29 { return 32; }
+    if days_in_month(1900, 2) != 28 { return 33; }
+    if days_in_month(2023, 4) != 30 { return 34; }
+    if days_in_month(2023, 12) != 31 { return 35; }
+
+    // 5) format_iso：长度 20，'YYYY-MM-DDTHH:MM:SSZ'。
+    let iso0 = format_iso(dt0);
+    if iso0.len() != 20 { return 36; }
+    let b0 = iso0.as_bytes();
+    if b0.ptr[0] != 49 { return 37; }        // '1'
+    if b0.ptr[4] != 45 { return 38; }        // '-'
+    if b0.ptr[10] != 84 { return 39; }       // 'T'
+    if b0.ptr[19] != 90 { return 40; }       // 'Z'
+    let iso1 = format_iso(dt1);
+    if iso1.len() != 20 { return 41; }
+    let b1 = iso1.as_bytes();
+    if b1.ptr[0] != 50 { return 42; }        // '2'
+    if b1.ptr[19] != 90 { return 43; }
+
+    // 6) parse_iso 往返。
+    match parse_iso("2023-11-14T22:13:20Z") {
+        Option::Some(d) => {
+            if unix_from_civil(d) != 1700000000 { return 45; }
+            if d.weekday != 2 { return 46; }
+            if format_iso(d).len() != 20 { return 47; }
+        },
+        Option::None => { return 44; },
+    }
+
+    // 7) 越界：13 月、2 月 30 日、非数字、长度不对都返回 None。
+    match parse_iso("2023-13-01T00:00:00Z") {
+        Option::Some(_) => { return 48; },
+        Option::None => {},
+    }
+    match parse_iso("2023-02-30T00:00:00Z") {
+        Option::Some(_) => { return 49; },
+        Option::None => {},
+    }
+    match parse_iso("2023-11-14T22:13:2XZ") {
+        Option::Some(_) => { return 50; },
+        Option::None => {},
+    }
+    match parse_iso("2023-11-14") {
+        Option::Some(_) => { return 51; },
+        Option::None => {},
+    }
+
+    // 8) 时钟：sleep 后单调时钟必须前进。
+    let t0 = monotonic_ns();
+    sleep_ms(10);
+    let t1 = monotonic_ns();
+    if t1 <= t0 { return 52; }
+
+    // 9) 墙上时钟：现在一定晚于 2023-11-14（1700000000 秒）。
+    if unix_secs() <= 1700000000 { return 53; }
+    if now_ms() <= 1700000000000 { return 54; }
+    if unix_ns() <= 1700000000000000000 { return 55; }
+
+    return 0;
+}

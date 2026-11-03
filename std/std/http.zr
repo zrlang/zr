@@ -1,0 +1,872 @@
+//=============================================================================
+// std/http.zr — HTTP/1.1 客户端与纯解析层
+//
+// 分两层：
+//   - 纯解析层：`url_parse` / `http_build_request` / `http_parse_response`，
+//     不碰网络，可直接单测；
+//   - 网络层：`http_get` 通过 `net::tcp_connect` 建连，发请求、读到对端关闭，
+//     再把原始字节交给解析层。
+//
+// 设计参考：
+// - Rust 的 `http` crate 把 Request / Response 的报文编解码与传输分开；
+// - Zig std.http 的 Client 同样保留"纯字节解析"入口，便于离线测试。
+//
+// 已知限制：
+// - 传输层只支持明文 `http://`；`https://` 能解析但请求会返回
+//   `TlsNotSupported`（TLS 在可选模块 `std/tls.zr`，见该模块文档）；
+// - 不支持 HTTP/2、代理；重定向最多跟随 5 次（301/302/303/307/308）。
+// - URL 只解析 `http://host[:port][/path]`，path 含查询串，host 里不处理
+//   userinfo / IPv6 字面量；
+// - `HttpResponse.reason` 与 `headers[*]` 都是**指向 `raw` 的切片**，调用方
+//   必须保证 `raw` 在响应对象使用期间存活（`http_get` 里由 `Vec<u8>` 持有）。
+//
+// 为什么没有直接 `use net::tcp_connect`：`std/net.zr` 里已经定义了
+// `HttpResponse` / `HttpHeader` / `http_get`。zr 的模块符号是**扁平**的，
+// 一旦加载 net，这几个同名条目会先占住符号表，本模块的 `HttpResponse` 就解析
+// 成 net 的结构体（字段是 `status` 而不是 `code`），整个解析层无法使用。
+// 这里改为直接声明运行时的那几个套接字封装（与 net.zr 里同一组 `zr_*` 符号），
+// 在内部做一个最小的 IPv4 TCP 客户端；对外 API 不受影响。
+//=============================================================================
+
+use core::Result;
+use string::String;
+use collections::Vec;
+use net::SockAddrStorage;
+
+//=============================================================================
+// 外部运行时（与 std/net.zr 使用的是同一组 `zr_*` 套接字封装）
+//=============================================================================
+
+extern "C" {
+    fn zr_socket(domain: i32, sock_type: i32, protocol: i32) -> i32;
+    fn zr_connect(fd: i32, addr: *const SockAddrStorage, addrlen: u32) -> i32;
+    fn zr_send(fd: i32, buf: *const u8, len: usize, flags: i32) -> isize;
+    fn zr_recv(fd: i32, buf: *mut u8, len: usize, flags: i32) -> isize;
+    fn zr_close(fd: i32) -> i32;
+    fn zr_htons(hostshort: u16) -> u16;
+}
+
+// TLS 不在本模块：TLS 后端放在可选模块 `std/tls.zr`（纯 ZR 实现，零外部依赖）。
+// 只有显式 `use tls::...` 的程序才承担 TLS 模块的代码体积代价。
+
+//=============================================================================
+// 公开类型
+//=============================================================================
+
+/// 解析后的 URL。
+pub struct Url {
+    /// 协议，目前恒为 `"http"`。
+    pub scheme: str,
+    /// 主机名或点分十进制 IPv4。
+    pub host:   str,
+    /// 端口，省略时默认 80。
+    pub port:   u16,
+    /// 请求路径（含查询串），省略时默认 `"/"`。
+    pub path:   str,
+}
+
+/// HTTP 客户端错误。
+pub enum HttpError {
+    /// URL 语法不合法。
+    BadUrl,
+    /// 响应报文不合法（缺状态行、头未闭合、块长度非法等）。
+    BadResponse,
+    /// 网络层失败（建连、读、写）。
+    Network,
+    /// TLS / HTTPS 不可用（本模块不提供加密传输层）。
+    TlsNotSupported,
+}
+
+/// 一个响应头。`name` / `value` 指向原始响应文本，已去掉首尾空白。
+pub struct HttpHeader {
+    pub name:  str,
+    pub value: str,
+}
+
+/// 一个 HTTP 响应。`reason` / `headers` 指向原始响应文本。
+pub struct HttpResponse {
+    /// 状态码。
+    pub code:    u16,
+    /// 原因短语（如 `"OK"`）。
+    pub reason:  str,
+    /// 全部响应头（按报文顺序）。
+    pub headers: Vec<HttpHeader>,
+    /// 响应体（已按 Content-Length 或 chunked 解码）。
+    pub body:    Vec<u8>,
+    /// 字符串所有权池。HTTP/2 的 HPACK 解码结果存放在这里，`headers` 里的
+    /// `str` 指针指向这些 `String` 各自的堆缓冲（`Vec<String>` 扩容只会移动
+    /// `String` 结构体，不会移动其堆缓冲），所以只要响应对象还活着，指针就有效。
+    /// HTTP/1.1 路径（头字段直接指向原始报文）为空。
+    pub strings: Vec<String>,
+}
+
+//=============================================================================
+// 小工具（全部带 `http_` 前缀：模块内所有自由函数落在同一个扁平命名空间）
+//=============================================================================
+
+fn http_is_digit(c: u8) -> bool {
+    return c >= 48 && c <= 57;
+}
+
+fn http_is_ws(c: u8) -> bool {
+    return c == 32 || c == 9;
+}
+
+/// 取 `[start, end)` 并去掉首尾空格 / 制表符，越界安全截断。
+fn http_trim(raw: []const u8, start: usize, end: usize) -> []const u8 {
+    let mut lo = start;
+    let mut hi = end;
+    if hi > raw.len { hi = raw.len; }
+    if lo > hi { lo = hi; }
+    while lo < hi && http_is_ws(raw.ptr[lo]) {
+        lo = lo + 1;
+    }
+    while hi > lo && http_is_ws(raw.ptr[hi - 1]) {
+        hi = hi - 1;
+    }
+    return raw[lo..hi];
+}
+
+/// 两个字节切片是否忽略 ASCII 大小写相等。
+fn http_eq_ci(a: []const u8, b: []const u8) -> bool {
+    if a.len != b.len {
+        return false;
+    }
+    let mut i = 0;
+    while i < a.len {
+        let mut ca = a.ptr[i];
+        let mut cb = b.ptr[i];
+        if ca >= 65 && ca <= 90 { ca = ca + 32; }
+        if cb >= 65 && cb <= 90 { cb = cb + 32; }
+        if ca != cb {
+            return false;
+        }
+        i = i + 1;
+    }
+    return true;
+}
+
+/// `hay` 是否包含 `needle`（忽略 ASCII 大小写）。
+fn http_contains_ci(hay: []const u8, needle: []const u8) -> bool {
+    if needle.len == 0 {
+        return true;
+    }
+    if needle.len > hay.len {
+        return false;
+    }
+    let mut i = 0;
+    while i <= hay.len - needle.len {
+        if http_eq_ci(hay[i..i + needle.len], needle) {
+            return true;
+        }
+        i = i + 1;
+    }
+    return false;
+}
+
+/// `url` 是否以 `prefix` 开头（忽略 ASCII 大小写）。
+fn http_starts_ci(url: str, prefix: str) -> bool {
+    if prefix.len > url.len {
+        return false;
+    }
+    let mut i = 0;
+    while i < prefix.len {
+        let mut ca = url.ptr[i];
+        let mut cb = prefix.ptr[i];
+        if ca >= 65 && ca <= 90 { ca = ca + 32; }
+        if cb >= 65 && cb <= 90 { cb = cb + 32; }
+        if ca != cb {
+            return false;
+        }
+        i = i + 1;
+    }
+    return true;
+}
+
+/// 在 `[start, limit)` 内找行尾（CR 或 LF），找不到返回 `limit`。
+fn http_line_end(raw: []const u8, start: usize, limit: usize) -> usize {
+    let mut i = start;
+    let mut end = limit;
+    if end > raw.len { end = raw.len; }
+    while i < end {
+        if raw.ptr[i] == 13 || raw.ptr[i] == 10 {
+            return i;
+        }
+        i = i + 1;
+    }
+    return end;
+}
+
+/// 从行尾索引跳到下一行开头（兼容 CRLF / LF）。
+fn http_next_line(raw: []const u8, line_end: usize) -> usize {
+    if line_end >= raw.len {
+        return raw.len;
+    }
+    if raw.ptr[line_end] == 13 {
+        if line_end + 1 < raw.len && raw.ptr[line_end + 1] == 10 {
+            return line_end + 2;
+        }
+        return line_end + 1;
+    }
+    return line_end + 1;
+}
+
+/// 定位头块结束的 `\r\n\r\n` 首字节；找不到返回 `raw.len`。
+fn http_find_header_end(raw: []const u8) -> usize {
+    let mut i = 0;
+    while i + 3 < raw.len {
+        if raw.ptr[i] == 13
+            && raw.ptr[i + 1] == 10
+            && raw.ptr[i + 2] == 13
+            && raw.ptr[i + 3] == 10 {
+            return i;
+        }
+        i = i + 1;
+    }
+    return raw.len;
+}
+
+/// 十进制无符号解析；非法返回 -1。
+fn http_parse_dec(s: []const u8) -> i64 {
+    if s.len == 0 {
+        return -1;
+    }
+    let mut value: i64 = 0;
+    let mut i = 0;
+    while i < s.len {
+        let c = s.ptr[i];
+        if !http_is_digit(c) {
+            return -1;
+        }
+        value = value * 10 + (c - 48) as i64;
+        // Content-Length 不可能接近 2^63；超过就按非法处理，避免回绕。
+        if value > 9000000000000000000 {
+            return -1;
+        }
+        i = i + 1;
+    }
+    return value;
+}
+
+/// 单个十六进制字符的数值；非法返回 -1。
+fn http_hex_val(c: u8) -> i32 {
+    if c >= 48 && c <= 57 {
+        return (c - 48) as i32;
+    }
+    if c >= 97 && c <= 102 {
+        return (c - 97 + 10) as i32;
+    }
+    if c >= 65 && c <= 70 {
+        return (c - 65 + 10) as i32;
+    }
+    return -1;
+}
+
+/// 解码 `Transfer-Encoding: chunked` 的正文。
+///
+/// 支持十六进制块长度、块扩展（`;...`，忽略）、块间 CRLF，以及结束块
+/// `0\r\n\r\n`（其后的 trailer 头也会被跳过）。
+fn http_parse_chunked(raw: []const u8, start: usize) -> Result<Vec<u8>, HttpError> {
+    let mut body: Vec<u8> = Vec::new();
+    let mut pos = start;
+    loop {
+        if pos >= raw.len {
+            return Result::Err(HttpError::BadResponse);
+        }
+        let line_end = http_line_end(raw, pos, raw.len);
+        if line_end >= raw.len || line_end + 1 >= raw.len {
+            return Result::Err(HttpError::BadResponse);
+        }
+
+        // 块长度：十六进制数字，遇到 ';'（扩展）或空白就停。
+        let mut q = pos;
+        let mut size: usize = 0;
+        let mut any = false;
+        while q < line_end {
+            let c = raw.ptr[q];
+            if c == 59 || http_is_ws(c) {
+                break;
+            }
+            let d = http_hex_val(c);
+            if d < 0 {
+                return Result::Err(HttpError::BadResponse);
+            }
+            size = size * 16 + (d as usize);
+            any = true;
+            q = q + 1;
+        }
+        if !any {
+            return Result::Err(HttpError::BadResponse);
+        }
+
+        let mut data_start = http_next_line(raw, line_end);
+        if size == 0 {
+            // 结束块：吞掉 trailer 行，直到空行或数据耗尽。
+            loop {
+                if data_start >= raw.len {
+                    break;
+                }
+                let te = http_line_end(raw, data_start, raw.len);
+                if te >= raw.len || te == data_start {
+                    break;
+                }
+                data_start = http_next_line(raw, te);
+            }
+            break;
+        }
+
+        if data_start >= raw.len || size > raw.len - data_start {
+            return Result::Err(HttpError::BadResponse);
+        }
+        let mut k = 0;
+        while k < size {
+            body.push(raw.ptr[data_start + k]);
+            k = k + 1;
+        }
+        pos = data_start + size;
+
+        // 块数据后必须跟 CRLF。
+        if pos + 1 >= raw.len || raw.ptr[pos] != 13 || raw.ptr[pos + 1] != 10 {
+            return Result::Err(HttpError::BadResponse);
+        }
+        pos = pos + 2;
+    }
+    return Result::Ok(body);
+}
+
+//=============================================================================
+// URL 解析
+//=============================================================================
+
+/// 解析 `http://host[:port][/path]` 或 `https://host[:port][/path]`。
+///
+/// - 协议必须是 `http` 或 `https`（大小写不敏感）；
+/// - `http` 缺省端口 80，`https` 缺省端口 443；
+/// - 缺省路径 `"/"`；
+/// - host 为空、端口非数字或越界、整体不是以 `http(s)://` 开头都返回 `BadUrl`。
+pub fn url_parse(url: str) -> Result<Url, HttpError> {
+    // 判断是 http:// 还是 https://
+    let mut is_https = false;
+    let mut scheme_len: usize = 4;  // "http"
+    let mut scheme_prefix_len: usize = 7;  // "http://"
+    let mut default_port: u16 = 80;
+
+    if url.len >= 8 && http_starts_ci(url, "https://") {
+        is_https = true;
+        scheme_len = 5;  // "https"
+        scheme_prefix_len = 8;  // "https://"
+        default_port = 443;
+    } else if url.len >= 7 && http_starts_ci(url, "http://") {
+        // 保持 http 默认值
+    } else {
+        return Result::Err(HttpError::BadUrl);
+    }
+
+    let mut auth_end = url.len;
+    let mut i: usize = scheme_prefix_len;
+    while i < url.len {
+        if url.ptr[i] == 47 { // '/'
+            auth_end = i;
+            break;
+        }
+        i = i + 1;
+    }
+
+    // authority 里找端口分隔符。
+    let mut colon = auth_end;
+    let mut j: usize = scheme_prefix_len;
+    while j < auth_end {
+        if url.ptr[j] == 58 { // ':'
+            colon = j;
+            break;
+        }
+        j = j + 1;
+    }
+
+    let mut host_end = auth_end;
+    let mut port: u16 = default_port;
+    if colon < auth_end {
+        host_end = colon;
+        if colon + 1 >= auth_end {
+            return Result::Err(HttpError::BadUrl);
+        }
+        let mut k = colon + 1;
+        let mut value: u32 = 0;
+        while k < auth_end {
+            if !http_is_digit(url.ptr[k]) {
+                return Result::Err(HttpError::BadUrl);
+            }
+            value = value * 10 + (url.ptr[k] - 48) as u32;
+            if value > 65535 {
+                return Result::Err(HttpError::BadUrl);
+            }
+            k = k + 1;
+        }
+        port = value as u16;
+    }
+
+    if host_end <= scheme_prefix_len {
+        return Result::Err(HttpError::BadUrl);
+    }
+
+    let host = url[scheme_prefix_len..host_end];
+    let path = if auth_end < url.len { url[auth_end..url.len] } else { "/" };
+    let scheme = url[0..scheme_len];
+    return Result::Ok(Url {
+        scheme: scheme,
+        host:   host,
+        port:   port,
+        path:   path,
+    });
+}
+
+//=============================================================================
+// 请求构造
+//=============================================================================
+
+/// 构造一个 HTTP/1.1 请求报文。
+///
+/// 顺序固定为：请求行、`Host`、自定义头（按给定顺序）、`Content-Length`、
+/// 空行、正文。`Content-Length` 始终按 `body.len` 输出（含 0）。
+pub fn http_build_request(
+    method:  str,
+    host:    str,
+    path:    str,
+    headers: []const HttpHeader,
+    body:    []const u8,
+) -> String {
+    let mut out = String::new();
+    out.push_bytes(method);
+    out.push_byte(32);
+    out.push_bytes(path);
+    out.push_bytes(" HTTP/1.1\r\nHost: ");
+    out.push_bytes(host);
+    out.push_bytes("\r\n");
+
+    let mut i = 0;
+    while i < headers.len {
+        let h = headers[i];
+        out.push_bytes(h.name);
+        out.push_bytes(": ");
+        out.push_bytes(h.value);
+        out.push_bytes("\r\n");
+        i = i + 1;
+    }
+
+    out.push_bytes("Content-Length: ");
+    out.push_uint(body.len as u64);
+    out.push_bytes("\r\n\r\n");
+
+    let mut j = 0;
+    while j < body.len {
+        out.push_byte(body.ptr[j]);
+        j = j + 1;
+    }
+    return out;
+}
+
+//=============================================================================
+// 响应解析
+//=============================================================================
+
+/// 解析原始响应字节。
+///
+/// - 状态行必须形如 `HTTP/1.x NNN reason`；
+/// - 头字段按 `name: value` 切分，name 大小写不敏感；
+/// - `Transfer-Encoding` 含 `chunked` 时按块解码；
+/// - 有 `Content-Length` 时按其长度截取（不足视为坏响应）；
+/// - 两者都没有时读到 `raw` 末尾。
+pub fn http_parse_response(raw: []const u8) -> Result<HttpResponse, HttpError> {
+    let header_end = http_find_header_end(raw);
+    if header_end >= raw.len {
+        return Result::Err(HttpError::BadResponse);
+    }
+
+    // 状态行：`HTTP/1.1 200 OK`。
+    let status_end = http_line_end(raw, 0, header_end + 1);
+    if status_end >= raw.len || raw.ptr[status_end] != 13 {
+        return Result::Err(HttpError::BadResponse);
+    }
+    if status_end < 5
+        || raw.ptr[0] != 72 || raw.ptr[1] != 84
+        || raw.ptr[2] != 84 || raw.ptr[3] != 80
+        || raw.ptr[4] != 47 {
+        return Result::Err(HttpError::BadResponse);
+    }
+    let mut p: usize = 5;
+    while p < status_end && raw.ptr[p] != 32 {
+        p = p + 1;
+    }
+    if p + 1 >= status_end {
+        return Result::Err(HttpError::BadResponse);
+    }
+    p = p + 1;
+    let code_start = p;
+    let mut code: u16 = 0;
+    while p < status_end && http_is_digit(raw.ptr[p]) {
+        code = code * 10 + (raw.ptr[p] - 48) as u16;
+        p = p + 1;
+    }
+    if p - code_start != 3 {
+        return Result::Err(HttpError::BadResponse);
+    }
+    let reason_start = if p < status_end && raw.ptr[p] == 32 { p + 1 } else { p };
+    let reason = http_trim(raw, reason_start, status_end);
+
+    // 逐个解析头。
+    let mut headers: Vec<HttpHeader> = Vec::new();
+    let mut content_len: i64 = -1;
+    let mut chunked = false;
+    let mut pos = http_next_line(raw, status_end);
+    while pos < header_end {
+        let line_end = http_line_end(raw, pos, header_end);
+        if line_end <= pos {
+            break;
+        }
+        let mut colon = pos;
+        while colon < line_end && raw.ptr[colon] != 58 {
+            colon = colon + 1;
+        }
+        if colon < line_end {
+            let name = http_trim(raw, pos, colon);
+            let value = http_trim(raw, colon + 1, line_end);
+            if name.len > 0 {
+                if http_eq_ci(name, "content-length") {
+                    let n = http_parse_dec(value);
+                    if n < 0 {
+                        return Result::Err(HttpError::BadResponse);
+                    }
+                    content_len = n;
+                } else if http_eq_ci(name, "transfer-encoding")
+                    && http_contains_ci(value, "chunked") {
+                    chunked = true;
+                }
+                headers.push(HttpHeader { name: name, value: value });
+            }
+        }
+        pos = http_next_line(raw, line_end);
+    }
+
+    // 正文。
+    let body_start = header_end + 4;
+    let mut body: Vec<u8> = Vec::new();
+    if chunked {
+        let decoded = http_parse_chunked(raw, body_start);
+        body = match decoded {
+            Result::Ok(v) => v,
+            Result::Err(e) => {
+                return Result::Err(e);
+            }
+        };
+    } else if content_len >= 0 {
+        let want = content_len as usize;
+        if want > raw.len - body_start {
+            return Result::Err(HttpError::BadResponse);
+        }
+        let mut i = 0;
+        while i < want {
+            body.push(raw.ptr[body_start + i]);
+            i = i + 1;
+        }
+    } else {
+        let mut i = body_start;
+        while i < raw.len {
+            body.push(raw.ptr[i]);
+            i = i + 1;
+        }
+    }
+
+    return Result::Ok(HttpResponse {
+        code:    code,
+        reason:  reason,
+        headers: headers,
+        body:    body,
+        strings: Vec::new(),
+    });
+}
+
+//=============================================================================
+// 网络层
+//=============================================================================
+
+/// 把点分十进制 IPv4 写进 `out[0..4]`；非法返回 false。
+fn http_parse_ipv4(host: str, out: *mut u8) -> bool {
+    let mut part: usize = 0;
+    let mut cur: u32 = 0;
+    let mut digits: usize = 0;
+    let mut i: usize = 0;
+    while i < host.len {
+        let c = host.ptr[i];
+        if http_is_digit(c) {
+            cur = cur * 10 + (c - 48) as u32;
+            digits = digits + 1;
+            if cur > 255 || digits > 3 {
+                return false;
+            }
+        } else if c == 46 { // '.'
+            if part >= 3 || digits == 0 {
+                return false;
+            }
+            out[part] = cur as u8;
+            part = part + 1;
+            cur = 0;
+            digits = 0;
+        } else {
+            return false;
+        }
+        i = i + 1;
+    }
+    if part != 3 || digits == 0 {
+        return false;
+    }
+    out[3] = cur as u8;
+    return true;
+}
+
+/// 建一个 IPv4 TCP 连接，成功返回 fd，失败返回 -1。
+fn http_tcp_connect(host: str, port: u16) -> i32 {
+    let mut octets: [u8; 4] = [0; 4];
+    if !http_parse_ipv4(host, &mut octets[0] as *mut u8) {
+        return -1;
+    }
+    let fd = zr_socket(2, 1, 0); // AF_INET, SOCK_STREAM, IPPROTO_IP
+    if fd < 0 {
+        return -1;
+    }
+    let mut addr = SockAddrStorage {
+        family: 2,
+        _pad0:  0,
+        port:   zr_htons(port),
+        addr:   [0; 24],
+    };
+    let mut k: usize = 0;
+    while k < 4 {
+        addr.addr[k] = octets[k];
+        k = k + 1;
+    }
+    if zr_connect(fd, &addr, 16) < 0 {
+        zr_close(fd);
+        return -1;
+    }
+    return fd;
+}
+
+//=============================================================================
+// 明文 TCP 传输
+//=============================================================================
+
+/// 用纯 TCP（无 TLS）发送请求、读回原始响应字节。
+fn http_plain_send_recv(fd: i32, request_bytes: []const u8) -> Result<Vec<u8>, HttpError> {
+    let mut sent: usize = 0;
+    while sent < request_bytes.len {
+        let n = zr_send(fd, &request_bytes.ptr[sent] as *const u8, request_bytes.len - sent, 0);
+        if n <= 0 {
+            zr_close(fd);
+            return Result::Err(HttpError::Network);
+        }
+        sent = sent + n as usize;
+    }
+
+    let mut raw: Vec<u8> = Vec::new();
+    let mut buf: [u8; 4096] = [0; 4096];
+    loop {
+        let n = zr_recv(fd, &mut buf[0] as *mut u8, 4096, 0);
+        if n < 0 {
+            zr_close(fd);
+            return Result::Err(HttpError::Network);
+        }
+        if n == 0 {
+            break;
+        }
+        let mut i = 0;
+        while i < n as usize {
+            raw.push(buf[i]);
+            i = i + 1;
+        }
+    }
+    zr_close(fd);
+    return Result::Ok(raw);
+}
+
+//=============================================================================
+// 重定向与通用请求逻辑
+//=============================================================================
+
+/// 在响应头里按名称找值（忽略 ASCII 大小写）。找不到返回 None。
+pub fn http_find_header_value(headers: []const HttpHeader, name: str) -> Option<str> {
+    let mut i = 0;
+    while i < headers.len {
+        if http_eq_ci(headers[i].name, name) {
+            return Option::Some(headers[i].value);
+        }
+        i = i + 1;
+    }
+    return Option::None;
+}
+
+/// 把 Location header 的值解析为完整 URL。
+/// - 绝对 URL（以 http:// 或 https:// 开头）直接返回；
+/// - 相对路径则把原 URL 的 scheme://host[:port] 作为前缀。
+pub fn http_resolve_redirect(original_scheme: str, original_host: str, original_port: u16, location: str) -> String {
+    // 先判断是不是绝对 URL
+    let is_absolute = http_starts_ci(location, "http://") || http_starts_ci(location, "https://");
+
+    if is_absolute {
+        // 直接拷贝 location 为新的 String
+        return String::from_bytes(location);
+    }
+
+    // 相对路径：拼接 scheme://host[:port] + location
+    let mut out = String::new();
+    out.push_bytes(original_scheme);
+    out.push_bytes("://");
+    out.push_bytes(original_host);
+
+    // 只有非默认端口才显式写出
+    let is_default = (http_eq_ci(original_scheme, "http") && original_port == 80)
+                  || (http_eq_ci(original_scheme, "https") && original_port == 443);
+    if !is_default {
+        out.push_byte(58); // ':'
+        out.push_uint(original_port as u64);
+    }
+
+    out.push_bytes(location);
+    return out;
+}
+
+/// 通用 HTTP 请求实现：解析 URL、按 scheme 选择明文 / TLS、构造请求、
+/// 发送-接收-解析，然后按重定向响应码循环（最多 `follow_redirects` 次）。
+fn http_do_method(
+    method: str,
+    url: str,
+    body: []const u8,
+    headers: []const HttpHeader,
+    follow_redirects: i32,
+) -> Result<HttpResponse, HttpError> {
+    // 初始 URL
+    let mut current_url = String::from_bytes(url);
+    let mut current_method = String::from_bytes(method);
+    let mut current_body = String::from_bytes(body);
+    let mut remaining = follow_redirects;
+
+    loop {
+        let parsed = match url_parse(current_url.as_bytes()) {
+            Result::Ok(u) => u,
+            Result::Err(e) => {
+                return Result::Err(e);
+            }
+        };
+
+        let req = http_build_request(
+            current_method.as_bytes(),
+            parsed.host,
+            parsed.path,
+            headers,
+            current_body.as_bytes(),
+        );
+
+        let req_bytes = req.as_bytes();
+
+        // `https://` 的 URL 本身合法（默认端口 443），但明文模块不提供传输层：
+        // 需要 TLS 的程序改用 `std/tls.zr`（纯 ZR TLS 后端，零外部依赖）。
+        if http_eq_ci(parsed.scheme, "https") {
+            return Result::Err(HttpError::TlsNotSupported);
+        }
+        let fd = http_tcp_connect(parsed.host, parsed.port);
+        if fd < 0 {
+            return Result::Err(HttpError::Network);
+        }
+        let raw = match http_plain_send_recv(fd, req_bytes) {
+            Result::Ok(v) => v,
+            Result::Err(e) => {
+                return Result::Err(e);
+            }
+        };
+
+        let response = match http_parse_response(raw.as_slice()) {
+            Result::Ok(r) => r,
+            Result::Err(e) => {
+                return Result::Err(e);
+            }
+        };
+
+        // 判断是否需要重定向
+        let code = response.code;
+        let is_redirect = code == 301 || code == 302 || code == 303 || code == 307 || code == 308;
+        if !is_redirect || remaining <= 0 {
+            return Result::Ok(response);
+        }
+
+        // 取 Location
+        let location_opt = http_find_header_value(response.headers.as_slice(), "Location");
+        let location = match location_opt {
+            Option::Some(l) => l,
+            Option::None => {
+                // 没有 Location 就直接返回这个响应
+                return Result::Ok(response);
+            }
+        };
+
+        // 303 一律切换为 GET，丢弃请求体
+        // 307 / 308 保留 method 和 body
+        // 301 / 302 按多数 HTTP 客户端的习惯：改为 GET 丢弃 body（POST 改 GET）
+        let is_get_like = http_eq_ci(current_method.as_bytes(), "GET")
+                        || http_eq_ci(current_method.as_bytes(), "HEAD")
+                        || http_eq_ci(current_method.as_bytes(), "OPTIONS");
+
+        if code == 303 {
+            // 303 必须改成 GET
+            current_method = String::from_bytes("GET");
+            current_body = String::new();
+        } else if code == 307 || code == 308 {
+            // 保留 method 和 body
+        } else {
+            // 301 / 302：非幂等方法（POST/PUT/DELETE）转 GET，丢弃 body；
+            // 幂等方法原样保留（body 本来就是空的）。
+            if !is_get_like {
+                current_method = String::from_bytes("GET");
+                current_body = String::new();
+            }
+        }
+
+        // 解析新 URL
+        current_url = http_resolve_redirect(parsed.scheme, parsed.host, parsed.port, location);
+        remaining = remaining - 1;
+    }
+}
+
+//=============================================================================
+// 公开 API
+//=============================================================================
+
+/// 对一个 URL 发起 GET，读完整个响应后解析。
+///
+/// 最多跟随 5 次重定向；`http://` 走明文 TCP，`https://` 返回
+/// `TlsNotSupported`（TLS 后端在 `std/tls.zr`）。
+/// 只支持点分十进制 IPv4 主机；不做 DNS。
+pub fn http_get(url: str) -> Result<HttpResponse, HttpError> {
+    let mut no_body: Vec<u8> = Vec::new();
+    let mut no_headers: Vec<HttpHeader> = Vec::new();
+    return http_do_method("GET", url, no_body.as_slice(), no_headers.as_slice(), 5);
+}
+
+/// 对一个 URL 发起 POST，读完整个响应后解析。
+///
+/// 最多跟随 5 次重定向。POST 在 301 / 302 / 303 时会自动转 GET 并丢弃请求体；
+/// 307 / 308 保留 POST 方法和 body。
+pub fn http_post(url: str, body: []const u8, headers: []const HttpHeader) -> Result<HttpResponse, HttpError> {
+    return http_do_method("POST", url, body, headers, 5);
+}
+
+/// 对一个 URL 发起自定义请求（任意方法）。
+///
+/// `follow_redirects <= 0` 时不跟随重定向。
+pub fn http_request(
+    method: str,
+    url: str,
+    body: []const u8,
+    headers: []const HttpHeader,
+    follow_redirects: i32,
+) -> Result<HttpResponse, HttpError> {
+    return http_do_method(method, url, body, headers, follow_redirects);
+}

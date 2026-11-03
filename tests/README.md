@@ -16,7 +16,7 @@ cargo test --test zr_language
 属性、断言内建这些设施编译器目前还不支持（闭包已可用，见 `83_closure_fnptr.zr`
 与 `84_closure_capture_value.zr`；见下方"尚未覆盖"）。
 
-`tests/cases/` 现有 130 个用例，每个在 `-O0/-O1/-O2/-O3/-Oz` 各跑一遍。
+`tests/cases/` 现有 152 个用例，每个在 `-O0/-O1/-O2/-O3/-Oz` 各跑一遍。
 
 "该报错的还在报错"由另一半套件补上：`tests/negative/*.zr`（37 个）每个都必须
 **编译失败**，且报错文本要含文件里 `// expect: <子串>` 标注的期望子串
@@ -149,11 +149,33 @@ cargo test --test zr_negative
 | `123_yield_cooperative.zr` | `yield` 协作让出点：spawn 两个带 `yield` 的 worker 交错执行（顺序 1,2,3,4）、`yield foo(p)` 的操作数副作用必须发生、循环里多轮让出且结构体/元组活跃值跨挂起点存活、tail 位置 `yield`。早先 `yield` 是类型占位（`Ty::Infer(InferId(0))`），操作数被 `let _ = inner;` 整体丢弃（`foo` 从不被调用），同步函数里静默空操作；现在同步函数与闭包体里的 `yield` 报错（负向 `35` / `36`） |
 | `124_trait_default_methods.zr` | trait 默认方法与 `default fn`：带方法体的 trait 方法在 impl 未覆盖时合成到目标类型（`A__m`）；覆盖默认方法、默认体读字段 / 调另一个默认体（`self.base()` 的 `&Self` 接收者核验）、trait 体与 impl 体两侧的 `default fn`。早先默认体等于没写，`s.m()` 报 `no field m on type S`；没有默认体的必需方法缺失现在在 impl 块报 `not all trait items implemented`（负向 `37`） |
 | `125_closure_to_fn.zr` | 带捕获闭包转裸 `fn(..)` 值（P1-2c）：函数值 = 16 字节聚合记录 `{code, env}`，`code` 指向统一 shim（末尾恒多收一个 `env` 形参，普通函数 shim 忽略它、带捕获闭包 thunk 把捕获 local 换成 `env.__cN`），间接调用统一按 `(用户实参..., env, [隐藏返回槽])` 传参。覆盖闭包直传 `fn(..)` 形参、作返回值（`make(10)(5)`）、`let g: fn(..) = |x| ..` 后跨函数调用、普通函数当值、返回的闭包再传出、循环里反复取带捕获闭包、函数值存结构体字段、捕获数组/元组。泛型函数 / 异步函数当值明确报错（负向 `38` / `39`）；带捕获闭包经 `extern "C"` 传给 C 侧回调仍不支持（`FnToCodePtr` 只把记录退化成裸代码地址，C 侧没有地方放 env） |
-| `126_cli_args.zr` | `std/cli.zr`：`arg_count` / `arg` / `arg_opt` / `args` / `get` / `program_name` 的自洽与越界兜底。参数来自入口桩交给运行时的 `(argc, argv)`（`zr_args_init`），`arg_count() >= 1`、`args().len() == arg_count()`、越界时 `arg` 返回空串 / `arg_opt` 返回 `None` / `get` 返回 default |
-| `127_env_vars.zr` | `std/env.zr`：初值来自入口 `envp`，写入落在本模块的覆盖表（不修改父进程环境）。覆盖未设置键的 `None` / `var_or` 兜底、`set_var` 后读回、后写覆盖先写、`remove_var` 写墓碑后 `has_var` 为假、空 key 与含 `=` 的 key 被拒绝 |
-| `128_json.zr` | `std/json.zr`：null / bool / int / float / string / array / 嵌套 object 七种形态的 `as_*` 访问、`len` / `at` / `get`，`json_stringify` 与 `json_stringify_pretty` 的生成 + 再解析往返，以及 `{"a":}` / `[1,2` / 空串三条错误路径 |
-| `129_xml.zr` | `std/xml.zr`：XML 声明 / 注释 / CDATA / 自闭合 / 单双引号属性 / 实体（`&amp;` `&lt;` `&gt;`）解析，`name` / `attr` / `child` / `child_named` / `child_count` / `text`，`xml_stringify` 往返与 `xml_stringify_pretty` 缩进，以及结束标签不匹配 / 根元素后有多余内容 / 元素未闭合三条错误路径 |
-| `130_toml.zr` | `std/toml.zr`：`[table]` / `[a.b]` 表头、点分键、跨行数组（尾逗号）、内联表、`[[array-of-tables]]`、整数（`_` 分隔与 `0x`）、浮点、布尔、基本字符串转义与字面字符串；`get` / `get_path` / `len` / `at` 访问，`toml_stringify` 往返，缺失值与未闭合数组两条错误路径。顺带钉住 `const X: str = "..."`（早先 MIR 把字符串常量按 8 字节指针形态内联，`str` 局部的 `len` 留在栈上垃圾里） |
+| `126_cli_args.zr` | `std/std/argparse.zr` 的索引读取（原 `std/cli.zr` 已重命名）：`arg_count` / `arg` / `arg_opt` / `args` / `get` / `program_name` 的自洽与越界兜底。参数来自入口桩交给运行时的 `(argc, argv)`（`zr_args_init`），`arg_count() >= 1`、`args().len() == arg_count()`、越界时 `arg` 返回空串 / `arg_opt` 返回 `None` / `get` 返回 default |
+| `127_env_vars.zr` | `std/std/env.zr`：初值来自入口 `envp`，写入落在本模块的覆盖表（不修改父进程环境）。覆盖未设置键的 `None` / `var_or` 兜底、`set_var` 后读回、后写覆盖先写、`remove_var` 写墓碑后 `has_var` 为假、空 key 与含 `=` 的 key 被拒绝 |
+| `128_json.zr` | `std/alloc/json.zr`：null / bool / int / float / string / array / 嵌套 object 七种形态的 `as_*` 访问、`len` / `at` / `get`，`json_stringify` 与 `json_stringify_pretty` 的生成 + 再解析往返，以及 `{"a":}` / `[1,2` / 空串三条错误路径 |
+| `129_xml.zr` | `std/alloc/xml.zr`：XML 声明 / 注释 / CDATA / 自闭合 / 单双引号属性 / 实体（`&amp;` `&lt;` `&gt;`）解析，`name` / `attr` / `child` / `child_named` / `child_count` / `text`，`xml_stringify` 往返与 `xml_stringify_pretty` 缩进，以及结束标签不匹配 / 根元素后有多余内容 / 元素未闭合三条错误路径 |
+| `130_toml.zr` | `std/alloc/toml.zr`：`[table]` / `[a.b]` 表头、点分键、跨行数组（尾逗号）、内联表、`[[array-of-tables]]`、整数（`_` 分隔与 `0x`）、浮点、布尔、基本字符串转义与字面字符串；`get` / `get_path` / `len` / `at` 访问，`toml_stringify` 往返，缺失值与未闭合数组两条错误路径。顺带钉住 `const X: str = "..."`（早先 MIR 把字符串常量按 8 字节指针形态内联，`str` 局部的 `len` 留在栈上垃圾里） |
+| `131_argparse_named.zr` | `std/std/argparse.zr` 的按名读取：`--name=value` / `--name value` / `-n value` / 裸 flag / positionals；`value_in` / `value_or_in` / `has_in` / `flag_in` / `positionals_in` 用注入的参数表做断言（不依赖真实进程 argv），并验证同名重复取首个、缺值返回 `None` / 默认值 |
+| `132_format.zr` | `io::format` / `string::join_parts`：`{}` / `{0}` 重复 / `{{}}` / `{:x}` / `{:X}` / `{:b}` / `{:o}` / 浮点 Display 与 Debug / 字符串 Display 与 Debug / 布尔 / 空格式串 / 无对应参数跳过；验证拼出来的是**独立的新 String** 且 `join` 覆盖 3 段 / 1 段 / 0 段 |
+| `133_base64.zr` | `std/base64.zr`：标准与 URL-safe 编解码往返、带 `=` padding、空串与 0–130 字节长度扫描；严格解码（非法字符 / 错误长度 / 缺 padding 返回 `None`） |
+| `134_md5.zr` | `std/md5.zr`：RFC 1321 测试向量（`""` / `"abc"` / `"message digest"` 等）与 0–130 字节长度扫描，逐值与 Python `hashlib.md5` 对照 |
+| `135_sha256.zr` | `std/sha256.zr`：FIPS 180-4 测试向量与 0–130 字节长度扫描，逐值与 Python `hashlib.sha256` 对照 |
+| `136_time.zr` | `std/std/time.zr`：`monotonic_ns` / `unix_ns` / `unix_secs` / `now_ms` / `sleep_ms` 的单调与量级关系；`civil_from_unix` / `unix_from_civil` 往返（含负秒、闰年、月末）、`format_iso` / `parse_iso` |
+| `137_tz.zr` | `std/std/tz.zr`：九个内置时区的偏移、`to_local` / `from_local` 往返；EU / US / AU 的 DST 真实边界前后各取一点，未知时区按 UTC |
+| `138_os_posix.zr` | `std/std/os.zr` + `std/std/posix.zr`：`pid` / `cwd_len` / `temp_dir` / `home_dir` / `os_name` / `pointer_bits`；`isatty` / `getpid` / `getcwd`、`SIG*` / `*_FILENO` 常量、`wifexited` / `wexitstatus` / `wifsignaled` / `wtermsig` 状态解码 |
+| `139_simd.zr` | `std/core/simd.zr`：`f32x4` / `i32x4` / `f64x2` / `i8x8` 的 `from_array` / `to_array` / `splat`、逐 lane `add` / `sub` / `mul` / `div`（浮点）/ `neg` / `min` / `max` / `abs`（浮点）、`sum` / `dot` |
+| `140_http.zr` | `std/std/http.zr`：`url_parse`（scheme / host / port / path / query）、`http_build_request`、`http_parse_response`（状态行 / 全部头 / `Content-Length` / `chunked` / 无长度）与三条错误路径。不发真实网络请求 |
+| `141_pdb.zr` | `std/alloc/pdb.zr`：`HEADER` / `TITLE` / 固定列宽 `ATOM` / `HETATM` 解析，`atom_count` / `atom` / `centroid`，坏行跳过 |
+| `142_tensor.zr` | `std/alloc/tensor.zr`：构造（`zeros` / `ones` / `full` / `scalar` / `identity`）、形状与 `get_flat` / `set_flat` / `get2` / `set2` / `get3` / `set3`、逐元素与标量运算、`relu` / `leaky_relu`、`matmul` / `transpose` / `reshape`、`sum` / `mean` / `max` / `min` / `argmax`、`copy` 深拷贝、`square` / `mse`、`same_shape` / `close_to`、`destroy` 幂等。为避开"超大函数里浮点比较误编译"的编译器缺陷，断言拆成四个小函数 |
+| `143_tensor_ai.zr` | 用 `Tensor` 做两层 MLP 前向（XOR）：`hidden()` 算 `x·w1 + b1` 再过 ReLU（AND 列 + 求和列），输出层 `-2*AND + (x0+x1)`；覆盖 `matmul` / `set2` / `relu` / `add_scalar` / `mse`（0 与偏移后 0.25）/ `argmax` / `transpose` 的组合使用。同样拆成多个小函数 |
+| `144_simd_ext.zr` | `std/core/simd.zr` 新增类型：`f64x4` / `f32x8` / `i64x2` 的逐 lane `add` / `sub` / `mul` / `div`（浮点）/ `neg` / `min` / `max` / `abs`（浮点）、`sum` / `dot`，以及 `best_width()` 返回值合理性 |
+| `145_argparse_sub.zr` | `std/std/argparse.zr` 的子命令与帮助：`subcommand_in` 取第一个非选项参数（全选项返回空串）、`help_requested_in` 识别 `--help` / `-h`、`print_help` 生成含 `USAGE` / `SUBCOMMANDS` 的文本、0 个子命令也能生成 |
+| `146_tensor_ext.zr` | `std/alloc/tensor.zr` 扩展：广播（`broadcast` / `broadcast_add` / `broadcast_mul`）、`conv2d`（stride / pad / bias）、autograd（`track_inplace` + `backward` 求 `y = a*x + b` 的梯度）、`sum_tensor`、`gpu_available()` 恒 false |
+| `147_autograd_numeric.zr` | autograd 数值验证：`y=a*x+b`（`da=x`、`dx=a`、`db=1`）、`y=x*x`（`dx=2x`）、`relu` 正负分支、`sum_tensor().backward()` |
+| `148_std_layers.zr` | **三层标准库**：`use std::*` 同时拿到 core（`min` / `max` / `size_of`）、alloc（`Vec` / `String`）、std（`join` / `println`）三层的名字，验证门面的传递性再导出 |
+| `149_std_core_ext.zr` | core 层按 Rust `core` 补齐：`Option` 的 `expect` / `unwrap_or_else` / `map_or` / `ok_or` / `filter` / `or`，`Result` 的 `unwrap_or` / `unwrap_or_else` / `ok` / `err` / `map_err`，`cmp::{Ordering, cmp, cmp_min, cmp_max, min, max}`，`char` ASCII 判定/大小写/数字转换，`num` 的 `abs` / `sign` / 饱和/检查/回绕算术 / 位计数 / `gcd` / `lcm` / `clamp` / `i64_min` / `i64_max`，标量 `Eq`/`Ord`/`Hash` 实现 |
+| `150_std_alloc_ext.zr` | alloc 层按 Rust `alloc` 补齐：`Box`（`new` / `get` / `get_mut` / `replace` / `free`），`Vec`（`first` / `last` / `truncate` / `retain` / `reverse` / `swap` / `extend_from_slice` / `dedup`），`String`（`trim*` / `to_lowercase` / `to_uppercase` / `find_str` / `rfind_byte` / `split` / `split_whitespace` / `replace` / `parse_i64` / `parse_i32` / `clone` / `Eq` / `Hash`），`VecDeque`（双端出入/索引/`destroy`），`HashMap`（String 与 i64 键、覆盖、删除、扩容 rehash）。该用例同时钉住了两处编译器缺陷：`size_of` 对泛型类型未按实参实例化（`Entry<K,V>` 被算成 1 字节）与结构体尺寸未按对齐补齐 |
+| `151_std_fs_time.zr` | std 层 OS 抽象按 Rust `std` 补齐：`fs` 的 `create_dir_all` / `exists` / `is_dir` / `write_string` / `append_string` / `read_to_string` / `read_bytes` / `copy_file` / `read_dir` / `file_size` / `remove_file` / `remove_dir`，`io` 的 `File::read_line` / `File::read_to_string` / `File::write_string` / `stdout()` / `stdin()` / `stderr()`，`time` 的 `Duration` / `Instant` / `sleep` 与 `DateTime` 日历换算（含纪元前负秒） |
+| `152_http2.zr` | `std/std/http2.zr`：HPACK 解码对 RFC 7541 附录 C 的六组向量（C.4.1–C.4.3 默认 4096 动态表连续解码、C.6.1–C.6.3 用 `with_table_size(256)` 触发淘汰）、自研编码器的字面量/静态索引格式、150 字节长值的多字节长度前缀往返、9 字节帧头的逐字节断言。全部离线，不发真实网络请求（h2c 端到端往返靠人工探针验证） |
 
 ## 尚未覆盖（编译器还不支持）
 

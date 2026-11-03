@@ -1,0 +1,107 @@
+//=============================================================================
+// tests/cases/141_pdb.zr — PDB 结构文件解析
+//
+// 内嵌 4 条 ATOM / HETATM 的迷你 PDB 文本，覆盖：
+//   - HEADER / TITLE 正文（固定列 10 起）
+//   - 原子计数与逐条字段（序列号 / 原子名 / 残基名 / 链 / 残基号）
+//   - 坐标的正负号与小数、occupancy / tempFactor、元素列
+//   - centroid 三坐标（容差比较，避开二进制浮点误差）
+//=============================================================================
+
+use pdb::pdb_parse;
+
+/// 浮点近似相等（容差 0.0005，足够覆盖 3 位小数的 PDB 坐标）。
+fn near(a: f64, b: f64) -> bool {
+    let d = a - b;
+    return d <= 0.0005 && d >= -0.0005;
+}
+
+fn main() -> i32 {
+    let src = "HEADER    ZR-MINI STRUCTURE\nTITLE     TINY PDB FIXTURE\nATOM      1 N    ALA A   1      11.104   6.134  -6.504  1.00 20.00          N \nATOM      2 CA   ALA A   1      12.000   7.000  -5.000  0.50 30.00          C \nHETATM    3 O    HOH B  10      13.500   8.250  -4.125  1.00 40.00          O \nATOM      4 FE   HEM C 100      14.000   9.000  -3.000  1.00 50.00          FE\nEND";
+
+    let p = pdb_parse(src);
+
+    // --- HEADER / TITLE ---
+    if p.header.len != 17 || p.header.ptr[0] != 90 { // 'Z'
+        return 1;
+    }
+    if p.title.len != 16 || p.title.ptr[0] != 84 { // 'T'
+        return 2;
+    }
+
+    // --- 原子计数 ---
+    if p.atom_count() != 4 {
+        return 3;
+    }
+
+    // --- 第 0 个原子（ATOM N ALA A 1）---
+    let a = p.atom(0);
+    if a.record.len != 4 || a.record.ptr[0] != 65 { // 'A'
+        return 4;
+    }
+    if a.serial != 1 {
+        return 5;
+    }
+    if a.name.len != 1 || a.name.ptr[0] != 78 { // 'N'
+        return 6;
+    }
+    if a.res_name.len != 3 || a.res_name.ptr[0] != 65 { // 'A'
+        return 7;
+    }
+    if a.chain != 65 { // 'A'
+        return 8;
+    }
+    if a.res_seq != 1 {
+        return 9;
+    }
+    if !near(a.x, 11.104) {
+        return 10;
+    }
+    if !near(a.y, 6.134) {
+        return 11;
+    }
+    if !near(a.z, -6.504) {
+        return 12;
+    }
+    if !near(a.occupancy, 1.0) {
+        return 13;
+    }
+    if !near(a.temp_factor, 20.0) {
+        return 14;
+    }
+    if a.element.len != 1 || a.element.ptr[0] != 78 { // 'N'
+        return 15;
+    }
+
+    // --- HETATM 记录与带正号的残基号 ---
+    let h = p.atom(2);
+    if h.record.len != 6 || h.record.ptr[0] != 72 { // 'H'
+        return 16;
+    }
+    if h.chain != 66 || h.res_seq != 10 { // 'B'
+        return 17;
+    }
+    if !near(h.z, -4.125) {
+        return 18;
+    }
+
+    // --- 两字母元素符号 ---
+    let fe = p.atom(3);
+    if fe.element.len != 2 || fe.element.ptr[0] != 70 { // 'F'
+        return 19;
+    }
+
+    // --- 几何中心 ---
+    let c = p.centroid();
+    if !near(c[0], 12.651) {
+        return 20;
+    }
+    if !near(c[1], 7.596) {
+        return 21;
+    }
+    if !near(c[2], -4.65725) {
+        return 22;
+    }
+
+    return 0;
+}

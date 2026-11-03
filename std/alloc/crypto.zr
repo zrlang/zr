@@ -1,0 +1,731 @@
+//=============================================================================
+// std/crypto.zr — 纯 ZR 加密原语库
+//
+// 包含 AES-128 (ECB + CTR)、SHA-256 流式 API、HMAC-SHA256、简单 PRNG。
+// 全部纯 ZR 实现，无 extern、无链接 OpenSSL。
+//
+// 注意：ZR 编译器对文件级 static 数组处理有问题（会变成外部引用），
+// 因此所有表常量都通过 getter 函数返回，或在函数内部作为 let 局部变量。
+//=============================================================================
+
+use mem::{memcpy, memset};
+
+//=============================================================================
+// AES S-box / Inv S-box / RCON getter
+//=============================================================================
+
+fn crypto_aes_sbox(i: usize) -> u8 {
+    let t: [u8; 256] = [
+        0x63, 0x7c, 0x77, 0x7b, 0xf2, 0x6b, 0x6f, 0xc5, 0x30, 0x01, 0x67, 0x2b, 0xfe, 0xd7, 0xab, 0x76,
+        0xca, 0x82, 0xc9, 0x7d, 0xfa, 0x59, 0x47, 0xf0, 0xad, 0xd4, 0xa2, 0xaf, 0x9c, 0xa4, 0x72, 0xc0,
+        0xb7, 0xfd, 0x93, 0x26, 0x36, 0x3f, 0xf7, 0xcc, 0x34, 0xa5, 0xe5, 0xf1, 0x71, 0xd8, 0x31, 0x15,
+        0x04, 0xc7, 0x23, 0xc3, 0x18, 0x96, 0x05, 0x9a, 0x07, 0x12, 0x80, 0xe2, 0xeb, 0x27, 0xb2, 0x75,
+        0x09, 0x83, 0x2c, 0x1a, 0x1b, 0x6e, 0x5a, 0xa0, 0x52, 0x3b, 0xd6, 0xb3, 0x29, 0xe3, 0x2f, 0x84,
+        0x53, 0xd1, 0x00, 0xed, 0x20, 0xfc, 0xb1, 0x5b, 0x6a, 0xcb, 0xbe, 0x39, 0x4a, 0x4c, 0x58, 0xcf,
+        0xd0, 0xef, 0xaa, 0xfb, 0x43, 0x4d, 0x33, 0x85, 0x45, 0xf9, 0x02, 0x7f, 0x50, 0x3c, 0x9f, 0xa8,
+        0x51, 0xa3, 0x40, 0x8f, 0x92, 0x9d, 0x38, 0xf5, 0xbc, 0xb6, 0xda, 0x21, 0x10, 0xff, 0xf3, 0xd2,
+        0xcd, 0x0c, 0x13, 0xec, 0x5f, 0x97, 0x44, 0x17, 0xc4, 0xa7, 0x7e, 0x3d, 0x64, 0x5d, 0x19, 0x73,
+        0x60, 0x81, 0x4f, 0xdc, 0x22, 0x2a, 0x90, 0x88, 0x46, 0xee, 0xb8, 0x14, 0xde, 0x5e, 0x0b, 0xdb,
+        0xe0, 0x32, 0x3a, 0x0a, 0x49, 0x06, 0x24, 0x5c, 0xc2, 0xd3, 0xac, 0x62, 0x91, 0x95, 0xe4, 0x79,
+        0xe7, 0xc8, 0x37, 0x6d, 0x8d, 0xd5, 0x4e, 0xa9, 0x6c, 0x56, 0xf4, 0xea, 0x65, 0x7a, 0xae, 0x08,
+        0xba, 0x78, 0x25, 0x2e, 0x1c, 0xa6, 0xb4, 0xc6, 0xe8, 0xdd, 0x74, 0x1f, 0x4b, 0xbd, 0x8b, 0x8a,
+        0x70, 0x3e, 0xb5, 0x66, 0x48, 0x03, 0xf6, 0x0e, 0x61, 0x35, 0x57, 0xb9, 0x86, 0xc1, 0x1d, 0x9e,
+        0xe1, 0xf8, 0x98, 0x11, 0x69, 0xd9, 0x8e, 0x94, 0x9b, 0x1e, 0x87, 0xe9, 0xce, 0x55, 0x28, 0xdf,
+        0x8c, 0xa1, 0x89, 0x0d, 0xbf, 0xe6, 0x42, 0x68, 0x41, 0x99, 0x2d, 0x0f, 0xb0, 0x54, 0xbb, 0x16,
+    ];
+    return t[i];
+}
+
+fn crypto_aes_inv_sbox(i: usize) -> u8 {
+    let t: [u8; 256] = [
+        0x52, 0x09, 0x6a, 0xd5, 0x30, 0x36, 0xa5, 0x38, 0xbf, 0x40, 0xa3, 0x9e, 0x81, 0xf3, 0xd7, 0xfb,
+        0x7c, 0xe3, 0x39, 0x82, 0x9b, 0x2f, 0xff, 0x87, 0x34, 0x8e, 0x43, 0x44, 0xc4, 0xde, 0xe9, 0xcb,
+        0x54, 0x7b, 0x94, 0x32, 0xa6, 0xc2, 0x23, 0x3d, 0xee, 0x4c, 0x95, 0x0b, 0x42, 0xfa, 0xc3, 0x4e,
+        0x08, 0x2e, 0xa1, 0x66, 0x28, 0xd9, 0x24, 0xb2, 0x76, 0x5b, 0xa2, 0x49, 0x6d, 0x8b, 0xd1, 0x25,
+        0x72, 0xf8, 0xf6, 0x64, 0x86, 0x68, 0x98, 0x16, 0xd4, 0xa4, 0x5c, 0xcc, 0x5d, 0x65, 0xb6, 0x92,
+        0x6c, 0x70, 0x48, 0x50, 0xfd, 0xed, 0xb9, 0xda, 0x5e, 0x15, 0x46, 0x57, 0xa7, 0x8d, 0x9d, 0x84,
+        0x90, 0xd8, 0xab, 0x00, 0x8c, 0xbc, 0xd3, 0x0a, 0xf7, 0xe4, 0x58, 0x05, 0xb8, 0xb3, 0x45, 0x06,
+        0xd0, 0x2c, 0x1e, 0x8f, 0xca, 0x3f, 0x0f, 0x02, 0xc1, 0xaf, 0xbd, 0x03, 0x01, 0x13, 0x8a, 0x6b,
+        0x3a, 0x91, 0x11, 0x41, 0x4f, 0x67, 0xdc, 0xea, 0x97, 0xf2, 0xcf, 0xce, 0xf0, 0xb4, 0xe6, 0x73,
+        0x96, 0xac, 0x74, 0x22, 0xe7, 0xad, 0x35, 0x85, 0xe2, 0xf9, 0x37, 0xe8, 0x1c, 0x75, 0xdf, 0x6e,
+        0x47, 0xf1, 0x1a, 0x71, 0x1d, 0x29, 0xc5, 0x89, 0x6f, 0xb7, 0x62, 0x0e, 0xaa, 0x18, 0xbe, 0x1b,
+        0xfc, 0x56, 0x3e, 0x4b, 0xc6, 0xd2, 0x79, 0x20, 0x9a, 0xdb, 0xc0, 0xfe, 0x78, 0xcd, 0x5a, 0xf4,
+        0x1f, 0xdd, 0xa8, 0x33, 0x88, 0x07, 0xc7, 0x31, 0xb1, 0x12, 0x10, 0x59, 0x27, 0x80, 0xec, 0x5f,
+        0x60, 0x51, 0x7f, 0xa9, 0x19, 0xb5, 0x4a, 0x0d, 0x2d, 0xe5, 0x7a, 0x9f, 0x93, 0xc9, 0x9c, 0xef,
+        0xa0, 0xe0, 0x3b, 0x4d, 0xae, 0x2a, 0xf5, 0xb0, 0xc8, 0xeb, 0xbb, 0x3c, 0x83, 0x53, 0x99, 0x61,
+        0x17, 0x2b, 0x04, 0x7e, 0xba, 0x77, 0xd6, 0x26, 0xe1, 0x69, 0x14, 0x63, 0x55, 0x21, 0x0c, 0x7d,
+    ];
+    return t[i];
+}
+
+fn crypto_aes_rcon(i: usize) -> u8 {
+    let t: [u8; 11] = [0, 1, 2, 4, 8, 16, 32, 64, 128, 27, 54];
+    return t[i];
+}
+
+//=============================================================================
+// GF(2^8) 乘法辅助
+//=============================================================================
+
+fn crypto_gf_mul2(b: u8) -> u8 {
+    let shifted = (b as u32) << 1;
+    let mask: u32 = if (b & 0x80) != 0 { 0x1b } else { 0 };
+    return ((shifted ^ mask) & 0xff) as u8;
+}
+
+fn crypto_gf_mul3(b: u8) -> u8 {
+    return crypto_gf_mul2(b) ^ b;
+}
+
+fn crypto_gf_mul9(b: u8) -> u8 {
+    // 9 = 8 + 1 = 2^3 + 1
+    let m2 = crypto_gf_mul2(b);
+    let m4 = crypto_gf_mul2(m2);
+    let m8 = crypto_gf_mul2(m4);
+    return m8 ^ b;
+}
+
+fn crypto_gf_mul11(b: u8) -> u8 {
+    // 11 = 8 + 2 + 1 = 2^3 + 2 + 1
+    let m2 = crypto_gf_mul2(b);
+    let m4 = crypto_gf_mul2(m2);
+    let m8 = crypto_gf_mul2(m4);
+    return m8 ^ m2 ^ b;
+}
+
+fn crypto_gf_mul13(b: u8) -> u8 {
+    // 13 = 8 + 4 + 1 = 2^3 + 2^2 + 1
+    let m2 = crypto_gf_mul2(b);
+    let m4 = crypto_gf_mul2(m2);
+    let m8 = crypto_gf_mul2(m4);
+    return m8 ^ m4 ^ b;
+}
+
+fn crypto_gf_mul14(b: u8) -> u8 {
+    // 14 = 8 + 4 + 2 = 2^3 + 2^2 + 2
+    let m2 = crypto_gf_mul2(b);
+    let m4 = crypto_gf_mul2(m2);
+    let m8 = crypto_gf_mul2(m4);
+    return m8 ^ m4 ^ m2;
+}
+
+//=============================================================================
+// AES-128 内部辅助
+//=============================================================================
+
+fn crypto_aes_sub_word(w: u32) -> u32 {
+    let b0 = crypto_aes_sbox(((w >> 24) & 0xff) as usize);
+    let b1 = crypto_aes_sbox(((w >> 16) & 0xff) as usize);
+    let b2 = crypto_aes_sbox(((w >> 8) & 0xff) as usize);
+    let b3 = crypto_aes_sbox((w & 0xff) as usize);
+    let result = ((b0 as u64) << 24) | ((b1 as u64) << 16) | ((b2 as u64) << 8) | (b3 as u64);
+    return (result % 4294967296) as u32;
+}
+
+fn crypto_aes_rot_word(w: u32) -> u32 {
+    let b0 = (w >> 24) & 0xff;
+    let shifted = ((w as u64) << 8) % 4294967296;
+    return ((shifted as u32) | b0);
+}
+
+fn crypto_aes_word_from_bytes(b0: u8, b1: u8, b2: u8, b3: u8) -> u32 {
+    let result = ((b0 as u64) << 24) | ((b1 as u64) << 16) | ((b2 as u64) << 8) | (b3 as u64);
+    return (result % 4294967296) as u32;
+}
+
+//=============================================================================
+// AES-128 密钥扩展
+//=============================================================================
+
+pub fn aes128_keyexp(key: *const u8, exp: *mut u8) {
+    let exp_words = exp as *mut u32;
+
+    let mut i: usize = 0;
+    while i < 4 {
+        let p = 4 * i;
+        let w = crypto_aes_word_from_bytes(key[p], key[p + 1], key[p + 2], key[p + 3]);
+        exp_words[i] = w;
+        i = i + 1;
+    }
+
+    while i < 44 {
+        let mut tmp = exp_words[i - 1];
+        if (i % 4) == 0 {
+            tmp = crypto_aes_sub_word(crypto_aes_rot_word(tmp));
+            let rcon_byte = crypto_aes_rcon(i / 4);
+            let result = (tmp as u64) ^ ((rcon_byte as u64) << 24);
+            tmp = (result % 4294967296) as u32;
+        }
+        let prev = exp_words[i - 4];
+        let combined = (prev as u64) ^ (tmp as u64);
+        exp_words[i] = (combined % 4294967296) as u32;
+        i = i + 1;
+    }
+}
+
+//=============================================================================
+// AES-128 加密（单块 ECB）
+//=============================================================================
+
+pub fn aes128_encrypt_block(pt: *const u8, exp: *const u8, ct: *mut u8) {
+    let exp_words = exp as *const u32;
+
+    let mut s0 = crypto_aes_word_from_bytes(pt[0], pt[1], pt[2], pt[3]);
+    let mut s1 = crypto_aes_word_from_bytes(pt[4], pt[5], pt[6], pt[7]);
+    let mut s2 = crypto_aes_word_from_bytes(pt[8], pt[9], pt[10], pt[11]);
+    let mut s3 = crypto_aes_word_from_bytes(pt[12], pt[13], pt[14], pt[15]);
+
+    s0 = ((s0 as u64) ^ (exp_words[0] as u64)) as u32;
+    s1 = ((s1 as u64) ^ (exp_words[1] as u64)) as u32;
+    s2 = ((s2 as u64) ^ (exp_words[2] as u64)) as u32;
+    s3 = ((s3 as u64) ^ (exp_words[3] as u64)) as u32;
+
+    let mut r: usize = 1;
+    while r < 10 {
+        let mut state: [u8; 16] = [0; 16];
+        let mut col: usize = 0;
+        while col < 4 {
+            let w = if col == 0 { s0 } else if col == 1 { s1 } else if col == 2 { s2 } else { s3 };
+            state[4 * col] = ((w >> 24) & 0xff) as u8;
+            state[4 * col + 1] = ((w >> 16) & 0xff) as u8;
+            state[4 * col + 2] = ((w >> 8) & 0xff) as u8;
+            state[4 * col + 3] = (w & 0xff) as u8;
+            col = col + 1;
+        }
+
+        // SubBytes + ShiftRows
+        let mut new_state: [u8; 16] = [0; 16];
+        col = 0;
+        while col < 4 {
+            new_state[4 * col + 0] = crypto_aes_sbox(state[4 * col + 0] as usize);
+            // 行 1 左移 1: new[row1][col] = old[row1][(col+1)%4]
+            new_state[4 * col + 1] = crypto_aes_sbox(state[4 * ((col + 1) % 4) + 1] as usize);
+            // 行 2 左移 2: new[row2][col] = old[row2][(col+2)%4]
+            new_state[4 * col + 2] = crypto_aes_sbox(state[4 * ((col + 2) % 4) + 2] as usize);
+            // 行 3 左移 3: new[row3][col] = old[row3][(col+3)%4]
+            new_state[4 * col + 3] = crypto_aes_sbox(state[4 * ((col + 3) % 4) + 3] as usize);
+            col = col + 1;
+        }
+
+        // MixColumns
+        let mut mixed: [u8; 16] = [0; 16];
+        col = 0;
+        while col < 4 {
+            let s0b = new_state[4 * col + 0];
+            let s1b = new_state[4 * col + 1];
+            let s2b = new_state[4 * col + 2];
+            let s3b = new_state[4 * col + 3];
+
+            mixed[4 * col + 0] = crypto_gf_mul2(s0b) ^ crypto_gf_mul3(s1b) ^ s2b ^ s3b;
+            mixed[4 * col + 1] = s0b ^ crypto_gf_mul2(s1b) ^ crypto_gf_mul3(s2b) ^ s3b;
+            mixed[4 * col + 2] = s0b ^ s1b ^ crypto_gf_mul2(s2b) ^ crypto_gf_mul3(s3b);
+            mixed[4 * col + 3] = crypto_gf_mul3(s0b) ^ s1b ^ s2b ^ crypto_gf_mul2(s3b);
+            col = col + 1;
+        }
+
+        s0 = crypto_aes_word_from_bytes(mixed[0], mixed[1], mixed[2], mixed[3]);
+        s1 = crypto_aes_word_from_bytes(mixed[4], mixed[5], mixed[6], mixed[7]);
+        s2 = crypto_aes_word_from_bytes(mixed[8], mixed[9], mixed[10], mixed[11]);
+        s3 = crypto_aes_word_from_bytes(mixed[12], mixed[13], mixed[14], mixed[15]);
+
+        let rk_base = 4 * r;
+        s0 = ((s0 as u64) ^ (exp_words[rk_base] as u64)) as u32;
+        s1 = ((s1 as u64) ^ (exp_words[rk_base + 1] as u64)) as u32;
+        s2 = ((s2 as u64) ^ (exp_words[rk_base + 2] as u64)) as u32;
+        s3 = ((s3 as u64) ^ (exp_words[rk_base + 3] as u64)) as u32;
+
+        r = r + 1;
+    }
+
+    // 最后一轮
+    let mut state2: [u8; 16] = [0; 16];
+    let mut col2: usize = 0;
+    while col2 < 4 {
+        let w = if col2 == 0 { s0 } else if col2 == 1 { s1 } else if col2 == 2 { s2 } else { s3 };
+        state2[4 * col2] = ((w >> 24) & 0xff) as u8;
+        state2[4 * col2 + 1] = ((w >> 16) & 0xff) as u8;
+        state2[4 * col2 + 2] = ((w >> 8) & 0xff) as u8;
+        state2[4 * col2 + 3] = (w & 0xff) as u8;
+        col2 = col2 + 1;
+    }
+
+    let mut final_state: [u8; 16] = [0; 16];
+    col2 = 0;
+    while col2 < 4 {
+        final_state[4 * col2 + 0] = crypto_aes_sbox(state2[4 * col2 + 0] as usize);
+        final_state[4 * col2 + 1] = crypto_aes_sbox(state2[4 * ((col2 + 1) % 4) + 1] as usize);
+        final_state[4 * col2 + 2] = crypto_aes_sbox(state2[4 * ((col2 + 2) % 4) + 2] as usize);
+        final_state[4 * col2 + 3] = crypto_aes_sbox(state2[4 * ((col2 + 3) % 4) + 3] as usize);
+        col2 = col2 + 1;
+    }
+
+    s0 = crypto_aes_word_from_bytes(final_state[0], final_state[1], final_state[2], final_state[3]);
+    s1 = crypto_aes_word_from_bytes(final_state[4], final_state[5], final_state[6], final_state[7]);
+    s2 = crypto_aes_word_from_bytes(final_state[8], final_state[9], final_state[10], final_state[11]);
+    s3 = crypto_aes_word_from_bytes(final_state[12], final_state[13], final_state[14], final_state[15]);
+
+    s0 = ((s0 as u64) ^ (exp_words[40] as u64)) as u32;
+    s1 = ((s1 as u64) ^ (exp_words[41] as u64)) as u32;
+    s2 = ((s2 as u64) ^ (exp_words[42] as u64)) as u32;
+    s3 = ((s3 as u64) ^ (exp_words[43] as u64)) as u32;
+
+    ct[0] = ((s0 >> 24) & 0xff) as u8;
+    ct[1] = ((s0 >> 16) & 0xff) as u8;
+    ct[2] = ((s0 >> 8) & 0xff) as u8;
+    ct[3] = (s0 & 0xff) as u8;
+    ct[4] = ((s1 >> 24) & 0xff) as u8;
+    ct[5] = ((s1 >> 16) & 0xff) as u8;
+    ct[6] = ((s1 >> 8) & 0xff) as u8;
+    ct[7] = (s1 & 0xff) as u8;
+    ct[8] = ((s2 >> 24) & 0xff) as u8;
+    ct[9] = ((s2 >> 16) & 0xff) as u8;
+    ct[10] = ((s2 >> 8) & 0xff) as u8;
+    ct[11] = (s2 & 0xff) as u8;
+    ct[12] = ((s3 >> 24) & 0xff) as u8;
+    ct[13] = ((s3 >> 16) & 0xff) as u8;
+    ct[14] = ((s3 >> 8) & 0xff) as u8;
+    ct[15] = (s3 & 0xff) as u8;
+}
+
+//=============================================================================
+// AES-128 解密（单块 ECB）
+//=============================================================================
+
+pub fn aes128_decrypt_block(ct: *const u8, exp: *const u8, pt: *mut u8) {
+    let exp_words = exp as *const u32;
+
+    let mut s0 = crypto_aes_word_from_bytes(ct[0], ct[1], ct[2], ct[3]);
+    let mut s1 = crypto_aes_word_from_bytes(ct[4], ct[5], ct[6], ct[7]);
+    let mut s2 = crypto_aes_word_from_bytes(ct[8], ct[9], ct[10], ct[11]);
+    let mut s3 = crypto_aes_word_from_bytes(ct[12], ct[13], ct[14], ct[15]);
+
+    s0 = ((s0 as u64) ^ (exp_words[40] as u64)) as u32;
+    s1 = ((s1 as u64) ^ (exp_words[41] as u64)) as u32;
+    s2 = ((s2 as u64) ^ (exp_words[42] as u64)) as u32;
+    s3 = ((s3 as u64) ^ (exp_words[43] as u64)) as u32;
+
+    let mut r: usize = 9;
+    while r >= 1 {
+        let mut state: [u8; 16] = [0; 16];
+        let mut col: usize = 0;
+        while col < 4 {
+            let w = if col == 0 { s0 } else if col == 1 { s1 } else if col == 2 { s2 } else { s3 };
+            state[4 * col] = ((w >> 24) & 0xff) as u8;
+            state[4 * col + 1] = ((w >> 16) & 0xff) as u8;
+            state[4 * col + 2] = ((w >> 8) & 0xff) as u8;
+            state[4 * col + 3] = (w & 0xff) as u8;
+            col = col + 1;
+        }
+
+        // InvShiftRows + InvSubBytes
+        let mut new_state: [u8; 16] = [0; 16];
+        col = 0;
+        while col < 4 {
+            new_state[4 * col + 0] = crypto_aes_inv_sbox(state[4 * col + 0] as usize);
+            // 行 1 右移 1: new[row1][col] = old[row1][(col+3)%4]
+            new_state[4 * col + 1] = crypto_aes_inv_sbox(state[4 * ((col + 3) % 4) + 1] as usize);
+            // 行 2 右移 2: new[row2][col] = old[row2][(col+2)%4]
+            new_state[4 * col + 2] = crypto_aes_inv_sbox(state[4 * ((col + 2) % 4) + 2] as usize);
+            // 行 3 右移 3: new[row3][col] = old[row3][(col+1)%4]
+            new_state[4 * col + 3] = crypto_aes_inv_sbox(state[4 * ((col + 1) % 4) + 3] as usize);
+            col = col + 1;
+        }
+
+        s0 = crypto_aes_word_from_bytes(new_state[0], new_state[1], new_state[2], new_state[3]);
+        s1 = crypto_aes_word_from_bytes(new_state[4], new_state[5], new_state[6], new_state[7]);
+        s2 = crypto_aes_word_from_bytes(new_state[8], new_state[9], new_state[10], new_state[11]);
+        s3 = crypto_aes_word_from_bytes(new_state[12], new_state[13], new_state[14], new_state[15]);
+
+        let rk_base = 4 * r;
+        s0 = ((s0 as u64) ^ (exp_words[rk_base] as u64)) as u32;
+        s1 = ((s1 as u64) ^ (exp_words[rk_base + 1] as u64)) as u32;
+        s2 = ((s2 as u64) ^ (exp_words[rk_base + 2] as u64)) as u32;
+        s3 = ((s3 as u64) ^ (exp_words[rk_base + 3] as u64)) as u32;
+
+        // InvMixColumns
+        let mut state2: [u8; 16] = [0; 16];
+        let mut col2: usize = 0;
+        while col2 < 4 {
+            let w = if col2 == 0 { s0 } else if col2 == 1 { s1 } else if col2 == 2 { s2 } else { s3 };
+            state2[4 * col2] = ((w >> 24) & 0xff) as u8;
+            state2[4 * col2 + 1] = ((w >> 16) & 0xff) as u8;
+            state2[4 * col2 + 2] = ((w >> 8) & 0xff) as u8;
+            state2[4 * col2 + 3] = (w & 0xff) as u8;
+            col2 = col2 + 1;
+        }
+
+        let mut mixed: [u8; 16] = [0; 16];
+        col2 = 0;
+        while col2 < 4 {
+            let s0b = state2[4 * col2 + 0];
+            let s1b = state2[4 * col2 + 1];
+            let s2b = state2[4 * col2 + 2];
+            let s3b = state2[4 * col2 + 3];
+
+            mixed[4 * col2 + 0] = crypto_gf_mul14(s0b) ^ crypto_gf_mul11(s1b) ^ crypto_gf_mul13(s2b) ^ crypto_gf_mul9(s3b);
+            mixed[4 * col2 + 1] = crypto_gf_mul9(s0b) ^ crypto_gf_mul14(s1b) ^ crypto_gf_mul11(s2b) ^ crypto_gf_mul13(s3b);
+            mixed[4 * col2 + 2] = crypto_gf_mul13(s0b) ^ crypto_gf_mul9(s1b) ^ crypto_gf_mul14(s2b) ^ crypto_gf_mul11(s3b);
+            mixed[4 * col2 + 3] = crypto_gf_mul11(s0b) ^ crypto_gf_mul13(s1b) ^ crypto_gf_mul9(s2b) ^ crypto_gf_mul14(s3b);
+            col2 = col2 + 1;
+        }
+
+        s0 = crypto_aes_word_from_bytes(mixed[0], mixed[1], mixed[2], mixed[3]);
+        s1 = crypto_aes_word_from_bytes(mixed[4], mixed[5], mixed[6], mixed[7]);
+        s2 = crypto_aes_word_from_bytes(mixed[8], mixed[9], mixed[10], mixed[11]);
+        s3 = crypto_aes_word_from_bytes(mixed[12], mixed[13], mixed[14], mixed[15]);
+
+        r = r - 1;
+    }
+
+    // 轮 0
+    let mut state3: [u8; 16] = [0; 16];
+    let mut col3: usize = 0;
+    while col3 < 4 {
+        let w = if col3 == 0 { s0 } else if col3 == 1 { s1 } else if col3 == 2 { s2 } else { s3 };
+        state3[4 * col3] = ((w >> 24) & 0xff) as u8;
+        state3[4 * col3 + 1] = ((w >> 16) & 0xff) as u8;
+        state3[4 * col3 + 2] = ((w >> 8) & 0xff) as u8;
+        state3[4 * col3 + 3] = (w & 0xff) as u8;
+        col3 = col3 + 1;
+    }
+
+    let mut final_state: [u8; 16] = [0; 16];
+    col3 = 0;
+    while col3 < 4 {
+        final_state[4 * col3 + 0] = crypto_aes_inv_sbox(state3[4 * col3 + 0] as usize);
+        final_state[4 * col3 + 1] = crypto_aes_inv_sbox(state3[4 * ((col3 + 3) % 4) + 1] as usize);
+        final_state[4 * col3 + 2] = crypto_aes_inv_sbox(state3[4 * ((col3 + 2) % 4) + 2] as usize);
+        final_state[4 * col3 + 3] = crypto_aes_inv_sbox(state3[4 * ((col3 + 1) % 4) + 3] as usize);
+        col3 = col3 + 1;
+    }
+
+    s0 = crypto_aes_word_from_bytes(final_state[0], final_state[1], final_state[2], final_state[3]);
+    s1 = crypto_aes_word_from_bytes(final_state[4], final_state[5], final_state[6], final_state[7]);
+    s2 = crypto_aes_word_from_bytes(final_state[8], final_state[9], final_state[10], final_state[11]);
+    s3 = crypto_aes_word_from_bytes(final_state[12], final_state[13], final_state[14], final_state[15]);
+
+    s0 = ((s0 as u64) ^ (exp_words[0] as u64)) as u32;
+    s1 = ((s1 as u64) ^ (exp_words[1] as u64)) as u32;
+    s2 = ((s2 as u64) ^ (exp_words[2] as u64)) as u32;
+    s3 = ((s3 as u64) ^ (exp_words[3] as u64)) as u32;
+
+    pt[0] = ((s0 >> 24) & 0xff) as u8;
+    pt[1] = ((s0 >> 16) & 0xff) as u8;
+    pt[2] = ((s0 >> 8) & 0xff) as u8;
+    pt[3] = (s0 & 0xff) as u8;
+    pt[4] = ((s1 >> 24) & 0xff) as u8;
+    pt[5] = ((s1 >> 16) & 0xff) as u8;
+    pt[6] = ((s1 >> 8) & 0xff) as u8;
+    pt[7] = (s1 & 0xff) as u8;
+    pt[8] = ((s2 >> 24) & 0xff) as u8;
+    pt[9] = ((s2 >> 16) & 0xff) as u8;
+    pt[10] = ((s2 >> 8) & 0xff) as u8;
+    pt[11] = (s2 & 0xff) as u8;
+    pt[12] = ((s3 >> 24) & 0xff) as u8;
+    pt[13] = ((s3 >> 16) & 0xff) as u8;
+    pt[14] = ((s3 >> 8) & 0xff) as u8;
+    pt[15] = (s3 & 0xff) as u8;
+}
+
+//=============================================================================
+// AES-128 CTR 模式
+//=============================================================================
+
+fn crypto_aes128_ctr_internal(key: *const u8, iv: *const u8, input: *const u8, output: *mut u8, len: usize) {
+    let mut exp: [u8; 176] = [0; 176];
+    aes128_keyexp(key, &exp[0]);
+
+    let mut counter: [u8; 16] = [0; 16];
+    memcpy(&counter[0] as *mut void, iv as *const void, 16);
+
+    let mut keystream: [u8; 16] = [0; 16];
+
+    let mut i: usize = 0;
+    while i < len {
+        aes128_encrypt_block(&counter[0], &exp[0], &keystream[0]);
+
+        let remaining: usize = len - i;
+        let block_size: usize = if remaining >= 16 { 16 } else { remaining };
+
+        let mut j: usize = 0;
+        while j < block_size {
+            output[i + j] = input[i + j] ^ keystream[j];
+            j = j + 1;
+        }
+        i = i + block_size;
+
+        let mut k: usize = 15;
+        while k >= 0 {
+            counter[k] = counter[k] + 1;
+            if counter[k] != 0 { break; }
+            k = k - 1;
+        }
+    }
+}
+
+pub fn aes128_ctr(key: *const u8, iv: *const u8, input: *const u8, output: *mut u8, len: usize) {
+    crypto_aes128_ctr_internal(key, iv, input, output, len);
+}
+
+pub fn aes128_ctr_decrypt(key: *const u8, iv: *const u8, input: *const u8, output: *mut u8, len: usize) {
+    crypto_aes128_ctr_internal(key, iv, input, output, len);
+}
+
+//=============================================================================
+// SHA-256 流式 API
+//=============================================================================
+
+pub struct Sha256State {
+    h: [u32; 8],
+    buf: [u8; 64],
+    buflen: usize,
+    bitlen: u64,
+}
+
+fn crypto_sha256_wrap(x: u64) -> u32 {
+    return (x % 4294967296) as u32;
+}
+
+fn crypto_sha256_not(x: u32) -> u32 {
+    return crypto_sha256_wrap((x as u64) ^ 4294967295);
+}
+
+fn crypto_sha256_rotr(x: u32, n: usize) -> u32 {
+    let lo = x >> n;
+    let hi = ((x as u64) << (32 - n)) % 4294967296;
+    return crypto_sha256_wrap((lo as u64) | hi);
+}
+
+fn crypto_sha256_k_get(i: usize) -> u32 {
+    let t: [u32; 64] = [
+        0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5,
+        0x3956c25b, 0x59f111f1, 0x923f82a4, 0xab1c5ed5,
+        0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3,
+        0x72be5d74, 0x80deb1fe, 0x9bdc06a7, 0xc19bf174,
+        0xe49b69c1, 0xefbe4786, 0x0fc19dc6, 0x240ca1cc,
+        0x2de92c6f, 0x4a7484aa, 0x5cb0a9dc, 0x76f988da,
+        0x983e5152, 0xa831c66d, 0xb00327c8, 0xbf597fc7,
+        0xc6e00bf3, 0xd5a79147, 0x06ca6351, 0x14292967,
+        0x27b70a85, 0x2e1b2138, 0x4d2c6dfc, 0x53380d13,
+        0x650a7354, 0x766a0abb, 0x81c2c92e, 0x92722c85,
+        0xa2bfe8a1, 0xa81a664b, 0xc24b8b70, 0xc76c51a3,
+        0xd192e819, 0xd6990624, 0xf40e3585, 0x106aa070,
+        0x19a4c116, 0x1e376c08, 0x2748774c, 0x34b0bcb5,
+        0x391c0cb3, 0x4ed8aa4a, 0x5b9cca4f, 0x682e6ff3,
+        0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208,
+        0x90befffa, 0xa4506ceb, 0xbef9a3f7, 0xc67178f2,
+    ];
+    return t[i];
+}
+
+fn crypto_sha256_compress(h: *mut u32, block: *const u8) {
+    let mut w: [u32; 64] = [0; 64];
+    let mut j: usize = 0;
+    while j < 16 {
+        let p = 4 * j;
+        w[j] = crypto_sha256_wrap(
+            ((block[p] as u64) << 24)
+            | ((block[p + 1] as u64) << 16)
+            | ((block[p + 2] as u64) << 8)
+            | (block[p + 3] as u64)
+        );
+        j = j + 1;
+    }
+    while j < 64 {
+        let x = w[j - 15];
+        let s0 = crypto_sha256_rotr(x, 7) ^ crypto_sha256_rotr(x, 18) ^ (x >> 3);
+        let y = w[j - 2];
+        let s1 = crypto_sha256_rotr(y, 17) ^ crypto_sha256_rotr(y, 19) ^ (y >> 10);
+        w[j] = crypto_sha256_wrap(
+            (w[j - 16] as u64) + (s0 as u64) + (w[j - 7] as u64) + (s1 as u64)
+        );
+        j = j + 1;
+    }
+
+    let mut a = h[0];
+    let mut b = h[1];
+    let mut c = h[2];
+    let mut d = h[3];
+    let mut e = h[4];
+    let mut f = h[5];
+    let mut g = h[6];
+    let mut hh = h[7];
+
+    let mut r: usize = 0;
+    while r < 64 {
+        let big1 = crypto_sha256_rotr(e, 6) ^ crypto_sha256_rotr(e, 11) ^ crypto_sha256_rotr(e, 25);
+        let ch = (e & f) ^ (crypto_sha256_not(e) & g);
+        let t1 = crypto_sha256_wrap(
+            (hh as u64) + (big1 as u64) + (ch as u64) + (crypto_sha256_k_get(r) as u64) + (w[r] as u64)
+        );
+        let big0 = crypto_sha256_rotr(a, 2) ^ crypto_sha256_rotr(a, 13) ^ crypto_sha256_rotr(a, 22);
+        let maj = (a & b) ^ (a & c) ^ (b & c);
+        let t2 = crypto_sha256_wrap((big0 as u64) + (maj as u64));
+
+        hh = g;
+        g = f;
+        f = e;
+        e = crypto_sha256_wrap((d as u64) + (t1 as u64));
+        d = c;
+        c = b;
+        b = a;
+        a = crypto_sha256_wrap((t1 as u64) + (t2 as u64));
+
+        r = r + 1;
+    }
+
+    h[0] = crypto_sha256_wrap((h[0] as u64) + (a as u64));
+    h[1] = crypto_sha256_wrap((h[1] as u64) + (b as u64));
+    h[2] = crypto_sha256_wrap((h[2] as u64) + (c as u64));
+    h[3] = crypto_sha256_wrap((h[3] as u64) + (d as u64));
+    h[4] = crypto_sha256_wrap((h[4] as u64) + (e as u64));
+    h[5] = crypto_sha256_wrap((h[5] as u64) + (f as u64));
+    h[6] = crypto_sha256_wrap((h[6] as u64) + (g as u64));
+    h[7] = crypto_sha256_wrap((h[7] as u64) + (hh as u64));
+}
+
+pub fn crypto_sha256_init() -> Sha256State {
+    let mut s = Sha256State {
+        h: [0; 8],
+        buf: [0; 64],
+        buflen: 0,
+        bitlen: 0,
+    };
+    s.h[0] = 0x6a09e667;
+    s.h[1] = 0xbb67ae85;
+    s.h[2] = 0x3c6ef372;
+    s.h[3] = 0xa54ff53a;
+    s.h[4] = 0x510e527f;
+    s.h[5] = 0x9b05688c;
+    s.h[6] = 0x1f83d9ab;
+    s.h[7] = 0x5be0cd19;
+    return s;
+}
+
+pub fn crypto_sha256_update(s: &mut Sha256State, data: *const u8, len: usize) {
+    let mut i: usize = 0;
+    while i < len {
+        s.buf[s.buflen] = data[i];
+        s.buflen = s.buflen + 1;
+        if s.buflen == 64 {
+            crypto_sha256_compress(&s.h[0], &s.buf[0]);
+            s.bitlen = s.bitlen + 512;
+            s.buflen = 0;
+        }
+        i = i + 1;
+    }
+}
+
+pub fn crypto_sha256_digest(s: &mut Sha256State, out_32: *mut u8) {
+    let mut pad: [u8; 128] = [0; 128];
+    pad[0] = 128;
+
+    let final_bitlen = s.bitlen + (s.buflen as u64) * 8;
+
+    let padlen = if s.buflen < 56 { 64 - s.buflen } else { 128 - s.buflen };
+
+    crypto_sha256_update(s, &pad[0], padlen - 8);
+
+    for k in 0..8 {
+        let shift = 56 - 8 * k;
+        let byte = ((final_bitlen >> shift) & 0xff) as u8;
+        crypto_sha256_update(s, &byte, 1);
+    }
+
+    let mut idx: usize = 0;
+    while idx < 8 {
+        let word = s.h[idx];
+        out_32[4 * idx] = ((word >> 24) & 0xff) as u8;
+        out_32[4 * idx + 1] = ((word >> 16) & 0xff) as u8;
+        out_32[4 * idx + 2] = ((word >> 8) & 0xff) as u8;
+        out_32[4 * idx + 3] = (word & 0xff) as u8;
+        idx = idx + 1;
+    }
+}
+
+//=============================================================================
+// HMAC-SHA256
+//=============================================================================
+
+fn crypto_sha256_once(data: *const u8, len: usize, out_32: *mut u8) {
+    let mut state = crypto_sha256_init();
+    crypto_sha256_update(&mut state, data, len);
+    crypto_sha256_digest(&mut state, out_32);
+}
+
+pub fn crypto_hmac_sha256(key: *const u8, keylen: usize, msg: *const u8, msglen: usize, out_32: *mut u8) {
+    let mut k_block: [u8; 64] = [0; 64];
+    if keylen > 64 {
+        let mut hash: [u8; 32] = [0; 32];
+        crypto_sha256_once(key, keylen, &hash[0]);
+        memcpy(&k_block[0] as *mut void, &hash[0] as *const void, 32);
+    } else {
+        memcpy(&k_block[0] as *mut void, key as *const void, keylen);
+    }
+
+    let mut ipad: [u8; 64] = [0; 64];
+    let mut opad: [u8; 64] = [0; 64];
+    for i in 0..64 {
+        ipad[i] = k_block[i] ^ 0x36;
+        opad[i] = k_block[i] ^ 0x5c;
+    }
+
+    let mut inner: [u8; 32] = [0; 32];
+    let mut state1 = crypto_sha256_init();
+    crypto_sha256_update(&mut state1, &ipad[0], 64);
+    crypto_sha256_update(&mut state1, msg, msglen);
+    crypto_sha256_digest(&mut state1, &inner[0]);
+
+    let mut state2 = crypto_sha256_init();
+    crypto_sha256_update(&mut state2, &opad[0], 64);
+    crypto_sha256_update(&mut state2, &inner[0], 32);
+    crypto_sha256_digest(&mut state2, out_32);
+}
+
+//=============================================================================
+// 简单 PRNG（无文件级 static，用线程局部模拟）
+//=============================================================================
+
+/// PRNG 状态结构体，调用方持有。
+pub struct PrngState {
+    state: [u8; 64],
+    counter: u64,
+}
+
+pub fn crypto_prng_seed(seed: *const u8, len: usize) -> PrngState {
+    let mut s = PrngState {
+        state: [0; 64],
+        counter: 0,
+    };
+    let copylen = if len > 64 { 64 } else { len };
+    memcpy(&s.state[0] as *mut void, seed as *const void, copylen);
+    return s;
+}
+
+pub fn crypto_prng_bytes(s: &mut PrngState, out: *mut u8, len: usize) {
+    let mut generated: usize = 0;
+    let mut block: [u8; 32] = [0; 32];
+
+    while generated < len {
+        s.state[56] = ((s.counter >> 56) & 0xff) as u8;
+        s.state[57] = ((s.counter >> 48) & 0xff) as u8;
+        s.state[58] = ((s.counter >> 40) & 0xff) as u8;
+        s.state[59] = ((s.counter >> 32) & 0xff) as u8;
+        s.state[60] = ((s.counter >> 24) & 0xff) as u8;
+        s.state[61] = ((s.counter >> 16) & 0xff) as u8;
+        s.state[62] = ((s.counter >> 8) & 0xff) as u8;
+        s.state[63] = (s.counter & 0xff) as u8;
+
+        crypto_sha256_once(&s.state[0], 64, &block[0]);
+        s.counter = s.counter + 1;
+
+        let remaining: usize = len - generated;
+        let copylen: usize = if remaining > 32 { 32 } else { remaining };
+        let mut j: usize = 0;
+        while j < copylen {
+            out[generated + j] = block[j];
+            j = j + 1;
+        }
+        generated = generated + copylen;
+    }
+}

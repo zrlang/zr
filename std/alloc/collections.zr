@@ -4,11 +4,8 @@
 // 提供可增长的连续存储容器 Vec，支持 push / pop / insert / remove / sort 等。
 //=============================================================================
 
-use core::{
-    zr_alloc, zr_dealloc, zr_realloc,
-    Option, Result, panic,
-    size_of,
-};
+use core::{Option, Result, panic, size_of};
+use mem::{zr_alloc, zr_dealloc, zr_realloc};
 
 //=============================================================================
 // Vec<T> — 可增长的连续容器
@@ -201,11 +198,91 @@ impl<T> Vec<T> {
         }
     }
 
+    /// 取出第一个元素（空时返回 None）。
+    pub fn first(self) -> Option<T> {
+        if self.len == 0 { return Option::None; }
+        return Option::Some(self.data[0]);
+    }
+
+    /// 取出最后一个元素（空时返回 None）。
+    pub fn last(self) -> Option<T> {
+        if self.len == 0 { return Option::None; }
+        return Option::Some(self.data[self.len - 1]);
+    }
+
+    /// 截断到前 `new_len` 个元素；超出长度时什么也不做。
+    pub fn truncate(self: &mut Vec<T>, new_len: usize) {
+        if new_len < self.len { self.len = new_len; }
+    }
+
+    /// 原地保留满足谓词的元素（对应 Rust `Vec::retain`）。
+    pub fn retain(self: &mut Vec<T>, pred: fn(T) -> bool) {
+        let mut write: usize = 0;
+        let mut read: usize = 0;
+        while read < self.len {
+            if pred(self.data[read]) {
+                self.data[write] = self.data[read];
+                write = write + 1;
+            }
+            read = read + 1;
+        }
+        self.len = write;
+    }
+
+    /// 反转元素顺序。
+    pub fn reverse(self: &mut Vec<T>) {
+        if self.len == 0 { return; }
+        let mut i = 0;
+        let mut j = self.len - 1;
+        while i < j {
+            let tmp = self.data[i];
+            self.data[i] = self.data[j];
+            self.data[j] = tmp;
+            i = i + 1;
+            j = j - 1;
+        }
+    }
+
+    /// 交换两个下标的元素。
+    pub fn swap(self: &mut Vec<T>, i: usize, j: usize) {
+        if i >= self.len || j >= self.len { panic("Vec: swap index out of range"); }
+        let tmp = self.data[i];
+        self.data[i] = self.data[j];
+        self.data[j] = tmp;
+    }
+
+    /// 追加上一段切片里的全部元素。
+    pub fn extend_from_slice(self: &mut Vec<T>, arr: []const T)
+    where T: Copy
+    {
+        let mut i = 0;
+        while i < arr.len {
+            self.push(arr.ptr[i]);
+            i = i + 1;
+        }
+    }
+
+    /// 去掉相邻重复元素（假定已排序，对应 Rust `Vec::dedup`）。
+    pub fn dedup(self: &mut Vec<T>)
+    where T: Eq
+    {
+        if self.len == 0 { return; }
+        let mut write: usize = 1;
+        let mut read: usize = 1;
+        while read < self.len {
+            if !self.data[read].eq(self.data[write - 1]) {
+                self.data[write] = self.data[read];
+                write = write + 1;
+            }
+            read = read + 1;
+        }
+        self.len = write;
+    }
+
     /// 取出一个切片视图。
     pub fn as_slice(self) -> []const T {
         return Slice { ptr: self.data as *const T, len: self.len };
     }
-
     /// 取出可变切片视图。
     pub fn as_mut_slice(self) -> []mut T {
         return SliceMut { ptr: self.data, len: self.len };

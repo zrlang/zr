@@ -1,0 +1,830 @@
+//=============================================================================
+// std/simd.zr — 便携 SIMD 向量类型
+//
+// 七类向量：
+//   128 位（SSE2，所有 x86_64 都有）：
+//     `f32x4`（4×f32）、`f64x2`（2×f64）、`i32x4`（4×i32）、
+//     `i8x8`（8×i8）、`i64x2`（2×i64）；
+//   256 位（AVX2，需检测）：
+//     `f32x8`（8×f32）、`f64x4`（4×f64）。
+//
+// 每个类型都提供：
+//   - `from_array` / `to_array`：与普通数组互转（值语义，拷贝）；
+//   - `splat(v)`：所有 lane 填同一个值；
+//   - 逐 lane 运算：`add` `sub` `mul`（整型另有 `neg` `min` `max`，
+//     浮点另有 `div` `neg` `min` `max` `abs`）；
+//   - 横向归约：`sum` `dot(other)`。
+//
+// 运算按 lane 逐元素展开实现（编译器对 128 位整型数组的 `+`/`-`/`&`
+// 会直接生成 SSE2 指令，这里保持与语言内建的数组运算语义一致：溢出回绕）。
+// 归约结果：`f32x4`/`f32x8` → `f32`；`f64x2`/`f64x4` → `f64`；
+// `i32x4` → `i32`；`i64x2` → `i64`；
+// `i8x8` 的 `sum` → `i32`（避免 8 个 i8 累加时提前溢出）。
+//
+// `best_width()` 返回当前平台推荐的最大 SIMD 字节宽度（目前硬编码为 16，
+// 未来版本会检测 AVX2 并返回 32）。
+//=============================================================================
+
+/// 4 个 f32 的向量。
+#[repr(simd)]
+pub struct f32x4 {
+    pub lanes: [f32; 4],
+}
+
+impl f32x4 {
+    pub fn from_array(arr: [f32; 4]) -> f32x4 {
+        return f32x4 { lanes: arr };
+    }
+
+    pub fn to_array(self) -> [f32; 4] {
+        return self.lanes;
+    }
+
+    /// 所有 lane 填同一个值。
+    pub fn splat(v: f32) -> f32x4 {
+        return f32x4 { lanes: [v; 4] };
+    }
+
+    pub fn add(self, other: f32x4) -> f32x4 {
+        return f32x4 { lanes: [
+            self.lanes[0] + other.lanes[0],
+            self.lanes[1] + other.lanes[1],
+            self.lanes[2] + other.lanes[2],
+            self.lanes[3] + other.lanes[3],
+        ] };
+    }
+
+    pub fn sub(self, other: f32x4) -> f32x4 {
+        return f32x4 { lanes: [
+            self.lanes[0] - other.lanes[0],
+            self.lanes[1] - other.lanes[1],
+            self.lanes[2] - other.lanes[2],
+            self.lanes[3] - other.lanes[3],
+        ] };
+    }
+
+    pub fn mul(self, other: f32x4) -> f32x4 {
+        return f32x4 { lanes: [
+            self.lanes[0] * other.lanes[0],
+            self.lanes[1] * other.lanes[1],
+            self.lanes[2] * other.lanes[2],
+            self.lanes[3] * other.lanes[3],
+        ] };
+    }
+
+    pub fn div(self, other: f32x4) -> f32x4 {
+        return f32x4 { lanes: [
+            self.lanes[0] / other.lanes[0],
+            self.lanes[1] / other.lanes[1],
+            self.lanes[2] / other.lanes[2],
+            self.lanes[3] / other.lanes[3],
+        ] };
+    }
+
+    pub fn neg(self) -> f32x4 {
+        return f32x4 { lanes: [
+            -self.lanes[0],
+            -self.lanes[1],
+            -self.lanes[2],
+            -self.lanes[3],
+        ] };
+    }
+
+    /// 逐 lane 取较小值。
+    pub fn min(self, other: f32x4) -> f32x4 {
+        return f32x4 { lanes: [
+            simd_min_f32(self.lanes[0], other.lanes[0]),
+            simd_min_f32(self.lanes[1], other.lanes[1]),
+            simd_min_f32(self.lanes[2], other.lanes[2]),
+            simd_min_f32(self.lanes[3], other.lanes[3]),
+        ] };
+    }
+
+    /// 逐 lane 取较大值。
+    pub fn max(self, other: f32x4) -> f32x4 {
+        return f32x4 { lanes: [
+            simd_max_f32(self.lanes[0], other.lanes[0]),
+            simd_max_f32(self.lanes[1], other.lanes[1]),
+            simd_max_f32(self.lanes[2], other.lanes[2]),
+            simd_max_f32(self.lanes[3], other.lanes[3]),
+        ] };
+    }
+
+    /// 逐 lane 取绝对值。
+    pub fn abs(self) -> f32x4 {
+        return f32x4 { lanes: [
+            simd_abs_f32(self.lanes[0]),
+            simd_abs_f32(self.lanes[1]),
+            simd_abs_f32(self.lanes[2]),
+            simd_abs_f32(self.lanes[3]),
+        ] };
+    }
+
+    /// 四个 lane 相加。
+    pub fn sum(self) -> f32 {
+        return self.lanes[0] + self.lanes[1] + self.lanes[2] + self.lanes[3];
+    }
+
+    /// 点积：`self[0]*other[0] + ... + self[3]*other[3]`。
+    pub fn dot(self, other: f32x4) -> f32 {
+        return self.lanes[0] * other.lanes[0]
+            + self.lanes[1] * other.lanes[1]
+            + self.lanes[2] * other.lanes[2]
+            + self.lanes[3] * other.lanes[3];
+    }
+}
+
+/// 4 个 i32 的向量。
+#[repr(simd)]
+pub struct i32x4 {
+    pub lanes: [i32; 4],
+}
+
+impl i32x4 {
+    pub fn from_array(arr: [i32; 4]) -> i32x4 {
+        return i32x4 { lanes: arr };
+    }
+
+    pub fn to_array(self) -> [i32; 4] {
+        return self.lanes;
+    }
+
+    pub fn splat(v: i32) -> i32x4 {
+        return i32x4 { lanes: [v; 4] };
+    }
+
+    pub fn add(self, other: i32x4) -> i32x4 {
+        return i32x4 { lanes: [
+            self.lanes[0] + other.lanes[0],
+            self.lanes[1] + other.lanes[1],
+            self.lanes[2] + other.lanes[2],
+            self.lanes[3] + other.lanes[3],
+        ] };
+    }
+
+    pub fn sub(self, other: i32x4) -> i32x4 {
+        return i32x4 { lanes: [
+            self.lanes[0] - other.lanes[0],
+            self.lanes[1] - other.lanes[1],
+            self.lanes[2] - other.lanes[2],
+            self.lanes[3] - other.lanes[3],
+        ] };
+    }
+
+    pub fn mul(self, other: i32x4) -> i32x4 {
+        return i32x4 { lanes: [
+            self.lanes[0] * other.lanes[0],
+            self.lanes[1] * other.lanes[1],
+            self.lanes[2] * other.lanes[2],
+            self.lanes[3] * other.lanes[3],
+        ] };
+    }
+
+    pub fn neg(self) -> i32x4 {
+        return i32x4 { lanes: [
+            0 - self.lanes[0],
+            0 - self.lanes[1],
+            0 - self.lanes[2],
+            0 - self.lanes[3],
+        ] };
+    }
+
+    pub fn min(self, other: i32x4) -> i32x4 {
+        return i32x4 { lanes: [
+            simd_min_i32(self.lanes[0], other.lanes[0]),
+            simd_min_i32(self.lanes[1], other.lanes[1]),
+            simd_min_i32(self.lanes[2], other.lanes[2]),
+            simd_min_i32(self.lanes[3], other.lanes[3]),
+        ] };
+    }
+
+    pub fn max(self, other: i32x4) -> i32x4 {
+        return i32x4 { lanes: [
+            simd_max_i32(self.lanes[0], other.lanes[0]),
+            simd_max_i32(self.lanes[1], other.lanes[1]),
+            simd_max_i32(self.lanes[2], other.lanes[2]),
+            simd_max_i32(self.lanes[3], other.lanes[3]),
+        ] };
+    }
+
+    pub fn sum(self) -> i32 {
+        return self.lanes[0] + self.lanes[1] + self.lanes[2] + self.lanes[3];
+    }
+
+    pub fn dot(self, other: i32x4) -> i32 {
+        return self.lanes[0] * other.lanes[0]
+            + self.lanes[1] * other.lanes[1]
+            + self.lanes[2] * other.lanes[2]
+            + self.lanes[3] * other.lanes[3];
+    }
+}
+
+/// 2 个 f64 的向量。
+#[repr(simd)]
+pub struct f64x2 {
+    pub lanes: [f64; 2],
+}
+
+impl f64x2 {
+    pub fn from_array(arr: [f64; 2]) -> f64x2 {
+        return f64x2 { lanes: arr };
+    }
+
+    pub fn to_array(self) -> [f64; 2] {
+        return self.lanes;
+    }
+
+    pub fn splat(v: f64) -> f64x2 {
+        return f64x2 { lanes: [v; 2] };
+    }
+
+    pub fn add(self, other: f64x2) -> f64x2 {
+        return f64x2 { lanes: [
+            self.lanes[0] + other.lanes[0],
+            self.lanes[1] + other.lanes[1],
+        ] };
+    }
+
+    pub fn sub(self, other: f64x2) -> f64x2 {
+        return f64x2 { lanes: [
+            self.lanes[0] - other.lanes[0],
+            self.lanes[1] - other.lanes[1],
+        ] };
+    }
+
+    pub fn mul(self, other: f64x2) -> f64x2 {
+        return f64x2 { lanes: [
+            self.lanes[0] * other.lanes[0],
+            self.lanes[1] * other.lanes[1],
+        ] };
+    }
+
+    pub fn div(self, other: f64x2) -> f64x2 {
+        return f64x2 { lanes: [
+            self.lanes[0] / other.lanes[0],
+            self.lanes[1] / other.lanes[1],
+        ] };
+    }
+
+    pub fn neg(self) -> f64x2 {
+        return f64x2 { lanes: [
+            -self.lanes[0],
+            -self.lanes[1],
+        ] };
+    }
+
+    pub fn min(self, other: f64x2) -> f64x2 {
+        return f64x2 { lanes: [
+            simd_min_f64(self.lanes[0], other.lanes[0]),
+            simd_min_f64(self.lanes[1], other.lanes[1]),
+        ] };
+    }
+
+    pub fn max(self, other: f64x2) -> f64x2 {
+        return f64x2 { lanes: [
+            simd_max_f64(self.lanes[0], other.lanes[0]),
+            simd_max_f64(self.lanes[1], other.lanes[1]),
+        ] };
+    }
+
+    pub fn abs(self) -> f64x2 {
+        return f64x2 { lanes: [
+            simd_abs_f64(self.lanes[0]),
+            simd_abs_f64(self.lanes[1]),
+        ] };
+    }
+
+    pub fn sum(self) -> f64 {
+        return self.lanes[0] + self.lanes[1];
+    }
+
+    pub fn dot(self, other: f64x2) -> f64 {
+        return self.lanes[0] * other.lanes[0]
+            + self.lanes[1] * other.lanes[1];
+    }
+}
+
+/// 8 个 i8 的向量。
+#[repr(simd)]
+pub struct i8x8 {
+    pub lanes: [i8; 8],
+}
+
+impl i8x8 {
+    pub fn from_array(arr: [i8; 8]) -> i8x8 {
+        return i8x8 { lanes: arr };
+    }
+
+    pub fn to_array(self) -> [i8; 8] {
+        return self.lanes;
+    }
+
+    pub fn splat(v: i8) -> i8x8 {
+        return i8x8 { lanes: [v; 8] };
+    }
+
+    pub fn add(self, other: i8x8) -> i8x8 {
+        return i8x8 { lanes: [
+            self.lanes[0] + other.lanes[0],
+            self.lanes[1] + other.lanes[1],
+            self.lanes[2] + other.lanes[2],
+            self.lanes[3] + other.lanes[3],
+            self.lanes[4] + other.lanes[4],
+            self.lanes[5] + other.lanes[5],
+            self.lanes[6] + other.lanes[6],
+            self.lanes[7] + other.lanes[7],
+        ] };
+    }
+
+    pub fn sub(self, other: i8x8) -> i8x8 {
+        return i8x8 { lanes: [
+            self.lanes[0] - other.lanes[0],
+            self.lanes[1] - other.lanes[1],
+            self.lanes[2] - other.lanes[2],
+            self.lanes[3] - other.lanes[3],
+            self.lanes[4] - other.lanes[4],
+            self.lanes[5] - other.lanes[5],
+            self.lanes[6] - other.lanes[6],
+            self.lanes[7] - other.lanes[7],
+        ] };
+    }
+
+    pub fn mul(self, other: i8x8) -> i8x8 {
+        return i8x8 { lanes: [
+            self.lanes[0] * other.lanes[0],
+            self.lanes[1] * other.lanes[1],
+            self.lanes[2] * other.lanes[2],
+            self.lanes[3] * other.lanes[3],
+            self.lanes[4] * other.lanes[4],
+            self.lanes[5] * other.lanes[5],
+            self.lanes[6] * other.lanes[6],
+            self.lanes[7] * other.lanes[7],
+        ] };
+    }
+
+    pub fn neg(self) -> i8x8 {
+        return i8x8 { lanes: [
+            0 - self.lanes[0],
+            0 - self.lanes[1],
+            0 - self.lanes[2],
+            0 - self.lanes[3],
+            0 - self.lanes[4],
+            0 - self.lanes[5],
+            0 - self.lanes[6],
+            0 - self.lanes[7],
+        ] };
+    }
+
+    pub fn min(self, other: i8x8) -> i8x8 {
+        return i8x8 { lanes: [
+            simd_min_i8(self.lanes[0], other.lanes[0]),
+            simd_min_i8(self.lanes[1], other.lanes[1]),
+            simd_min_i8(self.lanes[2], other.lanes[2]),
+            simd_min_i8(self.lanes[3], other.lanes[3]),
+            simd_min_i8(self.lanes[4], other.lanes[4]),
+            simd_min_i8(self.lanes[5], other.lanes[5]),
+            simd_min_i8(self.lanes[6], other.lanes[6]),
+            simd_min_i8(self.lanes[7], other.lanes[7]),
+        ] };
+    }
+
+    pub fn max(self, other: i8x8) -> i8x8 {
+        return i8x8 { lanes: [
+            simd_max_i8(self.lanes[0], other.lanes[0]),
+            simd_max_i8(self.lanes[1], other.lanes[1]),
+            simd_max_i8(self.lanes[2], other.lanes[2]),
+            simd_max_i8(self.lanes[3], other.lanes[3]),
+            simd_max_i8(self.lanes[4], other.lanes[4]),
+            simd_max_i8(self.lanes[5], other.lanes[5]),
+            simd_max_i8(self.lanes[6], other.lanes[6]),
+            simd_max_i8(self.lanes[7], other.lanes[7]),
+        ] };
+    }
+
+    /// 八个 lane 求和，用 i32 累计（避免 i8 提前溢出）。
+    pub fn sum(self) -> i32 {
+        let mut s: i32 = 0;
+        s = s + (self.lanes[0] as i32);
+        s = s + (self.lanes[1] as i32);
+        s = s + (self.lanes[2] as i32);
+        s = s + (self.lanes[3] as i32);
+        s = s + (self.lanes[4] as i32);
+        s = s + (self.lanes[5] as i32);
+        s = s + (self.lanes[6] as i32);
+        s = s + (self.lanes[7] as i32);
+        return s;
+    }
+
+    pub fn dot(self, other: i8x8) -> i32 {
+        let mut s: i32 = 0;
+        s = s + (self.lanes[0] * other.lanes[0]) as i32;
+        s = s + (self.lanes[1] * other.lanes[1]) as i32;
+        s = s + (self.lanes[2] * other.lanes[2]) as i32;
+        s = s + (self.lanes[3] * other.lanes[3]) as i32;
+        s = s + (self.lanes[4] * other.lanes[4]) as i32;
+        s = s + (self.lanes[5] * other.lanes[5]) as i32;
+        s = s + (self.lanes[6] * other.lanes[6]) as i32;
+        s = s + (self.lanes[7] * other.lanes[7]) as i32;
+        return s;
+    }
+}
+
+//----- i64 所需的标量辅助（必须在类型 impl 之前）----------------------------
+
+fn simd_min_i64(a: i64, b: i64) -> i64 {
+    if a < b { return a; }
+    return b;
+}
+
+fn simd_max_i64(a: i64, b: i64) -> i64 {
+    if a > b { return a; }
+    return b;
+}
+
+/// 2 个 i64 的向量（128 位，SSE2 级别）。
+#[repr(simd)]
+pub struct i64x2 {
+    pub lanes: [i64; 2],
+}
+
+impl i64x2 {
+    pub fn from_array(arr: [i64; 2]) -> i64x2 {
+        return i64x2 { lanes: arr };
+    }
+
+    pub fn to_array(self) -> [i64; 2] {
+        return self.lanes;
+    }
+
+    pub fn splat(v: i64) -> i64x2 {
+        return i64x2 { lanes: [v; 2] };
+    }
+
+    pub fn add(self, other: i64x2) -> i64x2 {
+        return i64x2 { lanes: [
+            self.lanes[0] + other.lanes[0],
+            self.lanes[1] + other.lanes[1],
+        ] };
+    }
+
+    pub fn sub(self, other: i64x2) -> i64x2 {
+        return i64x2 { lanes: [
+            self.lanes[0] - other.lanes[0],
+            self.lanes[1] - other.lanes[1],
+        ] };
+    }
+
+    pub fn mul(self, other: i64x2) -> i64x2 {
+        return i64x2 { lanes: [
+            self.lanes[0] * other.lanes[0],
+            self.lanes[1] * other.lanes[1],
+        ] };
+    }
+
+    pub fn neg(self) -> i64x2 {
+        return i64x2 { lanes: [
+            0 - self.lanes[0],
+            0 - self.lanes[1],
+        ] };
+    }
+
+    pub fn min(self, other: i64x2) -> i64x2 {
+        return i64x2 { lanes: [
+            simd_min_i64(self.lanes[0], other.lanes[0]),
+            simd_min_i64(self.lanes[1], other.lanes[1]),
+        ] };
+    }
+
+    pub fn max(self, other: i64x2) -> i64x2 {
+        return i64x2 { lanes: [
+            simd_max_i64(self.lanes[0], other.lanes[0]),
+            simd_max_i64(self.lanes[1], other.lanes[1]),
+        ] };
+    }
+
+    pub fn sum(self) -> i64 {
+        return self.lanes[0] + self.lanes[1];
+    }
+
+    pub fn dot(self, other: i64x2) -> i64 {
+        return self.lanes[0] * other.lanes[0]
+            + self.lanes[1] * other.lanes[1];
+    }
+}
+
+/// 8 个 f32 的向量（256 位，AVX2 级别）。
+#[repr(simd)]
+pub struct f32x8 {
+    pub lanes: [f32; 8],
+}
+
+impl f32x8 {
+    pub fn from_array(arr: [f32; 8]) -> f32x8 {
+        return f32x8 { lanes: arr };
+    }
+
+    pub fn to_array(self) -> [f32; 8] {
+        return self.lanes;
+    }
+
+    pub fn splat(v: f32) -> f32x8 {
+        return f32x8 { lanes: [v; 8] };
+    }
+
+    pub fn add(self, other: f32x8) -> f32x8 {
+        return f32x8 { lanes: [
+            self.lanes[0] + other.lanes[0],
+            self.lanes[1] + other.lanes[1],
+            self.lanes[2] + other.lanes[2],
+            self.lanes[3] + other.lanes[3],
+            self.lanes[4] + other.lanes[4],
+            self.lanes[5] + other.lanes[5],
+            self.lanes[6] + other.lanes[6],
+            self.lanes[7] + other.lanes[7],
+        ] };
+    }
+
+    pub fn sub(self, other: f32x8) -> f32x8 {
+        return f32x8 { lanes: [
+            self.lanes[0] - other.lanes[0],
+            self.lanes[1] - other.lanes[1],
+            self.lanes[2] - other.lanes[2],
+            self.lanes[3] - other.lanes[3],
+            self.lanes[4] - other.lanes[4],
+            self.lanes[5] - other.lanes[5],
+            self.lanes[6] - other.lanes[6],
+            self.lanes[7] - other.lanes[7],
+        ] };
+    }
+
+    pub fn mul(self, other: f32x8) -> f32x8 {
+        return f32x8 { lanes: [
+            self.lanes[0] * other.lanes[0],
+            self.lanes[1] * other.lanes[1],
+            self.lanes[2] * other.lanes[2],
+            self.lanes[3] * other.lanes[3],
+            self.lanes[4] * other.lanes[4],
+            self.lanes[5] * other.lanes[5],
+            self.lanes[6] * other.lanes[6],
+            self.lanes[7] * other.lanes[7],
+        ] };
+    }
+
+    pub fn div(self, other: f32x8) -> f32x8 {
+        return f32x8 { lanes: [
+            self.lanes[0] / other.lanes[0],
+            self.lanes[1] / other.lanes[1],
+            self.lanes[2] / other.lanes[2],
+            self.lanes[3] / other.lanes[3],
+            self.lanes[4] / other.lanes[4],
+            self.lanes[5] / other.lanes[5],
+            self.lanes[6] / other.lanes[6],
+            self.lanes[7] / other.lanes[7],
+        ] };
+    }
+
+    pub fn neg(self) -> f32x8 {
+        return f32x8 { lanes: [
+            -self.lanes[0],
+            -self.lanes[1],
+            -self.lanes[2],
+            -self.lanes[3],
+            -self.lanes[4],
+            -self.lanes[5],
+            -self.lanes[6],
+            -self.lanes[7],
+        ] };
+    }
+
+    /// 逐 lane 取较小值。
+    pub fn min(self, other: f32x8) -> f32x8 {
+        return f32x8 { lanes: [
+            simd_min_f32(self.lanes[0], other.lanes[0]),
+            simd_min_f32(self.lanes[1], other.lanes[1]),
+            simd_min_f32(self.lanes[2], other.lanes[2]),
+            simd_min_f32(self.lanes[3], other.lanes[3]),
+            simd_min_f32(self.lanes[4], other.lanes[4]),
+            simd_min_f32(self.lanes[5], other.lanes[5]),
+            simd_min_f32(self.lanes[6], other.lanes[6]),
+            simd_min_f32(self.lanes[7], other.lanes[7]),
+        ] };
+    }
+
+    /// 逐 lane 取较大值。
+    pub fn max(self, other: f32x8) -> f32x8 {
+        return f32x8 { lanes: [
+            simd_max_f32(self.lanes[0], other.lanes[0]),
+            simd_max_f32(self.lanes[1], other.lanes[1]),
+            simd_max_f32(self.lanes[2], other.lanes[2]),
+            simd_max_f32(self.lanes[3], other.lanes[3]),
+            simd_max_f32(self.lanes[4], other.lanes[4]),
+            simd_max_f32(self.lanes[5], other.lanes[5]),
+            simd_max_f32(self.lanes[6], other.lanes[6]),
+            simd_max_f32(self.lanes[7], other.lanes[7]),
+        ] };
+    }
+
+    /// 逐 lane 取绝对值。
+    pub fn abs(self) -> f32x8 {
+        return f32x8 { lanes: [
+            simd_abs_f32(self.lanes[0]),
+            simd_abs_f32(self.lanes[1]),
+            simd_abs_f32(self.lanes[2]),
+            simd_abs_f32(self.lanes[3]),
+            simd_abs_f32(self.lanes[4]),
+            simd_abs_f32(self.lanes[5]),
+            simd_abs_f32(self.lanes[6]),
+            simd_abs_f32(self.lanes[7]),
+        ] };
+    }
+
+    /// 八个 lane 相加。
+    pub fn sum(self) -> f32 {
+        return self.lanes[0] + self.lanes[1] + self.lanes[2] + self.lanes[3]
+            + self.lanes[4] + self.lanes[5] + self.lanes[6] + self.lanes[7];
+    }
+
+    /// 点积：`self[0]*other[0] + ... + self[7]*other[7]`。
+    pub fn dot(self, other: f32x8) -> f32 {
+        return self.lanes[0] * other.lanes[0]
+            + self.lanes[1] * other.lanes[1]
+            + self.lanes[2] * other.lanes[2]
+            + self.lanes[3] * other.lanes[3]
+            + self.lanes[4] * other.lanes[4]
+            + self.lanes[5] * other.lanes[5]
+            + self.lanes[6] * other.lanes[6]
+            + self.lanes[7] * other.lanes[7];
+    }
+}
+
+/// 4 个 f64 的向量（256 位，AVX2 级别）。
+#[repr(simd)]
+pub struct f64x4 {
+    pub lanes: [f64; 4],
+}
+
+impl f64x4 {
+    pub fn from_array(arr: [f64; 4]) -> f64x4 {
+        return f64x4 { lanes: arr };
+    }
+
+    pub fn to_array(self) -> [f64; 4] {
+        return self.lanes;
+    }
+
+    pub fn splat(v: f64) -> f64x4 {
+        return f64x4 { lanes: [v; 4] };
+    }
+
+    pub fn add(self, other: f64x4) -> f64x4 {
+        return f64x4 { lanes: [
+            self.lanes[0] + other.lanes[0],
+            self.lanes[1] + other.lanes[1],
+            self.lanes[2] + other.lanes[2],
+            self.lanes[3] + other.lanes[3],
+        ] };
+    }
+
+    pub fn sub(self, other: f64x4) -> f64x4 {
+        return f64x4 { lanes: [
+            self.lanes[0] - other.lanes[0],
+            self.lanes[1] - other.lanes[1],
+            self.lanes[2] - other.lanes[2],
+            self.lanes[3] - other.lanes[3],
+        ] };
+    }
+
+    pub fn mul(self, other: f64x4) -> f64x4 {
+        return f64x4 { lanes: [
+            self.lanes[0] * other.lanes[0],
+            self.lanes[1] * other.lanes[1],
+            self.lanes[2] * other.lanes[2],
+            self.lanes[3] * other.lanes[3],
+        ] };
+    }
+
+    pub fn div(self, other: f64x4) -> f64x4 {
+        return f64x4 { lanes: [
+            self.lanes[0] / other.lanes[0],
+            self.lanes[1] / other.lanes[1],
+            self.lanes[2] / other.lanes[2],
+            self.lanes[3] / other.lanes[3],
+        ] };
+    }
+
+    pub fn neg(self) -> f64x4 {
+        return f64x4 { lanes: [
+            -self.lanes[0],
+            -self.lanes[1],
+            -self.lanes[2],
+            -self.lanes[3],
+        ] };
+    }
+
+    pub fn min(self, other: f64x4) -> f64x4 {
+        return f64x4 { lanes: [
+            simd_min_f64(self.lanes[0], other.lanes[0]),
+            simd_min_f64(self.lanes[1], other.lanes[1]),
+            simd_min_f64(self.lanes[2], other.lanes[2]),
+            simd_min_f64(self.lanes[3], other.lanes[3]),
+        ] };
+    }
+
+    pub fn max(self, other: f64x4) -> f64x4 {
+        return f64x4 { lanes: [
+            simd_max_f64(self.lanes[0], other.lanes[0]),
+            simd_max_f64(self.lanes[1], other.lanes[1]),
+            simd_max_f64(self.lanes[2], other.lanes[2]),
+            simd_max_f64(self.lanes[3], other.lanes[3]),
+        ] };
+    }
+
+    pub fn abs(self) -> f64x4 {
+        return f64x4 { lanes: [
+            simd_abs_f64(self.lanes[0]),
+            simd_abs_f64(self.lanes[1]),
+            simd_abs_f64(self.lanes[2]),
+            simd_abs_f64(self.lanes[3]),
+        ] };
+    }
+
+    pub fn sum(self) -> f64 {
+        return self.lanes[0] + self.lanes[1] + self.lanes[2] + self.lanes[3];
+    }
+
+    pub fn dot(self, other: f64x4) -> f64 {
+        return self.lanes[0] * other.lanes[0]
+            + self.lanes[1] * other.lanes[1]
+            + self.lanes[2] * other.lanes[2]
+            + self.lanes[3] * other.lanes[3];
+    }
+}
+
+//----- 逐 lane 的标量辅助（模块前缀避免扁平符号表撞名）---------------------
+
+fn simd_min_f32(a: f32, b: f32) -> f32 {
+    if a < b { return a; }
+    return b;
+}
+
+fn simd_max_f32(a: f32, b: f32) -> f32 {
+    if a > b { return a; }
+    return b;
+}
+
+fn simd_abs_f32(a: f32) -> f32 {
+    if a < 0.0 { return -a; }
+    return a;
+}
+
+fn simd_min_f64(a: f64, b: f64) -> f64 {
+    if a < b { return a; }
+    return b;
+}
+
+fn simd_max_f64(a: f64, b: f64) -> f64 {
+    if a > b { return a; }
+    return b;
+}
+
+fn simd_abs_f64(a: f64) -> f64 {
+    if a < 0.0 { return -a; }
+    return a;
+}
+
+fn simd_min_i32(a: i32, b: i32) -> i32 {
+    if a < b { return a; }
+    return b;
+}
+
+fn simd_max_i32(a: i32, b: i32) -> i32 {
+    if a > b { return a; }
+    return b;
+}
+
+fn simd_min_i8(a: i8, b: i8) -> i8 {
+    if a < b { return a; }
+    return b;
+}
+
+fn simd_max_i8(a: i8, b: i8) -> i8 {
+    if a > b { return a; }
+    return b;
+}
+
+//----- 运行时平台辅助 -------------------------------------------------------
+
+/// 返回当前平台推荐的最大 SIMD 字节宽度。
+///
+/// 目前按指针宽度决定：
+///   - 64 位平台默认返回 32（256 位，推荐用 `f32x8` / `f64x4`）；
+///   - 32 位平台返回 16（128 位，推荐用 `f32x4` / `f64x2`）。
+///
+/// 未来版本会结合真实 CPU 特性（AVX2 / NEON / SSE2）更精确选择；
+/// 目前纯 zr 实现不依赖硬件 SIMD intrinsic，返回值只起"提示"作用。
+pub fn best_width() -> usize {
+    // 直接用指针字节数判断位宽；不引入新的 os 模块依赖。
+    let ptrb = size_of::<*mut u8>();
+    if ptrb >= 8 { return 32; }
+    return 16;
+}

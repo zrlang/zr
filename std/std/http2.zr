@@ -1,0 +1,1239 @@
+//=============================================================================
+// std/http2.zr — HTTP/2 (RFC 7540) 客户端 + HPACK (RFC 7541)
+//
+// 分两层，与 http.zr 一致：
+//   - 纯字节层：HPACK 编解码（`h2_encode_headers` / `HpackDecoder`）与帧编码
+//     （`h2_encode_frame`），不碰网络，可直接单测，RFC 7541 的附录 C 向量能
+//     原样跑；
+//   - 网络层：`http2_get` / `http2_post` / `http2_request` 通过 `net::tcp_connect`
+//     建连，走 **明文 h2c prior knowledge**（RFC 7540 §3.4）——直接发连接前导
+//     + SETTINGS，不做 HTTP/1.1 Upgrade。
+//
+// 与 http.zr 的关系：
+//   - 复用 `http::Url` / `url_parse` / `HttpResponse` / `HttpHeader` / `HttpError`，
+//     所以两个协议的返回值形状一致；
+//   - 头字段字符串的存放在 `HttpResponse.strings`（HPACK 解码出来的 `String`
+//     池），HTTP/1.1 路径里该字段为空。
+//
+// 已知边界：
+//   - 只支持明文 `http://`；`https://` 返回 `TlsNotSupported`（ALPN 协商
+//     `h2` 需要 TLS 侧支持，当前 tls.zr 未实现 ALPN）；
+//   - 不支持 h2 服务端推送（PUSH_PROMISE 帧被忽略）、不支持 PRIORITY 语义；
+//   - 请求体上限 65535 字节（初始流窗口大小）——不实现"边发边等
+//     WINDOW_UPDATE"的分段流控；
+//   - 响应体做了流控：每收到一条 DATA 就给流和连接各发一个 WINDOW_UPDATE，
+//     服务端可以持续发送。SIGPIPE 已在运行时入口被忽略，对端先关连接时
+//     写失败只会返回 `Network`。对端 SETTINGS 立即回 ACK（RFC 7540 §6.5.3）。
+//   - 不校验帧序的严格性（例如首帧必须是 SETTINGS），只处理自己需要的类型。
+//
+// 语言侧注意（实测）：
+//   - `&&` / `||` 不短路，先求值再判断；所有"先判空再解引用"都要拆成独立 if。
+//=============================================================================
+
+use core::Result;
+use string::String;
+use collections::Vec;
+use mem::{SliceMut, offset};
+use net::{TcpStream, tcp_connect};
+use http::{
+    HttpError, HttpHeader, HttpResponse, Url, url_parse,
+    http_resolve_redirect, http_find_header_value,
+};
+
+//=============================================================================
+// 常量（RFC 7540 §6 的帧类型与标志位）
+//=============================================================================
+
+pub const H2_HEADERS:       u8 = 1;
+pub const H2_DATA:          u8 = 0;
+pub const H2_PRIORITY:      u8 = 2;
+pub const H2_RST_STREAM:    u8 = 3;
+pub const H2_SETTINGS:      u8 = 4;
+pub const H2_PUSH_PROMISE:  u8 = 5;
+pub const H2_PING:          u8 = 6;
+pub const H2_GOAWAY:        u8 = 7;
+pub const H2_WINDOW_UPDATE: u8 = 8;
+pub const H2_CONTINUATION:  u8 = 9;
+
+pub const H2_FLAG_END_STREAM:  u8 = 1;
+pub const H2_FLAG_END_HEADERS: u8 = 4;
+pub const H2_FLAG_PADDED:      u8 = 8;
+pub const H2_FLAG_PRIORITY:    u8 = 32;
+
+/// RST_STREAM 错误码（RFC 7540 §7）。
+pub const H2_ERR_NO_ERROR:           u32 = 0;
+pub const H2_ERR_PROTOCOL_ERROR:     u32 = 1;
+pub const H2_ERR_REFUSED_STREAM:     u32 = 7;
+pub const H2_ERR_CANCEL:             u32 = 8;
+
+/// 服务端默认最大帧载荷（SETTINGS_MAX_FRAME_SIZE 默认值）。
+pub const H2_MAX_FRAME: usize = 16384;
+
+/// 初始流窗口 / 连接窗口大小（RFC 7540 §6.9.2 的默认值）。
+pub const H2_INIT_WINDOW: usize = 65535;
+
+//=============================================================================
+// HPACK 数据结构
+//=============================================================================
+
+/// 一个头字段（静态表条目 / 动态表条目共用）。字段指向字符串池。
+pub struct H2Field {
+    pub name:  []const u8,
+    pub value: []const u8,
+}
+
+/// HPACK 增量解码器。
+///
+/// 动态表跨多个 HEADERS 块保留（RFC 7541 §2.3），所以要复用同一个实例解码
+/// 同一条连接上的所有块。RFC 7541 附录 C 的请求示例 2/3 就依赖示例 1 写入
+/// 动态表的条目。
+pub struct HpackDecoder {
+    /// 动态表，最新条目在下标 0（索引 62 起）。
+    pub entries:  Vec<H2Field>,
+    /// 字符串池：解码出来的名字 / 值都放这里，`entries` 与调用方拿到的
+    /// `HttpHeader` 都指向池里的堆缓冲。
+    pub arena:    Vec<String>,
+    /// 动态表当前字节数（每条 = name.len + value.len + 32）。
+    pub size:     usize,
+    /// 动态表容量上限（对应 SETTINGS_HEADER_TABLE_SIZE），默认 4096。
+    pub max_size: usize,
+}
+
+impl HpackDecoder {
+    /// 默认动态表上限 4096（RFC 7540 的默认 SETTINGS_HEADER_TABLE_SIZE）。
+    pub fn new() -> HpackDecoder {
+        return HpackDecoder {
+            entries:  Vec::new(),
+            arena:    Vec::new(),
+            size:     0,
+            max_size: 4096,
+        };
+    }
+
+    /// 指定动态表上限（RFC 7541 附录 C.6 用 256）。
+    pub fn with_table_size(max_size: usize) -> HpackDecoder {
+        return HpackDecoder {
+            entries:  Vec::new(),
+            arena:    Vec::new(),
+            size:     0,
+            max_size: max_size,
+        };
+    }
+
+    /// 解码一个完整的头块（HEADERS + CONTINUATION 拼接后的字节）。
+    ///
+    /// 返回的头字段里 `str` 指向 `self.arena`，随解码器存活；网络层在返回
+    /// 响应前把 `arena` 移进 `HttpResponse.strings` 以延续生命周期。
+    pub fn decode(self: &mut HpackDecoder, block: []const u8) -> Result<Vec<HttpHeader>, HttpError> {
+        let mut out: Vec<HttpHeader> = Vec::new();
+        let table = h2_static_table();
+        let static_tab: []const H2Field = table[0..61];
+
+        let mut pos: usize = 0;
+        while pos < block.len {
+            let b = block.ptr[pos];
+
+            // 1) 索引形式：0xxxxxxx，7 位前缀索引。
+            if (b & 128) != 0 {
+                let n = h2_int(block, pos, 7);
+                if !n.ok {
+                    return Result::Err(HttpError::BadResponse);
+                }
+                pos = n.next;
+                let e = h2_lookup(self, static_tab, n.value);
+                if !e.ok {
+                    return Result::Err(HttpError::BadResponse);
+                }
+                out.push(HttpHeader { name: e.name, value: e.value });
+                continue;
+            }
+
+            // 2) 增量索引字面量：01xxxxxx，6 位前缀索引（0 = 新名字）。
+            if (b & 64) != 0 {
+                let n = h2_int(block, pos, 6);
+                if !n.ok {
+                    return Result::Err(HttpError::BadResponse);
+                }
+                pos = n.next;
+                let mut name: []const u8 = h2_empty();
+                if n.value == 0 {
+                    let s = h2_decode_string(self, block, pos);
+                    if !s.ok {
+                        return Result::Err(HttpError::BadResponse);
+                    }
+                    name = s.value;
+                    pos = s.next;
+                } else {
+                    let e = h2_lookup(self, static_tab, n.value);
+                    if !e.ok {
+                        return Result::Err(HttpError::BadResponse);
+                    }
+                    name = e.name;
+                }
+                let v = h2_decode_string(self, block, pos);
+                if !v.ok {
+                    return Result::Err(HttpError::BadResponse);
+                }
+                pos = v.next;
+                h2_add_entry(self, name, v.value);
+                out.push(HttpHeader { name: name, value: v.value });
+                continue;
+            }
+
+            // 3) 动态表容量更新：001xxxxx，5 位前缀（RFC 7541 §6.3）。
+            if (b & 32) != 0 {
+                let n = h2_int(block, pos, 5);
+                if !n.ok {
+                    return Result::Err(HttpError::BadResponse);
+                }
+                pos = n.next;
+                h2_set_max(self, n.value);
+                continue;
+            }
+
+            // 4) 不索引 / 永不索引字面量：0000xxxx / 0001xxxx，4 位前缀。
+            let n = h2_int(block, pos, 4);
+            if !n.ok {
+                return Result::Err(HttpError::BadResponse);
+            }
+            pos = n.next;
+            let mut name2: []const u8 = h2_empty();
+            if n.value == 0 {
+                let s = h2_decode_string(self, block, pos);
+                if !s.ok {
+                    return Result::Err(HttpError::BadResponse);
+                }
+                name2 = s.value;
+                pos = s.next;
+            } else {
+                let e = h2_lookup(self, static_tab, n.value);
+                if !e.ok {
+                    return Result::Err(HttpError::BadResponse);
+                }
+                name2 = e.name;
+            }
+            let v2 = h2_decode_string(self, block, pos);
+            if !v2.ok {
+                return Result::Err(HttpError::BadResponse);
+            }
+            pos = v2.next;
+            out.push(HttpHeader { name: name2, value: v2.value });
+        }
+        return Result::Ok(out);
+    }
+}
+
+/// `h2_empty`：零长度切片的统一写法（`raw[len..len]` 合法，但这里没有 raw）。
+fn h2_empty() -> []const u8 {
+    let zero: [u8; 0] = [0; 0];
+    return zero[0..0];
+}
+
+/// 静态表（RFC 7541 附录 A），下标 0 对应索引 1。
+fn h2_static_table() -> [H2Field; 61] {
+    let h2_static: [H2Field; 61] = [
+        H2Field { name: ":authority", value: "" },
+        H2Field { name: ":method", value: "GET" },
+        H2Field { name: ":method", value: "POST" },
+        H2Field { name: ":path", value: "/" },
+        H2Field { name: ":path", value: "/index.html" },
+        H2Field { name: ":scheme", value: "http" },
+        H2Field { name: ":scheme", value: "https" },
+        H2Field { name: ":status", value: "200" },
+        H2Field { name: ":status", value: "204" },
+        H2Field { name: ":status", value: "206" },
+        H2Field { name: ":status", value: "304" },
+        H2Field { name: ":status", value: "400" },
+        H2Field { name: ":status", value: "404" },
+        H2Field { name: ":status", value: "500" },
+        H2Field { name: "accept-charset", value: "" },
+        H2Field { name: "accept-encoding", value: "gzip, deflate" },
+        H2Field { name: "accept-language", value: "" },
+        H2Field { name: "accept-ranges", value: "" },
+        H2Field { name: "accept", value: "" },
+        H2Field { name: "access-control-allow-origin", value: "" },
+        H2Field { name: "age", value: "" },
+        H2Field { name: "allow", value: "" },
+        H2Field { name: "authorization", value: "" },
+        H2Field { name: "cache-control", value: "" },
+        H2Field { name: "content-disposition", value: "" },
+        H2Field { name: "content-encoding", value: "" },
+        H2Field { name: "content-language", value: "" },
+        H2Field { name: "content-length", value: "" },
+        H2Field { name: "content-location", value: "" },
+        H2Field { name: "content-range", value: "" },
+        H2Field { name: "content-type", value: "" },
+        H2Field { name: "cookie", value: "" },
+        H2Field { name: "date", value: "" },
+        H2Field { name: "etag", value: "" },
+        H2Field { name: "expect", value: "" },
+        H2Field { name: "expires", value: "" },
+        H2Field { name: "from", value: "" },
+        H2Field { name: "host", value: "" },
+        H2Field { name: "if-match", value: "" },
+        H2Field { name: "if-modified-since", value: "" },
+        H2Field { name: "if-none-match", value: "" },
+        H2Field { name: "if-range", value: "" },
+        H2Field { name: "if-unmodified-since", value: "" },
+        H2Field { name: "last-modified", value: "" },
+        H2Field { name: "link", value: "" },
+        H2Field { name: "location", value: "" },
+        H2Field { name: "max-forwards", value: "" },
+        H2Field { name: "proxy-authenticate", value: "" },
+        H2Field { name: "proxy-authorization", value: "" },
+        H2Field { name: "range", value: "" },
+        H2Field { name: "referer", value: "" },
+        H2Field { name: "refresh", value: "" },
+        H2Field { name: "retry-after", value: "" },
+        H2Field { name: "server", value: "" },
+        H2Field { name: "set-cookie", value: "" },
+        H2Field { name: "strict-transport-security", value: "" },
+        H2Field { name: "transfer-encoding", value: "" },
+        H2Field { name: "user-agent", value: "" },
+        H2Field { name: "vary", value: "" },
+        H2Field { name: "via", value: "" },
+        H2Field { name: "www-authenticate", value: "" },
+    ];
+    return h2_static;
+}
+
+/// 静态表查找：`(name, value)` 完全匹配时返回索引（1 起），否则 0。
+fn h2_find_static(static_tab: []const H2Field, name: []const u8, value: []const u8) -> usize {
+    let mut i: usize = 0;
+    while i < static_tab.len {
+        let e = static_tab[i];
+        if h2_bytes_eq(e.name, name) {
+            if h2_bytes_eq(e.value, value) {
+                return i + 1;
+            }
+        }
+        i = i + 1;
+    }
+    return 0;
+}
+
+//=============================================================================
+// HPACK 原语：整数、字符串、动态表
+//=============================================================================
+
+/// 前缀整数解码结果。
+struct H2Int {
+    pub value: usize,
+    pub next:  usize,
+    pub ok:    bool,
+}
+
+fn h2_int_fail(pos: usize) -> H2Int {
+    return H2Int { value: 0, next: pos, ok: false };
+}
+
+/// 解码 RFC 7541 §5.1 的变长整数：首字节低 `prefix_bits` 位，续字节 7 位。
+fn h2_int(raw: []const u8, pos: usize, prefix_bits: usize) -> H2Int {
+    if pos >= raw.len {
+        return h2_int_fail(pos);
+    }
+    let mask: usize = ((1 as usize) << prefix_bits) - 1;
+    let mut value: usize = (raw.ptr[pos] as usize) & mask;
+    let mut p: usize = pos + 1;
+    if value < mask {
+        return H2Int { value: value, next: p, ok: true };
+    }
+    let mut shift: usize = 0;
+    loop {
+        if p >= raw.len {
+            return h2_int_fail(pos);
+        }
+        let b = raw.ptr[p];
+        p = p + 1;
+        value = value + (((b & 127) as usize) << shift);
+        if (b & 128) == 0 {
+            break;
+        }
+        shift = shift + 7;
+        if shift > 49 {
+            return h2_int_fail(pos);
+        }
+    }
+    return H2Int { value: value, next: p, ok: true };
+}
+
+/// 字符串解码结果（`value` 指向解码器的字符串池）。
+struct H2Str {
+    pub value: []const u8,
+    pub next:  usize,
+    pub ok:    bool,
+}
+
+fn h2_str_fail(pos: usize) -> H2Str {
+    return H2Str { value: h2_empty(), next: pos, ok: false };
+}
+
+/// 解码一个字符串字面量（Huffman 位 = 首字节最高位）。
+fn h2_decode_string(self: &mut HpackDecoder, raw: []const u8, pos: usize) -> H2Str {
+    if pos >= raw.len {
+        return h2_str_fail(pos);
+    }
+    let huff: bool = (raw.ptr[pos] & 128) != 0;
+    let n = h2_int(raw, pos, 7);
+    if !n.ok {
+        return h2_str_fail(pos);
+    }
+    let start = n.next;
+    if n.value > raw.len - start {
+        return h2_str_fail(pos);
+    }
+    let end = start + n.value;
+    if huff {
+        let decoded = h2_huff_decode(raw[start..end]);
+        let s = h2_intern(self, decoded.as_slice());
+        return H2Str { value: s, next: end, ok: true };
+    }
+    let s2 = h2_intern(self, raw[start..end]);
+    return H2Str { value: s2, next: end, ok: true };
+}
+
+/// 把一段字节拷进字符串池，返回指向池内堆缓冲的切片。
+fn h2_intern(self: &mut HpackDecoder, bytes: []const u8) -> []const u8 {
+    let s = String::from_bytes(bytes);
+    self.arena.push(s);
+    let idx = self.arena.len() - 1;
+    return self.arena[idx].as_bytes();
+}
+
+/// 查表（1..61 静态，62 起动态，下标 0 非法）。
+struct H2Lookup {
+    pub name:  []const u8,
+    pub value: []const u8,
+    pub ok:    bool,
+}
+
+fn h2_lookup(self: &HpackDecoder, static_tab: []const H2Field, index: usize) -> H2Lookup {
+    if index == 0 {
+        return H2Lookup { name: h2_empty(), value: h2_empty(), ok: false };
+    }
+    if index <= 61 {
+        let e = static_tab[index - 1];
+        return H2Lookup { name: e.name, value: e.value, ok: true };
+    }
+    let dyn_idx = index - 62;
+    if dyn_idx >= self.entries.len() {
+        return H2Lookup { name: h2_empty(), value: h2_empty(), ok: false };
+    }
+    let e2 = self.entries[dyn_idx];
+    return H2Lookup { name: e2.name, value: e2.value, ok: true };
+}
+
+/// 按动态表容量腾出空间，再把新条目插到表头。
+fn h2_add_entry(self: &mut HpackDecoder, name: []const u8, value: []const u8) {
+    let entry_size = name.len + value.len + 32;
+    if entry_size > self.max_size {
+        self.entries.clear();
+        self.size = 0;
+        return;
+    }
+    while self.size + entry_size > self.max_size {
+        if self.entries.len() == 0 {
+            self.size = 0;
+            break;
+        }
+        let last = self.entries.len() - 1;
+        let old = self.entries[last];
+        self.size = self.size - (old.name.len + old.value.len + 32);
+        let _ = self.entries.remove(last);
+    }
+    self.entries.insert(0, H2Field { name: name, value: value });
+    self.size = self.size + entry_size;
+}
+
+/// `SETTINGS_HEADER_TABLE_SIZE` / 动态表容量更新：改上限并逐条淘汰。
+fn h2_set_max(self: &mut HpackDecoder, new_max: usize) {
+    self.max_size = new_max;
+    while self.size > self.max_size {
+        if self.entries.len() == 0 {
+            self.size = 0;
+            break;
+        }
+        let last = self.entries.len() - 1;
+        let old = self.entries[last];
+        self.size = self.size - (old.name.len + old.value.len + 32);
+        let _ = self.entries.remove(last);
+    }
+}
+
+//=============================================================================
+// Huffman 解码（RFC 7541 附录 B）
+//
+// 规范 Huffman 码按 (码长, 码值) 排序后，每个码长 L 的码值落在
+// [first[L], first[L] + count[L]) 区间内；解码时逐位累积码值，落在区间里就
+// 用 `index[L] + (code - first[L])` 查符号。CSV 表由 RFC 7541 附录 B 生成，
+// 不要手改。
+//=============================================================================
+
+fn h2_huff_decode(enc: []const u8) -> Vec<u8> {
+    let h2_huff_count: [u8; 31] = [0, 0, 0, 0, 0, 10, 26, 32, 6, 0, 5, 3, 2, 6, 2, 3, 0, 0, 0, 3, 8, 13, 26, 29, 12, 4, 15, 19, 29, 0, 4];
+    let h2_huff_first: [u32; 31] = [0, 0, 0, 0, 0, 0, 20, 92, 248, 508, 1016, 2042, 4090, 8184, 16380, 32764, 65534, 131068, 262136, 524272, 1048550, 2097116, 4194258, 8388568, 16777194, 33554412, 67108832, 134217694, 268435426, 536870910, 1073741820];
+    let h2_huff_index: [usize; 31] = [0, 0, 0, 0, 0, 0, 10, 36, 68, 74, 74, 79, 82, 84, 90, 92, 95, 95, 95, 95, 98, 106, 119, 145, 174, 186, 190, 205, 224, 253, 253];
+    let h2_huff_syms: [u16; 257] = [
+        48, 49, 50, 97, 99, 101, 105, 111, 115, 116, 32, 37, 45, 46, 47, 51,
+        52, 53, 54, 55, 56, 57, 61, 65, 95, 98, 100, 102, 103, 104, 108, 109,
+        110, 112, 114, 117, 58, 66, 67, 68, 69, 70, 71, 72, 73, 74, 75, 76,
+        77, 78, 79, 80, 81, 82, 83, 84, 85, 86, 87, 89, 106, 107, 113, 118,
+        119, 120, 121, 122, 38, 42, 44, 59, 88, 90, 33, 34, 40, 41, 63, 39,
+        43, 124, 35, 62, 0, 36, 64, 91, 93, 126, 94, 125, 60, 96, 123, 92,
+        195, 208, 128, 130, 131, 162, 184, 194, 224, 226, 153, 161, 167, 172, 176, 177,
+        179, 209, 216, 217, 227, 229, 230, 129, 132, 133, 134, 136, 146, 154, 156, 160,
+        163, 164, 169, 170, 173, 178, 181, 185, 186, 187, 189, 190, 196, 198, 228, 232,
+        233, 1, 135, 137, 138, 139, 140, 141, 143, 147, 149, 150, 151, 152, 155, 157,
+        158, 165, 166, 168, 174, 175, 180, 182, 183, 188, 191, 197, 231, 239, 9, 142,
+        144, 145, 148, 159, 171, 206, 215, 225, 236, 237, 199, 207, 234, 235, 192, 193,
+        200, 201, 202, 205, 210, 213, 218, 219, 238, 240, 242, 243, 255, 203, 204, 211,
+        212, 214, 221, 222, 223, 241, 244, 245, 246, 247, 248, 250, 251, 252, 253, 254,
+        2, 3, 4, 5, 6, 7, 8, 11, 12, 14, 15, 16, 17, 18, 19, 20,
+        21, 23, 24, 25, 26, 27, 28, 29, 30, 31, 127, 220, 249, 10, 13, 22,
+        256,
+    ];
+
+    let mut out: Vec<u8> = Vec::new();
+    let total: usize = enc.len * 8;
+    let mut pos: usize = 0;
+    while pos < total {
+        let mut code: u32 = 0;
+        let mut len: usize = 0;
+        let mut matched = false;
+        while len < 30 {
+            if pos >= total { break; }
+            let byte = enc.ptr[pos / 8];
+            let bit = ((byte >> (7 - (pos % 8))) & 1) as u32;
+            code = code * 2 + bit;
+            len = len + 1;
+            pos = pos + 1;
+            if h2_huff_count[len] > 0 {
+                let rel = code - h2_huff_first[len];
+                if code >= h2_huff_first[len] && rel < h2_huff_count[len] as u32 {
+                    let idx: usize = h2_huff_index[len] + rel as usize;
+                    let sym: u16 = h2_huff_syms[idx];
+                    // 256 是 EOS 符号，只用于补位前缀，不应出现在字面量里。
+                    if sym == 256 { return out; }
+                    out.push(sym as u8);
+                    matched = true;
+                    break;
+                }
+            }
+        }
+        if !matched { break; }
+    }
+    return out;
+}
+
+//=============================================================================
+// HPACK 编码（请求方向：只写"不索引"字面量与静态表精确匹配的索引项）
+//=============================================================================
+
+/// 编码一个字符串字面量（不做 Huffman，只写"原始字节"形式）。
+fn h2_enc_str(out: &mut Vec<u8>, s: []const u8) {
+    let n = s.len;
+    if n < 127 {
+        out.push(n as u8);
+    } else {
+        out.push(127 as u8);
+        let mut rest = n - 127;
+        loop {
+            if rest < 128 {
+                out.push(rest as u8);
+                break;
+            }
+            out.push(((rest & 127) | 128) as u8);
+            rest = rest >> 7;
+        }
+    }
+    let mut i: usize = 0;
+    while i < n {
+        out.push(s.ptr[i]);
+        i = i + 1;
+    }
+}
+
+/// 编码一个完整的头块。与静态表完全匹配的字段用索引项（1 字节），其余
+/// 用 `0000xxxx` 的"不索引、新名字"字面量（`名称len 名称 值len 值`）。
+pub fn h2_encode_headers(headers: []const HttpHeader) -> Vec<u8> {
+    let mut out: Vec<u8> = Vec::new();
+    let table = h2_static_table();
+    let static_tab: []const H2Field = table[0..61];
+    let mut i: usize = 0;
+    while i < headers.len {
+        let h = headers[i];
+        let idx = h2_find_static(static_tab, h.name, h.value);
+        if idx > 0 {
+            out.push((128 + idx) as u8);
+        } else {
+            out.push(0 as u8);
+            h2_enc_str(&mut out, h.name);
+            h2_enc_str(&mut out, h.value);
+        }
+        i = i + 1;
+    }
+    return out;
+}
+
+//=============================================================================
+// 帧编码
+//=============================================================================
+
+/// 编码一个帧（9 字节头 + 载荷）。长度字段 24 位、流号 31 位。
+pub fn h2_encode_frame(kind: u8, flags: u8, stream_id: u32, payload: []const u8) -> Vec<u8> {
+    let mut out: Vec<u8> = Vec::with_capacity(payload.len + 9);
+    let n = payload.len;
+    out.push(((n >> 16) & 255) as u8);
+    out.push(((n >> 8) & 255) as u8);
+    out.push((n & 255) as u8);
+    out.push(kind);
+    out.push(flags);
+    out.push(((stream_id >> 24) & 255) as u8);
+    out.push(((stream_id >> 16) & 255) as u8);
+    out.push(((stream_id >> 8) & 255) as u8);
+    out.push((stream_id & 255) as u8);
+    let mut i: usize = 0;
+    while i < n {
+        out.push(payload.ptr[i]);
+        i = i + 1;
+    }
+    return out;
+}
+
+//=============================================================================
+// 网络层：收发
+//=============================================================================
+
+/// 一个收到的帧。`payload` 是去掉 9 字节头之后的原始载荷。
+pub struct H2Frame {
+    pub kind:       u8,
+    pub flags:      u8,
+    pub stream_id:  u32,
+    pub payload:    Vec<u8>,
+}
+
+/// 把 `bytes` 全部写进连接（`TcpStream::write` 只保证写一次，不保证写完）。
+fn h2_send_all(stream: &TcpStream, bytes: []const u8) -> bool {
+    let mut sent: usize = 0;
+    while sent < bytes.len {
+        let rest = bytes[sent..bytes.len];
+        match stream.write(rest) {
+            Result::Ok(n) => {
+                if n == 0 {
+                    return false;
+                }
+                sent = sent + n;
+            }
+            Result::Err(e) => {
+                return false;
+            }
+        }
+    }
+    return true;
+}
+
+/// 精确读 `len` 字节；对端提前关闭返回 false。
+fn h2_read_exact(stream: &TcpStream, out: *mut u8, len: usize) -> bool {
+    let mut got: usize = 0;
+    while got < len {
+        match stream.read(SliceMut::new(offset(out as *const u8, got) as *mut u8, len - got)) {
+            Result::Ok(n) => {
+                if n == 0 {
+                    return false;
+                }
+                got = got + n;
+            }
+            Result::Err(e) => {
+                return false;
+            }
+        }
+    }
+    return true;
+}
+
+/// 读一个完整帧（先读 9 字节头，再按长度读载荷）。
+fn h2_read_frame(stream: &TcpStream) -> Result<H2Frame, HttpError> {
+    let mut head: [u8; 9] = [0; 9];
+    if !h2_read_exact(stream, &mut head[0] as *mut u8, 9) {
+        return Result::Err(HttpError::Network);
+    }
+    let len: usize = (head[0] as usize) * 65536 + (head[1] as usize) * 256 + (head[2] as usize);
+    // 载荷超过 64 KiB 的帧不接受（服务端帧受其自身 max_frame_size 限制，正常远小于此）。
+    if len > 65536 {
+        return Result::Err(HttpError::BadResponse);
+    }
+    let kind = head[3];
+    let flags = head[4];
+    let sid: u32 = (head[5] as u32) * 16777216 + (head[6] as u32) * 65536
+                 + (head[7] as u32) * 256 + (head[8] as u32);
+
+    let mut payload: Vec<u8> = Vec::with_capacity(len);
+    // 先按长度铺零再原地读入：`[u8; 65536]` 这种大栈数组字面量会让编译器
+    // 的类型检查 / 代码生成退化成分钟级，这里改用堆缓冲。
+    let mut z: usize = 0;
+    while z < len {
+        payload.push(0 as u8);
+        z = z + 1;
+    }
+    if len > 0 {
+        if !h2_read_exact(stream, payload.data, len) {
+            return Result::Err(HttpError::Network);
+        }
+    }
+    return Result::Ok(H2Frame { kind: kind, flags: flags, stream_id: sid, payload: payload });
+}
+
+/// 去掉 PADDED（首字节是填充长度）与可选的 PRIORITY（5 字节）前缀。
+fn h2_payload_bytes(f: &H2Frame, strip_priority: bool) -> Result<Vec<u8>, HttpError> {
+    let mut start: usize = 0;
+    let mut end: usize = f.payload.len();
+    if (f.flags & H2_FLAG_PADDED) != 0 {
+        if end == 0 {
+            return Result::Err(HttpError::BadResponse);
+        }
+        let pad = f.payload.data[0] as usize;
+        if pad + 1 > end {
+            return Result::Err(HttpError::BadResponse);
+        }
+        start = 1;
+        end = end - pad;
+    }
+    if strip_priority {
+        if (f.flags & H2_FLAG_PRIORITY) != 0 {
+            if end < start + 5 {
+                return Result::Err(HttpError::BadResponse);
+            }
+            start = start + 5;
+        }
+    }
+    let mut out: Vec<u8> = Vec::new();
+    let mut i: usize = start;
+    while i < end {
+        out.push(f.payload.data[i]);
+        i = i + 1;
+    }
+    return Result::Ok(out);
+}
+
+/// 发 WINDOW_UPDATE（4 字节增量）。
+fn h2_send_window_update(stream: &TcpStream, sid: u32, inc: usize) -> bool {
+    if inc > 2147483647 {
+        return false;
+    }
+    let v = inc as u32;
+    let mut p: [u8; 4] = [0; 4];
+    p[0] = ((v >> 24) & 255) as u8;
+    p[1] = ((v >> 16) & 255) as u8;
+    p[2] = ((v >> 8) & 255) as u8;
+    p[3] = (v & 255) as u8;
+    let f = h2_encode_frame(H2_WINDOW_UPDATE, 0, sid, p[0..4]);
+    return h2_send_all(stream, f.as_slice());
+}
+
+/// 发 RST_STREAM（4 字节错误码）。
+fn h2_send_rst_stream(stream: &TcpStream, sid: u32, err: u32) -> bool {
+    let mut p: [u8; 4] = [0; 4];
+    p[0] = ((err >> 24) & 255) as u8;
+    p[1] = ((err >> 16) & 255) as u8;
+    p[2] = ((err >> 8) & 255) as u8;
+    p[3] = (err & 255) as u8;
+    let f = h2_encode_frame(H2_RST_STREAM, 0, sid, p[0..4]);
+    return h2_send_all(stream, f.as_slice());
+}
+
+//=============================================================================
+// 网络层：一次请求 / 响应往返
+//=============================================================================
+
+/// 字节比较。
+fn h2_bytes_eq(a: []const u8, b: []const u8) -> bool {
+    if a.len != b.len {
+        return false;
+    }
+    let mut i: usize = 0;
+    while i < a.len {
+        if a.ptr[i] != b.ptr[i] {
+            return false;
+        }
+        i = i + 1;
+    }
+    return true;
+}
+
+/// 状态码 → 原因短语（只覆盖常见值，其余返回空串）。
+fn h2_reason(code: u16) -> str {
+    if code == 200 { return "OK"; }
+    if code == 201 { return "Created"; }
+    if code == 204 { return "No Content"; }
+    if code == 206 { return "Partial Content"; }
+    if code == 301 { return "Moved Permanently"; }
+    if code == 302 { return "Found"; }
+    if code == 303 { return "See Other"; }
+    if code == 304 { return "Not Modified"; }
+    if code == 307 { return "Temporary Redirect"; }
+    if code == 308 { return "Permanent Redirect"; }
+    if code == 400 { return "Bad Request"; }
+    if code == 401 { return "Unauthorized"; }
+    if code == 403 { return "Forbidden"; }
+    if code == 404 { return "Not Found"; }
+    if code == 405 { return "Method Not Allowed"; }
+    if code == 429 { return "Too Many Requests"; }
+    if code == 500 { return "Internal Server Error"; }
+    if code == 502 { return "Bad Gateway"; }
+    if code == 503 { return "Service Unavailable"; }
+    return "";
+}
+
+/// 十进制状态码解析（非法返回 0）。
+fn h2_parse_status(value: []const u8) -> u16 {
+    let mut v: u32 = 0;
+    let mut i: usize = 0;
+    while i < value.len {
+        let c = value.ptr[i];
+        if c < 48 {
+            break;
+        }
+        if c > 57 {
+            break;
+        }
+        v = v * 10 + (c - 48) as u32;
+        if v > 999 {
+            break;
+        }
+        i = i + 1;
+    }
+    return v as u16;
+}
+
+/// 发连接前导 + SETTINGS（空载荷，全部用对端默认值）。
+fn h2_send_preface(stream: &TcpStream) -> bool {
+    let preface = "PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";
+    if !h2_send_all(stream, preface) {
+        return false;
+    }
+    let mut empty: Vec<u8> = Vec::new();
+    let f = h2_encode_frame(H2_SETTINGS, 0, 0, empty.as_slice());
+    return h2_send_all(stream, f.as_slice());
+}
+
+/// 把头块拆成 HEADERS + 若干 CONTINUATION（单帧超过 16 KiB 时才拆）。
+fn h2_send_header_block(stream: &TcpStream, block: []const u8, end_stream: bool) -> bool {
+    let mut off: usize = 0;
+    let mut first = true;
+    loop {
+        let remain = block.len - off;
+        let n = if remain > H2_MAX_FRAME { H2_MAX_FRAME } else { remain };
+        let chunk = block[off..off + n];
+        let last = off + n >= block.len;
+        let mut flags: u8 = 0;
+        if first {
+            if end_stream {
+                flags = flags | H2_FLAG_END_STREAM;
+            }
+            if last {
+                flags = flags | H2_FLAG_END_HEADERS;
+            }
+            let f = h2_encode_frame(H2_HEADERS, flags, 1, chunk);
+            if !h2_send_all(stream, f.as_slice()) {
+                return false;
+            }
+            first = false;
+        } else {
+            if last {
+                flags = H2_FLAG_END_HEADERS;
+            }
+            let f = h2_encode_frame(H2_CONTINUATION, flags, 1, chunk);
+            if !h2_send_all(stream, f.as_slice()) {
+                return false;
+            }
+        }
+        off = off + n;
+        if last {
+            break;
+        }
+    }
+    return true;
+}
+
+/// 一次 h2c 往返：建连、发请求、收帧、HPACK 解码、组装 `HttpResponse`。
+fn h2_exchange(
+    host: []const u8,
+    port: u16,
+    path: []const u8,
+    method: []const u8,
+    body: []const u8,
+    headers: []const HttpHeader,
+) -> Result<HttpResponse, HttpError> {
+    let mut stream = match tcp_connect(host, port) {
+        Result::Ok(s) => s,
+        Result::Err(e) => {
+            return Result::Err(HttpError::Network);
+        }
+    };
+
+    if !h2_send_preface(&stream) {
+        return Result::Err(HttpError::Network);
+    }
+
+    // 伪头字段顺序必须是 :method / :scheme / :authority / :path。
+    let mut authority = String::from_bytes(host);
+    if port != 80 {
+        authority.push_byte(58);
+        authority.push_uint(port as u64);
+    }
+    let mut list: Vec<HttpHeader> = Vec::new();
+    list.push(HttpHeader { name: ":method", value: method });
+    list.push(HttpHeader { name: ":scheme", value: "http" });
+    list.push(HttpHeader { name: ":authority", value: authority.as_bytes() });
+    list.push(HttpHeader { name: ":path", value: path });
+    let mut hi: usize = 0;
+    while hi < headers.len {
+        list.push(headers[hi]);
+        hi = hi + 1;
+    }
+
+    let block = h2_encode_headers(list.as_slice());
+    if !h2_send_header_block(&stream, block.as_slice(), body.len == 0) {
+        return Result::Err(HttpError::Network);
+    }
+
+    // 流控状态：连接窗口与流窗口均从 RFC 7540 §6.9.2 默认值 65535 开始。
+    // 发送 DATA 时两者都消耗；收到 WINDOW_UPDATE（流 0 = 连接，流 1 = 本流）时回补。
+    let mut stream_window: usize = H2_INIT_WINDOW;
+    let mut conn_window: usize = H2_INIT_WINDOW;
+    let mut body_off: usize = 0;
+    let mut body_done: bool = body.len == 0;
+
+    // 响应组装状态。
+    let mut dec = HpackDecoder::new();
+    let mut resp_headers: Vec<HttpHeader> = Vec::new();
+    let mut body_out: Vec<u8> = Vec::new();
+    let mut ended = false;
+    let mut first_frame = true;
+
+    loop {
+        // 优先发送请求体：窗口允许时先发一帧 DATA，避免无谓阻塞在 recv 上。
+        if !body_done {
+            let avail = if stream_window < conn_window { stream_window } else { conn_window };
+            if avail > 0 {
+                let remain = body.len - body_off;
+                let mut n = if avail < remain { avail } else { remain };
+                if n > H2_MAX_FRAME {
+                    n = H2_MAX_FRAME;
+                }
+                let last = body_off + n >= body.len;
+                let flags: u8 = if last { H2_FLAG_END_STREAM } else { 0 };
+                let f = h2_encode_frame(H2_DATA, flags, 1, body[body_off..body_off + n]);
+                if !h2_send_all(&stream, f.as_slice()) {
+                    return Result::Err(HttpError::Network);
+                }
+                body_off = body_off + n;
+                stream_window = stream_window - n;
+                conn_window = conn_window - n;
+                if last {
+                    body_done = true;
+                }
+                continue;
+            }
+        }
+
+        // 窗口用尽或请求体已发完：读一帧。
+        let frame = match h2_read_frame(&stream) {
+            Result::Ok(f) => f,
+            Result::Err(e) => {
+                return Result::Err(e);
+            }
+        };
+
+        // RFC 7540 §3.5：服务端发送的第一个帧必须是 SETTINGS。
+        if first_frame {
+            first_frame = false;
+            if frame.kind != H2_SETTINGS {
+                return Result::Err(HttpError::BadResponse);
+            }
+        }
+
+        if frame.kind == H2_DATA {
+            if frame.stream_id == 1 {
+                let data = match h2_payload_bytes(&frame, false) {
+                    Result::Ok(v) => v,
+                    Result::Err(e) => {
+                        return Result::Err(e);
+                    }
+                };
+                let n = data.len();
+                let mut i: usize = 0;
+                while i < n {
+                    body_out.push(data.data[i]);
+                    i = i + 1;
+                }
+                // 消费了 n 字节：给流和连接各补一个 WINDOW_UPDATE，
+                // 否则服务端发满初始窗口就会停下。SIGPIPE 已在运行时入口被
+                // 忽略，对端先关连接时写失败只会返回 `Network`，不会杀进程。
+                // 写失败不当致命错误：响应帧可能已在接收缓冲区里，让读失败自
+                // 然触发网络错误。
+                if n > 0 {
+                    let _ = h2_send_window_update(&stream, 1, n);
+                    let _ = h2_send_window_update(&stream, 0, n);
+                }
+                if (frame.flags & H2_FLAG_END_STREAM) != 0 {
+                    ended = true;
+                }
+            }
+        } else if frame.kind == H2_HEADERS {
+            let mut fragment = match h2_payload_bytes(&frame, true) {
+                Result::Ok(v) => v,
+                Result::Err(e) => {
+                    return Result::Err(e);
+                }
+            };
+            if (frame.flags & H2_FLAG_END_HEADERS) == 0 {
+                let mut done = false;
+                while !done {
+                    let cf = match h2_read_frame(&stream) {
+                        Result::Ok(f) => f,
+                        Result::Err(e) => {
+                            return Result::Err(e);
+                        }
+                    };
+                    if cf.kind != H2_CONTINUATION {
+                        return Result::Err(HttpError::BadResponse);
+                    }
+                    let mut j: usize = 0;
+                    while j < cf.payload.len {
+                        fragment.push(cf.payload.data[j]);
+                        j = j + 1;
+                    }
+                    if (cf.flags & H2_FLAG_END_HEADERS) != 0 {
+                        done = true;
+                    }
+                }
+            }
+            let decoded = match dec.decode(fragment.as_slice()) {
+                Result::Ok(v) => v,
+                Result::Err(e) => {
+                    return Result::Err(e);
+                }
+            };
+            let mut d: usize = 0;
+            while d < decoded.len() {
+                resp_headers.push(decoded[d]);
+                d = d + 1;
+            }
+            if (frame.flags & H2_FLAG_END_STREAM) != 0 {
+                ended = true;
+            }
+        } else if frame.kind == H2_RST_STREAM {
+            if frame.stream_id == 1 {
+                return Result::Err(HttpError::BadResponse);
+            }
+        } else if frame.kind == H2_SETTINGS {
+            if (frame.flags & 1) == 0 {
+                // RFC 7540 §6.5.3：收到对端 SETTINGS 后必须回 ACK。
+                // 写失败不当致命：对端可能已发完响应并关闭，ACK 丢失不影响
+                // 我们继续读缓冲里的响应帧。
+                let mut empty: Vec<u8> = Vec::new();
+                let ack = h2_encode_frame(H2_SETTINGS, 1, 0, empty.as_slice());
+                let _ = h2_send_all(&stream, ack.as_slice());
+
+                // 解析 SETTINGS 参数，目前只关心 INITIAL_WINDOW_SIZE（ID=4）：
+                // 它改变所有流的发送窗口初值，当前流窗口按差值调整。
+                let plen = frame.payload.len();
+                let mut sp: usize = 0;
+                while sp + 6 <= plen {
+                    let sid: u16 = (frame.payload.data[sp] as u16) * 256
+                                 + (frame.payload.data[sp + 1] as u16);
+                    let sval: u32 = (frame.payload.data[sp + 2] as u32) * 16777216
+                                  + (frame.payload.data[sp + 3] as u32) * 65536
+                                  + (frame.payload.data[sp + 4] as u32) * 256
+                                  + (frame.payload.data[sp + 5] as u32);
+                    if sid == 4 {
+                        let old: usize = H2_INIT_WINDOW;
+                        let newv: usize = sval as usize;
+                        if newv >= old {
+                            stream_window = stream_window + (newv - old);
+                        } else {
+                            let shrink = old - newv;
+                            if stream_window >= shrink {
+                                stream_window = stream_window - shrink;
+                            } else {
+                                stream_window = 0;
+                            }
+                        }
+                    }
+                    sp = sp + 6;
+                }
+            }
+        } else if frame.kind == H2_WINDOW_UPDATE {
+            // RFC 7540 §6.9：流 0 的增量加到连接窗口，流 1 的加到本流窗口。
+            // 增量是 31 位无符号整数（最高位保留）。
+            if frame.payload.len() == 4 {
+                let p = frame.payload.data;
+                let inc: usize = ((p[0] as usize & 127) * 16777216)
+                               + ((p[1] as usize) * 65536)
+                               + ((p[2] as usize) * 256)
+                               + (p[3] as usize);
+                if frame.stream_id == 0 {
+                    conn_window = conn_window + inc;
+                } else if frame.stream_id == 1 {
+                    stream_window = stream_window + inc;
+                }
+            }
+        } else if frame.kind == H2_PING {
+            if frame.payload.len() == 8 {
+                let ack = h2_encode_frame(H2_PING, 1, 0, frame.payload.as_slice());
+                if !h2_send_all(&stream, ack.as_slice()) {
+                    return Result::Err(HttpError::Network);
+                }
+            }
+        } else if frame.kind == H2_GOAWAY {
+            if !ended {
+                return Result::Err(HttpError::Network);
+            }
+        } else if frame.kind == H2_PUSH_PROMISE {
+            // RFC 7540 §8.2.2：客户端不支持服务端推送时，收到 PUSH_PROMISE
+            // 必须回 RST_STREAM(REFUSED_STREAM) 拒绝被推送的流。载荷前 4 字节
+            // 是 Promised Stream ID，其后紧跟头块片段（此处不解码）。
+            if frame.payload.len() >= 4 {
+                let p = frame.payload.data;
+                let promised: u32 = (p[0] as u32) * 16777216
+                                 + (p[1] as u32) * 65536
+                                 + (p[2] as u32) * 256
+                                 + (p[3] as u32);
+                let _ = h2_send_rst_stream(&stream, promised, H2_ERR_REFUSED_STREAM);
+            }
+        } else if frame.kind == H2_PRIORITY {
+            // RFC 7540 §6.3：PRIORITY 帧只携带流依赖与权重，本客户端不实现
+            // 优先级调度，正确忽略即可（不报错、不影响流状态）。
+        }
+
+        if body_done && ended {
+            break;
+        }
+    }
+
+    stream.shutdown();
+
+    // 取 :status，并把伪头字段从对外列表里去掉。
+    let mut code: u16 = 0;
+    let mut code_found = false;
+    let mut visible: Vec<HttpHeader> = Vec::new();
+    let mut k: usize = 0;
+    while k < resp_headers.len() {
+        let h = resp_headers[k];
+        if h.name.len > 0 {
+            if h.name.ptr[0] == 58 {
+                if h2_bytes_eq(h.name, ":status") {
+                    code = h2_parse_status(h.value);
+                    code_found = true;
+                }
+            } else {
+                visible.push(h);
+            }
+        }
+        k = k + 1;
+    }
+    if !code_found {
+        return Result::Err(HttpError::BadResponse);
+    }
+
+    return Result::Ok(HttpResponse {
+        code:    code,
+        reason:  h2_reason(code),
+        headers: visible,
+        body:    body_out,
+        strings: dec.arena,
+    });
+}
+
+//=============================================================================
+// 公开 API
+//=============================================================================
+
+/// 通用 HTTP/2 请求（明文 h2c prior knowledge）。
+///
+/// 重定向策略与 `http::http_request` 相同：301/302/303 把非幂等方法改成 GET
+/// 并丢弃请求体，307/308 保留方法与请求体，最多跟随 `follow_redirects` 次。
+pub fn http2_request(
+    method: str,
+    url: str,
+    body: []const u8,
+    headers: []const HttpHeader,
+    follow_redirects: i32,
+) -> Result<HttpResponse, HttpError> {
+    let mut current_url = String::from_bytes(url);
+    let mut current_method = String::from_bytes(method);
+    let mut current_body = String::from_bytes(body);
+    let mut remaining = follow_redirects;
+
+    loop {
+        let parsed = match url_parse(current_url.as_bytes()) {
+            Result::Ok(u) => u,
+            Result::Err(e) => {
+                return Result::Err(e);
+            }
+        };
+        if h2_bytes_eq(parsed.scheme, "https") {
+            return Result::Err(HttpError::TlsNotSupported);
+        }
+
+        let response = match h2_exchange(
+            parsed.host,
+            parsed.port,
+            parsed.path,
+            current_method.as_bytes(),
+            current_body.as_bytes(),
+            headers,
+        ) {
+            Result::Ok(r) => r,
+            Result::Err(e) => {
+                return Result::Err(e);
+            }
+        };
+
+        let code = response.code;
+        let is_redirect = code == 301 || code == 302 || code == 303 || code == 307 || code == 308;
+        if !is_redirect || remaining <= 0 {
+            return Result::Ok(response);
+        }
+
+        let location_opt = http_find_header_value(response.headers.as_slice(), "Location");
+        let location = match location_opt {
+            Option::Some(l) => l,
+            Option::None => {
+                return Result::Ok(response);
+            }
+        };
+
+        let is_get_like = h2_bytes_eq(current_method.as_bytes(), "GET")
+                       || h2_bytes_eq(current_method.as_bytes(), "HEAD")
+                       || h2_bytes_eq(current_method.as_bytes(), "OPTIONS");
+
+        if code == 303 {
+            current_method = String::from_bytes("GET");
+            current_body = String::new();
+        } else if code == 307 || code == 308 {
+            // 保留方法与请求体
+        } else {
+            if !is_get_like {
+                current_method = String::from_bytes("GET");
+                current_body = String::new();
+            }
+        }
+
+        current_url = http_resolve_redirect(parsed.scheme, parsed.host, parsed.port, location);
+        remaining = remaining - 1;
+    }
+}
+
+/// HTTP/2 GET。
+pub fn http2_get(url: str) -> Result<HttpResponse, HttpError> {
+    let mut no_body: Vec<u8> = Vec::new();
+    let mut no_headers: Vec<HttpHeader> = Vec::new();
+    return http2_request("GET", url, no_body.as_slice(), no_headers.as_slice(), 5);
+}
+
+/// HTTP/2 POST。
+pub fn http2_post(url: str, body: []const u8, headers: []const HttpHeader) -> Result<HttpResponse, HttpError> {
+    return http2_request("POST", url, body, headers, 5);
+}

@@ -1,0 +1,74 @@
+//=============================================================================
+// tests/cases/134_md5.zr — MD5 正向回归（RFC 1321 向量 + 分块边界）
+//
+// 覆盖：
+//   - 标准向量："" / "abc" / "message digest"
+//   - 长输入（64 个 'a'）
+//   - 分组边界：55 / 56 / 63 / 64 字节（正好踩在补齐边界两侧）
+//   - `md5_hex_str` 与 `md5_hex` 一致
+//=============================================================================
+
+use md5::{md5_hex, md5_hex_str};
+use collections::Vec;
+use string::String;
+
+/// 逐字节比较摘要与期望字面量。
+fn md5_same(s: String, want: []const u8) -> bool {
+    if s.len != want.len { return false; }
+    let mut i: usize = 0;
+    while i < s.len {
+        if s.ptr[i] != want[i] { return false; }
+        i = i + 1;
+    }
+    return true;
+}
+
+/// 构造 `n` 个 'a'（0x61）的字节序列。
+fn md5_rep_a(n: usize) -> Vec<u8> {
+    let mut v: Vec<u8> = Vec::new();
+    let mut i: usize = 0;
+    while i < n {
+        v.push(97 as u8);
+        i = i + 1;
+    }
+    return v;
+}
+
+fn main() -> i32 {
+    // --- 1) RFC 1321 标准向量 ---
+    if !md5_same(md5_hex(""), "d41d8cd98f00b204e9800998ecf8427e") { return 1; }
+    if !md5_same(md5_hex("abc"), "900150983cd24fb0d6963f7d28e17f72") { return 2; }
+    if !md5_same(md5_hex("message digest"), "f96b697d7cb7938d525a2f31aaf161d0") { return 3; }
+
+    // --- 2) `md5_hex_str` 与 `md5_hex` 一致 ---
+    if !md5_same(md5_hex_str("abc"), "900150983cd24fb0d6963f7d28e17f72") { return 4; }
+    if !md5_same(md5_hex_str(""), "d41d8cd98f00b204e9800998ecf8427e") { return 5; }
+
+    // --- 3) 长输入：64 个 'a' ---
+    let many = md5_rep_a(64);
+    if !md5_same(md5_hex(many.as_slice()), "014842d480b571495a4a0363793f7367") { return 6; }
+
+    // --- 4) 分块边界：55 / 56 / 63 / 64 字节 ---
+    // 55 字节时补 0x80 后刚好到 56，仍在同一分组；56 字节则被迫进入下一分组。
+    let s55 = md5_rep_a(55);
+    let h55 = md5_hex(s55.as_slice());
+    if h55.len != 32 { return 7; }
+    if !md5_same(h55, "ef1772b6dff9a122358552954ad0df65") { return 8; }
+
+    let s56 = md5_rep_a(56);
+    let h56 = md5_hex(s56.as_slice());
+    if h56.len != 32 { return 9; }
+    if !md5_same(h56, "3b0c8ac703f828b04c6c197006d17218") { return 10; }
+
+    let s63 = md5_rep_a(63);
+    let h63 = md5_hex(s63.as_slice());
+    if h63.len != 32 { return 11; }
+    if !md5_same(h63, "b06521f39153d618550606be297466d5") { return 12; }
+
+    let s64 = md5_rep_a(64);
+    let h64 = md5_hex(s64.as_slice());
+    if h64.len != 32 { return 13; }
+    if !md5_same(h64, "014842d480b571495a4a0363793f7367") { return 14; }
+
+    return 0;
+}

@@ -34,6 +34,13 @@ pub struct InferCtxt<'a> {
     pub borrow_intervals: Vec<BorrowInterval>,
     /// 类型定义表（用于查找字段、变体）。
     pub type_defs: &'a HashMap<DefId, hir::HirTypeDef>,
+    /// 每个泛型类型定义的形参（声明期的 `Ty::Infer` / `Ty::ConstParam`）。
+    ///
+    /// `size_of` / `align_of` 遇到 `Entry<K, V>` 这类**泛型**具名类型时，
+    /// 必须先把字段类型按实参实例化再算布局；否则字段仍是形参占位符，
+    /// 每个都按 1 字节计（`Entry<String, i32>` 会被算成 1 字节，而真实
+    /// 步长是 32 字节，按它分配的桶数组越界写堆）。
+    pub type_params: Option<&'a HashMap<DefId, Vec<Ty>>>,
     /// impl 表。
     pub impl_blocks: &'a [hir::HirImpl],
     /// 函数表。
@@ -90,6 +97,51 @@ fn lookup_def_name(id: DefId) -> Option<String> {
     DEF_NAMES.with(|m| m.borrow().get(&id).cloned())
 }
 
+/// 把类型里出现的形参占位符 `InferId` / `const` 名字替换成实参。
+///
+/// 与 `TypeChecker::subst_infer` 同语义，但放在这里供布局计算使用
+///（`size_of` / `align_of` 拿不到 `TypeChecker`）。
+fn subst_ty(ty: &Ty, map: &HashMap<InferId, Ty>, consts: &HashMap<String, i128>) -> Ty {
+    match ty {
+        Ty::Infer(id) => map.get(id).cloned().unwrap_or_else(|| ty.clone()),
+        Ty::Named(id, args) => {
+            Ty::Named(*id, args.iter().map(|t| subst_ty(t, map, consts)).collect())
+        }
+        Ty::Pointer(t, m) => Ty::Pointer(Box::new(subst_ty(t, map, consts)), *m),
+        Ty::Reference(t, m) => Ty::Reference(Box::new(subst_ty(t, map, consts)), *m),
+        Ty::Array(t, len) => {
+            let len = match len {
+                hir::ArrayLen::Param(name) => match consts.get(name) {
+                    Some(v) => super::const_array_len(*v, Span::unknown()),
+                    None => len.clone(),
+                },
+                other => other.clone(),
+            };
+            Ty::Array(Box::new(subst_ty(t, map, consts)), len)
+        }
+        Ty::Slice(t, m) => Ty::Slice(Box::new(subst_ty(t, map, consts)), *m),
+        Ty::Tuple(ts) => Ty::Tuple(ts.iter().map(|t| subst_ty(t, map, consts)).collect()),
+        Ty::Function {
+            params,
+            ret,
+            is_async,
+            abi,
+        } => Ty::Function {
+            params: params.iter().map(|t| subst_ty(t, map, consts)).collect(),
+            ret: Box::new(subst_ty(ret, map, consts)),
+            is_async: *is_async,
+            abi: abi.clone(),
+        },
+        Ty::Optional(t) => Ty::Optional(Box::new(subst_ty(t, map, consts))),
+        Ty::ErrorUnion(t, e) => Ty::ErrorUnion(
+            Box::new(subst_ty(t, map, consts)),
+            Box::new(subst_ty(e, map, consts)),
+        ),
+        Ty::Pin(t) => Ty::Pin(Box::new(subst_ty(t, map, consts))),
+        _ => ty.clone(),
+    }
+}
+
 impl<'a> InferCtxt<'a> {
     /// 创建一个空的推断上下文（仅用于字段初始化占位）。
     ///
@@ -103,6 +155,7 @@ impl<'a> InferCtxt<'a> {
             return_ty: None,
             borrow_intervals: Vec::new(),
             type_defs: empty_type_defs(),
+            type_params: None,
             impl_blocks: &[],
             functions: empty_functions(),
             locals: empty_locals(),
@@ -117,80 +170,141 @@ impl<'a> InferCtxt<'a> {
         Ty::Infer(id)
     }
 
+    /// 把类型定义声明里的字段类型按实参实例化。
+    ///
+    /// 声明期字段类型是形参占位符（`Ty::Infer` / `Ty::ConstParam`），
+    /// 不替换就直接算布局会把每个形参都按 1 字节计。仅当 `type_params`
+    /// 可用且实参个数匹配时替换；否则原样返回（保持旧行为）。
+    fn instantiate_field_ty(&self, def_id: DefId, args: &[Ty], ty: &Ty) -> Ty {
+        let Some(params) = self.type_params.and_then(|p| p.get(&def_id)) else {
+            return ty.clone();
+        };
+        if params.len() != args.len() {
+            return ty.clone();
+        }
+        let mut map: HashMap<InferId, Ty> = HashMap::new();
+        let mut consts: HashMap<String, i128> = HashMap::new();
+        for (p, a) in params.iter().zip(args) {
+            match (p, a) {
+                (Ty::Infer(id), _) => {
+                    map.insert(*id, a.clone());
+                }
+                (Ty::ConstParam(name), Ty::ConstVal(v)) => {
+                    consts.insert(name.clone(), *v);
+                }
+                _ => {}
+            }
+        }
+        if map.is_empty() && consts.is_empty() {
+            return ty.clone();
+        }
+        subst_ty(ty, &map, &consts)
+    }
+
     /// 计算类型的大小（字节）。简化实现：64 位目标。
     pub fn size_of(&self, ty: &Ty) -> usize {
         match ty {
             Ty::Int(w) | Ty::Uint(w) => (*w as usize).max(8) / 8,
             Ty::Float(w) => (*w as usize) / 8,
             Ty::Bool => 1,
-            Ty::Char => 4,
+            // 与 MIR `type_size_align`（`Ty::Bool | Ty::Char => (1, 1)`）
+            // 保持一致：`char` 是 1 字节。早先多算了 3 字节，`Vec<char>`
+            // 分配尺寸与实际步长不符。
+            Ty::Char => 1,
             Ty::Str => 16, // ptr + len
             Ty::Unit | Ty::Never => 0,
             Ty::Pointer(..) | Ty::Reference(..) => 8,
             Ty::Dyn(_) => 16, // 胖指针：data + vtable
             Ty::Array(inner, len) => {
-                let n = match len {
-                    hir::ArrayLen::Const(_) => 1, // 简化：无法求值时按 1 计
-                    hir::ArrayLen::Param(_) => 0, // 声明期 const 参数（尚未代入）
-                    hir::ArrayLen::Dynamic => 0,
+                // 长度必须与 MIR 的 `type_size_align` 用同一个求值口径
+                //（`hir::array_len_value`）。早先 `Const(_) => 1` 把定长数组
+                // 一律按 1 个元素算，`[Entry; 16]` 之类只分到 1/16 的字节。
+                let n = match hir::array_len_value(len) {
+                    Some(n) => n as usize,
+                    None => 0, // 声明期 const 参数尚未代入 / 动态长度
                 };
                 self.size_of(inner) * n
             }
             Ty::Slice(..) => 16, // ptr + len
             Ty::Tuple(tys) => {
                 let mut sz = 0usize;
+                let mut align = 1usize;
                 for t in tys {
-                    let a = self.align_of(t);
+                    let a = self.align_of(t).max(1);
                     sz = sz.div_ceil(a) * a;
                     sz += self.size_of(t);
+                    align = align.max(a);
                 }
-                sz
+                // 末尾补齐到最大对齐——与 MIR `type_size_align` 的结构体 /
+                // 元组口径一致。少了这一步，`size_of` 会比实际步长小
+                //（`{String, i32, bool}` 算 29、真实步长 32），按 `size_of`
+                // 分配的桶数组越界写堆（`HashMap` 的 String 键直接段错误）。
+                sz.div_ceil(align) * align
             }
             // 函数值是 `{code, env}` 记录——两个机器字（与 MIR 布局一致）。
             Ty::Function { .. } => 16,
             Ty::Optional(inner) => self.size_of(inner) + 1,
             Ty::ErrorUnion(ok, _) => self.size_of(ok) + 1,
-            Ty::Named(def_id, _) => match self.type_defs.get(def_id) {
+            Ty::Named(def_id, args) => match self.type_defs.get(def_id) {
                 Some(hir::HirTypeDef::Struct(s)) => {
                     let mut sz = 0usize;
+                    let mut align = 1usize;
                     for f in &s.fields {
-                        let a = self.align_of(&f.ty);
+                        let fty = self.instantiate_field_ty(*def_id, args, &f.ty);
+                        let a = self.align_of(&fty).max(1);
                         sz = sz.div_ceil(a) * a;
-                        sz += self.size_of(&f.ty);
+                        sz += self.size_of(&fty);
+                        align = align.max(a);
                     }
-                    sz
+                    // 末尾补齐到最大对齐，与 MIR `struct_layout` 一致。
+                    sz.div_ceil(align) * align
                 }
                 Some(hir::HirTypeDef::Enum(e)) => {
-                    let tag = match e.repr {
+                    let tag: usize = match e.repr {
                         hir::IntegerRepr::I8 => 1,
                         hir::IntegerRepr::I16 => 2,
                         hir::IntegerRepr::I32 => 4,
                         _ => 8,
                     };
-                    let mut max_payload = 0usize;
+                    // 载荷区：每个变体的字段按元组布局（逐个对齐、末尾补齐），
+                    // 取最大的那个；再与判别式按载荷对齐拼起来、整体补齐——
+                    // 必须与 MIR `enum_layout` 一致，否则 `size_of` 比真实步长
+                    // 小，`Vec<T>` / 桶数组按它分配会越界写堆。
+                    let mut payload_size = 0usize;
+                    let mut payload_align = 1usize;
                     for v in &e.variants {
-                        let payload_size = match &v.payload {
-                            hir::HirVariantPayload::Tuple(tys) => {
-                                tys.iter().map(|t| self.size_of(t)).max().unwrap_or(0)
+                        let mut sz = 0usize;
+                        let mut al = 1usize;
+                        let decl_tys: Vec<hir::Ty> = match &v.payload {
+                            hir::HirVariantPayload::Tuple(tys) => tys.clone(),
+                            hir::HirVariantPayload::Struct(fields) => {
+                                fields.iter().map(|f| f.ty.clone()).collect()
                             }
-                            hir::HirVariantPayload::Struct(fields) => fields
-                                .iter()
-                                .map(|f| self.size_of(&f.ty))
-                                .max()
-                                .unwrap_or(0),
-                            hir::HirVariantPayload::Unit => 0,
+                            hir::HirVariantPayload::Unit => Vec::new(),
                         };
-                        max_payload = max_payload.max(payload_size);
+                        for t in decl_tys {
+                            let t = self.instantiate_field_ty(*def_id, args, &t);
+                            let a = self.align_of(&t).max(1);
+                            sz = sz.div_ceil(a) * a;
+                            sz += self.size_of(&t);
+                            al = al.max(a);
+                        }
+                        payload_size = payload_size.max(sz.div_ceil(al) * al);
+                        payload_align = payload_align.max(al);
                     }
-                    tag + max_payload
+                    let payload_off = tag.div_ceil(payload_align) * payload_align;
+                    let align = tag.max(payload_align);
+                    (payload_off + payload_size).div_ceil(align) * align
                 }
                 Some(hir::HirTypeDef::Union(u)) => u
                     .fields
                     .iter()
-                    .map(|f| self.size_of(&f.ty))
+                    .map(|f| self.size_of(&self.instantiate_field_ty(*def_id, args, &f.ty)))
                     .max()
                     .unwrap_or(0),
-                Some(hir::HirTypeDef::Alias { target, .. }) => self.size_of(target),
+                Some(hir::HirTypeDef::Alias { target, .. }) => {
+                    self.size_of(&self.instantiate_field_ty(*def_id, args, target))
+                }
                 None => 0,
             },
             Ty::Opaque(_) => 0,
@@ -212,7 +326,9 @@ impl<'a> InferCtxt<'a> {
             Ty::Float(8) => 1,
             Ty::Float(_) => 8,
             Ty::Bool => 1,
-            Ty::Char => 4,
+            // 与 MIR `type_size_align` 一样按 1 字节：`char` 字段后面
+            // 紧跟的字段不能被垫到 4 字节。
+            Ty::Char => 1,
             Ty::Str | Ty::Slice(..) => 8,
             Ty::Unit | Ty::Never => 1,
             Ty::Pointer(..) | Ty::Reference(..) | Ty::Function { .. } => 8,
@@ -220,21 +336,23 @@ impl<'a> InferCtxt<'a> {
             Ty::Array(inner, _) => self.align_of(inner),
             Ty::Tuple(tys) => tys.iter().map(|t| self.align_of(t)).max().unwrap_or(1),
             Ty::Optional(inner) | Ty::ErrorUnion(inner, _) => self.align_of(inner).max(1),
-            Ty::Named(def_id, _) => match self.type_defs.get(def_id) {
+            Ty::Named(def_id, args) => match self.type_defs.get(def_id) {
                 Some(hir::HirTypeDef::Struct(s)) => s
                     .fields
                     .iter()
-                    .map(|f| self.align_of(&f.ty))
+                    .map(|f| self.align_of(&self.instantiate_field_ty(*def_id, args, &f.ty)))
                     .max()
                     .unwrap_or(1),
                 Some(hir::HirTypeDef::Enum(_)) => 8,
                 Some(hir::HirTypeDef::Union(u)) => u
                     .fields
                     .iter()
-                    .map(|f| self.align_of(&f.ty))
+                    .map(|f| self.align_of(&self.instantiate_field_ty(*def_id, args, &f.ty)))
                     .max()
                     .unwrap_or(1),
-                Some(hir::HirTypeDef::Alias { target, .. }) => self.align_of(target),
+                Some(hir::HirTypeDef::Alias { target, .. }) => {
+                    self.align_of(&self.instantiate_field_ty(*def_id, args, target))
+                }
                 None => 1,
             },
             Ty::Opaque(_) => 1,

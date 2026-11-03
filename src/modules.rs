@@ -77,6 +77,63 @@ pub fn std_root() -> PathBuf {
     manifest.join("std")
 }
 
+//=============================================================================
+// 三层标准库：core ⊂ alloc ⊂ std（与 Rust 的 crate 分层对应）
+//
+//   core  零依赖：无堆、无 OS、无 I/O（trait / Option / Result / panic 等）
+//   alloc 在 core 上加堆分配（String / Vec / 容器 / 纯解析库）
+//   std   完整标准库，依赖 OS（io / fs / net / 进程 / 线程 …）
+//
+// 模块名仍是扁平的（`use core::Option`、`use string::String`、`use io::File`），
+// 层级由文件所在目录决定：`std/core/*.zr`、`std/alloc/*.zr`、`std/std/*.zr`。
+// 依赖方向只允许 core → core、alloc → {core, alloc}、std → 任意，
+// 违反时在加载阶段报错（见 `load_uses`）。
+//=============================================================================
+
+/// 三层目录名，按依赖从低到高排列（顺序即 `Layer` 的比较顺序）。
+pub const STDLIB_LAYERS: &[&str] = &["core", "alloc", "std"];
+
+/// 标准库层级。`PartialOrd` 的顺序就是依赖方向：低层不能依赖高层。
+#[derive(Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Debug)]
+pub enum Layer {
+    Core,
+    Alloc,
+    Std,
+}
+
+impl Layer {
+    pub fn name(self) -> &'static str {
+        match self {
+            Layer::Core => "core",
+            Layer::Alloc => "alloc",
+            Layer::Std => "std",
+        }
+    }
+}
+
+/// 由模块文件的存放位置推出它属于哪一层。
+///
+/// 只有 `<root>/<layer>/<name>.zr` 才带层信息；直接放在 `<root>/` 下的
+/// 根级文件（例如门面 `std.zr`）按最上层 `std` 处理。
+fn layer_of_path(root: &Path, path: &Path) -> Layer {
+    if let Ok(rel) = path.strip_prefix(root) {
+        let mut comps = rel.components();
+        let first = comps.next();
+        let has_more = comps.next().is_some();
+        if has_more {
+            if let Some(std::path::Component::Normal(seg)) = first {
+                return match seg.to_string_lossy().as_ref() {
+                    "core" => Layer::Core,
+                    "alloc" => Layer::Alloc,
+                    _ => Layer::Std,
+                };
+            }
+        }
+    }
+    // 根级文件（门面）视为 std 层。
+    Layer::Std
+}
+
 /// 加载结果。
 pub struct Loaded {
     /// 加载失败时的原因。
@@ -98,7 +155,10 @@ pub struct Loaded {
 /// 递归加载 `prog` 的全部依赖，把定义并回 `prog`。
 ///
 /// `base_dir` 是根源文件所在目录，用来定位 `mod foo;` 对应的 `foo.zr`。
-pub fn load(prog: &mut Program, base_dir: &Path) -> Loaded {
+/// `root_file` 是根源文件本身：登记进 `seen` 后，prelude 再 `use` 同名模块时
+/// 不会把同一份定义并第二遍（否则"编译标准库模块本身"会报
+/// `multiple impls of the same trait`）。普通用户程序传 `None` 即可。
+pub fn load_with_root(prog: &mut Program, base_dir: &Path, root_file: Option<&Path>) -> Loaded {
     let mut out = Loaded {
         error: None,
         modules: Vec::new(),
@@ -107,9 +167,14 @@ pub fn load(prog: &mut Program, base_dir: &Path) -> Loaded {
         report: LoadReport::default(),
     };
     let mut loader = Loader {
-        seen: std::collections::HashSet::new(),
+        seen: root_file
+            .map(absolutize)
+            .into_iter()
+            .collect::<std::collections::HashSet<_>>(),
         modules: std::collections::HashSet::new(),
         flattened: std::collections::HashSet::new(),
+        layers: std::collections::HashMap::new(),
+        glob_deps: std::collections::HashMap::new(),
         report: &mut out.report,
         module_exports: &mut out.module_exports,
     };
@@ -146,15 +211,61 @@ pub fn load(prog: &mut Program, base_dir: &Path) -> Loaded {
     let flattened = std::mem::take(&mut loader.flattened)
         .into_iter()
         .collect::<Vec<_>>();
+    let glob_deps = std::mem::take(&mut loader.glob_deps);
     drop(loader);
 
     out.modules = modules;
     out.modules.sort();
     out.flattened = flattened;
     out.flattened.sort();
+    // `std` 门面的 `use core::*; use string::*; ..` 要真的把下层名字再导出：
+    // 把 glob 依赖的导出名并进本模块的导出表（多轮直到不再增长，含环依赖）。
+    expand_glob_exports(&mut out.module_exports, &glob_deps);
     out.report.modules = out.modules.clone();
     out.report.flattened = out.flattened.clone();
     out
+}
+
+/// 把 `use foo::*` 的导出名传递性地并进本模块的 `module_exports`。
+///
+/// 扁平化后模块没有真正的命名空间，`std` 门面要"再导出"下层模块的名字，
+/// 只能靠这张表把下层的导出名并进来。多轮传播以处理 `std -> io -> core`
+/// 这类传递链；`names` 排序固定顺序，避免不同 HashMap 迭代顺序造成差异。
+fn expand_glob_exports(
+    exports: &mut std::collections::HashMap<String, Vec<String>>,
+    globs: &std::collections::HashMap<String, Vec<String>>,
+) {
+    let mut names: Vec<String> = exports.keys().cloned().collect();
+    names.sort();
+    // 模块数有限、名字集只增不减，最多传播 `names.len()` 轮。
+    for _ in 0..=names.len() {
+        let mut changed = false;
+        for m in &names {
+            let deps = match globs.get(m) {
+                Some(d) => d.clone(),
+                None => continue,
+            };
+            let mut add: Vec<String> = Vec::new();
+            for d in &deps {
+                if let Some(xs) = exports.get(d) {
+                    add.extend(xs.iter().cloned());
+                }
+            }
+            let cur = match exports.get_mut(m) {
+                Some(c) => c,
+                None => continue,
+            };
+            for a in add {
+                if !cur.contains(&a) {
+                    cur.push(a);
+                    changed = true;
+                }
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
 }
 
 struct Loader<'a> {
@@ -164,6 +275,10 @@ struct Loader<'a> {
     modules: std::collections::HashSet<String>,
     /// 内联模块名（条目扁平并入顶层，模块名本身不是符号）。
     flattened: std::collections::HashSet<String>,
+    /// 已加载的标准库模块 → 层级（依赖方向校验用）。
+    layers: std::collections::HashMap<String, Layer>,
+    /// 模块名 → 它通过 `use foo::*` 依赖的模块名（`std` 门面再导出用）。
+    glob_deps: std::collections::HashMap<String, Vec<String>>,
     report: &'a mut LoadReport,
     /// 模块名 → 导出的条目名（`use foo::*` 用）。
     module_exports: &'a mut std::collections::HashMap<String, Vec<String>>,
@@ -179,27 +294,55 @@ impl Loader<'_> {
             return Err("module `use` chain is too deep (cycle?)".to_string());
         }
         let roots = collect_use_roots(&prog.imports);
-        let mut queue = roots;
-        while let Some(name) = queue.pop() {
+        // 队列元素带上"发起依赖的模块名"：来自用户程序的根导入不做层级限制。
+        let mut queue: Vec<(String, Option<String>)> =
+            roots.into_iter().map(|n| (n, None)).collect();
+        while let Some((name, origin)) = queue.pop() {
+            let maybe_path = stdlib_module_path(&std_root(), &name);
+
+            // 分层约束：core 只能依赖 core；alloc 只能依赖 core/alloc；
+            // std 可以依赖任意层。先于"已加载则跳过"检查，避免依赖方向
+            // 因加载顺序不同而被漏检（例如 io 先加载后再被 alloc 依赖）。
+            if let (Some(origin_name), Some(path)) = (&origin, &maybe_path) {
+                let layer = layer_of_path(&std_root(), path);
+                if let Some(origin_layer) = self.layers.get(origin_name) {
+                    if *origin_layer < layer {
+                        return Err(format!(
+                            "layering violation: module `{origin_name}` ({} layer) may not depend on `{name}` ({} layer)",
+                            origin_layer.name(),
+                            layer.name()
+                        ));
+                    }
+                }
+            }
+
             if self.modules.contains(&name) {
                 continue;
             }
-            let path = stdlib_module_path(&std_root(), &name).ok_or_else(|| {
+            let path = maybe_path.ok_or_else(|| {
                 format!(
                     "unknown module `{name}` (looked in {})",
                     std_root().display()
                 )
             })?;
+            let layer = layer_of_path(&std_root(), &path);
+
             let (module, path) = self.parse_file(&path)?;
             self.modules.insert(name.clone());
+            self.layers.insert(name.clone(), layer);
 
             // 记录本模块导出的条目名，供 `use core::*` 导入。
             self.module_exports
                 .insert(name.clone(), module_item_names(&module));
+            // 记录 `use foo::*` 的 glob 依赖，供 `std` 门面传递性再导出。
+            let globs = collect_glob_roots(&module.imports);
+            if !globs.is_empty() {
+                self.glob_deps.insert(name.clone(), globs);
+            }
 
             for dep in collect_use_roots(&module.imports) {
                 if !self.modules.contains(&dep) {
-                    queue.push(dep);
+                    queue.push((dep, Some(name.clone())));
                 }
             }
             let dir = path.parent().unwrap_or(_base).to_path_buf();
@@ -370,10 +513,22 @@ pub fn parse_program(src: &str, origin: &str) -> Result<Program, String> {
 }
 
 /// 标准库模块的文件位置（`a::b` -> `a/b.zr`）。
+///
+/// 查找顺序：先根级（门面 `std.zr` 与历史布局），再 `core/`、`alloc/`、`std/`。
+/// 这样旧写法 `use io::File` 与分层后的 `use std::io::File` 都能命中。
 fn stdlib_module_path(root: &Path, name: &str) -> Option<PathBuf> {
     let rel = name.replace("::", "/");
-    let p = root.join(format!("{rel}.zr"));
-    p.is_file().then_some(p)
+    let direct = root.join(format!("{rel}.zr"));
+    if direct.is_file() {
+        return Some(direct);
+    }
+    for layer in STDLIB_LAYERS {
+        let p = root.join(layer).join(format!("{rel}.zr"));
+        if p.is_file() {
+            return Some(p);
+        }
+    }
+    None
 }
 
 /// `mod foo;` 的文件位置：先找 `foo.zr`，再找 `mod/foo.zr`。
@@ -407,6 +562,53 @@ fn collect_use_roots(imports: &[crate::parser::ast::UseDecl]) -> Vec<String> {
             out.push(root);
         }
     }
+    out
+}
+
+/// 收集 `use foo::*` 里的 `foo`（glob 依赖的模块名）。
+///
+/// 树形是 `Group([Name(foo), Glob])`；带前缀时（`use a::b::*`）把 Glob 之外的
+/// 各段按顺序拼回 `a::b`。只有 glob 才登记——普通 `use` 不构成"再导出"。
+fn collect_glob_roots(imports: &[crate::parser::ast::UseDecl]) -> Vec<String> {
+    fn segments(t: &crate::parser::ast::UseTree, out: &mut Vec<String>) {
+        match t {
+            crate::parser::ast::UseTree::Name(n) => out.push(n.clone()),
+            crate::parser::ast::UseTree::Group(items) => {
+                for it in items {
+                    segments(it, out);
+                }
+            }
+            crate::parser::ast::UseTree::Rename(inner, _) => segments(inner, out),
+            crate::parser::ast::UseTree::Glob => {}
+        }
+    }
+    fn walk(t: &crate::parser::ast::UseTree, out: &mut Vec<String>) {
+        match t {
+            crate::parser::ast::UseTree::Group(items) => {
+                if items
+                    .iter()
+                    .any(|it| matches!(it, crate::parser::ast::UseTree::Glob))
+                {
+                    let mut segs = Vec::new();
+                    for it in items {
+                        segments(it, &mut segs);
+                    }
+                    if !segs.is_empty() {
+                        out.push(segs.join("::"));
+                    }
+                }
+                for it in items {
+                    walk(it, out);
+                }
+            }
+            _ => {}
+        }
+    }
+    let mut out = Vec::new();
+    for imp in imports {
+        walk(&imp.tree, &mut out);
+    }
+    out.dedup();
     out
 }
 
@@ -697,4 +899,54 @@ pub fn clean() -> Result<usize, String> {
         }
     }
     Ok(n)
+}
+
+#[cfg(test)]
+mod layer_tests {
+    use super::*;
+    use std::collections::HashMap;
+
+    #[test]
+    fn classifies_layer_by_directory() {
+        let root = Path::new("/x/std");
+        assert_eq!(
+            layer_of_path(root, Path::new("/x/std/core/core.zr")),
+            Layer::Core
+        );
+        assert_eq!(
+            layer_of_path(root, Path::new("/x/std/alloc/string.zr")),
+            Layer::Alloc
+        );
+        assert_eq!(
+            layer_of_path(root, Path::new("/x/std/std/io.zr")),
+            Layer::Std
+        );
+        // 门面等根级文件按最上层处理
+        assert_eq!(layer_of_path(root, Path::new("/x/std/std.zr")), Layer::Std);
+        // 依赖方向的内建顺序：Core < Alloc < Std
+        assert!(Layer::Core < Layer::Alloc);
+        assert!(Layer::Alloc < Layer::Std);
+    }
+
+    #[test]
+    fn glob_exports_propagate_transitively() {
+        let mut exports: HashMap<String, Vec<String>> = HashMap::new();
+        exports.insert("core".into(), vec!["Option".into(), "min".into()]);
+        exports.insert("string".into(), vec!["String".into()]);
+        exports.insert("io".into(), vec!["println".into()]);
+        exports.insert("std".into(), vec!["facade_only".into()]);
+
+        let mut globs: HashMap<String, Vec<String>> = HashMap::new();
+        globs.insert(
+            "std".into(),
+            vec!["core".into(), "string".into(), "io".into()],
+        );
+
+        expand_glob_exports(&mut exports, &globs);
+
+        let got = exports.get("std").unwrap();
+        for name in ["facade_only", "Option", "min", "String", "println"] {
+            assert!(got.contains(&name.to_string()), "missing {name}");
+        }
+    }
 }

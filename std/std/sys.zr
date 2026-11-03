@@ -1,0 +1,28 @@
+//=============================================================================
+// std/std/sys.zr — std 层：OS 抽象的最小集合
+//
+// 把运行时提供的 OS 原语（写 / 读 / 退出）包装成安全函数。
+// Rust 里这些对应 `std::process::exit` 与 `std::io` 的底层实现；
+// zr 把它们集中到一处，避免 core / alloc 直接接触 OS。
+//=============================================================================
+
+extern "C" {
+    fn zr_write(fd: i32, buf: *const u8, count: usize) -> isize;
+    fn zr_read(fd: i32, buf: *mut u8, count: usize) -> isize;
+    fn zr_exit(code: i32) -> !;
+}
+
+/// 向文件描述符写入字节，返回写入数量（出错为负）。
+pub fn write(fd: i32, buf: *const u8, count: usize) -> isize {
+    zr_write(fd, buf, count)
+}
+
+/// 从文件描述符读取字节，返回读取数量（0 为 EOF，负为出错）。
+pub fn read(fd: i32, buf: *mut u8, count: usize) -> isize {
+    zr_read(fd, buf, count)
+}
+
+/// 以 `code` 退出进程。
+pub fn exit(code: i32) -> ! {
+    zr_exit(code)
+}

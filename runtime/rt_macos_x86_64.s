@@ -299,6 +299,16 @@ _zr_envc:
 #------------------------------------------------------------------------------
     .globl _zr_args_init
 _zr_args_init:
+    // 忽略 SIGPIPE：向已关闭的套接字写数据时，Unix 默认发 SIGPIPE 杀进程。
+    // Rust 在启动时就 `signal(SIGPIPE, SIG_IGN)`，这里对齐它——HTTP/2 的
+    // SETTINGS ACK / WINDOW_UPDATE 不能因为对端先关连接就把整个进程炸掉。
+    push    rdi
+    push    rsi
+    mov     rdi, 13                 // SIGPIPE
+    mov     rsi, 1                  // SIG_IGN
+    call    _signal
+    pop     rsi
+    pop     rdi
     mov     [rip + _zr_argc], rdi
     mov     [rip + _zr_argv], rsi
     test    rdi, rdi

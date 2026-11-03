@@ -1,0 +1,332 @@
+//=============================================================================
+// std/time.zr — 时间
+//
+// 纯 zr 实现的时间库，只把「读时钟」交给运行时：
+//
+//   zr_time_ns()       单调时钟，纳秒（`Instant` 语义）
+//   zr_time_unix_ns()  墙上时钟，Unix 纪元起的纳秒
+//   zr_sleep_ms(ms)    休眠
+//
+// 日历换算用 Howard Hinnant 的 `days_from_civil` / `civil_from_days`，
+// 全部按 UTC 计算，支持负秒（纪元之前）。整数除法向零截断，负秒先修正
+// 成「商 + 非负余数」再进算法，负年份同理用 `z - 146096` / `y - 399`
+// 把截断除法掰成向下取整（与 Hinnant 的 C++ 原式一致）。
+//
+// 内部辅助一律 `time_` 前缀：zr 的模块内所有函数落在同一个扁平命名空间，
+// 不加前缀会与其它 std 模块的同名函数撞成一个符号。
+//=============================================================================
+
+use core::Option;
+use string::String;
+
+//----- 外部运行时 -------------------------------------------------------------
+
+extern "C" {
+    fn zr_time_ns() -> i64;
+}
+
+extern "C" {
+    fn zr_time_unix_ns() -> i64;
+}
+
+extern "C" {
+    fn zr_sleep_ms(ms: u64);
+}
+
+/// 一个已拆好的 UTC 日历时间。
+pub struct DateTime {
+    pub year:    i32,
+    pub month:   u8,
+    pub day:     u8,
+    pub hour:    u8,
+    pub minute:  u8,
+    pub second:  u8,
+    /// 0 = 周日，1 = 周一 … 6 = 周六。
+    pub weekday: u8,
+    /// 秒内的纳秒部分（`civil_from_unix` 产生的总是 0）。
+    pub nanos:   u32,
+}
+
+//----- 时钟 -------------------------------------------------------------------
+
+/// 单调时钟，纳秒（只用于测量间隔，不表示日期）。
+pub fn monotonic_ns() -> i64 {
+    return zr_time_ns();
+}
+
+/// 墙上时钟：Unix 纪元起的纳秒。
+pub fn unix_ns() -> i64 {
+    return zr_time_unix_ns();
+}
+
+/// 墙上时钟：Unix 纪元起的整秒。
+pub fn unix_secs() -> i64 {
+    return zr_time_unix_ns() / 1000000000;
+}
+
+/// 墙上时钟：Unix 纪元起的毫秒。
+pub fn now_ms() -> i64 {
+    return zr_time_unix_ns() / 1000000;
+}
+
+/// 休眠 `ms` 毫秒。
+pub fn sleep_ms(ms: u64) {
+    zr_sleep_ms(ms);
+}
+
+//----- 日历换算 ---------------------------------------------------------------
+
+/// 公历 `y/m/d` 距 1970-01-01 的天数（可为负）。
+///
+/// `m` 用 1..12；调用方保证日期合法。`m <= 2` 时把年退一格，让 3 月成为
+/// 「年内第 0 月」，闰日落在年末，`doy` 就不用特判二月。
+fn time_days_from_civil(y: i64, m: i64, d: i64) -> i64 {
+    let y2 = if m <= 2 { y - 1 } else { y };
+    // 400 年一个 era；负数用 y2 - 399 把向零截断掰成向下取整。
+    let mut ye = y2;
+    if y2 < 0 { ye = y2 - 399; }
+    let era = ye / 400;
+    let yoe = y2 - era * 400;                 // [0, 399]
+    let mp = if m > 2 { m - 3 } else { m + 9 }; // [0, 11]
+    let doy = (153 * mp + 2) / 5 + d - 1;     // [0, 365]
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    return era * 146097 + doe - 719468;
+}
+
+/// 天数 → UTC 日期（不含时分秒）。支持纪元之前的天数。
+fn time_civil_from_days(days: i64) -> DateTime {
+    let z = days + 719468;
+    // 同上：负数补 146096 再除，得到向下取整的 era。
+    let mut ze = z;
+    if z < 0 { ze = z - 146096; }
+    let era = ze / 146097;
+    let doe = z - era * 146097;                                  // [0, 146096]
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365; // [0, 399]
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);           // [0, 365]
+    let mp = (5 * doy + 2) / 153;                                // [0, 11]
+    let d = doy - (153 * mp + 2) / 5 + 1;                        // [1, 31]
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };               // [1, 12]
+    let year = if m <= 2 { y + 1 } else { y };
+    // 1970-01-01 是周四（4，周日为 0）。
+    let mut wd = days % 7;
+    if wd < 0 { wd = wd + 7; }
+    let weekday = (wd + 4) % 7;
+    return DateTime {
+        year: year as i32,
+        month: m as u8,
+        day: d as u8,
+        hour: 0,
+        minute: 0,
+        second: 0,
+        weekday: weekday as u8,
+        nanos: 0,
+    };
+}
+
+/// Unix 秒 → UTC 日历时间。负秒（1970 之前）也正确。
+pub fn civil_from_unix(secs: i64) -> DateTime {
+    // 先拆成「天 + 当天秒」，并让余数非负。
+    let mut days = secs / 86400;
+    let mut rem = secs % 86400;
+    if rem < 0 {
+        rem = rem + 86400;
+        days = days - 1;
+    }
+    let mut dt = time_civil_from_days(days);
+    dt.hour = (rem / 3600) as u8;
+    dt.minute = ((rem % 3600) / 60) as u8;
+    dt.second = (rem % 60) as u8;
+    return dt;
+}
+
+/// UTC 日历时间 → Unix 秒（忽略 `nanos`，按整秒计）。
+pub fn unix_from_civil(dt: DateTime) -> i64 {
+    let days = time_days_from_civil(
+        dt.year as i64,
+        dt.month as i64,
+        dt.day as i64,
+    );
+    return days * 86400
+        + dt.hour as i64 * 3600
+        + dt.minute as i64 * 60
+        + dt.second as i64;
+}
+
+/// 是否闰年（能被 4 整除、但不能被 100 整除，或能被 400 整除）。
+pub fn is_leap(year: i32) -> bool {
+    if year % 400 == 0 { return true; }
+    if year % 100 == 0 { return false; }
+    return year % 4 == 0;
+}
+
+/// 某年某月的天数；`month` 越界返回 0。
+pub fn days_in_month(year: i32, month: u8) -> u8 {
+    if month < 1 || month > 12 { return 0; }
+    if month == 2 {
+        if is_leap(year) { return 29; }
+        return 28;
+    }
+    if month == 4 || month == 6 || month == 9 || month == 11 {
+        return 30;
+    }
+    return 31;
+}
+
+//----- 格式化 -----------------------------------------------------------------
+
+/// 十进制零填充：`value` 至少占 `width` 位。
+fn time_push_pad(s: &mut String, value: i64, width: usize) {
+    let mut v = value;
+    if v < 0 {
+        s.push_byte(45);   // '-'
+        v = -v;
+    }
+    let mut digits: usize = 1;
+    let mut t = v;
+    while t >= 10 {
+        t = t / 10;
+        digits = digits + 1;
+    }
+    let mut zeros = width - digits;
+    while zeros > 0 {
+        s.push_byte(48);   // '0'
+        zeros = zeros - 1;
+    }
+    s.push_int(v);
+}
+
+/// 以 `YYYY-MM-DDTHH:MM:SSZ` 输出（UTC）。
+pub fn format_iso(dt: DateTime) -> String {
+    let mut s = String::with_capacity(20);
+    time_push_pad(&mut s, dt.year as i64, 4);
+    s.push_byte(45);                              // '-'
+    time_push_pad(&mut s, dt.month as i64, 2);
+    s.push_byte(45);                              // '-'
+    time_push_pad(&mut s, dt.day as i64, 2);
+    s.push_byte(84);                              // 'T'
+    time_push_pad(&mut s, dt.hour as i64, 2);
+    s.push_byte(58);                              // ':'
+    time_push_pad(&mut s, dt.minute as i64, 2);
+    s.push_byte(58);                              // ':'
+    time_push_pad(&mut s, dt.second as i64, 2);
+    s.push_byte(90);                              // 'Z'
+    return s;
+}
+
+/// 读 `s[off]` 起 `n` 位的十进制数；遇非数字返回 -1。
+fn time_parse_num(s: str, off: usize, n: usize) -> i64 {
+    let mut v: i64 = 0;
+    let mut i: usize = 0;
+    while i < n {
+        let c = s.ptr[off + i];
+        if c < 48 || c > 57 { return -1; }
+        v = v * 10 + (c - 48) as i64;
+        i = i + 1;
+    }
+    return v;
+}
+
+/// 解析 `YYYY-MM-DDTHH:MM:SSZ`（UTC）。格式或字段越界返回 `None`。
+pub fn parse_iso(s: str) -> Option<DateTime> {
+    let mut result: Option<DateTime> = Option::None;
+    if s.len != 20 { return result; }
+    if s.ptr[4] != 45 || s.ptr[7] != 45 || s.ptr[10] != 84 {
+        return result;
+    }
+    if s.ptr[13] != 58 || s.ptr[16] != 58 || s.ptr[19] != 90 {
+        return result;
+    }
+    let year = time_parse_num(s, 0, 4);
+    let month = time_parse_num(s, 5, 2);
+    let day = time_parse_num(s, 8, 2);
+    let hour = time_parse_num(s, 11, 2);
+    let minute = time_parse_num(s, 14, 2);
+    let second = time_parse_num(s, 17, 2);
+    if year < 0 || month < 1 || month > 12 { return result; }
+    if day < 1 || day > days_in_month(year as i32, month as u8) as i64 {
+        return result;
+    }
+    if hour < 0 || hour > 23 { return result; }
+    if minute < 0 || minute > 59 { return result; }
+    if second < 0 || second > 59 { return result; }
+    let mut dt = DateTime {
+        year: year as i32,
+        month: month as u8,
+        day: day as u8,
+        hour: hour as u8,
+        minute: minute as u8,
+        second: second as u8,
+        weekday: 0,
+        nanos: 0,
+    };
+    // 用往返换算补上 weekday，保证与 `civil_from_unix` 一致。
+    dt = civil_from_unix(unix_from_civil(dt));
+    return Option::Some(dt);
+}
+
+//=============================================================================
+// Duration / Instant（对齐 Rust `std::time`）
+//=============================================================================
+
+/// 时间跨度。`secs` 可为负；`nanos` 恒在 0–999,999,999。
+pub struct Duration {
+    pub secs:  i64,
+    pub nanos: u32,
+}
+
+impl Duration {
+    pub fn from_secs(secs: i64) -> Duration {
+        return Duration { secs, nanos: 0 };
+    }
+
+    pub fn from_millis(ms: i64) -> Duration {
+        return Duration { secs: ms / 1000, nanos: ((ms % 1000) * 1000000) as u32 };
+    }
+
+    pub fn from_micros(us: i64) -> Duration {
+        return Duration { secs: us / 1000000, nanos: ((us % 1000000) * 1000) as u32 };
+    }
+
+    pub fn from_nanos(ns: i64) -> Duration {
+        return Duration { secs: ns / 1000000000, nanos: (ns % 1000000000) as u32 };
+    }
+
+    pub fn as_secs(self) -> i64 { return self.secs; }
+    pub fn subsec_nanos(self) -> u32 { return self.nanos; }
+    pub fn as_millis(self) -> i64 { return self.secs * 1000 + (self.nanos / 1000000) as i64; }
+    pub fn as_micros(self) -> i64 { return self.secs * 1000000 + (self.nanos / 1000) as i64; }
+    pub fn as_nanos(self) -> i64 { return self.secs * 1000000000 + self.nanos as i64; }
+
+    pub fn is_zero(self) -> bool { return self.secs == 0 && self.nanos == 0; }
+}
+
+/// 单调时钟的瞬间（只可比较 / 求差，不表示日期）。
+pub struct Instant {
+    pub ns: i64,
+}
+
+impl Instant {
+    pub fn now() -> Instant {
+        return Instant { ns: zr_time_ns() };
+    }
+
+    /// 从创建到现在经过的时间。
+    pub fn elapsed(self) -> Duration {
+        return Duration::from_nanos(zr_time_ns() - self.ns);
+    }
+
+    pub fn as_nanos(self) -> i64 { return self.ns; }
+}
+
+/// 休眠 `d`（毫秒精度，向下取整）。
+pub fn sleep(d: Duration) {
+    let ms = d.as_millis();
+    if ms <= 0 { return; }
+    zr_sleep_ms(ms as u64);
+}
+
+/// 单调时钟上两点之间的毫秒差。
+pub fn elapsed_ms(start_ns: i64, end_ns: i64) -> i64 {
+    return (end_ns - start_ns) / 1000000;
+}

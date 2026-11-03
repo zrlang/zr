@@ -1,0 +1,206 @@
+//=============================================================================
+// std/base64.zr — Base64 / Base64URL 编解码（RFC 4648）
+//
+// 标准字母表（`+` / `/`）与 URL 安全字母表（`-` / `_`），两者都强制带 `=`
+// 填充。解码是严格的：长度不是 4 的倍数、缺少填充、出现非字母表字符（包括
+// 出现在数据区中部的 `=`）一律返回 `Option::None`。
+//
+// 注意 zr 的 u32 左移会被算成 64 位宽（`a << 7` 的结果带高位），所以本模块
+// 的位运算都先转 `u32`/`i32` 再按需截断；编码里的 `n` 用 u32 且每项都
+// `& 63`，天然落在 32 位内。
+//=============================================================================
+
+use core::Option;
+use string::String;
+use collections::Vec;
+
+//-----------------------------------------------------------------------------
+// 内部辅助（统一 `b64_` 前缀，避免与其它标准库模块的扁平命名空间撞名）
+//-----------------------------------------------------------------------------
+
+/// 按字母表把 6 位值（0..63）映射成字符。`url` 选择 URL 安全字母表。
+fn b64_alpha(index: usize, url: bool) -> u8 {
+    if index < 26 {
+        return (b'A' + (index as u8)) as u8;
+    }
+    if index < 52 {
+        return (b'a' + ((index - 26) as u8)) as u8;
+    }
+    if index < 62 {
+        return (b'0' + ((index - 52) as u8)) as u8;
+    }
+    if url {
+        if index == 62 {
+            return b'-';
+        }
+        return b'_';
+    }
+    if index == 62 {
+        return b'+';
+    }
+    return b'/';
+}
+
+/// 把字符映射回 0..63；非法字符返回 -1。`url` 选择 URL 安全字母表。
+fn b64_val(c: u8, url: bool) -> i32 {
+    if c >= b'A' && c <= b'Z' {
+        return (c - b'A') as i32;
+    }
+    if c >= b'a' && c <= b'z' {
+        return (c - b'a') as i32 + 26;
+    }
+    if c >= b'0' && c <= b'9' {
+        return (c - b'0') as i32 + 52;
+    }
+    if url {
+        if c == b'-' {
+            return 62;
+        }
+        if c == b'_' {
+            return 63;
+        }
+        return -1;
+    }
+    if c == b'+' {
+        return 62;
+    }
+    if c == b'/' {
+        return 63;
+    }
+    return -1;
+}
+
+/// 编码核心：`url` 选择字母表。
+fn b64_enc(bytes: []const u8, url: bool) -> String {
+    let mut out = String::new();
+    let mut i = 0;
+    while i < bytes.len {
+        let b0 = bytes[i];
+        let b1 = if i + 1 < bytes.len { bytes[i + 1] } else { 0 as u8 };
+        let b2 = if i + 2 < bytes.len { bytes[i + 2] } else { 0 as u8 };
+        let n = ((b0 as u32) << 16) | ((b1 as u32) << 8) | (b2 as u32);
+
+        out.push_byte(b64_alpha(((n >> 18) & 63) as usize, url));
+        out.push_byte(b64_alpha(((n >> 12) & 63) as usize, url));
+        if i + 1 < bytes.len {
+            out.push_byte(b64_alpha(((n >> 6) & 63) as usize, url));
+        } else {
+            out.push_byte(b'=');
+        }
+        if i + 2 < bytes.len {
+            out.push_byte(b64_alpha((n & 63) as usize, url));
+        } else {
+            out.push_byte(b'=');
+        }
+        i = i + 3;
+    }
+    return out;
+}
+
+/// 解码核心：`url` 选择字母表。严格校验长度 / 填充 / 字符。
+fn b64_dec(s: []const u8, url: bool) -> Option<Vec<u8>> {
+    // 带填充的编码长度必然是 4 的倍数。
+    if s.len % 4 != 0 {
+        return Option::None;
+    }
+    if s.len == 0 {
+        let mut empty: Vec<u8> = Vec::new();
+        return Option::Some(empty);
+    }
+
+    // 统计尾部填充：最多两个 `=`。
+    let mut pad: usize = 0;
+    if s[s.len - 1] == b'=' {
+        pad = 1;
+        if s.len >= 2 && s[s.len - 2] == b'=' {
+            pad = 2;
+        }
+    }
+    let data_len = s.len - pad;
+
+    // 数据区必须全是字母表字符。
+    let mut i: usize = 0;
+    while i < data_len {
+        if b64_val(s[i], url) < 0 {
+            return Option::None;
+        }
+        i = i + 1;
+    }
+    // 填充区必须全是 `=`（挡住 `A==`、`AAAA=` 之类）。
+    i = data_len;
+    while i < s.len {
+        if s[i] != b'=' {
+            return Option::None;
+        }
+        i = i + 1;
+    }
+
+    // 填充数与数据长度必须自洽：无填充 → 4k；1 个 → 4k+3；2 个 → 4k+2。
+    let rem = data_len % 4;
+    if pad == 0 {
+        if rem != 0 {
+            return Option::None;
+        }
+    } else if pad == 1 {
+        if rem != 3 {
+            return Option::None;
+        }
+    } else {
+        if rem != 2 {
+            return Option::None;
+        }
+    }
+
+    let mut out: Vec<u8> = Vec::with_capacity(s.len / 4 * 3 - pad);
+    let mut i: usize = 0;
+    while i + 1 < data_len {
+        let v0 = b64_val(s[i], url);
+        let v1 = b64_val(s[i + 1], url);
+        let mut v2 = 0;
+        let mut v3 = 0;
+        let mut have2 = false;
+        let mut have3 = false;
+        if i + 2 < data_len {
+            v2 = b64_val(s[i + 2], url);
+            have2 = true;
+        }
+        if i + 3 < data_len {
+            v3 = b64_val(s[i + 3], url);
+            have3 = true;
+        }
+
+        out.push((((v0 << 2) | (v1 >> 4)) & 255) as u8);
+        if have2 {
+            out.push((((v1 << 4) | (v2 >> 2)) & 255) as u8);
+        }
+        if have3 {
+            out.push((((v2 << 6) | v3) & 255) as u8);
+        }
+        i = i + 4;
+    }
+    return Option::Some(out);
+}
+
+//-----------------------------------------------------------------------------
+// 公开 API
+//-----------------------------------------------------------------------------
+
+/// 标准 Base64 编码（带 `=` 填充）。
+pub fn base64_encode(bytes: []const u8) -> String {
+    return b64_enc(bytes, false);
+}
+
+/// 标准 Base64 解码；非法输入返回 `Option::None`。
+pub fn base64_decode(s: []const u8) -> Option<Vec<u8>> {
+    return b64_dec(s, false);
+}
+
+/// URL 安全 Base64 编码（`-` / `_` 字母表，带 `=` 填充）。
+pub fn base64url_encode(bytes: []const u8) -> String {
+    return b64_enc(bytes, true);
+}
+
+/// URL 安全 Base64 解码；非法输入返回 `Option::None`。
+pub fn base64url_decode(s: []const u8) -> Option<Vec<u8>> {
+    return b64_dec(s, true);
+}

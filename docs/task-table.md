@@ -178,7 +178,7 @@ zr 的做法是让被调方是**泛型**函数（`fn apply<F>(f: F, ..)`）：`F
 
 ### P1-5 格式串 `{name}` 与 `{:#?}` 聚合
 
-现状：`std/io.zr` 格式引擎支持 `{}` `{:?}` `{:x}` …、位置参数、动态宽度/精度；
+现状：`std/std/io.zr` 格式引擎支持 `{}` `{:?}` `{:x}` …、位置参数、动态宽度/精度；
 **命名参数 `{name}` 已实现**（`io::println_fmt_named(fmt, &[NamedArg], n)`，
 `0d40ab1`）。**`{:#?}` 多行聚合 Debug 已全线打通**：derive 侧 `#[derive(Debug)]`
 生成 `.debug_pretty()` / `.debug_pretty_at(e, ind)`（输出对齐 Rust `{:#?}`）；
@@ -295,7 +295,7 @@ trait 默认方法（带方法体的方法 / `default fn` 拼写）已实现**�
 
 ---
 
-## 阶段 3 — 标准库平台能力（cli / env / json / xml / toml）
+## 阶段 3 — 标准库平台能力（argparse / env / json / xml / toml）
 
 > 2026-11-02 新增。五项能力全部落在 `std/`：命令行参数、环境变量、JSON、XML、TOML。
 > 不标"暂不做"——每一项都拆到可独立实现、可回归的子任务。
@@ -305,11 +305,12 @@ trait 默认方法（带方法体的方法 / `default fn` 拼写）已实现**�
 > 其余 API 用 `impl` 方法（按类型解析，不会撞名）。每个模块都必须能被
 > `use <m>::*;` + 空 `main` 全链路加载。
 
-### P3-1 命令行参数（std/cli.zr）
+### P3-1 命令行参数（std/std/argparse.zr，原 std/cli.zr）
 
 现状：✅ `_start` 在调用 `main` 之前把 `(argc, argv)` 交给 `zr_args_init`，
-运行时把二者存进 `__DATA/__bss`，`std/cli.zr` 只做薄封装（把 C 字符串复制成
-`String`）。各平台入口约定：
+运行时把二者存进 `__DATA/__bss`，`std/std/argparse.zr` 只做薄封装（把 C 字符串复制成
+`String`；**2026-11-02 已由 `std/cli.zr` 重命名为 `argparse`**，并补上按参数名
+读取，见阶段 4 的 P4-1）。各平台入口约定：
 
 | 平台 | 入口处参数位置 | 入口桩动作 |
 |---|---|---|
@@ -326,35 +327,35 @@ trait 默认方法（带方法体的方法 / `default fn` 拼写）已实现**�
 |---|---|---|
 | P3-1a | 运行时就绪：`zr_args_init(argc, argv)` + `zr_args_count()` / `zr_args_ptr(i)`（越界返回 null） | ✅ |
 | P3-1b | 六个 `_start` 入口桩按上表捕获参数（x86-64 / aarch64，Linux / macOS / Windows） | ✅ |
-| P3-1c | `std/cli.zr`：`arg_count()`、`arg(i) -> String`、`arg_opt(i) -> Option<String>`、`args() -> Vec<String>`、`program_name() -> String` | ✅ |
+| P3-1c | `std/std/argparse.zr`（现 `argparse`，原 `std/cli.zr`）：`arg_count()`、`arg(i) -> String`、`arg_opt(i) -> Option<String>`、`args() -> Vec<String>`、`program_name() -> String` | ✅ |
 | P3-1d | 回归 `tests/cases/126_cli_args.zr`：`arg_count() >= 1`、`arg(0)` 非空、越界返回空串 / `None`（运行器传入额外参数时不崩溃） | ✅ |
 
 **验收**：编译出的二进制被运行时，`arg_count()` 与真实 `argc` 一致；
-`arg(0)` 是程序路径；`use cli::*; fn main(){}` 可全链路编译链接。
+`arg(0)` 是程序路径；`use argparse::*; fn main(){}` 可全链路编译链接。
 
-### P3-2 环境变量（std/env.zr）
+### P3-2 环境变量（std/std/env.zr）
 
 现状：✅ 环境变量初值来自 P3-1a 一并记下的入口 `envp`，读取经运行时
 `zr_env_count()` / `zr_env_entry(i)` 返回只读条目；写操作不碰运行时，
-统一落在 `std/env.zr` 自己的**覆盖表**里。
+统一落在 `std/std/env.zr` 自己的**覆盖表**里。
 
 实现：覆盖表是堆上的 `*const u8` 数组，每项一条 C 字符串——`"KEY=VALUE"`
 表示设置，只有 `"KEY"`（没有 `=`）表示删除（墓碑）。查找**从后往前**扫
 覆盖表（后写优先），命中墓碑即视为未设置；没有覆盖时才扫入口 `envp`。
-`std/env.zr` 负责 `str` → NUL 结尾缓冲与结果 → `String` 的复制。
+`std/std/env.zr` 负责 `str` → NUL 结尾缓冲与结果 → `String` 的复制。
 
 | 子任务 | 内容 | 状态 |
 |---|---|---|
-| P3-2a | 运行时 `zr_env_count() -> usize`、`zr_env_entry(i) -> *const u8`（六平台汇编）；覆盖表在 `std/env.zr` 内实现 | ✅ |
-| P3-2b | `std/env.zr`：`var(key) -> Option<String>`、`var_or(key, default) -> String`、`set_var(key, value) -> bool`、`remove_var(key) -> bool`、`has_var(key) -> bool` | ✅ |
+| P3-2a | 运行时 `zr_env_count() -> usize`、`zr_env_entry(i) -> *const u8`（六平台汇编）；覆盖表在 `std/std/env.zr` 内实现 | ✅ |
+| P3-2b | `std/std/env.zr`：`var(key) -> Option<String>`、`var_or(key, default) -> String`、`set_var(key, value) -> bool`、`remove_var(key) -> bool`、`has_var(key) -> bool` | ✅ |
 | P3-2c | 回归 `tests/cases/127_env_vars.zr`：设置 → 读取 → 覆盖 → 删除；不存在的键返回 `None` / 默认值 | ✅ |
 
 **验收**：同一进程内 `set_var("ZR_TEST_X","1")` 后 `var` 立即读到 `"1"`，
 覆盖后读到新值，`remove_var` 后回到 `None`；未设置时 `var_or` 返回默认值。
 
-### P3-3 JSON（std/json.zr）
+### P3-3 JSON（std/alloc/json.zr）
 
-现状：✅ `std/json.zr` 已实现，解析 / 访问 / 生成全部可用。
+现状：✅ `std/alloc/json.zr` 已实现，解析 / 访问 / 生成全部可用。
 
 类型：`Json`（`Null` / `Bool` / `Int` / `Float` / `Str` / `Array` / `Object`，
 递归经 `Vec` 破环）、`JsonPair { key, value }`、`JsonError { pos, msg }`。
@@ -370,9 +371,9 @@ trait 默认方法（带方法体的方法 / `default fn` 拼写）已实现**�
 **验收**：`json_parse` 对嵌套样例返回正确树；`json_stringify` 的输出可被
 再次 `json_parse` 解析且内容一致；空输入 / 截断输入返回 `Err` 而非崩溃。
 
-### P3-4 XML（std/xml.zr）
+### P3-4 XML（std/alloc/xml.zr）
 
-现状：✅ `std/xml.zr` 已实现，解析 / 访问 / 生成全部可用。
+现状：✅ `std/alloc/xml.zr` 已实现，解析 / 访问 / 生成全部可用。
 
 类型：`XmlNode { name, attrs, children, text }`、`XmlAttr { name, value }`、
 `XmlError { pos, msg }`。解析支持 XML 声明、注释、DOCTYPE、CDATA、自闭合
@@ -389,9 +390,9 @@ trait 默认方法（带方法体的方法 / `default fn` 拼写）已实现**�
 **验收**：解析 → 生成 → 再解析得到同样的树；自闭合标签与文本混排正确；
 不匹配的结束标签返回带位置的 `Err`。
 
-### P3-5 TOML（std/toml.zr）
+### P3-5 TOML（std/alloc/toml.zr）
 
-现状：✅ `std/toml.zr` 已实现，解析 / 访问 / 生成全部可用。
+现状：✅ `std/alloc/toml.zr` 已实现，解析 / 访问 / 生成全部可用。
 
 类型：`Toml`（`Integer` / `Float` / `Bool` / `Str` / `Array` / `Table`）+ 
 `TomlEntry { key, value }` + `TomlError { pos, msg }`。解析覆盖配置文件的
@@ -413,7 +414,41 @@ trait 默认方法（带方法体的方法 / `default fn` 拼写）已实现**�
 
 ---
 
-## 阶段 4 — 已完成的缺口（核对后归档）
+## 阶段 4 — 标准库扩展与 AI 运行时（2026-11-02）
+
+> 目标：把通用工具能力与 AI 开发所需的数据类型补进 `std/`，全部用 **zr 语言**
+> 实现（不引第三方依赖）。每项都必须有正向回归用例并在 `-O0/-O1/-O2/-O3/-Oz`
+> 五档通过；**不设"暂不做"状态**——列出的每一条都是本轮要落地的真实任务。
+>
+> 状态：⬜ 未开始 / 🔧 进行中 / ✅ 已提交。
+
+| 子任务 | 内容 | 验收 | 状态 |
+|---|---|---|---|
+| P4-1 argparse | `std/std/argparse.zr` 重命名为 `std/std/argparse.zr`；保留索引读取（`arg_count` / `arg` / `arg_opt` / `args` / `get` / `program_name`），新增参数名读取：`value(name)` / `value_or(name, default)` / `flag(name)` / `has(name)` / `positionals()`，支持 `--name=value`、`--name value`、`-n value`；另给 `value_in` / `value_or_in` / `has_in` / `flag_in` / `positionals_in` 可注入参数表的版本便于单测 | `126` 更新、新增 `131` | ✅ |
+| P4-2 字符串格式化 | `io::format(fmt, args, nargs) -> String`：把格式串与参数拼成**新的字符串**（不写 stdout）；支持 `{}` `{:?}` `{:#?}` `{:x}` `{:X}` `{:b}` `{:o}`、位置参数 `{0}`、`{{` / `}}`；`string::join_parts(parts, count, sep)` | 新增 `132` | ✅ |
+| P4-3 simd | 在现有 `f32x4` / `i32x4` / `f64x2` / `i8x8` 上补逐 lane 运算与归约：`from_array` / `to_array` / `splat` / `add` / `sub` / `mul`（浮点另有 `div`）/ `neg` / `min` / `max`（浮点另有 `abs`）/ `sum` / `dot` | 新增 `139` | ✅ |
+| P4-4 os | `std/std/os.zr`：`pid` / `cwd_len(buf, cap)` / `temp_dir` / `home_dir` / `os_name`（运行时探测 macos/linux/windows）/ `pointer_bits` / `exit` | 新增 `138` | ✅ |
+| P4-5 posix | `std/std/posix.zr`：`isatty` / `getpid` / `kill` / `getcwd`；`SIG*` 与 `*_FILENO` 常量；`wifexited` / `wexitstatus` / `wifsignaled` / `wtermsig` 状态解码 | 新增 `138` | ✅ |
+| P4-6 time | `std/std/time.zr`：`monotonic_ns` / `unix_ns` / `unix_secs` / `now_ms` / `sleep_ms`；`DateTime` + `civil_from_unix` / `unix_from_civil`（含负秒、闰年）/ `format_iso` / `parse_iso` | 新增 `136` | ✅ |
+| P4-7 tz | `std/std/tz.zr`：`zone_exists` / `utc_offset_seconds(name, unix_secs)` / `to_local` / `from_local`；内置 UTC、Asia/Shanghai、Asia/Tokyo、Asia/Kolkata、Europe/London、Europe/Berlin、America/New_York、America/Los_Angeles、Australia/Sydney，并按真实 EU/US/AU DST 规则计算 | 新增 `137` | ✅ |
+| P4-8 md5 | `std/md5.zr`：RFC 1321，`md5_hex(bytes)` / `md5_hex_str(s)` | 新增 `134` | ✅ |
+| P4-9 sha256 | `std/sha256.zr`：FIPS 180-4，`sha256_hex(bytes)` / `sha256_hex_str(s)` | 新增 `135` | ✅ |
+| P4-10 base64 | `std/base64.zr`：标准与 URL-safe 编解码，带 `=` padding，严格解码（非法字符 / 长度 / 缺 padding 返回 `None`） | 新增 `133` | ✅ |
+| P4-11 http | `std/std/http.zr`：`url_parse`、`http_build_request`、`http_parse_response`（状态行 / 全部头 / Content-Length / chunked / 无长度）、`http_get`、`http_post`、`http_request(method, url, body, headers, follow)`（走运行时 `zr_*` 套接字，避免与 `net` 的同名类型冲突）；自动跟随 301/302/303/307/308（303 强制 GET、307/308 保留方法与 body、相对 Location 按原 URL 拼绝对地址）；仅点分 IPv4，不支持 HTTP/2 与代理；`https://` 可解析但明文模块返回 `TlsNotSupported`（TLS 在可选模块 `std/std/tls.zr`） | 新增 `140` | ✅ |
+| P4-12 pdb | `std/alloc/pdb.zr`：PDB（Protein Data Bank）结构文件解析——HEADER / TITLE / 固定列宽 ATOM / HETATM，`Pdb::atom_count` / `atom` / `centroid`；坏行跳过 | 新增 `141` | ✅ |
+| P4-13 tensor | `std/alloc/tensor.zr`：`Tensor` 值类型（`dims: [usize; 4]` + `ndim` + `len` + `data: *mut f64` + `grad` + `ctx`，行主序，最多 4 维）：`zeros` / `ones` / `full` / `scalar` / `from_slice` / `from_vec` / `from_matrix` / `identity`，`get_flat` / `set_flat` / `get2` / `set2` / `get3` / `set3`，逐元素 `add` / `sub` / `mul` / `div` / `neg`、标量 `add_scalar` / `mul_scalar`，`relu` / `leaky_relu`，`matmul` / `transpose` / `reshape`，`sum` / `mean` / `max` / `min` / `argmax`，`square` / `mse` / `same_shape` / `close_to` / `copy` / `fill` / `destroy`；浮点数学用 zr 自身实现（无外部依赖） | 新增 `142` / `143` | ✅ |
+| P4-14 tensor 广播 | `Tensor::broadcast(target_dims, target_ndim)`（NumPy 规则：末维对齐、1 扩到更大维度）、`broadcast_add` / `broadcast_mul` | 新增 `146` | ✅ |
+| P4-15 tensor conv2d | `Tensor::conv2d(weight, bias, stride_h, stride_w, pad_h, pad_w)`——NCHW 输入、`[OC, IC, KH, KW]` 权重、`[OC]` 偏置，直接卷积（无 im2col），输出 `[N, OC, OH, OW]` | 新增 `146` | ✅ |
+| P4-16 tensor autograd | 极简反向模式自动微分（`TensorCtx` 计算图 + 拓扑后序）：`track_inplace` / `backward` / `zero_grad` / `sum_tensor`；前向 `add` / `mul` / `matmul` / `relu` 自动挂图，反向按链式法则累积 `grad` | 新增 `146` | ✅ |
+| P4-17 tensor GPU 桩 | `gpu_available() -> bool`（当前恒 false）+ `GpuHandle` / `gpu_to()` 占位（`panic("not implemented")`），为将来 CUDA/Metal 后端预留接口 | 新增 `146` | ✅ |
+| P4-18 tls | `std/std/tls.zr`：**纯 zr** TLS 1.2 客户端骨架（rustls 式分层 `ClientConfig` / `ClientConnection`，`handshake()` / `write()` / `read()` / `close()`；ClientHello 编码 + ServerHello 解析 + 记录层收发 + close_notify；支持 4 种密码套件（0x002F / 0x003C / 0xC02F / 0xC030）；**无外部依赖**（底层密码学由 `std/alloc/crypto.zr` 提供）；密钥交换（RSA/ECDH）和证书验证留 TODO | 无（Python TLS server 端到端验证通过） | ✅ |
+| P4-21 crypto | `std/alloc/crypto.zr`：纯 zr 密码学原语——AES-128-ECB（keyexp + encrypt_block + decrypt_block）、AES-128-CTR 模式、SHA-256 流式（`Sha256State` + `init` / `update` / `digest`）、HMAC-SHA256、简易 PRNG（`PrngState` + `seed` / `bytes`）。三个 NIST AES-128 测试向量 + RFC 4231 HMAC-SHA256 向量全部通过 | 无（单文件自验证） | ✅ |
+| P4-19 simd 扩展 | `std/core/simd.zr` 新增 `f32x8` / `f64x4` / `i64x2`（逐 lane `add`/`sub`/`mul`/`div`/`neg`/`min`/`max`/`abs`、归约 `sum`/`dot`）+ `best_width()`（64 位平台 32 字节、32 位 16 字节） | 新增 `144` | ✅ |
+| P4-20 argparse 子命令 | `std/std/argparse.zr` 新增 `subcommand()` / `subcommand_in(argv)`（跳过选项取第一个位置参数）、`print_help(name, desc, cmds, descs, ncmd)` 生成 USAGE / SUBCOMMANDS 文本、`help_requested()` / `help_requested_in(argv)` 识别 `--help` / `-h` | 新增 `145` | ✅ |
+
+---
+
+## 阶段 5 — 已完成的缺口（核对后归档）
 
 > 以下为已提交并全绿验证的项，留档便于查证。
 
@@ -439,6 +474,61 @@ trait 默认方法（带方法体的方法 / `default fn` 拼写）已实现**�
 | §4 static mut 盲区核实 | `4ab802d` | ✅ |
 | §4 f8/f16 盲区核实 | `03fe185` | ✅ |
 | §3.4/§4 关联类型投影声明修正 | `0a7895d` | ✅ |
+
+---
+
+## 阶段 6 — 标准库三层重组（core ⊂ alloc ⊂ std）
+
+对齐 Rust 的 crate 分层，把扁平 `std/*.zr` 按依赖方向落到目录里：
+
+| 层 | 目录 | 模块 |
+|---|---|---|
+| **core**（零依赖，无堆/OS/I/O） | `std/core/` | `core` `simd` |
+| **alloc**（只依赖 core，有堆分配） | `std/alloc/` | `mem` `slice` `string` `collections` `json` `xml` `toml` `base64` `md5` `sha256` `crypto` `tensor` `pdb` `async` |
+| **std**（依赖 OS） | `std/std/` | `sys` `io` `fs` `net` `http` `tls` `env` `os` `posix` `process` `thread` `time` `tz` `path` `argparse` `error` |
+| **门面** | `std/std.zr` | `use core::*; use string::*; …` 传递性再导出，业务代码可 `use std::*` / `use std::io::File` |
+
+编译器配套（`src/modules.rs`）：
+- `stdlib_module_path`：按 `std/<name>.zr` → `core/` → `alloc/` → `std/` 顺序查找，旧的扁平 `use io::File` 不受影响。
+- `layer_of_path` + `Layer`：层级由目录推出；依赖方向 `core → core`、`alloc → {core, alloc}`、`std → 任意`，越界报 `layering violation`。
+- `expand_glob_exports`：门面的 `use x::*` 做传递性再导出（多轮直到收敛，可处理环）。
+- `load_with_root`：把根源文件登记进 `seen`，避免"编译标准库模块本身"时被 prelude 重复并入 → `multiple impls of the same trait`。
+- 拆分：`core.zr` 只留 trait/Option/Result/panic/assert/size_of；分配器接口移到 `alloc/mem.zr`；`write/read/exit` 移到 `std/std/sys.zr`。
+- 清理重名：删除 `net.zr` 里与 `http.zr` 冲突的旧 HTTP 客户端；`http` 复用 `net::SockAddrStorage`。
+
+回归：`tests/cases/148_std_layers.zr`（`use std::*` 同时取三层名字，五档全绿）；`modules::layer_tests`（层级分类 + glob 传递性，2 个单测）；`cargo test --bin zr` 269 通过；`zr_language` / `zr_negative` 全绿。
+
+---
+
+## 阶段 7 — 按 Rust 的 core / alloc / std 补齐 API
+
+| 层 | 新增 |
+|---|---|
+| **core** | `cmp.zr`（`Ordering` / `cmp` / `cmp_min` / `cmp_max`）、`char.zr`（ASCII 判定 / 大小写 / 数字转换，自由函数）、`num.zr`（`abs` / `sign` / `pow` / 饱和 / 检查 / 回绕 / 位计数 / `gcd` / `lcm` / `clamp` / `i64_min()` / `i64_max()`）；`core.zr` 的 `Option` / `Result` 补 `expect` / `unwrap_or_else` / `map_or` / `ok_or` / `filter` / `or` / `ok` / `err` / `map_err`，标量补 `Eq` / `Ord` / `Hash` |
+| **alloc** | 新增 `boxed.zr`（`Box<T>`）、`vec_deque.zr`（`VecDeque<T>`）、`hashmap.zr`（`HashMap<K, V>`，开放寻址 + rehash）；`collections.zr` 的 `Vec` 补 `first` / `last` / `truncate` / `retain` / `reverse` / `swap` / `extend_from_slice` / `dedup`；`string.zr` 的 `String` 补 `trim*` / `to_lowercase` / `to_uppercase` / `find_str` / `rfind_byte` / `split` / `split_whitespace` / `replace` / `parse_i64` / `parse_i32` 与 `Eq` / `Ord` / `Hash` / `Clone` / `Default`；`mem.zr` 的原子 `Ordering` 改名 `AtomicOrdering` |
+| **std** | `io.zr` 补 `stdout()` / `stderr()` / `stdin()`、`File::read_line` / `File::read_to_string` / `File::write_string`；`fs.zr` 补 `create_dir_all` / `read_to_string` / `read_bytes` / `write_string` / `append_string` / `copy_file` / `read_dir`；`time.zr` 补 `Duration` / `Instant` / `sleep` |
+
+顺带修的编译器缺陷：
+- `size_of` / `align_of` 对泛型具名类型未按实参实例化（`Entry<K,V>` 算成 1 字节）→ `InferCtxt::type_params` + `subst_ty`。
+- `size_of` 的结构体 / 元组 / 枚举未按对齐补齐（29 vs 真实 32）→ 与 `mir/builder` 的布局同口径；定长数组改用 `hir::array_len_value`；`char` 改为 1 字节。
+- `io.zr` 私有助手 `align_of` 遮蔽内建 `align_of::<T>()` → 改名 `io_align_of`。
+- 文档记录 `&&` / `||` 不短路（`HashMap::probe` 改为显式 `if used` 守住求值）。
+
+回归：`tests/cases/149_std_core_ext.zr`、`150_std_alloc_ext.zr`、`151_std_fs_time.zr`（五档全绿）；`cargo test --bin zr` / `zr_language` / `zr_negative` 全绿。
+
+---
+
+## 阶段 8 — HTTP/2 客户端（2026-11-03）
+
+| 项 | 内容 |
+|---|---|
+| **新增模块** | `std/std/http2.zr`：RFC 7540 明文 h2c 客户端。连接前导 + SETTINGS 协商、9 字节帧编解码（DATA / HEADERS / RST_STREAM / SETTINGS / PING / GOAWAY / WINDOW_UPDATE / CONTINUATION）、HEADERS + CONTINUATION 头块拆帧、16 KiB DATA 分帧、响应侧流控（每个非末 DATA 帧回流 + 连接各一个 WINDOW_UPDATE） |
+| **HPACK（RFC 7541）** | 静态表 61 项 + 动态表（4096 / 可配置，条目 = name + value + 32，LRU 淘汰）、三种字面量编码（增量索引 / 不索引 / 动态表容量更新）、7 位前缀变长整数、Huffman **解码**（附录 B 257 符号，规范 `count`/`first_code`/`first_index`/`syms` 表，逐位解码）；编码侧不做 Huffman |
+| **公开 API** | `http2_request` / `http2_get` / `http2_post`（返回既有 `HttpResponse`），以及 `HpackDecoder`、`h2_encode_headers`、`h2_encode_frame` 纯函数（便于离线测试）；`std.zr` 门面新增 `use http2::*;` |
+| **配套改动** | `HttpResponse` 新增 `strings: Vec<String>` 所有权池（HPACK 解码出的 `str` 指向池内堆缓冲，避免悬垂）；`http.zr` 的 `http_find_header_value` / `http_resolve_redirect` 改 `pub` 供 http2 复用重定向策略 |
+| **顺带修的缺陷** | `net.zr::tcp_connect(host, port)` 早先忽略 `port`，把 host 直接交给 `parse_socket_addr`（要求 `host:port`），所以 `tcp_connect("127.0.0.1", 18081)` 一律 `InvalidAddr`；**聚合字面量移动不登记**导致 `TcpStream::connect` 返回前就 drop 掉 `Socket`、fd 被关（详见 `docs/rust-parity.md` 与 `AGENTS.md` 的缺陷表） |
+| **限制** | 仅明文 `http://`（`https://` 返回 `TlsNotSupported`，`tls.zr` 没有 ALPN）；不支持服务端推送 / PRIORITY；请求体 ≤ 65535；不严格校验帧序 |
+| **回归** | `tests/cases/152_http2.zr`（五档全绿）：RFC 7541 附录 C.4.1–C.4.3 / C.6.1–C.6.3 六组向量、编码器字面量格式、长值多字节长度前缀、9 字节帧头逐字节断言。真实 h2c 往返（GET / POST）用 `/tmp` 探针 + 手写 Python 服务端人工验证 |
 
 ---
 

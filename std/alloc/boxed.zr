@@ -1,0 +1,69 @@
+//==============================================================================
+// std/alloc/boxed.zr — 堆上的单值所有权（对应 Rust `alloc::boxed::Box`）
+//
+// `Box<T>` 把值放在堆上，栈上只留一个指针。与 `Vec` / `String` 一样，
+// 释放需要显式调用 `free()`（zr 的 `Drop` 只走编译期内建，标准库类型
+// 不做自动析构）。
+//==============================================================================
+
+use core::{panic, size_of, align_of};
+use mem::{zr_alloc, zr_dealloc};
+
+pub struct Box<T> {
+    pub ptr: *mut T,
+}
+
+impl<T> Box<T> {
+    /// 把 `value` 移到堆上。
+    pub fn new(value: T) -> Box<T> {
+        let p = zr_alloc(size_of::<T>(), align_of::<T>()) as *mut T;
+        if p == 0 as *mut T { panic("Box: out of memory"); }
+        p[0] = value;
+        return Box { ptr: p };
+    }
+
+    /// 取堆上值的副本（值语义类型安全；`T` 为聚合类型时是浅拷贝）。
+    pub fn get(self) -> T {
+        return self.ptr[0];
+    }
+
+    /// 取堆上值的可变指针。
+    pub fn get_mut(self: &mut Box<T>) -> *mut T {
+        return self.ptr;
+    }
+
+    /// 取只读指针。
+    pub fn as_ptr(self) -> *const T {
+        return self.ptr as *const T;
+    }
+
+    /// 放弃所有权，返回裸指针（调用方负责释放）。
+    pub fn into_raw(self) -> *mut T {
+        return self.ptr;
+    }
+
+    /// 换掉堆上的值，返回旧值。
+    pub fn replace(self: &mut Box<T>, value: T) -> T {
+        let old = self.ptr[0];
+        self.ptr[0] = value;
+        return old;
+    }
+
+    /// 释放堆内存（不析构 `T` 内部资源）。
+    pub fn free(self: &mut Box<T>) {
+        if self.ptr != 0 as *mut T {
+            zr_dealloc(self.ptr as *mut void, size_of::<T>(), align_of::<T>());
+            self.ptr = 0 as *mut T;
+        }
+    }
+}
+
+/// 便捷构造（对应 Rust 的 `Box::new` 自由函数形式）。
+pub fn box_new<T>(value: T) -> Box<T> {
+    return Box::new(value);
+}
+
+/// 从裸指针重建 `Box`，由 `into_raw` 产生。
+pub fn box_from_raw<T>(ptr: *mut T) -> Box<T> {
+    return Box { ptr };
+}

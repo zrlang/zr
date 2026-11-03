@@ -3053,7 +3053,7 @@ fn emit_movzx(unit: &mut CompilationUnit, dst: Gpr, src: Gpr) {
 ///
 /// 装不下的实参（第 7 个及之后的整数、第 9 个及之后的浮点）按 SysV 走
 /// 栈上传参区。早先这两类实参被**静默丢弃**——被调用方读到的是栈上的垃圾，
-/// 编译期一声不响，运行结果全错。`std/io.zr` 里 7 个形参的 `emit_arg`
+/// 编译期一声不响，运行结果全错。`std/std/io.zr` 里 7 个形参的 `emit_arg`
 /// 就踩在这上面：`{:8}` 的宽度实参根本没传进去，宽度恒为 0，所有
 /// 填充 / 对齐 / 零填充规格全部失效。
 fn emit_call_args(unit: &mut CompilationUnit, args: &[SsaValue]) -> usize {
@@ -3380,7 +3380,7 @@ pub fn emit_start_wrapper(target: &Target, unit: &mut CompilationUnit, run_tasks
     debug_assert_eq!(target.arch(), Arch::X86_64);
     let start = unit.code.len();
 
-    // 把入口处的 (argc, argv) 交给运行时，供 `std/cli.zr` 读取。
+    // 把入口处的 (argc, argv) 交给运行时，供 `std/std/argparse.zr` 读取。
     // Linux 的 `_start` 由内核直接进入，参数在栈上：`[rsp]`=argc、`rsp+8`=argv；
     // macOS 的入口由 dyld 调用，参数按 SysV 约定在 rdi / rsi 里。
     match target.os() {

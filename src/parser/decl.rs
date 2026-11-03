@@ -481,7 +481,7 @@ impl Parser {
         // 与函数 / impl 上的 where 子句一致——**解析并消费，但暂不强制**
         // （边界在泛型单态化时由 `check_trait_bounds` 校验）。早先这里没有
         // where 分支，`pub struct Join2<..> where ..` 直接撞上 `{` 分派，
-        // 报 `expected '{' after struct name: found KwWhere`，`std/async.zr`
+        // 报 `expected '{' after struct name: found KwWhere`，`std/alloc/async.zr`
         // 整模块加载不了。
         if self.match_kind(&TokenKind::KwWhere) {
             let _ = self.parse_where_clause()?;

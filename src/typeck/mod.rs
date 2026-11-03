@@ -2167,7 +2167,7 @@ impl TypeChecker {
             // - 普通调用靠 `fresh_infer` 兜底，实参从未被真正核验（静默洞）；
             // - 方法调用更是拿全局 `InferId(0)` 当哨兵——红线 2：它是**活的**
             //   推断变量，会被更早的调用绑上（`a.set(&b)` 把它绑成
-            //   `*const T`），后面 std/string.zr 的 `reserve(8)` 实参 `u64`
+            //   `*const T`），后面 std/alloc/string.zr 的 `reserve(8)` 实参 `u64`
             //   resolve 出旧值，报出无中生有的 `expected *const T, found u64`。
             //
             // 签名必须在函数体检查开始前就完整。这里把参数类型一并降低
@@ -3344,7 +3344,7 @@ impl TypeChecker {
                 // `}`，不产生值但**不**发散，类型是 `()`）。早先混为一谈，后者被误判
                 // 成发散，`if` 于是拿到 `Never`，再经 `unify_or` 的"不一致返回推断
                 // 变量"兜底落到 `InferId(0)`——而 `InferId(0)` 是个**活的**推断变量，
-                // 长编译里可能早已被绑定（`std/io.zr` 里绑成了 `u8`），`subtype` 一
+                // 长编译里可能早已被绑定（`std/std/io.zr` 里绑成了 `u8`），`subtype` 一
                 // resolve 就解析出 `u8` 去和 `()` 比，报出一条完全无中生有的
                 // "expected `()`, found `u8`"。短文件不绑定 `InferId(0)`，所以碰不到。
                 let ty = if then_diverges && else_diverges {
@@ -3826,9 +3826,16 @@ impl TypeChecker {
                     })?;
                     let first = self.check_expr(first_expr, &elem)?;
                     self.check_partial_move(&first, first_expr.span())?;
-                    for _ in 0..n {
-                        hir_elems.push(first.clone());
-                    }
+                    // 不展开成 N 个 HIR 节点——`[0; 65536]` 会让编译退化到
+                    // 分钟级。保留重复形式，交给 MIR 降级成运行期填槽循环。
+                    hir_elems.clear();
+                    let arr_ty = Ty::Array(Box::new(self.infer.resolve(&elem)), const_array_len(n, span));
+                    let rep = HirExpr {
+                        kind: ExprKind::ArrayRepeat { init: Box::new(first), len: n as usize },
+                        ty: arr_ty,
+                        span,
+                    };
+                    return Ok(rep);
                 } else if self.infer.resolve(&elem) != Ty::Infer(InferId(0)) {
                     // 元素类型已由声明定下：直接按它检查。
                     let elem_ty = self.infer.resolve(&elem);
@@ -4886,8 +4893,8 @@ impl TypeChecker {
 
     /// 识别 `size_of` / `align_of` 的**编译期定义**形状。
     ///
-    /// 这两个名字在标准库里有两份定义：`std/core.zr` 的**无 body 声明**
-    /// （`pub fn size_of<T>() -> usize;`）与 `std/mem.zr` 的 `intrinsic!` 实现
+    /// 这两个名字在标准库里有两份定义：`std/core/core.zr` 的**无 body 声明**
+    /// （`pub fn size_of<T>() -> usize;`）与 `std/alloc/mem.zr` 的 `intrinsic!` 实现
     /// （`pub fn size_of<T>() -> usize { intrinsic!(size_of T) }`）。
     ///
     /// 早先只认 `body.is_none()`，但扁平符号表让 `use core::size_of` 实际绑到
@@ -4906,9 +4913,9 @@ impl TypeChecker {
             _ => return None,
         };
         match &ast_fn.body {
-            // `pub fn size_of<T>() -> usize;`（std/core.zr 的声明）
+            // `pub fn size_of<T>() -> usize;`（std/core/core.zr 的声明）
             None => Some(kind),
-            // `pub fn size_of<T>() -> usize { intrinsic!(size_of T) }`（std/mem.zr）
+            // `pub fn size_of<T>() -> usize { intrinsic!(size_of T) }`（std/alloc/mem.zr）
             Some(b) if b.stmts.is_empty() => match b.tail.as_deref() {
                 Some(Expression::Intrinsic(k, _, _, _)) if *k == kind => Some(kind),
                 _ => None,
@@ -4979,6 +4986,9 @@ impl TypeChecker {
             // 类型再算。
             icx.vars = self.infer.vars.clone();
             icx.type_defs = &self.type_defs;
+            // 泛型具名类型（`Entry<K, V>` 等）的字段要按实参实例化后再算布局，
+            // 否则字段仍是形参占位符、每个都按 1 字节计。
+            icx.type_params = Some(&self.type_generic_params);
             let resolved = icx.resolve(ty);
             let value = if ast_fn.name == "size_of" {
                 icx.size_of(&resolved)
@@ -5053,7 +5063,7 @@ impl TypeChecker {
         // 层引用也没人看见；现在核验真跑了，这里必须把引用形参剥掉一层再
         // 比内层类型，否则标量 receiver（聚合靠 check_call_arg 的
         // "聚合值 ↔ 引用"放行，标量没有对应规则）报无中生有的
-        // `expected &i64, found i64`（`std/core.zr` 的 `max` 调 `a.lt(b)`）。
+        // `expected &i64, found i64`（`std/core/core.zr` 的 `max` 调 `a.lt(b)`）。
         // MIR 层不用动：调用点的 by_ref 按被调方形参类型传地址，receiver
         // 值本就走"聚合值 = 地址"的通路。
         // 注意普通调用没有这个语法糖——`g(5)` 传 `fn(&i64)` 形参仍然报错。
@@ -5226,8 +5236,22 @@ impl TypeChecker {
         // （指针下标，读/写都走指针算术，元素类型 = `data` 指向的类型）。这样
         // `Vec<u8>` 就能像 Rust 一样 `v[i]`（读）与 `v[i] = x`（写）。
         // `net.zr` 靠它加载（`buf[i]` 读 `Vec<u8>`）。
-        if let Ty::Named(id, args) = &recv_ty {
-            let fields = self.struct_field_tys(*id, args);
+        //
+        // 接收者也可能是 `&Vec<T>` / `&mut Vec<T>` / `*mut Vec<T>`：早先只匹配
+        // `Ty::Named`，于是引用形态绕过了脱糖，`v[i]` 直接对 Vec 结构体本身做
+        // 指针算术，读到的是 `data` 指针 / `len` / `cap` 的字节，全部是垃圾。
+        // 这里把外层的引用 / 裸指针剥开一层，指向的 Named 结构体只要带 `data`
+        // 字段就同样脱糖——`Field` 在类型检查里会自动解引用，得到 `*mut T`。
+        let data_target: Option<(DefId, Vec<Ty>)> = match &recv_ty {
+            Ty::Named(id, args) => Some((*id, args.clone())),
+            Ty::Reference(inner, _) | Ty::Pointer(inner, _) => match &**inner {
+                Ty::Named(id, args) => Some((*id, args.clone())),
+                _ => None,
+            },
+            _ => None,
+        };
+        if let Some((id, args)) = data_target {
+            let fields = self.struct_field_tys(id, &args);
             if let Some((_, data_ty, _)) = fields.iter().find(|(n, _, _)| n == "data") {
                 let data_ty = self.infer.resolve(data_ty);
                 if matches!(data_ty, Ty::Pointer(..) | Ty::Reference(..)) {
@@ -5458,7 +5482,7 @@ impl TypeChecker {
             // 早先这里 `unwrap_or(Ty::Infer(InferId(0)))` 拿 `InferId(0)` 当
             // "未知类型"哨兵——但它是**活的推断变量**，大文件编译到一半它早
             // 已被 unify 到别的类型上（曾绑成某个 `Ty::Named`），`resolve` 出旧值
-            // 后 `subtype` 报出与真实问题无关的 `type#N` 错（`std/io.zr` 的
+            // 后 `subtype` 报出与真实问题无关的 `type#N` 错（`std/std/io.zr` 的
             // `prefix_of` 前向调用就踩过）。改回新建推断变量：未知形参就让它
             // 独立推断、被实参绑上，不与全局共享的 `InferId(0)` 纠缠。
             let param_ty = param_tys
@@ -5599,7 +5623,7 @@ impl TypeChecker {
     /// `g(5)`（`g(p: &i32)`）把整数 5 当指针解引用直接 SIGSEGV，
     /// `takes_f32(f64 值)` 把 8 字节位模式当 4 字节读（恒为 0.0），
     /// `str`（16 字节 `{ptr, len}`）塞进 `&str`（8 字节引用）字段静默截断
-    /// （曾让 `std/error.zr` 的 `SimpleError.msg` 读出垃圾长度）。
+    /// （曾让 `std/std/error.zr` 的 `SimpleError.msg` 读出垃圾长度）。
     /// `widen_arg_for_call` 的注释早记录了这笔债（"要真正禁止窄化得在调用
     /// 点补一次类型校验"），本方法就是那笔债的偿还。
     ///
@@ -8984,6 +9008,9 @@ impl TypeChecker {
                     self.rewrite_fn_values_expr(el, fns);
                 }
             }
+            ExprKind::ArrayRepeat { init, .. } => {
+                self.rewrite_fn_values_expr(init, fns);
+            }
             ExprKind::Struct(fields) => {
                 for (_, f) in fields {
                     self.rewrite_fn_values_expr(f, fns);
@@ -10702,7 +10729,7 @@ impl TypeChecker {
     ///
     /// 早先这里对任何不一致都返回 `Ty::Infer(InferId(0))`，那是一颗定时炸弹：
     /// `InferId(0)` 不是哨兵，是个**活的**推断变量，长编译里可能早就被绑定了
-    /// （`std/io.zr` 里绑成了 `u8`）。下游 `subtype` 一 `resolve` 就解出那个旧值，
+    /// （`std/std/io.zr` 里绑成了 `u8`）。下游 `subtype` 一 `resolve` 就解出那个旧值，
     /// 凭空报出一条 "expected `()`, found `u8`" 这类毫无根据的错，而且报错指向
     /// 的位置跟真正的问题毫无关系。
     fn unify_or(&self, a: &Ty, b: &Ty) -> Ty {
@@ -11276,6 +11303,7 @@ fn rewrite_for_continue_expr(e: &mut HirExpr, inc: &HirExpr, depth: usize) {
                 rewrite_for_continue_expr(elem, inc, depth);
             }
         }
+        ExprKind::ArrayRepeat { init, .. } => rewrite_for_continue_expr(init, inc, depth),
         ExprKind::Struct(fields) => {
             for (_, value) in fields {
                 rewrite_for_continue_expr(value, inc, depth);
@@ -11482,6 +11510,7 @@ fn substitute_local(e: &mut hir::HirExpr, target: LocalId, with: &hir::HirExpr) 
                 substitute_local(e, target, with);
             }
         }
+        ExprKind::ArrayRepeat { init, .. } => substitute_local(init, target, with),
         ExprKind::Struct(fields) => {
             for (_, f) in fields {
                 substitute_local(f, target, with);
@@ -11644,6 +11673,7 @@ fn remap_lifted_body(
                     remap_expr(el, map, next);
                 }
             }
+            ExprKind::ArrayRepeat { init, .. } => remap_expr(init, map, next),
             ExprKind::Tuple(elems) => {
                 for el in elems {
                     remap_expr(el, map, next);

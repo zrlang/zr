@@ -1,0 +1,206 @@
+//=============================================================================
+// std/sha256.zr — SHA-256 消息摘要（FIPS 180-4）
+//
+// 输出 256 位摘要的小写十六进制串（64 字符）。64 字节分组、大端读入 16 个
+// 32 位字、64 轮压缩、大端输出。
+//
+// zr 的 u32 算术实际按 64 位计算（左移 / 加法都可能带出高位，`as u32` 不做
+// 截断），所以每次加法 / 左移 / 取反后都用 `sha256_wrap`（`% 2^32`）显式回绕。
+//=============================================================================
+
+use string::String;
+use collections::Vec;
+
+//-----------------------------------------------------------------------------
+// 内部辅助（统一 `sha256_` 前缀，避免与其它标准库模块的扁平命名空间撞名）
+//-----------------------------------------------------------------------------
+
+/// 把 64 位中间结果回绕到 32 位。
+fn sha256_wrap(x: u64) -> u32 {
+    return (x % 4294967296) as u32;
+}
+
+/// 32 位按位取反。
+fn sha256_not(x: u32) -> u32 {
+    return sha256_wrap((x as u64) ^ 4294967295);
+}
+
+/// 32 位循环右移 `n` 位（0 < n < 32）。
+fn sha256_rotr(x: u32, n: usize) -> u32 {
+    let lo = x >> n;
+    let hi = ((x as u64) << (32 - n)) % 4294967296;
+    return sha256_wrap((lo as u64) | hi);
+}
+
+fn sha256_add2(a: u32, b: u32) -> u32 {
+    return sha256_wrap((a as u64) + (b as u64));
+}
+
+fn sha256_add4(a: u32, b: u32, c: u32, d: u32) -> u32 {
+    return sha256_wrap((a as u64) + (b as u64) + (c as u64) + (d as u64));
+}
+
+fn sha256_add5(a: u32, b: u32, c: u32, d: u32, e: u32) -> u32 {
+    return sha256_wrap(
+        (a as u64) + (b as u64) + (c as u64) + (d as u64) + (e as u64)
+    );
+}
+
+/// 小写十六进制数字。
+fn sha256_hex_digit(x: u8) -> u8 {
+    if x < 10 {
+        return b'0' + x;
+    }
+    return b'a' + (x - 10);
+}
+
+/// 生成 64 字符的小写十六进制摘要（每个 32 位字按大端展开）。
+fn sha256_hex_from_state(state: [u32; 8]) -> String {
+    let mut out = String::with_capacity(64);
+    let mut w: usize = 0;
+    while w < 8 {
+        let word = state[w];
+        let mut k: usize = 0;
+        while k < 4 {
+            let v = ((word >> (24 - 8 * k)) & 255) as u8;
+            out.push_byte(sha256_hex_digit(v >> 4));
+            out.push_byte(sha256_hex_digit(v & 15));
+            k = k + 1;
+        }
+        w = w + 1;
+    }
+    return out;
+}
+
+/// 计算 SHA-256 的八个 32 位状态字。
+fn sha256_state(bytes: []const u8) -> [u32; 8] {
+    // 补齐：0x80 + 若干 0x00 使长度 ≡ 56 (mod 64)，再补 8 字节大端位长。
+    let mut buf: Vec<u8> = Vec::with_capacity(bytes.len + 72);
+    let mut i: usize = 0;
+    while i < bytes.len {
+        buf.push(bytes[i]);
+        i = i + 1;
+    }
+    let bit_len = (bytes.len as u64) * 8;
+    buf.push(128 as u8);
+    while buf.len % 64 != 56 {
+        buf.push(0 as u8);
+    }
+    let mut k: usize = 0;
+    while k < 8 {
+        buf.push(((bit_len >> (56 - 8 * k)) & 255) as u8);
+        k = k + 1;
+    }
+
+    // FIPS 180-4 的 64 个轮常数（前 64 个素数立方根小数部分的高 32 位）。
+    let sha256_k: [u32; 64] = [
+        0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5,
+        0x3956c25b, 0x59f111f1, 0x923f82a4, 0xab1c5ed5,
+        0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3,
+        0x72be5d74, 0x80deb1fe, 0x9bdc06a7, 0xc19bf174,
+        0xe49b69c1, 0xefbe4786, 0x0fc19dc6, 0x240ca1cc,
+        0x2de92c6f, 0x4a7484aa, 0x5cb0a9dc, 0x76f988da,
+        0x983e5152, 0xa831c66d, 0xb00327c8, 0xbf597fc7,
+        0xc6e00bf3, 0xd5a79147, 0x06ca6351, 0x14292967,
+        0x27b70a85, 0x2e1b2138, 0x4d2c6dfc, 0x53380d13,
+        0x650a7354, 0x766a0abb, 0x81c2c92e, 0x92722c85,
+        0xa2bfe8a1, 0xa81a664b, 0xc24b8b70, 0xc76c51a3,
+        0xd192e819, 0xd6990624, 0xf40e3585, 0x106aa070,
+        0x19a4c116, 0x1e376c08, 0x2748774c, 0x34b0bcb5,
+        0x391c0cb3, 0x4ed8aa4a, 0x5b9cca4f, 0x682e6ff3,
+        0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208,
+        0x90befffa, 0xa4506ceb, 0xbef9a3f7, 0xc67178f2,
+    ];
+
+    let mut h0: u32 = 0x6a09e667;
+    let mut h1: u32 = 0xbb67ae85;
+    let mut h2: u32 = 0x3c6ef372;
+    let mut h3: u32 = 0xa54ff53a;
+    let mut h4: u32 = 0x510e527f;
+    let mut h5: u32 = 0x9b05688c;
+    let mut h6: u32 = 0x1f83d9ab;
+    let mut h7: u32 = 0x5be0cd19;
+
+    let mut off: usize = 0;
+    while off < buf.len {
+        // 大端读入 16 个字。
+        let mut w: [u32; 64] = [0; 64];
+        let mut j: usize = 0;
+        while j < 16 {
+            let p = off + 4 * j;
+            w[j] = sha256_wrap(
+                ((buf[p] as u64) << 24)
+                | ((buf[p + 1] as u64) << 16)
+                | ((buf[p + 2] as u64) << 8)
+                | (buf[p + 3] as u64)
+            );
+            j = j + 1;
+        }
+        // 扩展消息调度表。
+        while j < 64 {
+            let x = w[j - 15];
+            let s0 = sha256_rotr(x, 7) ^ sha256_rotr(x, 18) ^ (x >> 3);
+            let y = w[j - 2];
+            let s1 = sha256_rotr(y, 17) ^ sha256_rotr(y, 19) ^ (y >> 10);
+            w[j] = sha256_add4(w[j - 16], s0, w[j - 7], s1);
+            j = j + 1;
+        }
+
+        let mut a = h0;
+        let mut b = h1;
+        let mut c = h2;
+        let mut d = h3;
+        let mut e = h4;
+        let mut f = h5;
+        let mut g = h6;
+        let mut h = h7;
+
+        let mut r: usize = 0;
+        while r < 64 {
+            let big1 = sha256_rotr(e, 6) ^ sha256_rotr(e, 11) ^ sha256_rotr(e, 25);
+            let ch = (e & f) ^ (sha256_not(e) & g);
+            let t1 = sha256_add5(h, big1, ch, sha256_k[r], w[r]);
+            let big0 = sha256_rotr(a, 2) ^ sha256_rotr(a, 13) ^ sha256_rotr(a, 22);
+            let maj = (a & b) ^ (a & c) ^ (b & c);
+            let t2 = sha256_add2(big0, maj);
+
+            h = g;
+            g = f;
+            f = e;
+            e = sha256_add2(d, t1);
+            d = c;
+            c = b;
+            b = a;
+            a = sha256_add2(t1, t2);
+            r = r + 1;
+        }
+
+        h0 = sha256_add2(h0, a);
+        h1 = sha256_add2(h1, b);
+        h2 = sha256_add2(h2, c);
+        h3 = sha256_add2(h3, d);
+        h4 = sha256_add2(h4, e);
+        h5 = sha256_add2(h5, f);
+        h6 = sha256_add2(h6, g);
+        h7 = sha256_add2(h7, h);
+        off = off + 64;
+    }
+
+    let state: [u32; 8] = [h0, h1, h2, h3, h4, h5, h6, h7];
+    return state;
+}
+
+//-----------------------------------------------------------------------------
+// 公开 API
+//-----------------------------------------------------------------------------
+
+/// 计算任意字节切片的 SHA-256，返回 64 字符小写十六进制串。
+pub fn sha256_hex(bytes: []const u8) -> String {
+    let state = sha256_state(bytes);
+    return sha256_hex_from_state(state);
+}
+
+/// 对字符串（`str`）计算 SHA-256。
+pub fn sha256_hex_str(s: str) -> String {
+    return sha256_hex(s);
+}

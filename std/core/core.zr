@@ -1,21 +1,16 @@
 //=============================================================================
-// std/core.zr — 核心库（平台无关 + 平台相关实现）
+// std/core/core.zr — core 层：零依赖核心库
 //
-// 类似 Rust 的 core crate：
-// - 平台无关的类型定义、trait、工具函数
-// - 平台相关的实现（panic、内存分配、IO）通过 cfg 选择
+// 与 Rust 的 core crate 对应：只有类型定义、trait、编译期内建与 panic。
+// 不含堆分配（见 alloc/mem.zr）、不含 OS / I/O（见 std/sys.zr）。
+//
+// 唯一的外部符号是运行时的 `zr_panic`（Rust 的 core 同样自带 panic 入口）。
 //=============================================================================
 
-//----- 外部运行时符号声明（由运行时提供，所有平台共有）---------------------
+//----- 外部运行时符号声明（仅 panic；分配与 IO 在更高层）---------------------
 
 extern "C" {
     fn zr_panic(msg: *const u8, len: usize) -> !;
-    fn zr_write(fd: i32, buf: *const u8, count: usize) -> isize;
-    fn zr_read(fd: i32, buf: *mut u8, count: usize) -> isize;
-    fn zr_exit(code: i32) -> !;
-    fn zr_alloc(size: usize, align: usize) -> *mut void;
-    fn zr_dealloc(ptr: *mut void, size: usize, align: usize);
-    fn zr_realloc(ptr: *mut void, old_size: usize, new_size: usize, align: usize) -> *mut void;
 }
 
 //=============================================================================
@@ -131,6 +126,57 @@ impl<T> Option<T> {
             Option::None    => return Option::None,
         }
     }
+
+    /// 取出值；为空时用 `msg` 触发 panic（对应 Rust `Option::expect`）。
+    pub fn expect(self, msg: []const u8) -> T {
+        match self {
+            Option::Some(v) => return v,
+            Option::None    => panic(msg),
+        }
+    }
+
+    /// 为空时调用 `f` 生成默认值。
+    pub fn unwrap_or_else(self, f: fn() -> T) -> T {
+        match self {
+            Option::Some(v) => return v,
+            Option::None    => return f(),
+        }
+    }
+
+    /// 映射后取默认值（对应 Rust `Option::map_or`）。
+    pub fn map_or<U>(self, default: U, f: fn(T) -> U) -> U {
+        match self {
+            Option::Some(v) => return f(v),
+            Option::None    => return default,
+        }
+    }
+
+    /// 把 `Option` 转成 `Result`：`Some(v) -> Ok(v)`，`None -> Err(err)`。
+    pub fn ok_or<E>(self, err: E) -> Result<T, E> {
+        match self {
+            Option::Some(v) => return Result::Ok(v),
+            Option::None    => return Result::Err(err),
+        }
+    }
+
+    /// 保留满足谓词的值（对应 Rust `Option::filter`）。
+    pub fn filter(self, pred: fn(T) -> bool) -> Option<T> {
+        match self {
+            Option::Some(v) => {
+                if pred(v) { return Option::Some(v); }
+                return Option::None;
+            }
+            Option::None => return Option::None,
+        }
+    }
+
+    /// 为空时返回 `other`。
+    pub fn or(self, other: Option<T>) -> Option<T> {
+        match self {
+            Option::Some(v) => return Option::Some(v),
+            Option::None    => return other,
+        }
+    }
 }
 
 //=============================================================================
@@ -179,6 +225,46 @@ impl<T, E> Result<T, E> {
         match self {
             Result::Ok(v)  => return f(v),
             Result::Err(e) => return Result::Err(e),
+        }
+    }
+
+    /// 成功时返回值，失败时返回 `default`。
+    pub fn unwrap_or(self, default: T) -> T {
+        match self {
+            Result::Ok(v)  => return v,
+            Result::Err(_) => return default,
+        }
+    }
+
+    /// 失败时调用 `f` 生成默认值。
+    pub fn unwrap_or_else(self, f: fn(E) -> T) -> T {
+        match self {
+            Result::Ok(v)  => return v,
+            Result::Err(e) => return f(e),
+        }
+    }
+
+    /// 丢弃错误，转成 `Option<T>`。
+    pub fn ok(self) -> Option<T> {
+        match self {
+            Result::Ok(v)  => return Option::Some(v),
+            Result::Err(_) => return Option::None,
+        }
+    }
+
+    /// 丢弃成功值，转成 `Option<E>`。
+    pub fn err(self) -> Option<E> {
+        match self {
+            Result::Ok(_)  => return Option::None,
+            Result::Err(e) => return Option::Some(e),
+        }
+    }
+
+    /// 映射错误值，成功值不变。
+    pub fn map_err<F>(self, f: fn(E) -> F) -> Result<T, F> {
+        match self {
+            Result::Ok(v)  => return Result::Ok(v),
+            Result::Err(e) => return Result::Err(f(e)),
         }
     }
 }
@@ -243,6 +329,62 @@ impl Clone for bool {
 }
 
 impl Copy for u8 {}
+impl Eq for u8 {
+    fn eq(self, other: u8) -> bool { return self == other; }
+}
+impl Ord for u8 {
+    fn lt(self, other: u8) -> bool { return self < other; }
+}
+impl Clone for u8 {
+    fn clone(self) -> u8 { return self; }
+}
+impl Default for u8 {
+    fn default() -> u8 { return 0; }
+}
+
+impl Copy for char {}
+impl Eq for char {
+    fn eq(self, other: char) -> bool { return self == other; }
+}
+impl Ord for char {
+    fn lt(self, other: char) -> bool { return self < other; }
+}
+impl Clone for char {
+    fn clone(self) -> char { return self; }
+}
+
+//------------------------------------------------------------------------------
+// Hash：供 `HashMap` 等容器做键用。
+//
+// 注意 receiver 必须写成显式的 `self: T`。裸 `self` 会被降成 `&Self`，
+// 而 zr 的 `*&scalar` 解引用目前是坏的（`AddrOf => Deref` 占位），
+// 写裸 `self` 根本取不到标量的值。
+//------------------------------------------------------------------------------
+
+impl Hash for i32 {
+    fn hash(self: i32) -> u64 { return self as u64; }
+}
+impl Hash for i64 {
+    fn hash(self: i64) -> u64 { return self as u64; }
+}
+impl Hash for u32 {
+    fn hash(self: u32) -> u64 { return self as u64; }
+}
+impl Hash for u64 {
+    fn hash(self: u64) -> u64 { return self; }
+}
+impl Hash for u8 {
+    fn hash(self: u8) -> u64 { return self as u64; }
+}
+impl Hash for bool {
+    fn hash(self: bool) -> u64 {
+        if self { return 1; }
+        return 0;
+    }
+}
+impl Hash for char {
+    fn hash(self: char) -> u64 { return self as u64; }
+}
 
 //=============================================================================
 // 数值工具函数
@@ -275,15 +417,7 @@ pub fn swap<T>(a: &mut T, b: &mut T) {
 }
 
 //=============================================================================
-// 常用文件描述符常量
-//=============================================================================
-
-pub const STDIN_FD:  i32 = 0;
-pub const STDOUT_FD: i32 = 1;
-pub const STDERR_FD: i32 = 2;
-
-//=============================================================================
-// panic 与断言实现
+// panic 与断言实现（core 自带，不依赖 OS）
 //=============================================================================
 
 /// 无条件终止程序，并打印消息。
@@ -316,7 +450,7 @@ pub fn assert_eq<T: Eq>(a: T, b: T, msg: []const u8) {
 }
 
 //=============================================================================
-// 内存管理（重新导出运行时符号）
+// 编译期内建（不依赖分配 / OS）
 //=============================================================================
 
 /// 编译期内建：类型 `T` 的字节大小。
@@ -324,31 +458,3 @@ pub fn size_of<T>() -> usize;
 
 /// 编译期内建：类型 `T` 的对齐。
 pub fn align_of<T>() -> usize;
-
-pub fn alloc(size: usize, align: usize) -> *mut void {
-    zr_alloc(size, align)
-}
-
-pub fn dealloc(ptr: *mut void, size: usize, align: usize) {
-    zr_dealloc(ptr, size, align);
-}
-
-pub fn realloc(ptr: *mut void, old_size: usize, new_size: usize, align: usize) -> *mut void {
-    zr_realloc(ptr, old_size, new_size, align)
-}
-
-//=============================================================================
-// 基础 IO（重新导出运行时符号）
-//=============================================================================
-
-pub fn write(fd: i32, buf: *const u8, count: usize) -> isize {
-    zr_write(fd, buf, count)
-}
-
-pub fn read(fd: i32, buf: *mut u8, count: usize) -> isize {
-    zr_read(fd, buf, count)
-}
-
-pub fn exit(code: i32) -> ! {
-    zr_exit(code)
-}

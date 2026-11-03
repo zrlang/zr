@@ -1,0 +1,334 @@
+//=============================================================================
+// std/pdb.zr — PDB（Protein Data Bank）结构文件解析
+//
+// 注意：这里解析的是**蛋白质结构文件**，不是调试器符号表（同名不同物）。
+//
+// 覆盖：
+//   - HEADER / TITLE 记录（取正文列并去首尾空白）；
+//   - ATOM / HETATM 记录的固定列宽字段：序列号、原子名、残基名、链、
+//     残基号、坐标、occupancy、tempFactor、元素；
+//   - 列宽不足的行按实际长度安全截断，数值 / 列缺失的坏行直接跳过。
+//
+// 借用约定：`Pdb.header` / `Pdb.title` / 每个 `PdbAtom` 的字符串字段都是
+// **指向 `src` 的切片**，不是拷贝。`Pdb` 只在 `src` 存活期间有效，
+// 调用方不能让 Pdb 比源文本活得更久。
+//
+// 数值解析：zr 没有 atof / atoi，坐标与计数都在本文件里手工解析（只支持
+// 十进制、可带正负号与小数点；PDB 不使用指数记法）。
+//=============================================================================
+
+use core::Option;
+use collections::Vec;
+
+/// 一个 ATOM / HETATM 记录。
+pub struct PdbAtom {
+    /// 记录类型，`"ATOM"` 或 `"HETATM"`。
+    pub record:      str,
+    /// 序列号（第 6–10 列）。
+    pub serial:      i32,
+    /// 原子名（第 12–15 列）。
+    pub name:        str,
+    /// 残基名（第 17–19 列）。
+    pub res_name:    str,
+    /// 链标识（第 21 列）；缺失时为空格。
+    pub chain:       u8,
+    /// 残基号（第 22–25 列）。
+    pub res_seq:     i32,
+    /// x 坐标（第 30–37 列）。
+    pub x:           f64,
+    /// y 坐标（第 38–45 列）。
+    pub y:           f64,
+    /// z 坐标（第 46–53 列）。
+    pub z:           f64,
+    /// 占据率（第 54–59 列），缺失时为 0。
+    pub occupancy:   f64,
+    /// 温度因子（第 60–65 列），缺失时为 0。
+    pub temp_factor: f64,
+    /// 元素符号（第 76–77 列），缺失时为空串。
+    pub element:     str,
+}
+
+/// 解析后的 PDB 文件。
+pub struct Pdb {
+    /// HEADER 正文（第 10–49 列）。
+    pub header: str,
+    /// TITLE 正文（第 10–79 列；只取第一条 TITLE 记录）。
+    pub title:  str,
+    /// 全部原子记录，按文件顺序。
+    pub atoms:  Vec<PdbAtom>,
+}
+
+impl Pdb {
+    /// 原子总数。
+    pub fn atom_count(self) -> usize {
+        return self.atoms.len;
+    }
+
+    /// 取第 `i` 个原子（越界 panic，与 `Vec::get` 一致）。
+    pub fn atom(self, i: usize) -> PdbAtom {
+        return self.atoms.get(i);
+    }
+
+    /// 几何中心（所有原子坐标的算术平均）。没有原子时返回原点。
+    pub fn centroid(self) -> [f64; 3] {
+        let n = self.atoms.len;
+        if n == 0 {
+            return [0.0, 0.0, 0.0];
+        }
+        let mut sx: f64 = 0.0;
+        let mut sy: f64 = 0.0;
+        let mut sz: f64 = 0.0;
+        let mut i = 0;
+        while i < n {
+            let a = self.atoms.get(i);
+            sx = sx + a.x;
+            sy = sy + a.y;
+            sz = sz + a.z;
+            i = i + 1;
+        }
+        let dn = n as f64;
+        return [sx / dn, sy / dn, sz / dn];
+    }
+}
+
+//=============================================================================
+// 小工具（全部带 `pdb_` 前缀：模块内自由函数共用一个扁平命名空间）
+//=============================================================================
+
+fn pdb_is_digit(c: u8) -> bool {
+    return c >= 48 && c <= 57;
+}
+
+fn pdb_is_ws(c: u8) -> bool {
+    return c == 32 || c == 9;
+}
+
+/// 去掉首尾空白；`str` 切片直接引用原文本。
+fn pdb_trim(s: str) -> str {
+    let mut lo: usize = 0;
+    let mut hi: usize = s.len;
+    while lo < hi && pdb_is_ws(s.ptr[lo]) {
+        lo = lo + 1;
+    }
+    while hi > lo && pdb_is_ws(s.ptr[hi - 1]) {
+        hi = hi - 1;
+    }
+    return s[lo..hi];
+}
+
+/// 取 `line[start, end)` 并去空白；列位不足时安全截断为更短的串。
+fn pdb_field(line: str, start: usize, end: usize) -> str {
+    let mut hi = end;
+    if hi > line.len {
+        hi = line.len;
+    }
+    if start >= hi {
+        return line[0..0];
+    }
+    return pdb_trim(line[start..hi]);
+}
+
+/// `line` 是否以 `prefix` 开头。
+fn pdb_starts(line: str, prefix: str) -> bool {
+    if prefix.len > line.len {
+        return false;
+    }
+    let mut i = 0;
+    while i < prefix.len {
+        if line.ptr[i] != prefix.ptr[i] {
+            return false;
+        }
+        i = i + 1;
+    }
+    return true;
+}
+
+/// 十进制整数（可带 `+` / `-`）；空串或含非法字符返回 None。
+fn pdb_parse_int(s: str) -> Option<i32> {
+    if s.len == 0 {
+        return Option::None;
+    }
+    let mut i: usize = 0;
+    let mut neg = false;
+    if s.ptr[i] == 45 || s.ptr[i] == 43 {
+        neg = s.ptr[i] == 45;
+        i = i + 1;
+    }
+    if i >= s.len {
+        return Option::None;
+    }
+    let mut value: i32 = 0;
+    let mut digits: usize = 0;
+    while i < s.len {
+        let c = s.ptr[i];
+        if !pdb_is_digit(c) {
+            return Option::None;
+        }
+        value = value * 10 + (c - 48) as i32;
+        digits = digits + 1;
+        i = i + 1;
+    }
+    if digits == 0 {
+        return Option::None;
+    }
+    if neg {
+        return Option::Some(0 - value);
+    }
+    return Option::Some(value);
+}
+
+/// 十进制浮点（可带符号、小数点）；空串、无数字或含非法字符返回 None。
+fn pdb_parse_float(s: str) -> Option<f64> {
+    if s.len == 0 {
+        return Option::None;
+    }
+    let mut i: usize = 0;
+    let mut neg = false;
+    if s.ptr[i] == 45 || s.ptr[i] == 43 {
+        neg = s.ptr[i] == 45;
+        i = i + 1;
+    }
+    let mut value: f64 = 0.0;
+    let mut digits: usize = 0;
+    while i < s.len && pdb_is_digit(s.ptr[i]) {
+        value = value * 10.0 + (s.ptr[i] - 48) as f64;
+        digits = digits + 1;
+        i = i + 1;
+    }
+    if i < s.len && s.ptr[i] == 46 { // '.'
+        i = i + 1;
+        let mut scale: f64 = 0.1;
+        while i < s.len && pdb_is_digit(s.ptr[i]) {
+            value = value + (s.ptr[i] - 48) as f64 * scale;
+            scale = scale * 0.1;
+            digits = digits + 1;
+            i = i + 1;
+        }
+    }
+    if digits == 0 || i != s.len {
+        return Option::None;
+    }
+    if neg {
+        value = 0.0 - value;
+    }
+    return Option::Some(value);
+}
+
+/// 可选浮点字段：空串按 0 处理，非法内容也按 0（不因 occupancy 缺列丢整行）。
+fn pdb_float_or_zero(s: str) -> f64 {
+    let parsed = pdb_parse_float(s);
+    match parsed {
+        Option::Some(v) => {
+            return v;
+        }
+        Option::None => {
+            return 0.0;
+        }
+    }
+}
+
+//=============================================================================
+// 解析入口
+//=============================================================================
+
+/// 解析一段 PDB 文本。
+///
+/// - 只认 `HEADER` / `TITLE` / `ATOM` / `HETATM`，其余记录忽略；
+/// - 坐标或序列号解析失败的 ATOM / HETATM 行**跳过**，不 panic；
+/// - 返回的 Pdb 借用 `src`，不能比 `src` 活得久。
+pub fn pdb_parse(src: str) -> Pdb {
+    let mut header: str = "";
+    let mut title: str = "";
+    let mut atoms: Vec<PdbAtom> = Vec::new();
+
+    let mut pos: usize = 0;
+    while pos < src.len {
+        // 找行尾；行尾的 '\r' 不算进内容。
+        let mut raw_end = pos;
+        while raw_end < src.len && src.ptr[raw_end] != 10 {
+            raw_end = raw_end + 1;
+        }
+        let mut line_end = raw_end;
+        if line_end > pos && src.ptr[line_end - 1] == 13 {
+            line_end = line_end - 1;
+        }
+        let line = src[pos..line_end];
+
+        if pdb_starts(line, "HEADER") {
+            if header.len == 0 {
+                header = pdb_field(line, 10, 50);
+            }
+        } else if pdb_starts(line, "TITLE") {
+            if title.len == 0 {
+                title = pdb_field(line, 10, 80);
+            }
+        } else if pdb_starts(line, "ATOM") || pdb_starts(line, "HETATM") {
+            let mut ok = true;
+
+            let serial = match pdb_parse_int(pdb_field(line, 6, 11)) {
+                Option::Some(v) => v,
+                Option::None => {
+                    ok = false;
+                    0
+                }
+            };
+            let res_seq = match pdb_parse_int(pdb_field(line, 22, 26)) {
+                Option::Some(v) => v,
+                Option::None => {
+                    ok = false;
+                    0
+                }
+            };
+            let x = match pdb_parse_float(pdb_field(line, 30, 38)) {
+                Option::Some(v) => v,
+                Option::None => {
+                    ok = false;
+                    0.0
+                }
+            };
+            let y = match pdb_parse_float(pdb_field(line, 38, 46)) {
+                Option::Some(v) => v,
+                Option::None => {
+                    ok = false;
+                    0.0
+                }
+            };
+            let z = match pdb_parse_float(pdb_field(line, 46, 54)) {
+                Option::Some(v) => v,
+                Option::None => {
+                    ok = false;
+                    0.0
+                }
+            };
+
+            if ok {
+                let mut chain: u8 = 32;
+                if line.len > 21 {
+                    chain = line.ptr[21];
+                }
+                atoms.push(PdbAtom {
+                    record:      pdb_field(line, 0, 6),
+                    serial:      serial,
+                    name:        pdb_field(line, 12, 16),
+                    res_name:    pdb_field(line, 17, 20),
+                    chain:       chain,
+                    res_seq:     res_seq,
+                    x:           x,
+                    y:           y,
+                    z:           z,
+                    occupancy:   pdb_float_or_zero(pdb_field(line, 54, 60)),
+                    temp_factor: pdb_float_or_zero(pdb_field(line, 60, 66)),
+                    element:     pdb_field(line, 76, 78),
+                });
+            }
+        }
+
+        if raw_end < src.len {
+            pos = raw_end + 1;
+        } else {
+            pos = raw_end;
+        }
+    }
+
+    return Pdb { header: header, title: title, atoms: atoms };
+}

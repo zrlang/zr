@@ -59,8 +59,8 @@ target/debug/zr prog.zr -O1 -o /tmp/prog   # 编译单个程序
   `ld` 直接断言崩溃（`atomShouldReplaceExisting`）。先 `nm` 看目标文件有没有
   重复符号，再下结论。已修复（提交 `1ef4a02`：MIR 按最终符号名去重，保留首个
   用户定义）。
-- 测试：`tests/zr_language.rs` 把 130 个 `tests/cases/*.zr` 各在
-  `-O0/-O1/-O2/-O3/-Oz` 跑一遍（650 次编译+运行）。退出码 0 = 过，非 0 = 失败（编号指向失败的断言）。
+- 测试：`tests/zr_language.rs` 把 152 个 `tests/cases/*.zr` 各在
+  `-O0/-O1/-O2/-O3/-Oz` 跑一遍（760 次编译+运行）。退出码 0 = 过，非 0 = 失败（编号指向失败的断言）。
   宿主端另有 `io_print_matches_rust` 等 Rust 对照用例。
 - **负向测试机制是 `tests/zr_negative.rs`**（`cargo test --test zr_negative`，
   37 个用例）。`tests/negative/*.zr` 每个都必须**编译失败**，且报错文本里含
@@ -91,17 +91,29 @@ lexer → parser(ast) → typeck(hir, infer) → mir → ssa → opt → codegen
   `encoder_thumb.rs`(Thumb-2)、`encoder_riscv.rs`(RV32/64IM)、`wasm.rs`(wasm32/64)。
   目标格式：`objfile.rs`(ELF)、`macho.rs`、`pe.rs`、`wasm.rs`。另有 `c_backend.rs`：**已接 CLI**
   （`--emit-c` 从 HIR 直译成一个 C 翻译单元，自举路径，见 `main.rs:762-766`）。
-- 标准库 `std/`：19 个 `.zr` 源文件（编译器自编译）——
-  `async` `cli` `collections` `core` `env` `error` `fs` `io` `json` `mem` `net` `path`
-  `process` `simd` `slice` `string` `thread` `toml` `xml`。
-  **注意模块名不带 `std::` 前缀**：`use core::Option;`，不是 `use std::core::Option;`。
-  **2026-11-02 实测**（macOS x86-64，`use <m>::*;` + 空 `main`，全链路编译+链接）：
-  **18 个通过**（cli/collections/core/env/error/fs/io/json/mem/net/path/process/simd/slice/string/thread/toml/xml；
-  `error` 随调用实参/字段值类型核验落地而可加载——`as *const _` 推断占位、
-  字面量传 `push_bytes` 的切片放行均已补上；`(&dyn Error).cause()` 的
-  vtable 分派仍不可用，模块里没有走它的路径就能加载），
-  一个不可加载——`async`（`Box` 类型未实现 + `*mut dyn Wake` 需要 vtable 分派；
-  结构体 `where` 子句、`F::Output` 关联类型投影已在本分支补上，不再是阻塞项）。
+- 标准库 `std/`：**三层架构（core ⊂ alloc ⊂ std，与 Rust 对应）**，共 32 个 `.zr` 源文件
+  （编译器自编译）：
+  - `std/core/`（零依赖：无堆、无 OS、无 I/O）——`core` `simd`
+  - `std/alloc/`（只依赖 core，带堆分配）——`mem` `slice` `string` `collections`
+    `json` `xml` `toml` `base64` `md5` `sha256` `crypto` `tensor` `pdb` `async`
+  - `std/std/`（依赖 OS）——`sys` `io` `fs` `net` `http` `http2` `tls` `env` `os` `posix`
+    `process` `thread` `time` `tz` `path` `argparse` `error`
+  - `std/std.zr`：**门面**，`use core::*; use string::*; …` 把三层名字传递性再导出，
+    所以业务代码可以 `use std::*` 或 `use std::io::File`。
+  **模块名仍是扁平的**：`use core::Option;` / `use io::File;` 照旧可用；
+  `use std::core::Option;` 也行（走门面）。
+  层级由**文件所在目录**决定，依赖方向越界（core→alloc/std、alloc→std）在加载阶段
+  直接报 `layering violation`（`src/modules.rs::layer_of_path` + `load_uses`）。
+  查找顺序：`std/<name>.zr`（门面/历史）→ `std/core/` → `std/alloc/` → `std/std/`。
+  **2026-11-03 实测**（macOS x86-64，`use <m>::*;` + 空 `main`，全链路编译+链接）：
+  **30 个通过**（除 `async`、`crypto`、`tls` 外全部；`crypto` / `tls` 不依赖外部链接但主程序未引入时不参与自链接，`-c` 单独验证 OK；TLS 是纯 zr 实现、零外部依赖）。新加的 `argparse` / `base64` / `crypto` / `md5` / `sha256` /
+  `time` / `tz` / `os` / `posix` / `http` / `http2` / `pdb` / `simd` / `tensor` / `tls` 均有正向用例
+  126/131–152 覆盖；`cli` 已重命名为 `argparse`）。
+  另有 `error` 因类型核验落地而可加载——`as *const _` 推断占位、字面量传 `push_bytes`
+  的切片放行均已补上；`(&dyn Error).cause()` 的 vtable 分派仍不可用，模块里没有走它
+  的路径就能加载。`async` 仍不可用——`Box` 类型未实现 + `*mut dyn Wake` 需要 vtable
+  分派（结构体 `where` 子句、`F::Output` 关联类型投影已在本分支补上，不再是阻塞项），
+  因此它暂不并入 `std` 门面。
 - 运行时 `runtime/*.s`：每平台一份汇编（Linux/macOS/Windows 的 x86-64+aarch64，裸机 ARM/RISC-V）。
   提供 `zr_write` / `zr_alloc` 等符号，与编译器分离编译。
 - 已接线的优化 pass（`src/opt/mod.rs:68-102`，按 `-O` 等级分层）：
@@ -131,7 +143,7 @@ lexer → parser(ast) → typeck(hir, infer) → mir → ssa → opt → codegen
    不可恢复、无诊断输出。写递归解析/检查代码必须能证明终止，别靠"应该不会爆"。
 2. **`Ty::Infer(InferId(0))` 不是哨兵，是活的推断变量。** 大文件里会被绑定掉。
    拿它当"未知类型"的占位返回值会让 `subtype` resolve 出旧值，报出完全无中生有的错
-   （曾导致 `std/io.zr` 报 `expected (), found u8` 且报错位置与真实问题无关）。
+   （曾导致 `std/std/io.zr` 报 `expected (), found u8` 且报错位置与真实问题无关）。
    **不一致时应返回 `Unit` 或显式报错，绝不复用已有 `InferId`。**
 3. **`tail.is_none()` ≠ 发散。** 两种情况 tail 都是 `None`：块以 `return;` 结尾（真发散），
    或块最后一句带了分号（`f(x);` 后直接 `}`，不产生值但**不**发散，类型是 `()`）。
@@ -188,7 +200,7 @@ README 里"指针与 unsafe"一节目前是**愿景**：
 - **`dyn` 是关键字、`&dyn Trait` 能解析，但没有 vtable 分派**（`src/lexer/token.rs:97`
   `KwDyn`、`src/parser/ty.rs` 的 `Type::Dyn`；类型检查把它当 `dyn trait#N`）。
   方法/字段访问一律报 `cannot access field `..` on type `dyn trait#N``，所以
-  `std/error.zr`（`(&dyn Error).cause()`）仍加载不了；`dyn` 值也构造不出来。
+  `std/std/error.zr`（`(&dyn Error).cause()`）仍加载不了；`dyn` 值也构造不出来。
 - **切片/数组索引不做越界检查**：`check_index_scalar` 不检查边界。
 - **借用检查是最小切片**：同位置的借用与已有借用重叠（`&mut` 独占、`&` 可共享，
   至少一个可变）报 `cannot borrow ... while already borrowed`；**写被借用位置**
@@ -208,9 +220,9 @@ README 里"指针与 unsafe"一节目前是**愿景**：
   结束；`binding_last_use` 按局部 id 记最后使用，跨作用域重名（遮蔽）可能混淆。
 - **移动语义只做最小检查**：`let b = a` 后读 `a` 报 `use of moved value`，
   但**仅当 `a` 的类型含 drop glue**（自身或成员递归 `impl Drop`，
-  `has_drop_glue`，`src/typeck/mod.rs:5895`）。`std/string.zr` 的 `String`
+  `has_drop_glue`，`src/typeck/mod.rs:5895`）。`std/alloc/string.zr` 的 `String`
   与 `collections` 的 `Vec` **都没有 `impl Drop`**，因此 `let s2 = s1; s1.len()`
-  仍静默通过（`std/net.zr:752` 的 `Socket` 是唯一带 Drop 的标准库类型）。
+  仍静默通过（`std/std/net.zr:752` 的 `Socket` 是唯一带 Drop 的标准库类型）。
   字段级移动、实参移动、容器内元素移动都不检查。
 - **可见性检查**：解析阶段保留 `pub` / `pub(crate)` / `pub(super)`（早先
   `_visibility` 直接丢弃，`pub(crate)` / `pub(super)` 被当成 `pub`，私有条目
@@ -261,10 +273,11 @@ README 里"指针与 unsafe"一节目前是**愿景**：
 | `src/typeck/derive.rs` | 新增：在 AST 层生成 `Type__clone` / `__eq` / `__lt` / `__hash` / `__default` 方法体 |
 | `src/typeck/hir.rs`、`src/mir/builder.rs` | 新增 `ExprKind::Unreachable` → `MirTerminator::Unreachable`（上面的发散 else） |
 | `src/typeck/infer.rs` | 诊断名字表：`unify`/`subtype` 的错误不再把具名类型打成 `type#N` |
-| `std/io.zr` | `(*p)[i]` → `p[i]`（两处）；`{:#X}` 的前缀改回小写 `0x`（与 Rust 一致） |
+| `std/std/io.zr` | `(*p)[i]` → `p[i]`（两处）；`{:#X}` 的前缀改回小写 `0x`（与 Rust 一致） |
 | `src/ssa/mod.rs`、`src/codegen/encoder*.rs` | `SsaFunction` 新增 `param_types`（从 MIR 抄），两个后端拿它给浮点形参**播种**：只被转手的 `f64` 形参早先被判成整数，走 rdi 而调用方放 xmm0 |
-| `std/io.zr` | 格式串补 `{:e}` / `{:E}`（浮点与整数都走十进制指数形式，整数按有效数字四舍五入）、动态宽度 `{:1$}`、动态精度 `{:.*}` / `{:.1$}`；顺带修 `{:.}`（点后面没数字）不再被当成精度 0 |
+| `std/std/io.zr` | 格式串补 `{:e}` / `{:E}`（浮点与整数都走十进制指数形式，整数按有效数字四舍五入）、动态宽度 `{:1$}`、动态精度 `{:.*}` / `{:.1$}`；顺带修 `{:.}`（点后面没数字）不再被当成精度 0 |
 | `src/mir/builder.rs` | `const X: str = "..."` 引用：常量值表里存的是 `MirValue::Str`（后端发射成 8 字节字符串指针），早先直接当表达式值返回，写进 16 字节 `str` 局部只填了 ptr、`len` 留在栈上垃圾（`const LAST: str = "@last"; LAST.len` 实测读出 `0x666e69004e614e`）。现在聚合形态的字符串常量与字符串字面量走同一套"栈上架 `{ptr, len}`"的降级。钉子：`tests/cases/130_toml.zr` 用常量当 `get` / `get_path` 的键 |
+| `src/mir/builder.rs` | **聚合字面量里的移动没有登记**（2026-11-03）：`TcpStream { inner: sock }` 只把 `sock` 的字节拷进新聚合，却不标记源已移动，源局部的 drop glue 仍在作用域结束时发射——`TcpStream::connect` 返回时 `sock` 被 drop、fd 关掉，随后 `stream.write` 一律 EBADF（`std/net.zr` 的 `TcpStream` 之前根本用不了；`std/http.zr` 走裸 fd 才没暴露）。现在 `Struct` / `Tuple` / `EnumVariant` 三个字面量分支在降级字段前调 `mark_aggregate_move`（复用 `mark_place_moved` 的路径跟踪）。钉子在 `std/std/http2.zr` 的 h2c 往返（人工探针） |
 | `tests/cases/76..79`、`81`、`tests/negative/12..15` | 分别钉住上面每一处 |
 
 ### 三个"改对了才算改对"的点（代码里都有长注释）
@@ -279,10 +292,10 @@ README 里"指针与 unsafe"一节目前是**愿景**：
 3. **栈上传参的偏移要跟着 `rsp` 走**：`Src::Mem(slot)` 是 `[rsp + 8*slot]` 的原始帧偏移，
    压入实参后必须整体加 `released/8`；被调方读 `[rbp + 16 + 8k]`（`rbp` 才是稳定基准）。
 
-### `cargo test` 当前基线（2026-11-02，全绿）
+### `cargo test` 当前基线（2026-11-03，全绿）
 
-- `cargo test --bin zr`：267 项。
-- `cargo test --test zr_language`：130 个用例 × 5 个优化等级 = 650 项，另有 3 个宿主端
+- `cargo test --bin zr`：269 项（含标准库三层重组的 2 个 `layer_tests`）。
+- `cargo test --test zr_language`：152 个用例 × 5 个优化等级 = 760 项，另有 3 个宿主端
   对照用例（`io_print_matches_rust`——逐字符对比 Rust 的格式化输出，含 `{:e}` / `{:E}`
   与大浮点 Display（`|v| ≥ 2⁶⁴` 不带 `.0`）的回归；`extern_c_write_prints_string_literal`；
   `toolchain_subcommands_emit`——`zr fmt` / `zr fmt --check` / `zr pkg init` / `zr lsp`
@@ -352,7 +365,7 @@ README 里"指针与 unsafe"一节目前是**愿景**：
   `build_instance_signature` 没推 `Self` 的 bug（泛型 impl 方法签名里的
   `Self` / `Self::Output` 在实例化重降低时找不到）。覆盖 `Self::Output`
   （泛型 impl 内）、`F::Output`（泛型参数）、非泛型 impl 的 `Type::Output`，
-  回归 `tests/cases/118_assoc_projection.zr`。`std/async.zr` 的 `block_on<F:
+  回归 `tests/cases/118_assoc_projection.zr`。`std/alloc/async.zr` 的 `block_on<F:
   Future>` 签名现在能过类型检查；剩余阻塞是 `Box` 类型未实现与 `*mut dyn Wake`
   的 vtable 分派（`dyn` 仍未接）。`<T as Tr>::Item` 限定写法已支持，见下一条。
 - **限定路径 `<T as Trait>::Item`**：✅ 已实现（2026-11-02）——早先类型位置
@@ -483,7 +496,7 @@ README 里"指针与 unsafe"一节目前是**愿景**：
   操作数副作用、循环多轮让出 + 结构体/元组活跃值跨挂起点、tail 位置）；
   负向 `tests/negative/35_yield_sync.zr` / `36_yield_closure.zr`。
   **仍不支持**：生成器语义（`yield v` 产出值 + 调用方 resume 消费，需要新的
-  生成器类型与 resume 协议）；`intrinsic!(yield)`（`std/async.zr::yield_now()`）
+  生成器类型与 resume 协议）；`intrinsic!(yield)`（`std/alloc/async.zr::yield_now()`）
   在 typeck 就把 kind 丢成 `ExprKind::Intrinsic` 单位变体，MIR 无消费分支，
   且普通函数里的 `Suspend` 不会被状态机拆分——属独立工程。
 - **trait 默认方法 / `default fn`**：✅ 已实现（2026-11-02）。trait 声明里
@@ -539,7 +552,7 @@ README 里"指针与 unsafe"一节目前是**愿景**：
   Debug 已由 `#[derive(Debug)]` 生成 `.debug_pretty()`（`13acff2`）并接入格式
   引擎（`debug_fmt` 通道，`112_fmt_debug.zr`，见 §4 的 `println` 条）。
   **2026-11-01 定根因（此前"代码生成器寄存器/局部槽别名缺陷"的结论全部作废）**：
-  该 bug 与代码生成无关，真凶在 `std/string.zr::push_bytes` 自己的 `reserve`
+  该 bug 与代码生成无关，真凶在 `std/alloc/string.zr::push_bytes` 自己的 `reserve`
   算错。`push_bytes` 追加 `bytes` 后要保证 `capacity >= len + bytes.len`，却把
   增量传成了 `reserve(new_len - capacity)`（`new_len = len + bytes.len`）；
   而 `reserve(additional)` 只保证 `capacity >= len + additional`，于是只有当
@@ -565,7 +578,7 @@ README 里"指针与 unsafe"一节目前是**愿景**：
   三组钉住。
 - **闭包**：**无捕获**闭包已可存进变量/当实参/返回（提升成 `__closure_N` 顶层函数指针）；**带捕获**闭包已可存进变量/嵌套/多次调用（`tests/cases/84_closure_capture_value.zr`）；**跨函数传 env 已支持**——把环境结构体按值当实参传给**泛型**形参（`fn apply<F>(f: F, ..)`，`F` 单态化到 `__env_N`，被调函数体的 `f(x)` 按环境 DefId 内联展开，`tests/cases/109_closure_env_cross_fn.zr`）。跨函数内联靠 `substitute_local` 把捕获 local 替换成形参 `f.__cN`——**该函数必须递归进 `Index` 的基址、`Array`/`Tuple` 元素**，早先 `Index(_, v)` 只替换下标，数组捕获跨函数内联读到别的栈帧直接 SIGSEGV（同函数内联因外层 local 还在而"碰巧"对）。
   **P1-2c：带捕获闭包转裸 `fn(..)` 值** ✅ 已实现（2026-11-02）。早先传给 `fn(..)` 形参报 `captured closure cannot be passed as a plain `fn` value`（负向 `07`）、作 `fn(..)` 返回值报 `captured closure cannot be returned as a plain `fn` value`（负向 `25`；早先编译通过、运行 SIGSEGV），两个负向用例已随实现删除。现在**函数值 = 16 字节聚合记录 `{code, env}`**：
-  (1) `Ty::Function` 从标量改成聚合（MIR 里聚合以地址表示），`type_size_align = (16, 8)`、`struct_layout` 返回 `code`@0 / `env`@8、`is_scalar_ty` 移除 Function、`element_size = 16`、`infer.rs::size_of = 16`；`std/thread.zr::size_of_thread_handle` 随之 16 → **24**。
+  (1) `Ty::Function` 从标量改成聚合（MIR 里聚合以地址表示），`type_size_align = (16, 8)`、`struct_layout` 返回 `code`@0 / `env`@8、`is_scalar_ty` 移除 Function、`element_size = 16`、`infer.rs::size_of = 16`；`std/std/thread.zr::size_of_thread_handle` 随之 16 → **24**。
   (2) **统一 shim（thunk）ABI**：`code` 恒指向「末尾多收一个 `env`」的 shim，间接调用统一按 `(用户实参..., env, [隐藏返回槽])` 传参。**env 必须在 retptr 之前**——MIR 给聚合返回函数追加隐藏返回槽的位次正是 `params.len()`，而 shim 声明的形参就是 `(用户形参..., env)`，两边自动对齐。
   (3) 新 HIR 节点（`src/typeck/hir.rs`）：`ExprKind::FnValue { func, shim }`（函数名作一等值）、`ClosureToFn { env, thunk }`（带捕获闭包转函数值）、`FnToCodePtr(Box<HirExpr>)`（记录退化裸代码地址）。`check_expr` 末尾 `coerce_closure_to_fn` 在期望类型 resolve 成 `Ty::Function` 且实参是 `__env_N` 时生成 `ClosureToFn`；`Expression::Return` 与 `check_call` 两处原有的「不能当函数值」报错删除。
   (4) `finalize_fn_value_shims`（`src/typeck/mod.rs`，`check_function_bodies` 收尾在 `finalize_lifted_closures` 之后调用）：`std::mem::take(&mut self.functions)` → 所有函数体跑 `rewrite_fn_values_block`（把 `ExprKind::Def(id)` 就地改成 `FnValue`）→ 逐个 `pending_shims` 落成 shim。普通函数 shim = `shim(args..., env) { return func(args..); }`（env 忽略）；带捕获闭包 thunk 把捕获 local 换成 `env.__cN`；**环境在 MIR 降级时用 `zr_alloc` 复制到堆**（调用方可能立刻返回，栈上环境活不到被调方使用它的时刻）。
@@ -609,7 +622,7 @@ README 里"指针与 unsafe"一节目前是**愿景**：
   单独登记（`flattened`，与**加载**模块 `known_modules` 区分），`resolve_path`
   看到首段是内联模块时把叶子段拿到顶层符号表解析：`af::INET` → 顶层 `INET`。
   `tests/cases/103_inline_mod.zr`（常量 + 函数都钉住）。
-- **`net` 模块可加载 + BSD 套接字运行时**：✅ 已实现——`std/net.zr` 是一个从未
+- **`net` 模块可加载 + BSD 套接字运行时**：✅ 已实现——`std/std/net.zr` 是一个从未
   被测试加载的破损标准库模块，早先它在类型检查阶段就挂掉（`#[repr(C,
   align(4))]` 语法、缺 `Vec` 导入、`unwrap_or_else` 实参是值非闭包、内联模块
   `af::INET` 无法解析、`into_socket` 从 Drop 类型移字段）。修完后 `net` 能通过
@@ -648,7 +661,7 @@ README 里"指针与 unsafe"一节目前是**愿景**：
 - **穷尽性报错**：✅ 已改进（`a526953`：枚举缺臂列出缺失变体名，`17_match_missing_variant.zr`；整型/标量仍保留尾 `_` 臂措辞）。
 - **调用实参 / 字段值的类型核验**：✅ 已实现（2026-11-02）——早先实参核验是个静默洞：
   `check_method_call` 缺参时拿 `InferId(0)` 哨兵兜底、实参整体没有核验路径，
-  `std/error.zr` 里字面量直传 `String__push_str(&String)` 这类"16 字节值的高 8
+  `std/std/error.zr` 里字面量直传 `String__push_str(&String)` 这类"16 字节值的高 8
   字节被当指针用"的必然 SIGSEGV 代码静默通过。现在统一走
   `check_call_arg` / `check_field_value`：先精确 `unify`，引用/指针形状再按
   **内层** unify 绑推断变量（`push_slice(&mut req, ..)` 的 `Vec<_>` 才有机会
@@ -665,7 +678,7 @@ README 里"指针与 unsafe"一节目前是**愿景**：
   (2) `lower_pattern` 的 Tuple 分支不 resolve 就拆，`let (a, b) = f()?;`
   的子绑定拿到整个元组；(3) `ty_equiv_relaxed` 规则 3a 早先直接 `return`
   递归结果，数组退化（3c）永远轮不到。核验暴露的既有错误点已逐个修正
-  （`std/error.zr` 调用点改 `push_bytes`、`std/mem.zr` 的
+  （`std/std/error.zr` 调用点改 `push_bytes`、`std/alloc/mem.zr` 的
   `Layout::from_size_align` 返回 `Result`）。`std/error` 因此可加载
   （std 模块 12→13，见 §2）；回归 `cargo test` 三套件全绿。
 - **文档债**：✅ 已清（`fb4dfb2` 修 `tests/README.md` / `future/README.md`；`1d38ca3` 修 README 安全模型节 / `rust-parity.md` / `CONTRIBUTING.md` / `Cargo.toml` description）。

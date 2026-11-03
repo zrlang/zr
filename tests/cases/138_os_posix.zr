@@ -1,0 +1,138 @@
+//=============================================================================
+// tests/cases/138_os_posix.zr — std/os + std/posix 正向回归
+//
+// 覆盖：
+//   os::pid / cwd_len / temp_dir / home_dir / os_name / pointer_bits
+//   posix::getpid / isatty / kill / 退出状态解码（wifexited / wexitstatus /
+//   wifsignaled / wtermsig）
+//
+// 注意：加载模块（std/os.zr、std/posix.zr）不产生 `os::` / `posix::` 模块别名，
+// 所以这里用 `use ... as ...` 重命名导入。`isatty(1)` 只做 0/1 自洽断言
+// （测试环境通常不是 tty，不能断言真假）；`kill(pid, 0)` 只要求不崩溃。
+//=============================================================================
+
+use core::{Option, size_of};
+use string::String;
+use os::{
+    pid as os_pid,
+    cwd_len as os_cwd_len,
+    temp_dir,
+    home_dir,
+    os_name,
+    pointer_bits,
+};
+use posix::{
+    getpid as posix_getpid,
+    isatty,
+    kill,
+    wifexited,
+    wexitstatus,
+    wifsignaled,
+    wtermsig,
+};
+
+/// 按字节比较两个 `str`。
+fn case_streq(a: str, b: str) -> bool {
+    if a.len != b.len {
+        return false;
+    }
+    let mut i: usize = 0;
+    while i < a.len {
+        if a.ptr[i] != b.ptr[i] {
+            return false;
+        }
+        i = i + 1;
+    }
+    return true;
+}
+
+fn main() -> i32 {
+    // 1) 进程 ID：os 与 posix 两个入口一致。
+    if os_pid() <= 0 {
+        return 1;
+    }
+    if posix_getpid() != os_pid() {
+        return 2;
+    }
+
+    // 2) 指针宽度：与编译期内建 size_of 自洽，当前 x86_64 宿主为 64。
+    if pointer_bits() != 64 {
+        return 3;
+    }
+    if size_of::<*mut u8>() * 8 != pointer_bits() {
+        return 4;
+    }
+
+    // 3) 操作系统名：非空且是三种之一。
+    let name = os_name();
+    if name.len == 0 {
+        return 5;
+    }
+    let is_macos = case_streq(name, "macos");
+    let is_linux = case_streq(name, "linux");
+    let is_windows = case_streq(name, "windows");
+    if !(is_macos || is_linux || is_windows) {
+        return 6;
+    }
+
+    // 4) 当前工作目录写进缓冲区，长度为正、首字节不是 NUL。
+    let mut cbuf: [u8; 512] = [0; 512];
+    let n = os_cwd_len(&mut cbuf[0], 512);
+    if n <= 0 {
+        return 7;
+    }
+    if cbuf[0] == 0 {
+        return 8;
+    }
+
+    // 5) 临时目录非空。
+    let td = temp_dir();
+    if td.len == 0 {
+        return 9;
+    }
+
+    // 6) 家目录存在且非空。
+    let hd: Option<String> = home_dir();
+    match hd {
+        Option::Some(h) => {
+            if h.len == 0 {
+                return 10;
+            }
+        }
+        Option::None => {
+            return 11;
+        }
+    }
+
+    // 7) isatty 只要求返回值能自洽地映射成 0/1（不断言真假）。
+    let tty = isatty(1);
+    let tty_i = tty as i32;
+    if tty_i != 0 && tty_i != 1 {
+        return 12;
+    }
+
+    // 8) 退出状态解码。
+    if !wifexited(0) {
+        return 13;
+    }
+    if wexitstatus(0) != 0 {
+        return 14;
+    }
+    if !wifexited(0x7f00) {
+        return 15;
+    }
+    if wexitstatus(0x7f00) != 127 {
+        return 16;
+    }
+    if !wifsignaled(9) {
+        return 17;
+    }
+    if wtermsig(9) != 9 {
+        return 18;
+    }
+
+    // 9) 信号 0 只探测进程是否存在，返回值不作断言，只要求不崩溃。
+    let _ = kill(os_pid(), 0);
+
+    return 0;
+}

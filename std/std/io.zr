@@ -17,11 +17,15 @@
 //   io::println_fmt("x = {}, y = {}\n", &[io::fmt_int(x), io::fmt_int(y)]);
 //   io::print_fmt("pi = {}\n", &[io::fmt_float(3.14)]);
 //
-// 这个模块是**自足**的：不依赖 core，因此单独 `use io::...` 就能用。
+// 这个模块依赖 `core`（堆分配）与 `string`（`format` 返回 `String`），
+// 因此单独 `use io::...` 就能用（`string` 本就在 prelude 里）。
 //
 // 浮点参数（`FormatArg` 里的那一项）用 IEEE 754 的位模式传，不用 f64
 // 字段——见下面"f64 的位模式"一节。
 //=============================================================================
+
+use mem::{zr_alloc, zr_dealloc};
+use string::String;
 
 //----- 外部运行时（由编译器/运行时提供）----------------------------------------
 
@@ -1167,6 +1171,323 @@ const FLAG_ZERO: u64 = 4;
 const FLAG_NUMERIC: u64 = 8;
 const FLAG_NOPAD: u64 = 16;
 
+//=============================================================================
+// 字符串格式化：把格式串与参数拼成一个**新的 String**（不写 stdout）
+//
+//   io::format("x = {}, y = {}", &[io::fmt_int(x), io::fmt_int(y)], 2)
+//
+// 与 `print_fmt` 共用 `FormatArg` 与同一套规格字符，但支持的范围是它的子集：
+//   `{}`      Display（整数十进制 / 浮点 / 布尔 / 字符串原样 / 字符）
+//   `{:?}`    Debug（字符串加引号、浮点整数值补 ".0"、自定义类型走 Debug）
+//   `{:#?}`   Debug（自定义类型走多行渲染）
+//   `{:x}` `{:X}` `{:b}` `{:o}`  十六进制（小写/大写）/ 二进制 / 八进制
+//   `{0}`    位置参数；`{{` / `}}` 是字面花括号
+//
+// 不做填充/对齐/宽度/精度——需要这些请直接 `print_fmt` / `println_fmt`。
+// 浮点最多给 6 位小数（不足补零后去掉尾部零），超出 1e16 的量级走
+// `1.23456e+N` 的科学记法。
+//=============================================================================
+
+/// 把 IEEE 754 位模式解释成 f64（类型双关）。
+union FormatFloatBits {
+    bits: i64,
+    value: f64,
+}
+
+fn io_format_digit(c: u8) -> bool {
+    return c >= b'0' && c <= b'9';
+}
+
+/// 按进制把无符号整数写进 out。
+fn io_format_radix(out: &mut String, mut n: u64, base: u64, upper: bool) {
+    if n == 0 {
+        out.push_byte(b'0');
+        return;
+    }
+    let mut digits: [u8; 64] = [0; 64];
+    let mut len: usize = 0;
+    while n > 0 && len < 64 {
+        let d = (n % base) as u8;
+        if d < 10 {
+            digits[len] = b'0' + d;
+        } else if upper {
+            digits[len] = b'A' + (d - 10);
+        } else {
+            digits[len] = b'a' + (d - 10);
+        }
+        n = n / base;
+        len = len + 1;
+    }
+    let mut i = len;
+    while i > 0 {
+        i = i - 1;
+        out.push_byte(digits[i]);
+    }
+}
+
+/// 把 f64 位模式写进 out：最多 6 位小数，debug 时整数值补 ".0"。
+fn io_format_float_bits(out: &mut String, bits: i64, debug: bool) {
+    let u = FormatFloatBits { bits };
+    let mut v = u.value;
+    if v != v {
+        out.push_bytes("NaN");
+        return;
+    }
+    if v > 1.0e308 {
+        out.push_bytes("inf");
+        return;
+    }
+    if v < -1.0e308 {
+        out.push_bytes("-inf");
+        return;
+    }
+    if v < 0.0 {
+        out.push_byte(b'-');
+        v = -v;
+    }
+    // 超大 / 超小量级走科学记法，避免整数部分溢出 i64。
+    let mut exp: i32 = 0;
+    if v >= 1.0e16 {
+        while v >= 10.0 {
+            v = v / 10.0;
+            exp = exp + 1;
+        }
+    } else if v > 0.0 && v < 1.0e-6 {
+        while v < 1.0 {
+            v = v * 10.0;
+            exp = exp - 1;
+        }
+    }
+    let ip = v as i64;
+    out.push_int(ip);
+    let mut frac = v - (ip as f64);
+    // 截断到 6 位（不做四舍五入，避免进位改到整数部分）。
+    let scaled = frac * 1000000.0;
+    let fi = scaled as i64;
+    if fi > 0 {
+        let mut digits: [u8; 6] = [0; 6];
+        let mut m = fi;
+        let mut k: usize = 6;
+        while k > 0 {
+            k = k - 1;
+            digits[k] = b'0' + ((m % 10) as u8);
+            m = m / 10;
+        }
+        let mut end: usize = 6;
+        while end > 0 && digits[end - 1] == b'0' {
+            end = end - 1;
+        }
+        if end > 0 {
+            out.push_byte(b'.');
+            let mut i: usize = 0;
+            while i < end {
+                out.push_byte(digits[i]);
+                i = i + 1;
+            }
+        }
+    } else if debug {
+        out.push_bytes(".0");
+    }
+    if exp != 0 {
+        out.push_byte(b'e');
+        if exp > 0 {
+            out.push_byte(b'+');
+        }
+        out.push_int(exp as i64);
+    }
+}
+
+/// 写一个 Debug 字符串（加引号，转义 `"` `\` 与常见控制字符）。
+fn io_format_debug_str(out: &mut String, ptr: *const u8, len: usize) {
+    out.push_byte(b'"');
+    let mut i: usize = 0;
+    while i < len {
+        let c = ptr[i];
+        if c == b'"' || c == b'\\' {
+            out.push_byte(b'\\');
+            out.push_byte(c);
+        } else if c == b'\n' {
+            out.push_bytes("\\n");
+        } else if c == b'\r' {
+            out.push_bytes("\\r");
+        } else if c == b'\t' {
+            out.push_bytes("\\t");
+        } else {
+            out.push_byte(c);
+        }
+        i = i + 1;
+    }
+    out.push_byte(b'"');
+}
+
+/// 按规格渲染一个参数。
+fn io_format_arg(out: &mut String, arg: &FormatArg, spec: i32, pretty: bool) {
+    let mut kind = spec;
+    // `fmt_hex` 的参数默认按十六进制显示。
+    if arg.kind == 6 && kind == SPEC_DISPLAY {
+        kind = SPEC_HEX_LOWER;
+    }
+    if arg.kind == 3 {
+        if arg.int_value != 0 {
+            out.push_bytes("true");
+        } else {
+            out.push_bytes("false");
+        }
+        return;
+    }
+    if arg.kind == 4 {
+        if kind == SPEC_DEBUG {
+            io_format_debug_str(out, arg.str_ptr, arg.str_len);
+        } else {
+            let mut i: usize = 0;
+            while i < arg.str_len {
+                out.push_byte(arg.str_ptr[i]);
+                i = i + 1;
+            }
+        }
+        return;
+    }
+    if arg.kind == 5 {
+        if kind == SPEC_DEBUG {
+            out.push_byte(b'\'');
+            out.push_byte(arg.int_value as u8);
+            out.push_byte(b'\'');
+        } else {
+            out.push_byte(arg.int_value as u8);
+        }
+        return;
+    }
+    if arg.kind == 2 {
+        io_format_float_bits(out, arg.float_bits, kind == SPEC_DEBUG);
+        return;
+    }
+    if arg.kind == 7 {
+        // 自定义类型：调 derive 生成的渲染函数。先试 256 字节栈缓冲，
+        // 不够再按返回的所需长度分配堆缓冲重来一次。
+        let mut buf: [u8; 256] = [0; 256];
+        let need = (arg.debug_fn)(arg.obj_ptr, pretty, &mut buf[0] as *mut u8, 256);
+        if need <= 256 {
+            let mut i: usize = 0;
+            while i < need {
+                out.push_byte(buf[i]);
+                i = i + 1;
+            }
+        } else {
+            let p = zr_alloc(need, 8) as *mut u8;
+            let need2 = (arg.debug_fn)(arg.obj_ptr, pretty, p, need);
+            let mut i: usize = 0;
+            while i < need2 {
+                out.push_byte(p[i]);
+                i = i + 1;
+            }
+            zr_dealloc(p as *mut void, need, 8);
+        }
+        return;
+    }
+    // 整数（kind 0 / 1 / 未知）。
+    let u: u64 = if arg.kind == 0 && arg.int_value < 0 {
+        (0 - arg.int_value) as u64
+    } else {
+        arg.int_value as u64
+    };
+    if arg.kind == 0 && arg.int_value < 0 {
+        out.push_byte(b'-');
+    }
+    if kind == SPEC_HEX_LOWER || kind == SPEC_HEX_UPPER {
+        io_format_radix(out, u, 16, kind == SPEC_HEX_UPPER);
+    } else if kind == SPEC_BIN {
+        io_format_radix(out, u, 2, false);
+    } else if kind == SPEC_OCT {
+        io_format_radix(out, u, 8, false);
+    } else {
+        out.push_uint(u);
+    }
+}
+
+/// 从格式串与参数表拼出一个新字符串。
+pub fn format(fmt: str, args: *const FormatArg, nargs: usize) -> String {
+    let mut out = String::with_capacity(fmt.len + 16);
+    let mut ai: usize = 0;
+    let mut i: usize = 0;
+    while i < fmt.len {
+        let c = fmt.ptr[i];
+        if c == b'{' {
+            if i + 1 < fmt.len && fmt.ptr[i + 1] == b'{' {
+                out.push_byte(b'{');
+                i = i + 2;
+                continue;
+            }
+            let mut j = i + 1;
+            let mut idx = ai;
+            let mut explicit = false;
+            if j < fmt.len && io_format_digit(fmt.ptr[j]) {
+                let mut n: usize = 0;
+                while j < fmt.len && io_format_digit(fmt.ptr[j]) {
+                    n = n * 10 + ((fmt.ptr[j] - b'0') as usize);
+                    j = j + 1;
+                }
+                idx = n;
+                explicit = true;
+            }
+            let mut spec = SPEC_DISPLAY;
+            let mut pretty = false;
+            if j < fmt.len && fmt.ptr[j] == b':' {
+                j = j + 1;
+                if j < fmt.len && fmt.ptr[j] == b'#' {
+                    pretty = true;
+                    j = j + 1;
+                }
+                if j < fmt.len {
+                    let t = fmt.ptr[j];
+                    if t == b'?' {
+                        spec = SPEC_DEBUG;
+                        j = j + 1;
+                    } else if t == b'x' {
+                        spec = SPEC_HEX_LOWER;
+                        j = j + 1;
+                    } else if t == b'X' {
+                        spec = SPEC_HEX_UPPER;
+                        j = j + 1;
+                    } else if t == b'b' {
+                        spec = SPEC_BIN;
+                        j = j + 1;
+                    } else if t == b'o' {
+                        spec = SPEC_OCT;
+                        j = j + 1;
+                    }
+                }
+                // 其余填充/宽度/精度字符忽略，跳到 `}`。
+                while j < fmt.len && fmt.ptr[j] != b'}' {
+                    j = j + 1;
+                }
+            }
+            while j < fmt.len && fmt.ptr[j] != b'}' {
+                j = j + 1;
+            }
+            if idx < nargs {
+                io_format_arg(&mut out, &args[idx], spec, pretty);
+            }
+            if !explicit {
+                ai = ai + 1;
+            }
+            if j < fmt.len {
+                i = j + 1;
+            } else {
+                i = fmt.len;
+            }
+            continue;
+        }
+        if c == b'}' && i + 1 < fmt.len && fmt.ptr[i + 1] == b'}' {
+            out.push_byte(b'}');
+            i = i + 2;
+            continue;
+        }
+        out.push_byte(c);
+        i = i + 1;
+    }
+    return out;
+}
+
 /// 按 Rust 的规则把格式串里的 `{}` / `{:?}` / `{:x}` 等替换成参数并输出。
 ///
 /// 支持的规格：`[[填充]对齐][+][#][0][宽度][.精度][类型]`，
@@ -1215,10 +1536,10 @@ pub fn print_fmt(fmt: str, args: *const FormatArg, nargs: usize) {
                 // 填充 + 对齐（填充字符后面必须跟一个对齐符）
                 if j + 1 < fmt.len && is_align(fmt.ptr[j + 1]) {
                     fill = fmt.ptr[j];
-                    align = align_of(fmt.ptr[j + 1]);
+                    align = io_align_of(fmt.ptr[j + 1]);
                     j = j + 2;
                 } else if j < fmt.len && is_align(fmt.ptr[j]) {
-                    align = align_of(fmt.ptr[j]);
+                    align = io_align_of(fmt.ptr[j]);
                     j = j + 1;
                 }
                 if j < fmt.len && fmt.ptr[j] == b'+' {
@@ -1494,10 +1815,10 @@ pub fn print_fmt_named(fmt: str, args: *const NamedArg, nargs: usize) {
                 // 填充 + 对齐（填充字符后面必须跟一个对齐符）
                 if j + 1 < fmt.len && is_align(fmt.ptr[j + 1]) {
                     fill = fmt.ptr[j];
-                    align = align_of(fmt.ptr[j + 1]);
+                    align = io_align_of(fmt.ptr[j + 1]);
                     j = j + 2;
                 } else if j < fmt.len && is_align(fmt.ptr[j]) {
-                    align = align_of(fmt.ptr[j]);
+                    align = io_align_of(fmt.ptr[j]);
                     j = j + 1;
                 }
                 if j < fmt.len && fmt.ptr[j] == b'+' {
@@ -1681,7 +2002,14 @@ fn is_align(c: u8) -> bool {
     return c == b'<' || c == b'^' || c == b'>';
 }
 
-fn align_of(c: u8) -> i32 {
+/// 格式串对齐字符 → 对齐枚举。
+///
+/// **不能叫 `align_of`**：`std` 门面把本模块和其它层一起 `use ...::*` 再导出，
+/// 而模块符号表是扁平的——同名会盖住 `core` / `mem` 的编译期内建
+/// `align_of::<T>()`，用户程序里 `align_of::<i64>()` 会绑到这个 `u8 -> i32`
+/// 的私有助手（返回对齐枚举常量 2），`size_of` / `Box` / `HashMap` 的分配
+/// 尺寸与对齐随之全错。
+fn io_align_of(c: u8) -> i32 {
     if c == b'<' {
         return ALIGN_LEFT;
     }
@@ -2244,10 +2572,12 @@ pub fn eprint(s: str) {
 // 输入
 //=============================================================================
 
-/// 从标准输入读一段字节，返回读到的字节数（0 表示 EOF）。
+/// 从标准输入读最多 `cap` 字节，返回字节数（0 表示 EOF / 出错）。
 ///
-/// 读到 EOF 或者出错时返回 0。
-pub fn read_bytes(buf: *mut u8, cap: usize) -> usize {
+/// 名字不能是 `read_bytes`：`fs` 层也有一个 `read_bytes(path) -> Option<Vec<u8>>`
+///（对齐 Rust `std::fs::read`），同处 `std` 门面的扁平符号表里会被本助手
+/// 盖掉，用户写 `read_bytes(path)` 就绑到"读 stdin"这个签名上了。
+pub fn stdin_read_bytes(buf: *mut u8, cap: usize) -> usize {
     if cap == 0 {
         return 0;
     }
@@ -2287,6 +2617,23 @@ pub fn read_line(buf: *mut u8, cap: usize) -> usize {
 /// 与 `read_line` 相同，只是名字更贴近 Rust 的 `read_line`。
 pub fn stdin_read_line(buf: *mut u8, cap: usize) -> usize {
     return read_line(buf, cap);
+}
+
+/// 从任意文件描述符读一行（去掉行尾 `\r\n` / `\n`），返回字节数。
+///
+/// 逐字节读，缓冲区不够时截断（剩余部分留在流里）。
+pub fn file_read_line(fd: i32, buf: *mut u8, cap: usize) -> usize {
+    let mut n = 0;
+    let mut one: [u8; 1] = [0; 1];
+    while n < cap {
+        let got = zr_read(fd, &one[0] as *const u8 as *mut u8, 1);
+        if got <= 0 { break; }
+        if one[0] == b'\n' { break; }
+        buf[n] = one[0];
+        n = n + 1;
+    }
+    if n > 0 && buf[n - 1] == b'\r' { n = n - 1; }
+    return n;
 }
 
 //=============================================================================
@@ -2478,4 +2825,35 @@ impl File {
     pub fn is_terminal(&self) -> bool {
         return file_is_terminal(self.fd);
     }
+
+    /// 把文件剩余内容全部读成 `String`（对应 Rust `File::read_to_string`）。
+    pub fn read_to_string(&self) -> String {
+        let mut s = String::new();
+        let mut buf: [u8; 4096] = [0; 4096];
+        loop {
+            let n = self.read(&mut buf[0] as *mut u8, 4096);
+            if n <= 0 { break; }
+            s.push_bytes(Slice { ptr: &buf[0] as *const u8, len: n as usize });
+        }
+        return s;
+    }
+
+    /// 读一行（去掉行尾 `\r\n` / `\n`），返回字节数；EOF 返回 0。
+    pub fn read_line(&self, buf: *mut u8, cap: usize) -> usize {
+        return file_read_line(self.fd, buf, cap);
+    }
+
+    /// 把 `String` 全部写进文件。
+    pub fn write_string(&self, s: &String) -> usize {
+        return file_write_all(self.fd, Slice { ptr: s.ptr as *const u8, len: s.len });
+    }
 }
+
+/// 标准输入句柄。
+pub fn stdin() -> File { return File { fd: STDIN_FD }; }
+
+/// 标准输出句柄。
+pub fn stdout() -> File { return File { fd: STDOUT_FD }; }
+
+/// 标准错误句柄。
+pub fn stderr() -> File { return File { fd: STDERR_FD }; }

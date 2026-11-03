@@ -1,0 +1,188 @@
+// 150_std_alloc_ext.zr — alloc 层补充（Box / Vec / String / VecDeque / HashMap）
+//
+// 对照 Rust `alloc`：
+//   Box::{new, get, replace, free}
+//   Vec::{first, last, truncate, retain, reverse, swap, extend_from_slice, dedup}
+//   String::{trim, to_lowercase, to_uppercase, split, split_whitespace, replace,
+//            find_str, rfind_byte, parse_i64, parse_i32, clone, Eq, Hash}
+//   VecDeque、HashMap
+
+use std::*;
+
+fn keep_gt2(v: i32) -> bool { return v > 2; }
+
+fn main() -> i32 {
+    //----- Box ----------------------------------------------------------------
+    let b: Box<i32> = Box::new(42);
+    if b.get() != 42 { return 1; }
+    let mut bi = Box::new(7);
+    if bi.replace(9) != 7 { return 2; }
+    if bi.get() != 9 { return 3; }
+    bi.free();
+
+    //----- Vec ----------------------------------------------------------------
+    let mut v: Vec<i32> = Vec::new();
+    v.push(1); v.push(2); v.push(3); v.push(4);
+
+    match v.first() {
+        Option::Some(x) => { if x != 1 { return 4; } }
+        Option::None => { return 5; }
+    }
+    match v.last() {
+        Option::Some(x) => { if x != 4 { return 6; } }
+        Option::None => { return 7; }
+    }
+
+    v.reverse();
+    if v.get(0) != 4 { return 8; }
+    if v.get(3) != 1 { return 9; }
+
+    v.swap(0, 3);
+    if v.get(0) != 1 { return 10; }
+
+    v.truncate(2);
+    if v.len != 2 { return 11; }
+
+    let mut w: Vec<i32> = Vec::new();
+    w.push(1); w.push(5); w.push(2); w.push(6); w.push(3);
+    w.retain(keep_gt2);
+    if w.len != 3 { return 12; }
+    if w.get(0) != 5 { return 13; }
+    if w.get(1) != 6 { return 14; }
+    if w.get(2) != 3 { return 84; }
+
+    let mut d: Vec<i32> = Vec::new();
+    d.push(1); d.push(1); d.push(2); d.push(2); d.push(3);
+    d.dedup();
+    if d.len != 3 { return 15; }
+    if d.get(0) != 1 { return 16; }
+    if d.get(2) != 3 { return 17; }
+
+    let arr: [i32; 3] = [10, 11, 12];
+    let sl: []const i32 = arr;
+    let mut e: Vec<i32> = Vec::new();
+    e.push(9);
+    e.extend_from_slice(sl);
+    if e.len != 4 { return 18; }
+    if e.get(3) != 12 { return 19; }
+
+    //----- String -------------------------------------------------------------
+    let s = String::from_bytes("  Hello, World  ");
+    if s.len != 16 { return 20; }
+    if s.trim().len != 12 { return 21; }
+    if s.trim_start().len != 14 { return 22; }
+    if s.trim_end().len != 14 { return 23; }
+    if s.to_lowercase().len != 16 { return 24; }
+    if s.trim().to_uppercase().len != 12 { return 25; }
+
+    let csv = String::from_bytes("a,b,c");
+    let parts = csv.split(",");
+    if parts.len() != 3 { return 26; }
+    if parts.get(0).len != 1 { return 27; }
+    if parts.get(2).len != 1 { return 28; }
+
+    let ws = String::from_bytes("  a  bb \t c ");
+    if ws.split_whitespace().len() != 3 { return 29; }
+
+    let rp = String::from_bytes("banana").replace("na", "NA");
+    if rp.len != 6 { return 30; }
+    if rp.find_str("NA").unwrap_or(99 as usize) != 2 { return 31; }
+    if String::from_bytes("banana").find_str("na").unwrap_or(99 as usize) != 2 { return 32; }
+    if String::from_bytes("banana").rfind_byte('a' as u8).unwrap_or(99 as usize) != 5 { return 33; }
+
+    match String::from_bytes(" 42 ").parse_i64() {
+        Result::Ok(n) => { if n != 42 { return 34; } }
+        Result::Err(_) => { return 35; }
+    }
+    match String::from_bytes("-7").parse_i32() {
+        Result::Ok(n) => { if n != -7 { return 36; } }
+        Result::Err(_) => { return 37; }
+    }
+    match String::from_bytes("4x").parse_i64() {
+        Result::Ok(_) => { return 38; }
+        Result::Err(_) => {}
+    }
+
+    let c1 = csv.clone();
+    if !csv.eq(&c1) { return 39; }
+    if String::new().len != 0 { return 40; }
+
+    //----- VecDeque -----------------------------------------------------------
+    let mut q: VecDeque<i32> = VecDeque::new();
+    q.push_back(2);
+    q.push_back(3);
+    q.push_front(1);
+    if q.len() != 3 { return 41; }
+    match q.front() {
+        Option::Some(x) => { if x != 1 { return 42; } }
+        Option::None => { return 43; }
+    }
+    match q.back() {
+        Option::Some(x) => { if x != 3 { return 44; } }
+        Option::None => { return 45; }
+    }
+    if q.get(1) != 2 { return 46; }
+    match q.pop_front() {
+        Option::Some(x) => { if x != 1 { return 47; } }
+        Option::None => { return 48; }
+    }
+    match q.pop_back() {
+        Option::Some(x) => { if x != 3 { return 49; } }
+        Option::None => { return 50; }
+    }
+    if q.len() != 1 { return 51; }
+    if q.get(0) != 2 { return 52; }
+    q.destroy();
+
+    //----- HashMap：String 键 -------------------------------------------------
+    let mut m: HashMap<String, i32> = HashMap::new();
+    m.insert(String::from_bytes("one"), 1);
+    m.insert(String::from_bytes("two"), 2);
+
+    let k1 = String::from_bytes("one");
+    match m.get(k1) {
+        Option::Some(x) => { if x != 1 { return 53; } }
+        Option::None => { return 54; }
+    }
+    if !m.contains_key(String::from_bytes("two")) { return 55; }
+    if m.contains_key(String::from_bytes("three")) { return 56; }
+    if m.len() != 2 { return 57; }
+
+    // 覆盖已有键
+    m.insert(String::from_bytes("one"), 10);
+    let k1b = String::from_bytes("one");
+    match m.get(k1b) {
+        Option::Some(x) => { if x != 10 { return 58; } }
+        Option::None => { return 59; }
+    }
+    if m.len() != 2 { return 60; }
+
+    // 删除
+    match m.remove(String::from_bytes("two")) {
+        Option::Some(x) => { if x != 2 { return 61; } }
+        Option::None => { return 62; }
+    }
+    if m.len() != 1 { return 63; }
+    m.destroy();
+
+    //----- HashMap：扩容（装载因子 > 1/2 触发 rehash）-------------------------
+    let mut h: HashMap<i64, i64> = HashMap::with_capacity(8);
+    let mut i: i64 = 0;
+    while i < 40 {
+        h.insert(i, i * 10);
+        i = i + 1;
+    }
+    if h.len() != 40 { return 64; }
+    let mut j: i64 = 0;
+    while j < 40 {
+        match h.get(j) {
+            Option::Some(x) => { if x != j * 10 { return 65; } }
+            Option::None => { return 66; }
+        }
+        j = j + 1;
+    }
+    h.destroy();
+
+    println("150 alloc ext ok");
+    return 0;
+}

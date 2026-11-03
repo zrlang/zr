@@ -1,0 +1,64 @@
+//=============================================================================
+// std/std.zr — std 门面：把 core ⊂ alloc ⊂ std 三层再导出
+//
+// 与 Rust 一致：平时写业务只 `use std::*`（或直接按扁平模块名 import），
+// 只有 no_std 场景才分别用 core / alloc 层。
+//
+// 这里的 `use x::*` 会被编译器做**传递性再导出**（见 modules.rs 的
+// expand_glob_exports）：`use std::*` 等价于同时 glob 导入三层全部模块。
+//
+// 分层约束：
+//   core  零依赖        （core / cmp / char / num / simd）
+//   alloc 只依赖 core   （mem / slice / string / collections / boxed / vec_deque /
+//                        hashmap / 解析与密码学 …）
+//   std   依赖 OS       （io / fs / net / http / tls / 进程 / 线程 / 时间 …）
+//=============================================================================
+
+//----- core 层（零依赖）-------------------------------------------------------
+
+use core::*;
+use cmp::*;
+use char::*;
+use num::*;
+use simd::*;
+
+//----- alloc 层（堆分配，无 OS 依赖）------------------------------------------
+
+use mem::*;
+use slice::*;
+use string::*;
+use collections::*;
+use boxed::*;
+use vec_deque::*;
+use hashmap::*;
+use json::*;
+use xml::*;
+use toml::*;
+use base64::*;
+use md5::*;
+use sha256::*;
+use crypto::*;
+use tensor::*;
+use pdb::*;
+// `async` 仍是实验性模块（生成器 / Future 协议骨架），暂不并入 `std` 门面，
+// 需要时显式 `use async::{...}`。
+
+//----- std 层（OS 抽象）-------------------------------------------------------
+
+use sys::*;
+use io::*;
+use fs::*;
+use net::*;
+use http::*;
+use http2::*;
+use tls::*;
+use env::*;
+use os::*;
+use posix::*;
+use process::*;
+use thread::*;
+use time::*;
+use tz::*;
+use path::*;
+use argparse::*;
+use error::*;

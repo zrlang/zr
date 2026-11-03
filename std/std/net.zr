@@ -1122,211 +1122,6 @@ pub fn parse_socket_addr(s: []const u8) -> Option<SocketAddr> {
     return Option::None;
 }
 
-//=============================================================================
-// HTTP — 极简 HTTP/1.1 客户端（文本协议层，依赖 TcpStream）
-//=============================================================================
-
-/// HTTP 请求方法。
-pub enum HttpMethod {
-    Get,
-    Post,
-    Put,
-    Delete,
-    Head,
-    Options,
-    Patch,
-}
-
-/// HTTP 响应状态。
-pub struct HttpStatus {
-    /// 状态码（200 / 404 / 500 等）。
-    pub code: u16,
-    /// 原因短语（如 "OK"）。
-    pub reason: []const u8,
-}
-
-/// HTTP 响应。
-pub struct HttpResponse {
-    /// 状态行。
-    pub status: HttpStatus,
-    /// 头字段列表（简化：扁平键值对）。
-    pub headers: Vec<HttpHeader>,
-    /// 响应体。
-    pub body: Vec<u8>,
-}
-
-/// 单个 HTTP 头。
-pub struct HttpHeader {
-    pub name: []const u8,
-    pub value: []const u8,
-}
-
-/// 发送一个 HTTP 请求并读取完整响应。
-///
-/// 这是一个骨架实现：
-/// - 支持 GET / POST（文本请求体）
-/// - 不支持 HTTPS / TLS（需额外 crypto 层）
-/// - 不支持分块传输（Transfer-Encoding: chunked）
-/// - 不支持 HTTP/2、HTTP/3
-///
-/// 用法：
-/// ```zr
-/// let mut stream = TcpStream::connect(SocketAddr::v4(Ipv4Addr::new(93,184,216,34), 80))?;
-/// let resp = http_get(&mut stream, "/", "example.com")?;
-/// println(resp.body);
-/// ```
-pub fn http_get(stream: &TcpStream, path: []const u8, host: []const u8) -> Result<HttpResponse, NetError> {
-    return http_request(stream, HttpMethod::Get, path, host, Slice::new(0 as *const u8, 0));
-}
-
-/// 发送一个带请求体的 HTTP 请求。
-pub fn http_request(
-    stream: &TcpStream,
-    method: HttpMethod,
-    path: []const u8,
-    host: []const u8,
-    body: []const u8,
-) -> Result<HttpResponse, NetError> {
-    // 构造请求行
-    let mut req = Vec::new();
-    match method {
-        HttpMethod::Get    => { push_slice(&mut req, "GET "); }
-        HttpMethod::Post   => { push_slice(&mut req, "POST "); }
-        HttpMethod::Put    => { push_slice(&mut req, "PUT "); }
-        HttpMethod::Delete => { push_slice(&mut req, "DELETE "); }
-        HttpMethod::Head   => { push_slice(&mut req, "HEAD "); }
-        HttpMethod::Options=> { push_slice(&mut req, "OPTIONS "); }
-        HttpMethod::Patch  => { push_slice(&mut req, "PATCH "); }
-    }
-    push_slice(&mut req, path);
-    push_slice(&mut req, " HTTP/1.1\r\n");
-
-    // Host 头（HTTP/1.1 必需）
-    push_slice(&mut req, "Host: ");
-    push_slice(&mut req, host);
-    push_slice(&mut req, "\r\n");
-
-    // User-Agent
-    push_slice(&mut req, "User-Agent: zr-net/0.5\r\n");
-
-    // Content-Length（如有请求体）
-    if body.len > 0 {
-        push_slice(&mut req, "Content-Length: ");
-        let mut buf: [u8; 16] = [0; 16];
-        let mut n = body.len;
-        let mut idx: usize = 15;
-        if n == 0 {
-            buf[15] = b'0';
-        } else {
-            while n > 0 {
-                buf[idx] = ((n % 10) as u8) + b'0';
-                n = n / 10;
-                if n > 0 { idx = idx - 1; }
-            }
-        }
-        // 计算实际起始位置
-        let mut start: usize = 0;
-        let mut k: usize = 0;
-        while k < 16 {
-            if buf[k] != 0 { start = k; break; }
-            k = k + 1;
-        }
-        let mut m = start;
-        while m < 16 {
-            req.push(buf[m]);
-            m = m + 1;
-        }
-        push_slice(&mut req, "\r\n");
-    }
-
-    // 连接关闭
-    push_slice(&mut req, "Connection: close\r\n");
-    push_slice(&mut req, "\r\n");
-
-    // 请求体
-    if body.len > 0 {
-        let mut i: usize = 0;
-        while i < body.len {
-            req.push(body.ptr[i]);
-            i = i + 1;
-        }
-    }
-
-    // 发送
-    stream.inner.send( Slice::new(req.data as *const u8, req.len) , 0)?;
-
-    // 读取响应
-    let mut resp_buf = Vec::with_capacity(4096);
-    let mut tmp: [u8; 4096] = [0; 4096];
-    loop {
-        let n = zr_recv(stream.inner.fd, &mut tmp[0] as *mut u8, 4096, 0);
-        if n <= 0 { break; }
-        let mut i: usize = 0;
-        while i < n as usize {
-            resp_buf.push(tmp[i]);
-            i = i + 1;
-        }
-    }
-
-    // 解析响应
-    return parse_http_response(resp_buf);
-}
-
-/// 解析 HTTP 响应（骨架：仅解析状态行与头部）。
-fn parse_http_response(buf: Vec<u8>) -> Result<HttpResponse, NetError> {
-    // 找到状态行结束位置
-    let mut status_code: u16 = 0;
-    let mut header_end: usize = 0;
-
-    // 扫描 "\r\n\r\n" 定位头部结束
-    let mut i: usize = 0;
-    while i + 3 < buf.len {
-        if buf[i] == b'\r' && buf[i + 1] == b'\n' && buf[i + 2] == b'\r' && buf[i + 3] == b'\n' {
-            header_end = i;
-            break;
-        }
-        i = i + 1;
-    }
-
-    // 解析状态行 "HTTP/1.1 200 OK"
-    // 跳过 "HTTP/1.x "
-    let mut pos: usize = 0;
-    while pos < buf.len && buf[pos] != b' ' { pos = pos + 1; }
-    pos = pos + 1; // 跳过空格
-    let code_start = pos;
-    while pos < buf.len && buf[pos] != b' ' { pos = pos + 1; }
-    let code_str =  Slice::new(offset(buf.data as *const u8, code_start), pos - code_start) ;
-    status_code = parse_u16(code_str);
-
-    // 提取 body（头部结束后的所有内容）
-    let body_start = header_end + 4;
-    let mut body = Vec::new();
-    let mut j: usize = body_start;
-    while j < buf.len {
-        body.push(buf[j]);
-        j = j + 1;
-    }
-
-    return Result::Ok(HttpResponse {
-        status: HttpStatus { code: status_code, reason: "OK" },
-        headers: Vec::new(),
-        body,
-    });
-}
-
-/// 把 u16 转为字符串（辅助）。
-fn parse_u16(s: []const u8) -> u16 {
-    let mut v: u16 = 0;
-    let mut i: usize = 0;
-    while i < s.len {
-        let c = s.ptr[i];
-        if c >= b'0' && c <= b'9' {
-            v = v * 10 + (c - b'0') as u16;
-        }
-        i = i + 1;
-    }
-    return v;
-}
 
 /// 把字节切片追加到 Vec<u8>。
 fn push_slice(vec: &mut Vec<u8>, s: []const u8) {
@@ -1453,9 +1248,18 @@ impl NetError {
 // 便捷函数
 //=============================================================================
 
-/// 快速创建一个 TCP 连接到 host:port（字符串形式）。
-/// host 应为点分十进制 IPv4 地址。
+/// 快速创建一个 TCP 连接。
+///
+/// 两种调用形式都支持：
+///   - `tcp_connect("127.0.0.1", 8080)`：点分十进制 IPv4 + 独立端口；
+///   - `tcp_connect("127.0.0.1:8080", 0)`：把端口写在主机串里（此时 `port` 被忽略）。
+///
+/// 早先只走 `parse_socket_addr(host)`，于是 "host" 形式的调用一律拿不到端口、
+/// 直接返回 `InvalidAddr`——HTTP/2 客户端因此连不上任何服务端。
 pub fn tcp_connect(host: []const u8, port: u16) -> Result<TcpStream, NetError> {
+    if let Option::Some(v4) = parse_ipv4(host) {
+        return TcpStream::connect(SocketAddr::V4(v4, port));
+    }
     let addr = match parse_socket_addr(host) {
         Option::Some(a) => a,
         Option::None => return Result::Err(NetError::InvalidAddr),
@@ -1474,14 +1278,3 @@ fn echo_fn(input: []u8) -> []u8 {
     return input;
 }
 
-/// 发送一条 HTTP GET 请求并打印响应体（极简 fetch）。
-pub fn fetch(url_host: []const u8, port: u16, path: []const u8) -> Result<Vec<u8>, NetError> {
-    let addr = match parse_socket_addr(url_host) {
-        Option::Some(a) => a,
-        Option::None => return Result::Err(NetError::InvalidAddr),
-    };
-    let mut stream = TcpStream::connect(addr)?;
-    let resp = http_get(&stream, path, url_host)?;
-    stream.shutdown();
-    return Result::Ok(resp.body);
-}

@@ -1,0 +1,84 @@
+//==============================================================================
+// std/core/cmp.zr — 比较（对应 Rust `core::cmp`）
+//
+// 提供三值比较结果 `Ordering` 与泛型比较函数。`Ord` trait 本身只有
+// `lt`（其余 `le`/`gt`/`ge`/`eq` 由默认方法补齐），三值结果由这里补上。
+//
+// 注意：`mem.zr` 里有一个同名的 `Ordering`，那是原子内存序
+// （Rust `core::sync::atomic::Ordering`）。zr 的模块符号表是扁平的，
+// 两个同名类型会互相覆盖，所以原子那个已改名 `AtomicOrdering`。
+//==============================================================================
+
+use core::Ord;
+
+/// 三值比较结果，语义与 Rust `core::cmp::Ordering` 一致。
+pub enum Ordering {
+    Less,
+    Equal,
+    Greater,
+}
+
+impl Ordering {
+    pub fn is_lt(self) -> bool {
+        match self {
+            Ordering::Less => return true,
+            _ => return false,
+        }
+    }
+
+    pub fn is_eq(self) -> bool {
+        match self {
+            Ordering::Equal => return true,
+            _ => return false,
+        }
+    }
+
+    pub fn is_gt(self) -> bool {
+        match self {
+            Ordering::Greater => return true,
+            _ => return false,
+        }
+    }
+
+    pub fn is_le(self) -> bool {
+        match self {
+            Ordering::Greater => return false,
+            _ => return true,
+        }
+    }
+
+    pub fn is_ge(self) -> bool {
+        match self {
+            Ordering::Less => return false,
+            _ => return true,
+        }
+    }
+
+    /// 大小关系反转（`Less` ↔ `Greater`）。
+    pub fn reverse(self) -> Ordering {
+        match self {
+            Ordering::Less    => return Ordering::Greater,
+            Ordering::Greater => return Ordering::Less,
+            Ordering::Equal   => return Ordering::Equal,
+        }
+    }
+}
+
+/// 泛型三值比较（对应 Rust `Ord::cmp`，这里做成自由函数）。
+pub fn cmp<T: Ord>(a: T, b: T) -> Ordering {
+    if a.lt(b) { return Ordering::Less; }
+    if b.lt(a) { return Ordering::Greater; }
+    return Ordering::Equal;
+}
+
+/// 取较小值（同 `min`，保留给按 `Ord` 语义书写的代码）。
+pub fn cmp_min<T: Ord>(a: T, b: T) -> T {
+    if a.lt(b) { return a; }
+    return b;
+}
+
+/// 取较大值。
+pub fn cmp_max<T: Ord>(a: T, b: T) -> T {
+    if a.lt(b) { return b; }
+    return a;
+}

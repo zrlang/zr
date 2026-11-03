@@ -1,0 +1,73 @@
+// std/argparse.zr：按参数名读取（`*_in` 注入版本）。
+//
+// 进程实参在测试环境里不可控，所以这里用 `Vec<String>` 造一张参数表，
+// 覆盖 `--name=value` / `--name value` / `-n value` / `-n=value` / 布尔开关 /
+// 位置参数。编号指向失败的断言。
+use argparse::{flag_in, has_in, positionals_in, value_in, value_or_in};
+use collections::Vec;
+use core::Option;
+use string::String;
+
+fn main() -> i32 {
+    let mut argv: Vec<String> = Vec::new();
+    argv.push(String::from_bytes("prog"));
+    argv.push(String::from_bytes("input.txt"));
+    argv.push(String::from_bytes("--name=zr"));
+    argv.push(String::from_bytes("--count"));
+    argv.push(String::from_bytes("3"));
+    argv.push(String::from_bytes("-v"));
+    argv.push(String::from_bytes("--dry-run"));
+    argv.push(String::from_bytes("-o"));
+    argv.push(String::from_bytes("out.txt"));
+    argv.push(String::from_bytes("--empty="));
+
+    // `--name=value`
+    match value_in(&argv, "name") {
+        Option::Some(v) => {
+            if v.len != 2 || v.ptr[0] != b'z' { return 1; }
+        }
+        Option::None => { return 2; }
+    }
+    // 名字写成 `--name` 也认。
+    if value_or_in(&argv, "--name", "x").len != 2 { return 3; }
+    // `--name value`（值和键分两条）
+    match value_in(&argv, "count") {
+        Option::Some(v) => {
+            if v.len != 1 || v.ptr[0] != b'3' { return 4; }
+        }
+        Option::None => { return 5; }
+    }
+    // 短名 `-n value` / 短名带等号。
+    match value_in(&argv, "o") {
+        Option::Some(v) => {
+            if v.len != 7 || v.ptr[0] != b'o' { return 6; }
+        }
+        Option::None => { return 7; }
+    }
+    // `--empty=` 是"有值但值为空"，不能退化成 None。
+    match value_in(&argv, "empty") {
+        Option::Some(v) => {
+            if v.len != 0 { return 8; }
+        }
+        Option::None => { return 9; }
+    }
+    // 不存在的键。
+    match value_in(&argv, "missing") {
+        Option::Some(_) => { return 10; }
+        Option::None => {}
+    }
+    // 布尔开关：`-v` / `--dry-run` 打开。
+    if !flag_in(&argv, "v") { return 11; }
+    if !flag_in(&argv, "dry-run") { return 12; }
+    // 带值但没有 `=true`，不算打开。
+    if flag_in(&argv, "count") { return 13; }
+    // has 对"带值选项"和"开关"都成立。
+    if !has_in(&argv, "count") { return 14; }
+    if !has_in(&argv, "v") { return 15; }
+    if has_in(&argv, "missing") { return 16; }
+    // 位置参数只剩第一条非选项、且没被选项吃掉的那条。
+    let pos = positionals_in(&argv);
+    if pos.len != 1 { return 17; }
+    if pos.get(0).len != 9 || pos.get(0).ptr[0] != b'i' { return 18; }
+    return 0;
+}

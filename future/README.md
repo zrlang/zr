@@ -59,16 +59,20 @@ subsystem. Each file uses the following status legend:
 ### std
 | File                | Status | Summary                    |
 |---------------------|--------|----------------------------|
-| cli.md              | ✅     | 命令行参数：入口桩捕获 `(argc, argv)` → `zr_args_init`，`std/cli.zr` 提供 `arg_count` / `arg` / `arg_opt` / `args` / `get` / `program_name`（回归 `126`） |
-| env.md              | ✅     | 环境变量：初值来自入口 `envp`（`zr_env_count` / `zr_env_entry`），写操作落在 `std/env.zr` 的覆盖表（墓碑删除，后写优先），提供 `var` / `var_or` / `set_var` / `remove_var` / `has_var`（回归 `127`） |
+| argparse.md         | ✅     | 命令行参数：入口桩捕获 `(argc, argv)` → `zr_args_init`，`std/std/argparse.zr` 提供索引读取 `arg_count` / `arg` / `arg_opt` / `args` / `get` / `program_name`，按名读取 `value` / `value_or` / `has` / `flag` / `positionals`，以及子命令与帮助 `subcommand` / `print_help` / `help_requested`（回归 `126` / `131` / `145`；原 `std/cli.zr` 已重命名） |
+| env.md              | ✅     | 环境变量：初值来自入口 `envp`（`zr_env_count` / `zr_env_entry`），写操作落在 `std/std/env.zr` 的覆盖表（墓碑删除，后写优先），提供 `var` / `var_or` / `set_var` / `remove_var` / `has_var`（回归 `127`） |
 | json.md             | ✅     | JSON 解析 / 生成：`Json` 递归值树，`json_parse` / `json_stringify` / `json_stringify_pretty`（回归 `128`） |
 | xml.md              | ✅     | XML 解析 / 生成：`XmlNode`（属性 / 子节点 / 文本），`xml_parse` / `xml_stringify` / `xml_stringify_pretty`（回归 `129`） |
 | toml.md             | ✅     | TOML 解析 / 生成：`Toml` 表 / 数组 / 标量，支持 `[table]`、`[[array-of-tables]]`、点分键、内联表（回归 `130`） |
+| os / posix / time / tz | ✅ | `std/std/os.zr`（`pid` / `cwd_len` / `temp_dir` / `home_dir` / `os_name` / `pointer_bits` / `exit`）、`std/std/posix.zr`（`isatty` / `getpid` / `kill` / `getcwd` / `SIG*` / 等待状态解码）、`std/std/time.zr`（纳秒时钟 + `DateTime` / ISO 解析）、`std/std/tz.zr`（内置九时区 + 真实 DST）（回归 `136` / `137` / `138`） |
+| md5 / sha256 / base64 / http / pdb / tensor | ✅ | 纯 zr 实现的摘要与编码（`std/alloc/md5.zr` / `std/alloc/sha256.zr` / `std/alloc/base64.zr`）、HTTP 客户端（`std/std/http.zr`：GET / POST / 重定向）、PDB 结构解析（`std/alloc/pdb.zr`）、面向 AI 的 `Tensor`（`std/alloc/tensor.zr`：广播 / `conv2d` / autograd / GPU 桩）（回归 `133` / `134` / `135` / `140` / `141` / `142` / `143` / `146`；API 一览见 `docs/task-table.md` 阶段 4） |
+| tls.md              | 🟢     | `std/std/tls.zr`：**纯 zr** TLS 1.2 客户端（rustls 式 `ClientConfig` / `ClientConnection`），零外部依赖；完整 PSK 握手中实现（0x00B2）、AES-128-CTR+HMAC-SHA256 加密 record 层、PRF 密钥导出；非 PSK 密码套件走骨架模式（仅 ClientHello/ServerHello 交换）；RSA/ECDH 证书验证留 TODO（受限于无 u128/BigInt） |
+| crypto.md           | ✅     | `std/alloc/crypto.zr`：纯 zr 密码学原语——AES-128-ECB + AES-128-CTR + SHA-256 流式（`init` / `update` / `digest`）+ HMAC-SHA256 + 简易 PRNG；三个 NIST 测试向量 + RFC 4231 HMAC 向量全部通过 |
 
 ### misc
 | File                | Status | Summary                    |
 |---------------------|--------|----------------------------|
 | const_generics.md   | ⬜     | `<const N: usize>` 解析接受但检查时报错 |
 | macro_system.rs     | 🔧     | `macro_rules!` 已走 `src/macros.rs`（`58_macros.zr`）；proc-macro 未接线 |
-| simd.md             | 🔧     | `std/simd` 目标相关，非全平台 |
+| simd.md             | ✅     | `std/core/simd.zr`：`f32x4` / `i32x4` / `f64x2` / `i8x8` / `i64x2` / `f32x8` / `f64x4` 的 `from_array` / `to_array` / `splat` / 逐 lane 运算 / `sum` / `dot`，以及 `best_width()`（回归 `139` / `144`） |
 | wasm_backend.md     | ✅     | wasm32/wasm64 目标已实现（`src/codegen/wasm.rs`） |

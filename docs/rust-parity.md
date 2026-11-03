@@ -169,33 +169,86 @@
 | Rust 的写法 | zr 的现状 | 状态 | 说明 |
 |------|------|------|------|
 | `BufRead::read_line(&mut String)` | `stdin_read_line(buf, cap) -> usize` | 🟡 | 读的是**裸字节**（不含 `\n`），返回读到的字节数；没有 `String` 版本的行读取 |
-| `Read::read(&mut [u8])` | `read_bytes(buf, cap) -> usize` | 🟡 | 返回字节数，EOF 返回 0 |
+| `Read::read(&mut [u8])` | `stdin_read_bytes(buf, cap) -> usize` | 🟡 | 返回字节数，EOF 返回 0。名字带 `stdin_` 前缀是为了不和 `fs::read_bytes(path)` 在扁平符号表里撞名 |
 
 ### 3.3 文件
 
 | Rust 的写法 | zr 的现状 | 状态 | 说明 |
 |------|------|------|------|
 | `File::open` / `OpenOptions` | `File::open(path, mode)` | 🟡 | mode 是整数常量（`FILE_READ` / `FILE_WRITE` / `FILE_APPEND`）；`is_ok()` 判断成败（没有 `Result`） |
-| `read` / `read_to_end` | `read(buf, cap)` / `file_read_all` | 🟡 | 返回字节数；`read_to_string` 没有 |
+| `read` / `read_to_end` / `read_to_string` | `read(buf, cap)` / `file_read_all` / `File::read_to_string()` / `fs::read_to_string(path)` / `fs::read_bytes(path)` | ✅ | `File::read_to_string` 用 4 KB 栈缓冲循环读到 EOF 拼成 `String`；路径版返回 `Option`，文件打不开给 `None` |
 | `write` / `write_all` | `write(bytes)` / `write_all(bytes)` | ✅ | |
 | `seek` | `seek(offset, whence)` | 🟡 | `SEEK_SET` / `SEEK_CUR` / `SEEK_END`，返回新位置 |
 | `close` | `close() -> bool` | 🟡 | **显式关闭**，`File` 不实现 `Drop`，不会自动关闭 |
 | `metadata().len()` | `fs::file_size` / `file_mode` / `file_mtime` / `file_ctime` | 🟡 | 路径版元数据已补（大小 / mode / mtime / ctime）；**没有 `File` 上的 `metadata()`，也没有 inode** |
 | `is_terminal` | `is_terminal()` | ✅ | |
-| 目录操作（`create_dir` / `read_dir` / `remove_dir`） | `fs::create_dir` / `read_dir_count` + `read_dir_name` / `remove_dir` | ✅ | 目录遍历跳过 `.` 与 `..`；`read_dir_name` 写进调用方缓冲区 |
+| 目录操作（`create_dir` / `create_dir_all` / `read_dir` / `remove_dir`） | `fs::create_dir` / `create_dir_all` / `read_dir`（`Vec<String>`）/ `read_dir_count` + `read_dir_name` / `remove_dir` | ✅ | `create_dir_all` 逐段 `mkdir`、已存在视为成功；目录遍历跳过 `.` 与 `..`；`read_dir_name` 写进调用方缓冲区。回归 `tests/cases/151_std_fs_time.zr` |
+| 一次性读写（`fs::read_to_string` / `fs::write` / `fs::copy` / `fs::append`） | `fs::read_to_string` / `read_bytes` / `write_string` / `append_string` / `copy_file` | ✅ | 文件名 `copy_file` 而不叫 `copy`，避免和 `slice::copy` 撞名 |
 | 路径操作（`Path` / `join` / `exists`） | `path::join` / `normalize` / `basename` / `extname` / `substr` / `fs::exists` | 🟡 | 没有 `Path` 类型，直接在 `str` 上算；`substr` / `basename` / `extname` 直接返回 `str` 切片 |
-| `Instant` / `SystemTime` / `sleep` | `zr_time_ns` / `zr_time_unix_ns` / `zr_sleep_ms`（`thread::sleep_ms`） | 🟡 | 只有纳秒整数，没有类型化的时间差 / 格式化 |
+| `Instant` / `SystemTime` / `Duration` / `sleep` | `time::Instant`（`now` / `elapsed` / `as_nanos`）、`time::Duration`（`from_secs` / `from_millis` / `from_micros` / `from_nanos` / `as_*` / `subsec_nanos` / `is_zero`）、`time::sleep(Duration)`；底层 `zr_time_ns` / `zr_time_unix_ns` / `zr_sleep_ms` | ✅ | 墙钟仍是整数纳秒（`unix_ns` / `unix_secs` / `now_ms`），`DateTime` 负责日历换算与 `format_iso` / `parse_iso`；`sleep` 精度毫秒。回归 `tests/cases/151_std_fs_time.zr` |
 | 临时文件（`tempfile`） | `fs::temp_file()` / `temp_file_raw()` | 🟡 | `/tmp/zr_tmp_<纳秒>`；没有 `NamedTempFile` / 自动删除（`File` 不实现 `Drop`） |
 
 ### 3.4 进程参数 / 环境变量 / 配置格式
 
 | Rust 的写法 | zr 的现状 | 状态 | 说明 |
 |------|------|------|------|
-| `std::env::args()` | `cli::arg_count()` / `cli::arg(i)` / `cli::arg_opt(i)` / `cli::args()` / `cli::get(i, default)` / `cli::program_name()` | ✅ | 入口桩在 `main` 前捕获 `argc/argv`（Linux 读 `[rsp]`、macOS 由 dyld 传入、Windows 用 `GetCommandLineA`），存进运行时 `zr_args_*`；`arg` 返回 `String`（复制），`arg_opt` 越界给 `None`，`arg` / `get` 越界分别给空串 / 默认值。**没有迭代器**，`args()` 一次性收集成 `Vec<String>`。回归 `tests/cases/126_cli_args.zr` |
-| `std::env::var` / `set_var` / `remove_var` | `env::var(key)` / `env::var_or(key, default)` / `env::set_var` / `env::remove_var` / `env::has_var` | ✅ | `var` 返回 `Option<String>`；写操作进入 `std/env.zr` 的进程内覆盖表（初值来自入口 `envp` 的 `zr_env_count` / `zr_env_entry`），**不写回父进程 / 不改子进程继承块**；`remove_var` 用墓碑实现，后写优先（从后往前扫）。非法键（空串 / 含 `=`）的写操作返回假。回归 `tests/cases/127_env_vars.zr` |
+| `std::env::args()` | `argparse::arg_count()` / `argparse::arg(i)` / `argparse::arg_opt(i)` / `argparse::args()` / `argparse::get(i, default)` / `argparse::program_name()`；按名字读 `argparse::value(name)` / `value_or(name, default)` / `has(name)` / `flag(name)` / `positionals()` | ✅ | 入口桩在 `main` 前捕获 `argc/argv`（Linux 读 `[rsp]`、macOS 由 dyld 传入、Windows 用 `GetCommandLineA`），存进运行时 `zr_args_*`；`arg` 返回 `String`（复制），`arg_opt` 越界给 `None`，`arg` / `get` 越界分别给空串 / 默认值。**没有迭代器**，`args()` 一次性收集成 `Vec<String>`。名字版支持 `--name=value`、`--name value`、`-n value` 与裸 flag，另有 `value_in` / `value_or_in` / `has_in` / `flag_in` / `positionals_in` 可注入参数表便于单测。回归 `tests/cases/126_cli_args.zr`、`tests/cases/131_argparse_named.zr` |
+| `std::env::var` / `set_var` / `remove_var` | `env::var(key)` / `env::var_or(key, default)` / `env::set_var` / `env::remove_var` / `env::has_var` | ✅ | `var` 返回 `Option<String>`；写操作进入 `std/std/env.zr` 的进程内覆盖表（初值来自入口 `envp` 的 `zr_env_count` / `zr_env_entry`），**不写回父进程 / 不改子进程继承块**；`remove_var` 用墓碑实现，后写优先（从后往前扫）。非法键（空串 / 含 `=`）的写操作返回假。回归 `tests/cases/127_env_vars.zr` |
 | `serde_json` / `std::json`（Rust 无内置） | `json::json_parse` / `json::json_stringify` / `json::json_stringify_pretty` | ✅ | 手写递归下降：`null` / 布尔 / 整数与浮点 / 字符串（含 `\uXXXX` 与代理对）/ 数组 / 对象；值树是递归枚举 `Json`，访问器 `len` / `at` / `get` / `as_*` / `is_null`；生成分紧凑与缩进两种。错误带字节位置。回归 `tests/cases/128_json.zr` |
 | XML（Rust 无内置） | `xml::xml_parse` / `xml::xml_stringify` / `xml::xml_stringify_pretty` | ✅ | 支持 XML 声明、注释、DOCTYPE、CDATA、自闭合标签、属性、五种实体与数字实体；`XmlNode` 带 `name` / `attrs` / `children` / `text`，访问器 `attr` / `child` / `child_named` / `child_count`；生成时转义（pretty 只序列化节点、不带声明）。错误带字节位置。回归 `tests/cases/129_xml.zr` |
 | TOML（Rust 无内置，生态用 `toml` crate） | `toml::toml_parse` / `toml::toml_stringify` | ✅ | 支持注释、`[table]`、`[table.sub]`、`[[array-of-tables]]`、点分键、基本 / 字面字符串、整数（含 `0x` / `0o` / `0b` 与 `_` 分隔）/ 浮点 / 布尔、数组（含尾逗号）、内联表；`Toml` 递归值树与 `get` / `get_path` / `at` / `len` / `as_*` 访问器。**已知限制**：不解析日期时间、浮点最多 6 位小数、重复键后写覆盖；未闭合数组 / 缺值返回带位置的 `Err`。回归 `tests/cases/130_toml.zr` |
+
+### 3.5 字符串格式化 / 平台 / 时间 / 编码 / 网络 / 科学计算
+
+| Rust 的写法 | zr 的现状 | 状态 | 说明 |
+|------|------|------|------|
+| `format!` / `Iterator::join` | `io::format(fmt, args, nargs) -> String` / `string::join_parts(parts, count, sep) -> String` | ✅ | `format` 把格式串与 `io::FormatArg` 拼成**新 `String`**（不写 stdout）；支持 `{}` `{n}` `{:?}` `{:#?}` `{:x}` `{:X}` `{:b}` `{:o}`、`{{` / `}}`。`join` 用分隔符连接若干 `str`。回归 `tests/cases/132_format.zr` |
+| `std::env` 的 `pid` / `current_dir` / `temp_dir` / `home_dir` | `os::pid` / `os::cwd_len(buf, cap)` / `os::temp_dir` / `os::home_dir` / `os::os_name` / `os::pointer_bits` / `os::exit` | ✅ | `temp_dir` 返回 `String`，`home_dir` 返回 `Option<String>`，`os_name` 在运行期探测 `macos` / `linux` / `windows`。回归 `tests/cases/138_os_posix.zr` |
+| `libc`（`isatty` / `getpid` / `kill` / `getcwd`、`SIG*`、`*_FILENO`、`wait` 状态解码） | `posix::isatty` / `getpid` / `kill` / `getcwd`、`SIG*` / `*_FILENO` 常量、`wifexited` / `wexitstatus` / `wifsignaled` / `wtermsig` | ✅ | 薄封装运行时 `zr_isatty` / `zr_process_*` 等符号，不依赖 libc 头文件。回归 `tests/cases/138_os_posix.zr` |
+| `std::time::Instant` / `SystemTime` / `Duration` | `time::monotonic_ns` / `unix_ns` / `unix_secs` / `now_ms` / `sleep_ms`；`DateTime` + `civil_from_unix` / `unix_from_civil` / `is_leap` / `days_in_month` / `format_iso` / `parse_iso` | ✅ | 时间是整数纳秒 / 秒；`DateTime` 是 `{year, month, day, hour, minute, second, weekday, nanos}` 值类型，支持负秒与闰年。回归 `tests/cases/136_time.zr` |
+| `chrono-tz`（Rust 生态） | `tz::zone_exists` / `utc_offset_seconds(name, unix_secs)` / `to_local` / `from_local` | ✅ | 内置 UTC、Asia/Shanghai、Asia/Tokyo、Asia/Kolkata、Europe/London、Europe/Berlin、America/New_York、America/Los_Angeles、Australia/Sydney，按真实 EU/US/AU DST 规则计算；未知时区按 UTC。回归 `tests/cases/137_tz.zr` |
+| `md5` crate / `sha2` crate | `md5::md5_hex` / `md5_hex_str`；`sha256::sha256_hex` / `sha256_hex_str` | ✅ | 纯 zr 实现（RFC 1321 / FIPS 180-4），与 Python `hashlib` 0–130 字节逐值对照一致。回归 `tests/cases/134_md5.zr`、`tests/cases/135_sha256.zr` |
+| `base64` crate | `base64::base64_encode` / `base64_decode`、`base64url_encode` / `base64url_decode` | ✅ | 标准与 URL-safe，带 `=` padding；严格解码（非法字符 / 长度 / 缺 padding 返回 `None`）。回归 `tests/cases/133_base64.zr` |
+| `reqwest` / `http` crate | `http::url_parse` / `http_build_request` / `http_parse_response` / `http_get` / `http_post` / `http_request(method, url, body, headers, follow)`；`Url` / `HttpHeader` / `HttpResponse` / `HttpError` | 🟡 | 明文 HTTP，点分 IPv4，不支持 HTTP/2 与代理；自动跟随 301/302/303/307/308（303 强制 GET、307/308 保留方法与 body、相对 Location 拼回原 host）；`https://` 可解析但本模块返回 `TlsNotSupported`（TLS 见 `std/std/tls.zr`）。`http_get` 复用 `net::SockAddrStorage` 的 `zr_*` 套接字封装（旧版 net HTTP 客户端已删除，避免扁平符号表重名）。响应解析支持状态行、全部头、`Content-Length`、`chunked` 与无长度。回归 `tests/cases/140_http.zr` |
+| `rustls` / `openssl` crate | `tls::ClientConfig` / `tls::ClientConnection`（`handshake` / `write` / `read` / `close`）、`crypto::aes128_*` / `crypto::Sha256State` / `crypto::crypto_hmac_sha256` | 🟡 | **纯 zr** TLS 1.2 客户端（零外部依赖），rustls 式分层；PSK 完整握手（0x00B2）+ AES-128-CTR/HMAC-SHA256 加密 record 层 + PRF 密钥导出；非 PSK 套件走 ClientHello/ServerHello 骨架；RSA/ECDH 证书验证留 TODO（无 u128/BigInt）。底层密码学：`crypto.zr` 纯 zr 实现 AES-128-CTR + SHA-256 流式 + HMAC-SHA256 + PRNG |
+| `pdbtbx` / `bio` crate | `pdb::pdb_parse` / `Pdb::atom_count` / `atom` / `centroid` | ✅ | 解析 PDB 固定列宽的 `ATOM` / `HETATM`（含 `HEADER` / `TITLE`），坏行跳过。回归 `tests/cases/141_pdb.zr` |
+| `ndarray` / `tch` / `candle` | `tensor::Tensor`（`zeros` / `ones` / `full` / `scalar` / `identity` / `from_slice` / `from_vec` / `from_matrix`；`get_flat` / `set_flat` / `get2` / `set2` / `get3` / `set3`；`add` / `sub` / `mul` / `div` / `neg` / `add_scalar` / `mul_scalar`；`relu` / `leaky_relu`；`matmul` / `transpose` / `reshape`；`sum` / `mean` / `max` / `min` / `argmax`；`square` / `mse` / `same_shape` / `close_to` / `copy` / `fill` / `destroy`；广播 `broadcast` / `broadcast_add` / `broadcast_mul`；`conv2d`；autograd `track_inplace` / `backward` / `zero_grad` / `sum_tensor`；`gpu_available` / `gpu_to` 桩） | 🟡 | `f64`、行主序、最多 4 维，值语义（无 `impl Drop`，手动 `destroy`）；广播按 NumPy 规则；`conv2d` 是直接卷积（无 im2col）且无反向；autograd 是极简反向模式（`add` / `mul` / `matmul` / `relu` / `sum_tensor`，依赖前向对象的生命周期）；GPU 只有占位接口（`gpu_available()` 恒 false、`gpu_to()` panic）；`matmul` 仅 2-D。回归 `tests/cases/142_tensor.zr`、`tests/cases/143_tensor_ai.zr`（两层 MLP 前向做 XOR）、`tests/cases/146_tensor_ext.zr` |
+| 便携 SIMD（`std::simd`） | `simd::f32x4` / `i32x4` / `f64x2` / `i8x8` / `i64x2` / `f32x8` / `f64x4`：`from_array` / `to_array` / `splat` / `add` / `sub` / `mul` / `div`（浮点）/ `neg` / `min` / `max` / `abs`（浮点）/ `sum` / `dot`；`best_width()` | ✅ | 逐 lane 展开（128 位整型数组的 `+`/`-`/`&` 由后端直接出 SSE2）；`i8x8` 的 `sum` / `dot` 用 `i32` 累加。`best_width()` 按指针宽度给"推荐字节数"（64 位=32、32 位=16），不做 CPUID。回归 `tests/cases/139_simd.zr`、`tests/cases/144_simd_ext.zr` |
+
+### 3.6 三层标准库（`core ⊂ alloc ⊂ std`）
+
+目录与 Rust 同构：`std/core/*.zr`（零依赖）、`std/alloc/*.zr`（只依赖 core，有堆）、
+`std/std/*.zr`（依赖 OS）；门面 `std/std.zr` 用 `use x::*` 把三层传递性再导出，
+日常业务只 `use std::*`。依赖方向由 `Loader.layers` 强制（core 不能 import alloc/std，
+alloc 不能 import std）。
+
+| Rust 的模块 | zr 对应 | 状态 | 说明 |
+|------|------|------|------|
+| `core::cmp` | `cmp::Ordering`（`Less` / `Equal` / `Greater` + `is_*` / `reverse`）、`cmp::cmp` / `cmp_min` / `cmp_max` | ✅ | `mem.zr` 里的原子内存序枚举已改名 `AtomicOrdering`，避免与 `Ordering` 在扁平符号表里冲突 |
+| `core::char` | `char::is_ascii_digit` / `is_ascii_alphabetic` / `is_ascii_alphanumeric` / `is_ascii_whitespace` / `is_ascii_uppercase` / `is_ascii_lowercase` / `is_ascii_graphic` / `to_ascii_lowercase` / `to_ascii_uppercase` / `ascii_to_digit` / `ascii_from_digit` | ✅ | zr 不能给内建类型写固有 `impl`（orphan rule），所以全部是**自由函数** |
+| `core::num` | `num::abs_i64` / `abs_i32` / `sign_*` / `pow_*` / `saturating_*` / `checked_*` / `wrapping_*` / `count_ones_u64` / `leading_zeros_u64` / `trailing_zeros_u64` / `gcd_u64` / `lcm_u64` / `clamp_i64` / `i64_min()` / `i64_max()` | ✅ | 同样用带类型后缀的自由函数；`i64_min/max` 是**函数不是常量**（跨模块引用的大整数字面量 `const` 不会折叠，会留下未定义符号） |
+| `core::option` / `core::result` | `Option` 的 `expect` / `unwrap_or_else` / `map_or` / `ok_or` / `filter` / `or`；`Result` 的 `unwrap_or` / `unwrap_or_else` / `ok` / `err` / `map_err` | ✅ | 回归 `tests/cases/149_std_core_ext.zr` |
+| `alloc::boxed::Box` | `Box<T>`：`new` / `get` / `get_mut` / `as_ptr` / `into_raw` / `replace` / `free`；`box_new` / `box_from_raw` | 🟡 | 值语义，**没有 `Drop`**，要显式 `free` |
+| `alloc::vec::Vec` | 在原有 API 上补 `first` / `last` / `truncate` / `retain` / `reverse` / `swap` / `extend_from_slice` / `dedup` | ✅ | 回归 `tests/cases/150_std_alloc_ext.zr` |
+| `alloc::string::String` | 补 `trim` / `trim_start` / `trim_end` / `to_lowercase` / `to_uppercase` / `find_str` / `rfind_byte` / `split` / `split_whitespace` / `replace` / `parse_i64` / `parse_i32`，并实现 `Eq` / `Ord` / `Hash` / `Clone` / `Default` | ✅ | `Eq` 手写字节比较（不能在 trait impl 里调同名方法，会递归成栈溢出）；`Hash` 用 FNV-1a |
+| `alloc::collections::VecDeque` | `VecDeque<T>`：`new` / `with_capacity` / `push_back` / `push_front` / `pop_front` / `pop_back` / `front` / `back` / `get` / `set` / `clear` / `destroy` / `into_vec` | ✅ | 环形缓冲，字段叫 `size` / `capac` 以避开同名方法 |
+| `alloc::collections::HashMap` | `HashMap<K, V>`（`K: Eq + Hash`）：`new` / `with_capacity` / `insert` / `insert_get` / `get` / `get_ref` / `contains_key` / `remove` / `clear` / `destroy` | ✅ | 开放寻址线性探测 + 装载因子 1/2 扩容 rehash；`remove` 用 O(n) 重建（直接标空会截断探测链）。String 键与 i64 键都已回归 |
+| `std::io::stdout/stderr/stdin` | `stdout()` / `stderr()` / `stdin()` 返回 `File`；`File::read_line` / `File::read_to_string` / `File::write_string` | ✅ | 与路径版 `fs` 函数同层，注意两个 `read_bytes` 已拆分（见 §3.2） |
+
+**本轮顺带修的三处编译器缺陷**（否则泛型容器的分配尺寸对不上真实步长）：
+
+1. `size_of` / `align_of` 对**泛型具名类型**没有按实参实例化——`size_of::<Entry<K, V>>()`
+   把每个形参字段都按 1 字节算（`Entry<String, i32>` 得 1，真实 32）。修法：
+   `InferCtxt` 增加 `type_params`，`size_of` / `align_of` 先用 `subst_ty` 把字段里的
+   `Ty::Infer` / `ConstParam` 换成实参（`src/typeck/infer.rs`）。
+2. `size_of` 的结构体 / 元组 / 枚举尺寸**没有按对齐补齐**（`{String, i32, bool}` 得 29，
+   MIR 的 `struct_layout` 步长 32）。按 `size_of` 分配的桶数组会越界写堆。修法：
+   与 `src/mir/builder.rs` 的 `type_size_align` / `enum_layout` 同一口径，末尾
+   `align_up`；定长数组的 `size_of` 也改用 `hir::array_len_value`（原来一律按 1 个元素算）。
+   同时把 `char` 的尺寸 / 对齐改成 1 字节，和 MIR 一致。
+3. 排掉一个符号遮蔽：`std/std/io.zr` 里的私有助手 `align_of(c: u8) -> i32` 与内建
+   `align_of::<T>()` 撞名，`use std::*` 后用户程序里的 `align_of::<i64>()` 会绑到它
+   （返回对齐枚举常量 2）。已改名 `io_align_of`。
 
 ---
 
@@ -231,8 +284,11 @@
 
 6. **标准库模块不带 `std::` 前缀，`Option` / `Result` 不在 prelude。**
    Rust 写 `std::option::Option`（或直接 `Option`）；zr 要写 `use core::Option;`，
-   模块名是 `core` / `cli` / `collections` / `env` / `error` / `fs` / `io` / `json` /
-   `mem` / `net` / `path` / `process` / `simd` / `slice` / `string` / `thread` / `toml` / `xml`。
+   模块名是 `argparse` / `async` / `base64` / `collections` / `core` / `env` /
+   `error` / `fs` / `http` / `io` / `json` / `md5` / `mem` / `net` / `os` / `path` /
+   `pdb` / `posix` / `process` / `sha256` / `simd` / `slice` / `string` / `tensor` /
+   `thread` / `time` / `tls` / `toml` / `tz` / `xml`（`cli` 已重命名为 `argparse`；
+   `tls`、`crypto` 为纯 ZR 实现、零外部依赖，其余随 `use` 按需加载）。
 
 7. **枚举的内存布局与 Rust 一致。**
    zr 的枚举是 `[判别式][载荷区]`，`Auto` 判别式按变体个数挑最小够用的整数，
@@ -250,6 +306,28 @@
     `is_some()` / `is_none()` / `is_ok()` / `is_err()` / `unwrap()` /
     `unwrap_or()` / `map()`、模式匹配与后缀 `?` 均返回正确结果。
 
+11. **`&&` / `||` 不短路（两侧都会求值）。**
+    `if false && boom()` 会执行 `boom()`（实测 `tests/cases/05_logic.zr` 只验证了
+    纯函数布尔代数，没暴露求值顺序）。因此**不能**用 `&&` 做"空指针/越界保护"：
+    `map.data[i].used && map.data[i].key.eq(k)` 在空槽上仍会调 `eq`，读到未初始化
+    的 `ptr` 直接段错误。标准库的写法是先用 `if used { .. }` 把求值守住
+    （见 `std/alloc/hashmap.zr` 的 `probe`）。这条是编译器控制的语义缺口，
+    在补齐短路求值之前，写 zr 代码请把它当 C 的位运算 `&` / `|` 对待。
+
+12. **`Vec<T>` 经引用参数下标取值会取到错误地址。**
+    `fn f(v: &Vec<i32>) { v[i] }` 里 `v[i]` 返回的是垃圾值（同一份数据用
+    `v.get(i)` / `v.as_slice()[i]` / `v.get_ref(i)` 都正常；裸指针 `self.data[i]`
+    也不受影响，所以 `hashmap.zr` 没踩到）。`&mut Vec<T>` 同样中招。
+    `std/std/http2.zr` 的 `HpackDecoder` 因此一律用 `as_slice()[i]` 访问动态表。
+    这是 SILENT 级别的缺陷（不报错、值错），在修掉之前，**结构体方法里拿
+    `&Vec` / `&mut Vec` 形参时不要写 `v[i]`**。
+
+13. **超大栈数组字面量会让编译退化到分钟级。**
+    `let mut buf: [u8; 65536] = [0; 65536];` 实测 5 分钟仍未完成编译（同文件
+    删掉这一行后 6.2s 编完）。`std/std/http2.zr` 的读帧路径改成
+    `Vec::with_capacity(len)` 逐字节铺零 + `payload.data` 原地读入。
+    栈上大数组在 zr 里请一律换成堆缓冲。
+
 ---
 
 ## 五、按优先级排序的待办缺口
@@ -259,7 +337,10 @@
 
 ### P0 — 静默出错，必须先修
 
-（当前没有已知的 P0 问题。）
+- **`&Vec<T>` / `&mut Vec<T>` 形参上的 `v[i]` 返回垃圾值**（上文 §四.12）。
+  不报错、不越界检查，只是读到错误地址；没踩到是因为标准库恰好都用
+  `as_slice()` / 裸指针访问。修法是让引用参数的索引走与 `as_slice()` 相同的
+  地址计算。
 
 ### P1 — 明确报错或明显缺失的功能（能用不了，但至少看得见）
 
@@ -316,11 +397,21 @@
    标宽，`div128(-100, 7)` 在 -O2/-Oz 直接 SIGILL）；**32 位目标仍禁用**
    （类型检查阶段报错）。回归 `tests/cases/111_i128.zr`、
    `tests/cases/113_i128_muldiv.zr`。
-7. **标准库新增进程参数 / 环境变量 / 配置格式**：`std/cli.zr`（`arg_count` /
-   `arg` / `args`）、`std/env.zr`（`var` / `set_var` / `remove_var`）、
-   `std/json.zr`、`std/xml.zr`、`std/toml.zr`。JSON/XML/TOML 的公开入口带
-   `json_` / `xml_` / `toml_` 前缀以避开扁平符号表；解析错误都带字节位置。
-   限制：环境变量写入只影响本进程的覆盖表；TOML 不支持日期时间与 `[[array.of.tables]]`。
+7. **标准库新增进程参数 / 环境变量 / 配置格式 / 平台与编码工具**：`std/std/argparse.zr`
+   （`arg_count` / `arg` / `args` / 按名读取 / 子命令 / `print_help`）、`std/std/env.zr`
+   （`var` / `set_var` / `remove_var`）、`std/alloc/json.zr`、`std/alloc/xml.zr`、`std/alloc/toml.zr`、
+   `std/std/os.zr`、`std/std/posix.zr`、`std/std/time.zr`、`std/std/tz.zr`、`std/alloc/md5.zr`、
+   `std/alloc/sha256.zr`、`std/alloc/base64.zr`、`std/std/http.zr`、`std/std/http2.zr`、`std/alloc/pdb.zr`、`std/alloc/tensor.zr`、
+   `std/std/tls.zr`、`std/core/simd.zr`（七种 lane 宽度）。JSON/XML/TOML
+   的公开入口带 `json_` / `xml_` / `toml_` 前缀以避开扁平符号表
+   （`std/std/net.zr` 的旧版 HTTP 客户端已移除，`http` 复用 `net::SockAddrStorage`）；解析错误都带字节位置。
+   限制：环境变量写入只影响本进程的覆盖表；TOML 不支持日期时间与 `[[array.of.tables]]`；
+   HTTP 仅明文 + 点分 IPv4；HTTP/2 走明文 h2c（prior knowledge，无 TLS/ALPN），
+   实现了 HPACK 静态表 + 动态表 + Huffman 解码、HEADERS/CONTINUATION 拆帧、
+   DATA 帧与流控（每帧回 WINDOW_UPDATE，请求体上限 65535），不支持服务端推送与
+   PRIORITY 帧；`Tensor` 的 `conv2d` 无反向、autograd 是极简反向模式、
+   GPU 仅占位；`tls` 是纯 ZR TLS 1.2 客户端（PSK 握手中实现、AES-128-CTR+HMAC-SHA256
+   加密 record 层），零外部依赖，但无 RSA/ECDH 证书验证（受限于无 u128/BigInt）。
 
 8. **泛型推断的边界**：类型参数从实参、期望返回类型**和用法体**推断
    （`try_instantiate_call` 推不出时留推断变量，`let v = Vec::new(); v.push(1)`
@@ -341,7 +432,7 @@
 - 判定「已实现」的标准：程序**编译通过且运行结果与 Rust 一致**；
   判定「未实现」的标准：编译期明确报错，或运行结果与 Rust 不一致
   （后者一律在正文里标为 ❌ 并注明实测输出）
-- 审计期间 `std/io.zr` 正被并行修改（新增了 `zr_seek` / `zr_fstat_size` /
+- 审计期间 `std/std/io.zr` 正被并行修改（新增了 `zr_seek` / `zr_fstat_size` /
   `zr_isatty` 运行时导出），第三章的文件能力反映的是**当时的在途状态**；
   其余章节不依赖该文件的改动。
 
@@ -359,7 +450,7 @@
    `spawn` 的帧初始化把偏移量当地址，往 `0x20` 写，`-O3` 直接 SIGSEGV。
    现在先建完整重命名表，再逐操作数一次性映射。
 3. **第 7 个及之后的实参被静默丢弃**（`src/codegen/encoder.rs`）：SysV 的栈上传参
-   没实现，`std/io.zr` 里 7 形参的 `emit_arg` 宽度恒为 0，所有填充 / 对齐 / 零填充
+   没实现，`std/std/io.zr` 里 7 形参的 `emit_arg` 宽度恒为 0，所有填充 / 对齐 / 零填充
    规格失效。现在按 ABI 压栈、被调方从 `[rbp+16+8k]` 读，并补 16 字节对齐。
 4. **指针指向数组时元素类型取错**（`src/typeck/mod.rs`）：`p: *mut [u8; 16]` 的
    `p[k]` 曾被当成 `[u8; 16]`，按 16 字节步长缩放。

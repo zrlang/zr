@@ -1,0 +1,1992 @@
+//=============================================================================
+// std/tensor.zr — 多维张量（Tensor），面向 AI / 数值计算
+//
+// 参考 PyTorch / TensorFlow 的 Tensor：一个**值语义**的 n 维数组，元素为
+// f64，行主序（row-major）连续存储。最大支持 4 维（矩阵与卷积所需的
+// batch × channel × height × width 都够用），`ndim < 4` 时更高维长度为 1。
+//
+//   let t = Tensor::zeros([2, 3, 1, 1], 2);     // 2×3 矩阵
+//   let w = Tensor::identity(2);
+//   let y = t.matmul(w);                        // 矩阵乘
+//   let a = y.relu();                           // 激活
+//
+// 所有权：`data` 是堆分配（`zr_alloc`），**没有** `impl Drop`（与 `String` /
+// `Vec` 一致），不再使用时手动 `destroy()`。所有返回 Tensor 的函数都重新
+// 分配数据，不共享底层存储；`copy()` 是深拷贝。
+//
+// 形状约定：所有逐元素运算要求两边 `numel` 相同（按扁平顺序对齐）；需要
+// 形状更严格时，调用方自行校验 `dim(i)`。
+//=============================================================================
+
+use core::panic;
+use mem::{zr_alloc, zr_dealloc};
+
+/// 最多支持 4 维。
+pub const TENSOR_MAX_DIMS: usize = 4;
+
+//----- AUTOGRAD: 计算图节点类型常量 ---------------------------------------------
+
+pub const TENSOR_OP_LEAF:            u8 = 0;
+pub const TENSOR_OP_ADD:             u8 = 1;
+pub const TENSOR_OP_MUL:             u8 = 2;
+pub const TENSOR_OP_MATMUL:          u8 = 3;
+pub const TENSOR_OP_RELU:            u8 = 4;
+pub const TENSOR_OP_SUM:             u8 = 5;
+pub const TENSOR_OP_CONV2D:          u8 = 6;
+pub const TENSOR_OP_BROADCAST_ADD:   u8 = 7;
+pub const TENSOR_OP_BROADCAST_MUL:   u8 = 8;
+pub const TENSOR_OP_BROADCAST_MATMUL:u8 = 9;
+
+/// 计算图节点。Tensor.ctx 可选地指向这里。
+/// backward 时从终点节点出发，沿 parent1/parent2 反向传播。
+pub struct TensorCtx {
+    /// 操作类型（TENSOR_OP_*）
+    pub op: u8,
+    /// 第一个父节点（单操作数 op 也用这个）
+    pub parent1: *mut TensorCtx,
+    /// 第二个父节点（单操作数时为 null）
+    pub parent2: *mut TensorCtx,
+    /// 本节点对应 Tensor 的 len（分配 grad 时用）
+    pub tensor_len: usize,
+    /// 输出梯度缓冲区（backward 会写入）
+    pub grad: *mut f64,
+    /// 本节点对应的 Tensor 指针（backward 时读 data/shape）
+    pub tensor_ptr: *mut Tensor,
+    /// forward 时的第一个输入 Tensor（读 data）
+    pub parent1_tensor: *mut Tensor,
+    /// forward 时的第二个输入 Tensor（读 data）
+    pub parent2_tensor: *mut Tensor,
+    /// matmul: M = rows, K = inner, N = cols（forward 时保存）
+    pub mm_m: usize,
+    pub mm_k: usize,
+    pub mm_n: usize,
+    //---- 为修复 parent*_tensor 悬空指针而新增的 data 直存字段 ----
+    /// parent1 的数据缓冲区（堆内存，在函数返回后仍有效）
+    pub p1_data: *const f64,
+    /// parent2 的数据缓冲区（堆内存）
+    pub p2_data: *const f64,
+    /// parent1 的长度（用于 backward 中做广播长度判断）
+    pub p1_len: usize,
+    /// parent2 的长度
+    pub p2_len: usize,
+    //---- CONV2D 专用字段 ----
+    pub c2d_stride_h: usize,
+    pub c2d_stride_w: usize,
+    pub c2d_pad_h: usize,
+    pub c2d_pad_w: usize,
+    pub c2d_ic: usize,
+    pub c2d_oc: usize,
+    pub c2d_kh: usize,
+    pub c2d_kw: usize,
+    pub c2d_oh: usize,
+    pub c2d_ow: usize,
+    pub c2d_n: usize,
+    pub c2d_h: usize,
+    pub c2d_w: usize,
+    pub c2d_bias_data: *const f64,
+    pub c2d_bias_len: usize,
+    //---- BROADCAST 专用字段 ----
+    pub b_dims1: [usize; 4],
+    pub b_ndim1: usize,
+    pub b_dims2: [usize; 4],
+    pub b_ndim2: usize,
+    pub out_dims: [usize; 4],
+    pub out_ndim: usize,
+    //---- BROADCAST_MATMUL 专用字段 ----
+    pub bmm_leading1: usize,
+    pub bmm_leading2: usize,
+    pub bmm_leading_out: usize,
+}
+
+/// 一个 n 维浮点张量（元素 f64，行主序）。
+pub struct Tensor {
+    /// 各维长度；`ndim` 之后的项约定为 1。
+    pub dims: [usize; 4],
+    /// 实际维度数（0 = 标量，1 = 向量，2 = 矩阵）。
+    pub ndim: usize,
+    /// 元素总数。
+    pub len:  usize,
+    /// 堆上的元素缓冲区（长度 = `len`）。
+    pub data: *mut f64,
+    /// autograd 梯度缓冲区（backward 后有值；初始 null）。
+    pub grad: *mut f64,
+    /// 计算图节点（autograd 用；初始 null）。
+    pub ctx:  *mut TensorCtx,
+}
+
+impl Tensor {
+    /// 全 0 张量。
+    pub fn zeros(dims: [usize; 4], ndim: usize) -> Tensor {
+        return Tensor::full(dims, ndim, 0.0);
+    }
+
+    /// 全 1 张量。
+    pub fn ones(dims: [usize; 4], ndim: usize) -> Tensor {
+        return Tensor::full(dims, ndim, 1.0);
+    }
+
+    /// 用同一个值填充。
+    pub fn full(dims: [usize; 4], ndim: usize, value: f64) -> Tensor {
+        let n = tensor_numel(dims, ndim);
+        let d = tensor_dims4(dims, ndim);
+        let data = zr_alloc(n * 8, 8) as *mut f64;
+        if data == 0 as *mut f64 { panic("tensor: out of memory"); }
+        let mut i: usize = 0;
+        while i < n {
+            data[i] = value;
+            i = i + 1;
+        }
+        return Tensor { dims: d, ndim: tensor_rank(ndim), len: n, data, grad: 0 as *mut f64, ctx: 0 as *mut TensorCtx };
+    }
+
+    /// 秩为 0 的标量张量。
+    pub fn scalar(value: f64) -> Tensor {
+        return Tensor::full([1, 1, 1, 1], 0, value);
+    }
+
+    /// 从一段连续数据拷贝构造（`data` 指向至少 `numel(dims)` 个 f64）。
+    pub fn from_slice(src: *const f64, dims: [usize; 4], ndim: usize) -> Tensor {
+        let n = tensor_numel(dims, ndim);
+        let d = tensor_dims4(dims, ndim);
+        let data = zr_alloc(n * 8, 8) as *mut f64;
+        if data == 0 as *mut f64 { panic("tensor: out of memory"); }
+        let mut i: usize = 0;
+        while i < n {
+            data[i] = src[i];
+            i = i + 1;
+        }
+        return Tensor { dims: d, ndim: tensor_rank(ndim), len: n, data, grad: 0 as *mut f64, ctx: 0 as *mut TensorCtx };
+    }
+
+    /// 一维向量。
+    pub fn from_vec(src: *const f64, len: usize) -> Tensor {
+        return Tensor::from_slice(src, [len, 1, 1, 1], 1);
+    }
+
+    /// 二维矩阵（`src` 行主序，共 rows × cols 个元素）。
+    pub fn from_matrix(src: *const f64, rows: usize, cols: usize) -> Tensor {
+        return Tensor::from_slice(src, [rows, cols, 1, 1], 2);
+    }
+
+    /// n×n 单位矩阵。
+    pub fn identity(n: usize) -> Tensor {
+        let mut t = Tensor::zeros([n, n, 1, 1], 2);
+        let mut i: usize = 0;
+        while i < n {
+            t.data[i * n + i] = 1.0;
+            i = i + 1;
+        }
+        return t;
+    }
+
+    /// 元素总数。
+    pub fn numel(self) -> usize {
+        return self.len;
+    }
+
+    /// 维度数。
+    pub fn rank(self) -> usize {
+        return self.ndim;
+    }
+
+    /// 第 `axis` 维的长度（轴不存在时返回 1）。
+    pub fn dim(self, axis: usize) -> usize {
+        if axis >= 4 { return 1; }
+        return self.dims[axis];
+    }
+
+    /// 是否为空（0 个元素）。
+    pub fn is_empty(self) -> bool {
+        return self.len == 0;
+    }
+
+    /// 按扁平下标读元素（行主序）。
+    pub fn get_flat(self, i: usize) -> f64 {
+        if i >= self.len { panic("tensor: index out of range"); }
+        return self.data[i];
+    }
+
+    /// 按扁平下标写元素。
+    pub fn set_flat(self: &mut Tensor, i: usize, v: f64) {
+        if i >= self.len { panic("tensor: index out of range"); }
+        self.data[i] = v;
+    }
+
+    /// 二维矩阵按 `[row, col]` 读。
+    pub fn get2(self, row: usize, col: usize) -> f64 {
+        return self.get_flat(row * self.dims[1] + col);
+    }
+
+    /// 二维矩阵按 `[row, col]` 写。
+    pub fn set2(self: &mut Tensor, row: usize, col: usize, v: f64) {
+        self.set_flat(row * self.dims[1] + col, v);
+    }
+
+    /// 三维张量按 `[i0, i1, i2]` 读。
+    pub fn get3(self, i0: usize, i1: usize, i2: usize) -> f64 {
+        return self.get_flat((i0 * self.dims[1] + i1) * self.dims[2] + i2);
+    }
+
+    /// 三维张量按 `[i0, i1, i2]` 写。
+    pub fn set3(self: &mut Tensor, i0: usize, i1: usize, i2: usize, v: f64) {
+        self.set_flat((i0 * self.dims[1] + i1) * self.dims[2] + i2, v);
+    }
+
+    /// 深拷贝（独立缓冲区）。
+    pub fn copy(self) -> Tensor {
+        return Tensor::from_slice(self.data as *const f64, self.dims, self.ndim);
+    }
+
+    /// 释放缓冲区（幂等）。
+    pub fn destroy(self: &mut Tensor) {
+        if self.data != 0 as *mut f64 {
+            zr_dealloc(self.data as *mut void, self.len * 8, 8);
+            self.data = 0 as *mut f64;
+            self.len = 0;
+        }
+    }
+
+    /// 用同一个值填充自身。
+    pub fn fill(self: &mut Tensor, v: f64) {
+        let mut i: usize = 0;
+        while i < self.len {
+            self.data[i] = v;
+            i = i + 1;
+        }
+    }
+
+    /// 逐元素相加（带 autograd fwd 记录：任一输入有 ctx 时输出也有）。
+    pub fn add(self, other: Tensor) -> Tensor {
+        tensor_require_same_len(self.len, other.len, "add");
+        let mut out = Tensor::zeros(self.dims, self.ndim);
+        let mut i: usize = 0;
+        while i < self.len {
+            out.data[i] = self.data[i] + other.data[i];
+            i = i + 1;
+        }
+        if self.ctx != 0 as *mut TensorCtx || other.ctx != 0 as *mut TensorCtx {
+            out.ctx = tensor_autograd_new_node(
+                TENSOR_OP_ADD,
+                self.ctx, other.ctx,
+                0 as *mut Tensor,
+                0 as *mut Tensor,
+                0 as *mut Tensor,
+                out.len, 0, 0, 0
+            );
+            out.ctx.p1_data = self.data as *const f64;
+            out.ctx.p2_data = other.data as *const f64;
+            out.ctx.p1_len = self.len;
+            out.ctx.p2_len = other.len;
+        }
+        return out;
+    }
+
+    /// 逐元素相减。
+    pub fn sub(self, other: Tensor) -> Tensor {
+        tensor_require_same_len(self.len, other.len, "sub");
+        let mut out = Tensor::zeros(self.dims, self.ndim);
+        let mut i: usize = 0;
+        while i < self.len {
+            out.data[i] = self.data[i] - other.data[i];
+            i = i + 1;
+        }
+        return out;
+    }
+
+    /// 逐元素相乘（Hadamard 积）。
+    pub fn mul(self, other: Tensor) -> Tensor {
+        tensor_require_same_len(self.len, other.len, "mul");
+        let mut out = Tensor::zeros(self.dims, self.ndim);
+        let mut i: usize = 0;
+        while i < self.len {
+            out.data[i] = self.data[i] * other.data[i];
+            i = i + 1;
+        }
+        if self.ctx != 0 as *mut TensorCtx || other.ctx != 0 as *mut TensorCtx {
+            out.ctx = tensor_autograd_new_node(
+                TENSOR_OP_MUL, self.ctx, other.ctx,
+                0 as *mut Tensor, 0 as *mut Tensor, 0 as *mut Tensor,
+                out.len, 0, 0, 0
+            );
+            out.ctx.p1_data = self.data as *const f64;
+            out.ctx.p2_data = other.data as *const f64;
+            out.ctx.p1_len = self.len;
+            out.ctx.p2_len = other.len;
+        }
+        return out;
+    }
+
+    /// 逐元素相除。
+    pub fn div(self, other: Tensor) -> Tensor {
+        tensor_require_same_len(self.len, other.len, "div");
+        let mut out = Tensor::zeros(self.dims, self.ndim);
+        let mut i: usize = 0;
+        while i < self.len {
+            out.data[i] = self.data[i] / other.data[i];
+            i = i + 1;
+        }
+        return out;
+    }
+
+    /// 逐元素取负。
+    pub fn neg(self) -> Tensor {
+        let mut out = Tensor::zeros(self.dims, self.ndim);
+        let mut i: usize = 0;
+        while i < self.len {
+            out.data[i] = -self.data[i];
+            i = i + 1;
+        }
+        return out;
+    }
+
+    /// 每个元素加一个标量。
+    pub fn add_scalar(self, v: f64) -> Tensor {
+        let mut out = Tensor::zeros(self.dims, self.ndim);
+        let mut i: usize = 0;
+        while i < self.len {
+            out.data[i] = self.data[i] + v;
+            i = i + 1;
+        }
+        return out;
+    }
+
+    /// 每个元素乘一个标量（等价于 `scale`）。
+    pub fn mul_scalar(self, v: f64) -> Tensor {
+        let mut out = Tensor::zeros(self.dims, self.ndim);
+        let mut i: usize = 0;
+        while i < self.len {
+            out.data[i] = self.data[i] * v;
+            i = i + 1;
+        }
+        return out;
+    }
+
+    /// ReLU：`max(x, 0)`。
+    pub fn relu(self) -> Tensor {
+        let mut out = Tensor::zeros(self.dims, self.ndim);
+        let mut i: usize = 0;
+        while i < self.len {
+            let v = self.data[i];
+            if v > 0.0 {
+                out.data[i] = v;
+            } else {
+                out.data[i] = 0.0;
+            }
+            i = i + 1;
+        }
+        if self.ctx != 0 as *mut TensorCtx {
+            out.ctx = tensor_autograd_new_node(
+                TENSOR_OP_RELU, self.ctx,
+                0 as *mut TensorCtx,
+                0 as *mut Tensor, 0 as *mut Tensor,
+                0 as *mut Tensor,
+                out.len, 0, 0, 0
+            );
+            out.ctx.p1_data = self.data as *const f64;
+            out.ctx.p1_len = self.len;
+        }
+        return out;
+    }
+
+    /// Leaky ReLU：`x > 0 ? x : slope * x`。
+    pub fn leaky_relu(self, slope: f64) -> Tensor {
+        let mut out = Tensor::zeros(self.dims, self.ndim);
+        let mut i: usize = 0;
+        while i < self.len {
+            let v = self.data[i];
+            if v > 0.0 {
+                out.data[i] = v;
+            } else {
+                out.data[i] = v * slope;
+            }
+            i = i + 1;
+        }
+        return out;
+    }
+
+    /// 二维矩阵乘（带 autograd fwd 记录）：`self` 是 rows×k，`other` 是 k×cols。
+    pub fn matmul(self, other: Tensor) -> Tensor {
+        if self.ndim != 2 || other.ndim != 2 {
+            panic("tensor::matmul: both operands must be 2-D");
+        }
+        let rows = self.dims[0];
+        let k = self.dims[1];
+        if k != other.dims[0] {
+            panic("tensor::matmul: shape mismatch");
+        }
+        let cols = other.dims[1];
+        let mut out = Tensor::zeros([rows, cols, 1, 1], 2);
+        let mut i: usize = 0;
+        while i < rows {
+            let mut j: usize = 0;
+            while j < cols {
+                let mut acc: f64 = 0.0;
+                let mut p: usize = 0;
+                while p < k {
+                    acc = acc + self.data[i * k + p] * other.data[p * cols + j];
+                    p = p + 1;
+                }
+                out.data[i * cols + j] = acc;
+                j = j + 1;
+            }
+            i = i + 1;
+        }
+        if self.ctx != 0 as *mut TensorCtx || other.ctx != 0 as *mut TensorCtx {
+            out.ctx = tensor_autograd_new_node(
+                TENSOR_OP_MATMUL, self.ctx, other.ctx,
+                0 as *mut Tensor, 0 as *mut Tensor, 0 as *mut Tensor,
+                out.len, rows, k, cols
+            );
+            out.ctx.p1_data = self.data as *const f64;
+            out.ctx.p2_data = other.data as *const f64;
+            out.ctx.p1_len = self.len;
+            out.ctx.p2_len = other.len;
+        }
+        return out;
+    }
+
+    /// 二维转置。
+    pub fn transpose(self) -> Tensor {
+        if self.ndim != 2 {
+            panic("tensor::transpose: operand must be 2-D");
+        }
+        let rows = self.dims[0];
+        let cols = self.dims[1];
+        let mut out = Tensor::zeros([cols, rows, 1, 1], 2);
+        let mut i: usize = 0;
+        while i < rows {
+            let mut j: usize = 0;
+            while j < cols {
+                out.data[j * rows + i] = self.data[i * cols + j];
+                j = j + 1;
+            }
+            i = i + 1;
+        }
+        return out;
+    }
+
+    /// 改变形状（元素按扁平顺序复制，返回新张量）。
+    pub fn reshape(self, dims: [usize; 4], ndim: usize) -> Tensor {
+        let n = tensor_numel(dims, ndim);
+        if n != self.len {
+            panic("tensor::reshape: element count mismatch");
+        }
+        return Tensor::from_slice(self.data as *const f64, dims, ndim);
+    }
+
+    /// 所有元素求和。
+    pub fn sum(self) -> f64 {
+        let mut s: f64 = 0.0;
+        let mut i: usize = 0;
+        while i < self.len {
+            s = s + self.data[i];
+            i = i + 1;
+        }
+        return s;
+    }
+
+    /// 平均值（空张量返回 0.0）。
+    pub fn mean(self) -> f64 {
+        if self.len == 0 { return 0.0; }
+        return self.sum() / (self.len as f64);
+    }
+
+    /// 最大元素（空张量返回 0.0）。
+    pub fn max(self) -> f64 {
+        if self.len == 0 { return 0.0; }
+        let mut m = self.data[0];
+        let mut i: usize = 1;
+        while i < self.len {
+            if self.data[i] > m { m = self.data[i]; }
+            i = i + 1;
+        }
+        return m;
+    }
+
+    /// 最小元素（空张量返回 0.0）。
+    pub fn min(self) -> f64 {
+        if self.len == 0 { return 0.0; }
+        let mut m = self.data[0];
+        let mut i: usize = 1;
+        while i < self.len {
+            if self.data[i] < m { m = self.data[i]; }
+            i = i + 1;
+        }
+        return m;
+    }
+
+    /// 最大元素的下标（第一个；空张量返回 0）。
+    pub fn argmax(self) -> usize {
+        if self.len == 0 { return 0; }
+        let mut best: usize = 0;
+        let mut i: usize = 1;
+        while i < self.len {
+            if self.data[i] > self.data[best] { best = i; }
+            i = i + 1;
+        }
+        return best;
+    }
+
+    /// 逐元素平方。
+    pub fn square(self) -> Tensor {
+        let mut out = Tensor::zeros(self.dims, self.ndim);
+        let mut i: usize = 0;
+        while i < self.len {
+            let v = self.data[i];
+            out.data[i] = v * v;
+            i = i + 1;
+        }
+        return out;
+    }
+
+    /// 均方误差：`mean((self - target)^2)`。
+    pub fn mse(self, target: Tensor) -> f64 {
+        let d = self.sub(target);
+        return d.square().mean();
+    }
+
+    /// 是否与另一张量形状一致。
+    pub fn same_shape(self, other: Tensor) -> bool {
+        if self.ndim != other.ndim { return false; }
+        let mut i: usize = 0;
+        while i < self.ndim {
+            if self.dims[i] != other.dims[i] { return false; }
+            i = i + 1;
+        }
+        return true;
+    }
+
+    /// 逐元素近似相等（`|a - b| <= eps`），且形状一致。
+    pub fn close_to(self, other: Tensor, eps: f64) -> bool {
+        if !self.same_shape(other) { return false; }
+        let mut i: usize = 0;
+        while i < self.len {
+            let d = self.data[i] - other.data[i];
+            let a = if d < 0.0 { -d } else { d };
+            if a > eps { return false; }
+            i = i + 1;
+        }
+        return true;
+    }
+
+    //----- BROADCAST 方法 --------------------------------------------------------
+
+    /// 把 self 广播到 target_dims/target_ndim。numpy 规则：倒数维对齐，1 自动广播。
+    /// 如果 self 可以广播到 target，返回新 Tensor；否则 panic。
+    pub fn broadcast(self, target_dims: [usize; 4], target_ndim: usize) -> Tensor {
+        let out_dims = tensor_broadcast_compute(self.dims, self.ndim, target_dims, target_ndim);
+        let out_ndim = tensor_rank(target_ndim);
+        let data = tensor_broadcast_copy(
+            self.data as *const f64, self.dims, self.ndim,
+            out_dims, out_ndim
+        );
+        let n = tensor_numel(out_dims, out_ndim);
+        return Tensor { dims: out_dims, ndim: out_ndim, len: n, data, grad: 0 as *mut f64, ctx: 0 as *mut TensorCtx };
+    }
+
+    /// 把 self 和 other 广播相加。返回新 Tensor。
+    pub fn broadcast_add(self, other: *const Tensor) -> Tensor {
+        let out_dims = tensor_broadcast_compute(
+            self.dims, self.ndim,
+            other.dims, other.ndim
+        );
+        let out_ndim = tensor_rank(
+            if self.ndim > other.ndim { self.ndim } else { other.ndim }
+        );
+        let n = tensor_numel(out_dims, out_ndim);
+        let data = zr_alloc(n * 8, 8) as *mut f64;
+        if data == 0 as *mut f64 { panic("tensor: out of memory"); }
+        let mut i: usize = 0;
+        while i < n {
+            let si = tensor_broadcast_map_idx(i, out_dims, out_ndim, self.dims, self.ndim);
+            let oi = tensor_broadcast_map_idx(i, out_dims, out_ndim, other.dims, other.ndim);
+            data[i] = self.data[si] + other.data[oi];
+            i = i + 1;
+        }
+        let mut out = Tensor { dims: out_dims, ndim: out_ndim, len: n, data, grad: 0 as *mut f64, ctx: 0 as *mut TensorCtx };
+        let octx = (*other).ctx;
+        if self.ctx != 0 as *mut TensorCtx || octx != 0 as *mut TensorCtx {
+            out.ctx = tensor_autograd_new_node(
+                TENSOR_OP_BROADCAST_ADD, self.ctx, octx,
+                0 as *mut Tensor, 0 as *mut Tensor, 0 as *mut Tensor,
+                n, 0, 0, 0
+            );
+            out.ctx.p1_data = self.data as *const f64;
+            out.ctx.p1_len = self.len;
+            out.ctx.p2_data = (*other).data as *const f64;
+            out.ctx.p2_len = (*other).len;
+            out.ctx.b_dims1 = self.dims;
+            out.ctx.b_ndim1 = self.ndim;
+            out.ctx.b_dims2 = (*other).dims;
+            out.ctx.b_ndim2 = (*other).ndim;
+            out.ctx.out_dims = out_dims;
+            out.ctx.out_ndim = out_ndim;
+        }
+        return out;
+    }
+
+    /// 把 self 和 other 广播相乘（Hadamard）。
+    pub fn broadcast_mul(self, other: *const Tensor) -> Tensor {
+        let out_dims = tensor_broadcast_compute(
+            self.dims, self.ndim,
+            other.dims, other.ndim
+        );
+        let out_ndim = tensor_rank(
+            if self.ndim > other.ndim { self.ndim } else { other.ndim }
+        );
+        let n = tensor_numel(out_dims, out_ndim);
+        let data = zr_alloc(n * 8, 8) as *mut f64;
+        if data == 0 as *mut f64 { panic("tensor: out of memory"); }
+        let mut i: usize = 0;
+        while i < n {
+            let si = tensor_broadcast_map_idx(i, out_dims, out_ndim, self.dims, self.ndim);
+            let oi = tensor_broadcast_map_idx(i, out_dims, out_ndim, other.dims, other.ndim);
+            data[i] = self.data[si] * other.data[oi];
+            i = i + 1;
+        }
+        let mut out = Tensor { dims: out_dims, ndim: out_ndim, len: n, data, grad: 0 as *mut f64, ctx: 0 as *mut TensorCtx };
+        let octx = (*other).ctx;
+        if self.ctx != 0 as *mut TensorCtx || octx != 0 as *mut TensorCtx {
+            out.ctx = tensor_autograd_new_node(
+                TENSOR_OP_BROADCAST_MUL, self.ctx, octx,
+                0 as *mut Tensor, 0 as *mut Tensor, 0 as *mut Tensor,
+                n, 0, 0, 0
+            );
+            out.ctx.p1_data = self.data as *const f64;
+            out.ctx.p1_len = self.len;
+            out.ctx.p2_data = (*other).data as *const f64;
+            out.ctx.p2_len = (*other).len;
+            out.ctx.b_dims1 = self.dims;
+            out.ctx.b_ndim1 = self.ndim;
+            out.ctx.b_dims2 = (*other).dims;
+            out.ctx.b_ndim2 = (*other).ndim;
+            out.ctx.out_dims = out_dims;
+            out.ctx.out_ndim = out_ndim;
+        }
+        return out;
+    }
+
+    /// 批量矩阵乘（支持前导 batch 维广播）。
+    /// self 形状 [..., M, K]，other 形状 [..., K, N]。
+    /// 前导维度按 numpy 规则广播，对每个 batch 做常规 matmul。
+    /// MVP：ndim 必须 >= 2，两边 ndim 相同。
+    pub fn broadcast_matmul(self, other: *const Tensor) -> Tensor {
+        if self.ndim < 2 || other.ndim < 2 {
+            panic("tensor::broadcast_matmul: ndim must be >= 2");
+        }
+        let nd = if self.ndim > other.ndim { self.ndim } else { other.ndim };
+        let m = self.dims[nd - 2];
+        let k = self.dims[nd - 1];
+        let ok = other.dims[nd - 2];
+        let n = other.dims[nd - 1];
+        if k != ok {
+            panic("tensor::broadcast_matmul: inner dim mismatch");
+        }
+        // 前导维广播
+        let out_dims_l = tensor_broadcast_leading(
+            self.dims, self.ndim, other.dims, other.ndim, nd
+        );
+        // 计算 batch 元素个数
+        let leading: usize = tensor_numel(out_dims_l, nd - 2);
+        // 分配输出
+        let mut out_dims: [usize; 4] = [1, 1, 1, 1];
+        let mut i = 0;
+        while i < nd - 2 {
+            out_dims[i] = out_dims_l[i];
+            i = i + 1;
+        }
+        out_dims[nd - 2] = m;
+        out_dims[nd - 1] = n;
+        let out_len = tensor_numel(out_dims, nd);
+        let out_data = zr_alloc(out_len * 8, 8) as *mut f64;
+        if out_data == 0 as *mut f64 { panic("tensor: out of memory"); }
+        // 对每个 batch 元素做 matmul
+        let one_v: usize = 1;
+        let mut bi: usize = 0;
+        while bi < leading {
+            let a_off = tensor_broadcast_batch_offset(
+                bi, self.dims, self.ndim, out_dims_l, nd - 2
+            ) * (m * k);
+            let b_off = tensor_broadcast_batch_offset(
+                bi, other.dims, other.ndim, out_dims_l, nd - 2
+            ) * (k * n);
+            let c_off = bi * (m * n);
+            tensor_bmm_one(
+                self.data as *const f64, a_off,
+                other.data as *const f64, b_off,
+                out_data, c_off,
+                m, k, n
+            );
+            bi = bi + one_v;
+        }
+        let mut out = Tensor { dims: out_dims, ndim: nd, len: out_len, data: out_data, grad: 0 as *mut f64, ctx: 0 as *mut TensorCtx };
+        let octx = (*other).ctx;
+        if self.ctx != 0 as *mut TensorCtx || octx != 0 as *mut TensorCtx {
+            out.ctx = tensor_autograd_new_node(
+                TENSOR_OP_BROADCAST_MATMUL, self.ctx, octx,
+                0 as *mut Tensor, 0 as *mut Tensor, 0 as *mut Tensor,
+                out_len, m, k, n
+            );
+            out.ctx.p1_data = self.data as *const f64;
+            out.ctx.p1_len = self.len;
+            out.ctx.p2_data = (*other).data as *const f64;
+            out.ctx.p2_len = (*other).len;
+            out.ctx.b_dims1 = self.dims;
+            out.ctx.b_ndim1 = self.ndim;
+            out.ctx.b_dims2 = (*other).dims;
+            out.ctx.b_ndim2 = (*other).ndim;
+            out.ctx.out_dims = out_dims;
+            out.ctx.out_ndim = nd;
+            out.ctx.bmm_leading1 = leading;
+            out.ctx.bmm_leading2 = leading;
+            out.ctx.bmm_leading_out = leading;
+        }
+        return out;
+    }
+
+    //----- CONV2D 方法 ----------------------------------------------------------
+
+    /// 直接卷积（不做 im2col）。
+    /// self 是 input[N,C,H,W]，weight 是 [OC,IC,KH,KW]，bias 是 [OC]。
+    /// 返回 [N, OC, OH, OW]，OH = (H + 2*pad_h - KH)/stride_h + 1。
+    /// IC 必须等于 input.shape[1]，否则 panic。
+    pub fn conv2d(self, weight: *const Tensor, bias: *const Tensor,
+                  stride_h: usize, stride_w: usize,
+                  pad_h: usize, pad_w: usize) -> Tensor {
+        // 校验 input 4-D
+        if self.ndim != 4 { panic("tensor::conv2d: input must be 4-D [N,C,H,W]"); }
+        let n = self.dims[0];
+        let c = self.dims[1];
+        let h = self.dims[2];
+        let w = self.dims[3];
+        // 校验 weight 4-D
+        if weight.ndim != 4 { panic("tensor::conv2d: weight must be 4-D [OC,IC,KH,KW]"); }
+        let oc = weight.dims[0];
+        let ic = weight.dims[1];
+        let kh = weight.dims[2];
+        let kw = weight.dims[3];
+        if c != ic { panic("tensor::conv2d: input channels != weight IC"); }
+        // 校验 bias [OC]
+        if bias.ndim != 1 || bias.dims[0] != oc {
+            panic("tensor::conv2d: bias shape must be [OC]");
+        }
+        let oh = (h + 2 * pad_h - kh) / stride_h + 1;
+        let ow = (w + 2 * pad_w - kw) / stride_w + 1;
+        // 分配输出
+        let out_dims: [usize; 4] = [n, oc, oh, ow];
+        let out_ndim: usize = 4;
+        let out_len = tensor_numel(out_dims, out_ndim);
+        let out_data = zr_alloc(out_len * 8, 8) as *mut f64;
+        if out_data == 0 as *mut f64 { panic("tensor: out of memory"); }
+        // 逐元素计算
+        let one_v: usize = 1;
+        let mut ni: usize = 0;
+        while ni < n {
+            let mut oci: usize = 0;
+            while oci < oc {
+                let mut ohi: usize = 0;
+                while ohi < oh {
+                    let mut owi: usize = 0;
+                    while owi < ow {
+                        let val = tensor_conv2d_compute_one(
+                            self.data as *const f64,
+                            weight.data as *const f64,
+                            bias.data as *const f64,
+                            ni, oci, ohi, owi,
+                            stride_h, stride_w, pad_h, pad_w,
+                            n, c, h, w, ic, oc, kh, kw
+                        );
+                        let out_idx = ((ni * oc + oci) * oh + ohi) * ow + owi;
+                        out_data[out_idx] = val;
+                        owi = owi + one_v;
+                    }
+                    ohi = ohi + one_v;
+                }
+                oci = oci + one_v;
+            }
+            ni = ni + one_v;
+        }
+        let mut out = Tensor { dims: out_dims, ndim: out_ndim, len: out_len, data: out_data, grad: 0 as *mut f64, ctx: 0 as *mut TensorCtx };
+        let wctx = (*weight).ctx;
+        let bctx = self.ctx;
+        if bctx != 0 as *mut TensorCtx || wctx != 0 as *mut TensorCtx {
+            out.ctx = tensor_autograd_new_node(
+                TENSOR_OP_CONV2D, bctx, wctx,
+                0 as *mut Tensor, 0 as *mut Tensor, 0 as *mut Tensor,
+                out_len, 0, 0, 0
+            );
+            out.ctx.p1_data = self.data as *const f64;
+            out.ctx.p1_len = self.len;
+            out.ctx.p2_data = (*weight).data as *const f64;
+            out.ctx.p2_len = (*weight).len;
+            out.ctx.c2d_stride_h = stride_h;
+            out.ctx.c2d_stride_w = stride_w;
+            out.ctx.c2d_pad_h = pad_h;
+            out.ctx.c2d_pad_w = pad_w;
+            out.ctx.c2d_ic = ic;
+            out.ctx.c2d_oc = oc;
+            out.ctx.c2d_kh = kh;
+            out.ctx.c2d_kw = kw;
+            out.ctx.c2d_oh = oh;
+            out.ctx.c2d_ow = ow;
+            out.ctx.c2d_n = n;
+            out.ctx.c2d_h = h;
+            out.ctx.c2d_w = w;
+            out.ctx.c2d_bias_data = bias.data as *const f64;
+            out.ctx.c2d_bias_len = bias.len;
+        }
+        return out;
+    }
+
+    //----- AUTOGRAD 方法 --------------------------------------------------------
+
+    /// 所有元素求和，返回标量 Tensor（shape=[1,1,1,1], ndim=0）。带 fwd 记录。
+    pub fn sum_tensor(self) -> Tensor {
+        let mut s: f64 = 0.0;
+        let mut i: usize = 0;
+        while i < self.len {
+            s = s + self.data[i];
+            i = i + 1;
+        }
+        let mut out = Tensor::full([1, 1, 1, 1], 0, s);
+        if self.ctx != 0 as *mut TensorCtx {
+            out.ctx = tensor_autograd_new_node(
+                TENSOR_OP_SUM, self.ctx,
+                0 as *mut TensorCtx,
+                0 as *mut Tensor, 0 as *mut Tensor,
+                0 as *mut Tensor,
+                1, 0, 0, 0
+            );
+            out.ctx.p1_data = self.data as *const f64;
+            out.ctx.p1_len = self.len;
+        }
+        return out;
+    }
+
+    /// 把 self 设为 autograd 叶子节点（分配 ctx 和 grad 缓冲区）。
+    pub fn track_inplace(self: &mut Tensor) {
+        if self.ctx != 0 as *mut TensorCtx { return; }
+        self.ctx = tensor_autograd_new_node(
+            TENSOR_OP_LEAF,
+            0 as *mut TensorCtx,
+            0 as *mut TensorCtx,
+            0 as *mut Tensor,
+            0 as *mut Tensor,
+            0 as *mut Tensor,
+            self.len, 0, 0, 0
+        );
+        self.grad = self.ctx.grad;
+    }
+
+    /// 从本 Tensor 出发，反向传播计算梯度。调用前需本 Tensor 有 ctx。
+    pub fn backward(self) {
+        if self.ctx == 0 as *mut TensorCtx {
+            panic("tensor::backward: tensor has no ctx (call track_inplace first)");
+        }
+        let mut post: [usize; 512] = [0; 512];
+        let count = tensor_autograd_postorder(self.ctx, &mut post as *mut [usize; 512]);
+        if count == 0 { return; }
+        let mut order: [usize; 512] = [0; 512];
+        tensor_autograd_reverse(&post as *const [usize; 512], count, &mut order as *mut [usize; 512]);
+        // 清零并分配所有节点 grad
+        let mut i: usize = 0;
+        while i < count {
+            let node = order[i] as *mut TensorCtx;
+            if node.grad == 0 as *mut f64 {
+                node.grad = tensor_autograd_alloc_grad(node.tensor_len);
+            } else {
+                tensor_autograd_zero_grad(node.grad, node.tensor_len);
+            }
+            i = i + 1;
+        }
+        // root 的 dy 设为全 1
+        let root = order[0] as *mut TensorCtx;
+        let mut j2: usize = 0;
+        while j2 < root.tensor_len {
+            root.grad[j2] = 1.0;
+            j2 = j2 + 1;
+        }
+        // 逐节点传播 —— MUL 内联是临时 workaround（ZR 对 f64 + 多层调用链有已知缺陷）
+        let mut k: usize = 0;
+        while k < count {
+            let node = order[k] as *mut TensorCtx;
+            let op = node.op;
+            if op == TENSOR_OP_LEAF {
+                // LEAF: 无子节点，跳过
+            } else if op == TENSOR_OP_ADD {
+                tensor_autograd_ensure_parent_grad(node);
+                tensor_autograd_propagate_add(node);
+            } else if op == TENSOR_OP_MUL {
+                tensor_autograd_ensure_parent_grad(node);
+                tensor_autograd_propagate_mul(node);
+            } else if op == TENSOR_OP_RELU {
+                tensor_autograd_ensure_parent_grad(node);
+                tensor_autograd_propagate_relu(node);
+            } else if op == TENSOR_OP_SUM {
+                tensor_autograd_ensure_parent_grad(node);
+                tensor_autograd_propagate_sum(node);
+            } else if op == TENSOR_OP_MATMUL {
+                tensor_autograd_ensure_parent_grad(node);
+                tensor_autograd_propagate_matmul(node);
+            } else if op == TENSOR_OP_CONV2D {
+                tensor_autograd_ensure_parent_grad(node);
+                tensor_autograd_propagate_conv2d(node);
+            } else if op == TENSOR_OP_BROADCAST_ADD {
+                tensor_autograd_ensure_parent_grad(node);
+                tensor_autograd_propagate_broadcast_add(node);
+            } else if op == TENSOR_OP_BROADCAST_MUL {
+                tensor_autograd_ensure_parent_grad(node);
+                tensor_autograd_propagate_broadcast_mul(node);
+            } else if op == TENSOR_OP_BROADCAST_MATMUL {
+                tensor_autograd_ensure_parent_grad(node);
+                tensor_autograd_propagate_broadcast_matmul(node);
+            }
+            k = k + 1;
+        }
+    }
+
+    /// 把从本 Tensor 出发可达的所有 ctx 节点的 grad 清零。
+    pub fn zero_grad(self) {
+        if self.ctx == 0 as *mut TensorCtx { return; }
+        let mut post: [usize; 512] = [0; 512];
+        let count = tensor_autograd_postorder(self.ctx, &mut post as *mut [usize; 512]);
+        let mut i: usize = 0;
+        while i < count {
+            let node = post[i] as *mut TensorCtx;
+            if node.grad != 0 as *mut f64 {
+                tensor_autograd_zero_grad(node.grad, node.tensor_len);
+            }
+            i = i + 1;
+        }
+    }
+
+    //----- GPU STUB 方法 --------------------------------------------------------
+
+    /// 把张量搬到 GPU（当前为 stub，直接 panic）。
+    pub fn gpu_to(self) -> GpuHandle {
+        panic("tensor::gpu_to: not implemented (stub: future CUDA/Metal backend)");
+        // unreachable
+        GpuHandle { ptr: 0 as *mut void }
+    }
+}
+
+//----- 内部辅助（模块前缀避免扁平符号表撞名）----------------------------------
+
+/// 把维数限制在 [0, 4] 并规范成 `usize`。
+fn tensor_rank(ndim: usize) -> usize {
+    if ndim > TENSOR_MAX_DIMS { return TENSOR_MAX_DIMS; }
+    return ndim;
+}
+
+/// 把 `ndim` 之外的维长度规范成 1。
+fn tensor_dims4(dims: [usize; 4], ndim: usize) -> [usize; 4] {
+    let r = tensor_rank(ndim);
+    let mut d: [usize; 4] = [1, 1, 1, 1];
+    let mut i: usize = 0;
+    while i < r {
+        d[i] = dims[i];
+        i = i + 1;
+    }
+    return d;
+}
+
+/// 元素总数（`dims` 的前 `ndim` 项相乘）。
+fn tensor_numel(dims: [usize; 4], ndim: usize) -> usize {
+    let r = tensor_rank(ndim);
+    let mut n: usize = 1;
+    let mut i: usize = 0;
+    while i < r {
+        n = n * dims[i];
+        i = i + 1;
+    }
+    return n;
+}
+
+fn tensor_require_same_len(a: usize, b: usize, op: str) {
+    if a != b {
+        panic("tensor: element count mismatch in elementwise op");
+    }
+}
+
+//=============================================================================
+// BROADCAST — numpy 风格广播
+//=============================================================================
+
+/// 计算两个张量广播后的 dims 数组（numpy 规则）。
+/// 从最后一维开始对齐，较大的 dim 放后面，1 自动广播。
+fn tensor_broadcast_compute(
+    a_dims: [usize; 4], a_ndim: usize,
+    b_dims: [usize; 4], b_ndim: usize
+) -> [usize; 4] {
+    let max_r = if a_ndim > b_ndim { a_ndim } else { b_ndim };
+    if max_r > 4 { panic("tensor::broadcast: ndim too large"); }
+    let mut out: [usize; 4] = [1, 1, 1, 1];
+    let mut i: usize = 0;
+    while i < max_r {
+        let a_idx = a_ndim - 1 - i;
+        let b_idx = b_ndim - 1 - i;
+        let a_one: usize = 1;
+        let b_one: usize = 1;
+        let a_sz = if a_idx < a_ndim { a_dims[a_idx] } else { a_one };
+        let b_sz = if b_idx < b_ndim { b_dims[b_idx] } else { b_one };
+        if a_sz == b_sz {
+            out[max_r - 1 - i] = a_sz;
+        } else if a_sz == 1 {
+            out[max_r - 1 - i] = b_sz;
+        } else if b_sz == 1 {
+            out[max_r - 1 - i] = a_sz;
+        } else {
+            panic("tensor::broadcast: incompatible shapes");
+        }
+        i = i + 1;
+    }
+    return out;
+}
+
+/// 把扁平目标索引拆成目标张量的多维坐标（行主序）。
+fn tensor_broadcast_unravel(
+    idx: usize,
+    dims: [usize; 4],
+    ndim: usize
+) -> [usize; 4] {
+    let mut coords: [usize; 4] = [0, 0, 0, 0];
+    let mut rem = idx;
+    let mut i = ndim;
+    while i > 0 {
+        i = i - 1;
+        coords[i] = rem % dims[i];
+        rem = rem / dims[i];
+    }
+    return coords;
+}
+
+/// 把多维坐标压成扁平索引（行主序）。
+fn tensor_broadcast_ravel(
+    coords: [usize; 4],
+    dims: [usize; 4],
+    ndim: usize
+) -> usize {
+    let mut idx: usize = 0;
+    let mut i: usize = 0;
+    while i < ndim {
+        idx = idx * dims[i] + coords[i];
+        i = i + 1;
+    }
+    return idx;
+}
+
+/// 根据目标扁平索引，算出源张量中对应的扁平索引（处理广播的 1→N 复制）。
+fn tensor_broadcast_map_idx(
+    target_idx: usize,
+    target_dims: [usize; 4], target_ndim: usize,
+    src_dims: [usize; 4], src_ndim: usize
+) -> usize {
+    let coords = tensor_broadcast_unravel(target_idx, target_dims, target_ndim);
+    let mut src_coords: [usize; 4] = [0, 0, 0, 0];
+    let max_r = if target_ndim > src_ndim { target_ndim } else { src_ndim };
+    let mut i: usize = 0;
+    while i < max_r {
+        let t_axis = max_r - 1 - i;
+        let t_idx = target_ndim - 1 - i;
+        let s_idx = src_ndim - 1 - i;
+        let t_one: usize = 1;
+        let s_one: usize = 1;
+        let t_sz = if t_idx < target_ndim { target_dims[t_idx] } else { t_one };
+        let s_sz = if s_idx < src_ndim { src_dims[s_idx] } else { s_one };
+        let one_v: usize = 1;
+        if s_sz == one_v {
+            src_coords[t_axis] = 0;
+        } else {
+            src_coords[t_axis] = coords[t_axis];
+        }
+        i = i + 1;
+    }
+    return tensor_broadcast_ravel(src_coords, src_dims, src_ndim);
+}
+
+/// 把源数据按 target_dims/target_ndim 广播复制到新缓冲区。
+fn tensor_broadcast_copy(
+    src: *const f64,
+    src_dims: [usize; 4], src_ndim: usize,
+    target_dims: [usize; 4], target_ndim: usize
+) -> *mut f64 {
+    let n = tensor_numel(target_dims, target_ndim);
+    let dst = zr_alloc(n * 8, 8) as *mut f64;
+    if dst == 0 as *mut f64 { panic("tensor: out of memory"); }
+    let mut i: usize = 0;
+    while i < n {
+        let si = tensor_broadcast_map_idx(i, target_dims, target_ndim, src_dims, src_ndim);
+        dst[i] = src[si];
+        i = i + 1;
+    }
+    return dst;
+}
+
+//=============================================================================
+// CONV2D — 直接卷积实现（不做 im2col）
+//=============================================================================
+
+/// 从 input[N,C,H,W] 里按 (n,c,h,w) 取元素，越界返回 0（padding 用）。
+fn tensor_conv2d_input_at(
+    data: *const f64,
+    n: usize, c: usize, h: usize, w: usize,
+    N: usize, C: usize, H: usize, W: usize
+) -> f64 {
+    if n >= N || c >= C || h >= H || w >= W { return 0.0; }
+    return data[((n * C + c) * H + h) * W + w];
+}
+
+/// 从 weight[OC,IC,KH,KW] 取元素。
+fn tensor_conv2d_weight_at(
+    data: *const f64,
+    oc: usize, ic: usize, kh: usize, kw: usize,
+    OC: usize, IC: usize, KH: usize, KW: usize
+) -> f64 {
+    return data[((oc * IC + ic) * KH + kh) * KW + kw];
+}
+
+/// 计算 conv2d 输出张量一个 (n, oc, oh, ow) 位置的值。
+fn tensor_conv2d_compute_one(
+    input_data: *const f64,
+    weight_data: *const f64,
+    bias_data: *const f64,
+    n: usize, oc: usize, oh: usize, ow: usize,
+    stride_h: usize, stride_w: usize,
+    pad_h: usize, pad_w: usize,
+    N: usize, C: usize, H: usize, W: usize,
+    IC: usize, OC: usize, KH: usize, KW: usize
+) -> f64 {
+    let one_v: usize = 1;
+    let mut acc = bias_data[oc];
+    let mut ic: usize = 0;
+    while ic < IC {
+        let mut kh: usize = 0;
+        while kh < KH {
+            let mut kw: usize = 0;
+            while kw < KW {
+                let ih = oh * stride_h + kh - pad_h;
+                let iw = ow * stride_w + kw - pad_w;
+                let x = tensor_conv2d_input_at(
+                    input_data, n, ic, ih, iw, N, C, H, W
+                );
+                let wt = tensor_conv2d_weight_at(
+                    weight_data, oc, ic, kh, kw, OC, IC, KH, KW
+                );
+                acc = acc + x * wt;
+                kw = kw + one_v;
+            }
+            kh = kh + one_v;
+        }
+        ic = ic + one_v;
+    }
+    return acc;
+}
+
+//=============================================================================
+// BMM — 批量矩阵乘辅助
+//=============================================================================
+
+/// 对单个 batch 做 M×K @ K×N → M×N 的 matmul。
+fn tensor_bmm_one(
+    a_data: *const f64, a_off: usize,
+    b_data: *const f64, b_off: usize,
+    c_data: *mut f64, c_off: usize,
+    M: usize, K: usize, N: usize
+) {
+    let one_v: usize = 1;
+    let mut i: usize = 0;
+    while i < M {
+        let mut j: usize = 0;
+        while j < N {
+            let mut acc: f64 = 0.0;
+            let mut p: usize = 0;
+            while p < K {
+                acc = acc + a_data[a_off + i * K + p] * b_data[b_off + p * N + j];
+                p = p + one_v;
+            }
+            c_data[c_off + i * N + j] = acc;
+            j = j + one_v;
+        }
+        i = i + one_v;
+    }
+}
+
+/// 从 coords[0..n-1] 得到 flat 索引（dims 是完整 4 维数组）。
+fn tensor_ravel_coords(coords: [usize; 4], dims: [usize; 4], n: usize) -> usize {
+    let mut idx: usize = 0;
+    let mut stride: usize = 1;
+    let i = n;
+    let mut di: usize = 0;
+    while di < n {
+        let axis = i - 1 - di;
+        idx = idx + coords[axis] * stride;
+        stride = stride * dims[axis];
+        di = di + 1;
+    }
+    return idx;
+}
+
+/// 把一个 flat 索引 bi 在 target_leading 下转成坐标，然后映射回 src_leading。
+/// src 和 target 的 leading 维数都是 lead_ndim。
+fn tensor_broadcast_map_leading_idx(
+    bi: usize,
+    target_leading: [usize; 4], lead_ndim: usize,
+    src_leading: [usize; 4], src_ndim: usize
+) -> usize {
+    let mut coords: [usize; 4] = [0, 0, 0, 0];
+    let mut rem = bi;
+    let one_v: usize = 1;
+    let i = lead_ndim;
+    let mut di: usize = 0;
+    while di < lead_ndim {
+        let axis = i - 1 - di;
+        let sz = target_leading[axis];
+        coords[axis] = rem % sz;
+        rem = rem / sz;
+        di = di + one_v;
+    }
+    // 映射到 src 坐标
+    let mut s_coords: [usize; 4] = [0, 0, 0, 0];
+    let max_r = if lead_ndim > src_ndim { lead_ndim } else { src_ndim };
+    let mut ri: usize = 0;
+    while ri < max_r {
+        let t_axis = max_r - 1 - ri;
+        let s_axis = src_ndim - 1 - ri;
+        let t_sz = if t_axis < lead_ndim { target_leading[t_axis] } else { one_v };
+        let s_sz = if s_axis < src_ndim { src_leading[s_axis] } else { one_v };
+        if s_sz == one_v {
+            s_coords[s_axis] = 0;
+        } else {
+            s_coords[s_axis] = coords[t_axis];
+        }
+        ri = ri + one_v;
+    }
+    return tensor_ravel_coords(s_coords, src_leading, src_ndim);
+}
+
+/// 计算前导维（去掉最后两维）的广播结果。
+fn tensor_broadcast_leading(
+    a_dims: [usize; 4], a_ndim: usize,
+    b_dims: [usize; 4], b_ndim: usize,
+    full_ndim: usize
+) -> [usize; 4] {
+    let lead_ndim = full_ndim - 2;
+    let mut a_l: [usize; 4] = [1, 1, 1, 1];
+    let mut b_l: [usize; 4] = [1, 1, 1, 1];
+    let i = full_ndim;
+    let mut ai: usize = 0;
+    while ai < lead_ndim {
+        a_l[ai] = a_dims[ai];
+        b_l[ai] = b_dims[ai];
+        ai = ai + 1;
+    }
+    return tensor_broadcast_compute(a_l, lead_ndim, b_l, lead_ndim);
+}
+
+/// 给定 batch index bi，返回 src tensor 中该 batch 的起始 flat 索引（不带乘 M*K 因子）。
+fn tensor_broadcast_batch_offset(
+    bi: usize,
+    src_dims: [usize; 4], src_ndim: usize,
+    target_leading: [usize; 4], lead_ndim: usize
+) -> usize {
+    return tensor_broadcast_map_leading_idx(
+        bi, target_leading, lead_ndim, src_dims, src_ndim - 2
+    );
+}
+
+//=============================================================================
+// AUTOGRAD — 计算图与反向传播辅助函数
+//=============================================================================
+
+/// 拓扑排序后序 DFS 最大节点数。
+pub const TENSOR_AUTOGRAD_MAX_NODES: usize = 512;
+
+/// 分配一个全零的 f64 缓冲区（长度 = len）。
+fn tensor_autograd_alloc_grad(len: usize) -> *mut f64 {
+    let g = zr_alloc(len * 8, 8) as *mut f64;
+    if g == 0 as *mut f64 { panic("tensor: out of memory"); }
+    let mut i: usize = 0;
+    while i < len {
+        g[i] = 0.0;
+        i = i + 1;
+    }
+    return g;
+}
+
+/// 把一个 grad 缓冲区清零。
+fn tensor_autograd_zero_grad(g: *mut f64, len: usize) {
+    let mut i: usize = 0;
+    while i < len {
+        g[i] = 0.0;
+        i = i + 1;
+    }
+}
+
+/// 递归后序 DFS：把结果写入 out（由调用者分配），返回元素个数。
+/// 使用递归避免 ZR 对大栈数组的处理缺陷。
+fn tensor_autograd_postorder_rec(
+    node: *mut TensorCtx,
+    out: *mut [usize; 512],
+    idx: usize
+) -> usize {
+    let mut i = idx;
+    if node.parent1 != 0 as *mut TensorCtx {
+        i = tensor_autograd_postorder_rec(node.parent1, out, i);
+    }
+    if node.parent2 != 0 as *mut TensorCtx {
+        i = tensor_autograd_postorder_rec(node.parent2, out, i);
+    }
+    (*out)[i] = node as usize;
+    return i + 1;
+}
+
+/// 迭代后序 DFS 的包装入口。
+fn tensor_autograd_postorder(
+    root: *mut TensorCtx,
+    out: *mut [usize; 512]
+) -> usize {
+    return tensor_autograd_postorder_rec(root, out, 0);
+}
+
+/// 把后序序列反转：后序是 leaf→root，反向遍历需要 root→leaf。
+/// 输入在 `in_`，输出在 `out`（由调用者分配，长度 >= count）。
+/// 均为 usize 数组以绕过 ZR 对指针数组的缺陷。
+fn tensor_autograd_reverse(
+    in_: *const [usize; 512],
+    count: usize,
+    out: *mut [usize; 512]
+) {
+    let mut i: usize = 0;
+    while i < count {
+        (*out)[i] = (*in_)[count - 1 - i];
+        i = i + 1;
+    }
+}
+
+//----- backward 核心：每个 op 把 dy 传播给父节点 ---------------------------------
+
+/// ADD: dA += dy, dB += dy
+fn tensor_autograd_bwd_add(
+    dy: *const f64,
+    p1_grad: *mut f64,
+    p2_grad: *mut f64,
+    p1_len: usize,
+    p2_len: usize
+) {
+    let mut i: usize = 0;
+    let p1_one: usize = 1;
+    while i < p1_len {
+        let di = if p1_len == p2_len { i } else { i % p2_len };
+        p1_grad[i] = p1_grad[i] + dy[i];
+        p2_grad[di] = p2_grad[di] + dy[i];
+        i = i + p1_one;
+    }
+}
+
+/// MUL: dA += dy * B, dB += dy * A
+fn tensor_autograd_bwd_mul(
+    dy: *const f64,
+    a_data: *const f64, b_data: *const f64,
+    a_grad: *mut f64, b_grad: *mut f64,
+    a_len: usize, b_len: usize,
+    out_len: usize
+) {
+    let mut i: usize = 0;
+    let one_v: usize = 1;
+    while i < out_len {
+        let ai = if a_len == out_len { i } else { i % a_len };
+        let bi = if b_len == out_len { i } else { i % b_len };
+        a_grad[ai] = a_grad[ai] + dy[i] * b_data[bi];
+        b_grad[bi] = b_grad[bi] + dy[i] * a_data[ai];
+        i = i + one_v;
+    }
+}
+
+/// RELU: dx += dy * (x > 0 ? 1 : 0)
+fn tensor_autograd_bwd_relu(
+    dy: *const f64,
+    x_data: *const f64,
+    x_grad: *mut f64,
+    x_len: usize
+) {
+    let mut i: usize = 0;
+    let one_v: usize = 1;
+    while i < x_len {
+        if x_data[i] > 0.0 {
+            x_grad[i] = x_grad[i] + dy[i];
+        }
+        i = i + one_v;
+    }
+}
+
+/// SUM: dy 是标量（len=1），dx[i] += dy[0]
+fn tensor_autograd_bwd_sum(
+    dy: *const f64,
+    x_grad: *mut f64,
+    x_len: usize
+) {
+    let mut i: usize = 0;
+    let one_v: usize = 1;
+    let dv = dy[0];
+    while i < x_len {
+        x_grad[i] = x_grad[i] + dv;
+        i = i + one_v;
+    }
+}
+
+/// MATMUL: C(M,N) = A(M,K) @ B(K,N)
+/// dA += dC @ B^T, dB += A^T @ dC
+fn tensor_autograd_bwd_matmul(
+    dy: *const f64,        // dC, M*N
+    a_data: *const f64,    // A, M*K
+    b_data: *const f64,    // B, K*N
+    a_grad: *mut f64,      // dA, M*K
+    b_grad: *mut f64,      // dB, K*N
+    M: usize, K: usize, N: usize
+) {
+    let mut i: usize = 0;
+    let one_v: usize = 1;
+    // dA[m,k] += sum_n(dy[m,n] * b[k,n])
+    while i < M {
+        let mut k: usize = 0;
+        while k < K {
+            let mut n: usize = 0;
+            let mut acc: f64 = 0.0;
+            while n < N {
+                acc = acc + dy[i * N + n] * b_data[k * N + n];
+                n = n + one_v;
+            }
+            a_grad[i * K + k] = a_grad[i * K + k] + acc;
+            k = k + one_v;
+        }
+        i = i + one_v;
+    }
+    // dB[k,n] += sum_m(a[m,k] * dy[m,n])
+    let mut k2: usize = 0;
+    while k2 < K {
+        let mut n2: usize = 0;
+        while n2 < N {
+            let mut m: usize = 0;
+            let mut acc2: f64 = 0.0;
+            while m < M {
+                acc2 = acc2 + a_data[m * K + k2] * dy[m * N + n2];
+                m = m + one_v;
+            }
+            b_grad[k2 * N + n2] = b_grad[k2 * N + n2] + acc2;
+            n2 = n2 + one_v;
+        }
+        k2 = k2 + one_v;
+    }
+}
+
+//----- ctx 创建辅助 ------------------------------------------------------------
+
+/// 分配一个新的 TensorCtx（全字段初始化）。
+fn tensor_autograd_new_node(
+    op: u8,
+    parent1: *mut TensorCtx,
+    parent2: *mut TensorCtx,
+    tensor_ptr: *mut Tensor,
+    parent1_tensor: *mut Tensor,
+    parent2_tensor: *mut Tensor,
+    tensor_len: usize,
+    mm_m: usize,
+    mm_k: usize,
+    mm_n: usize
+) -> *mut TensorCtx {
+    // TensorCtx 已扩展到 ~400 字节（含 conv2d / broadcast / bmm 专用字段）；
+    // 这里一次性分配 512 字节，避免字段写入溢出相邻堆块。
+    let total: usize = 512;
+    let p = zr_alloc(total, 8) as *mut TensorCtx;
+    if p == 0 as *mut TensorCtx { panic("tensor: out of memory"); }
+    p.op = op;
+    p.parent1 = parent1;
+    p.parent2 = parent2;
+    p.tensor_len = tensor_len;
+    p.grad = tensor_autograd_alloc_grad(tensor_len);
+    p.tensor_ptr = tensor_ptr;
+    p.parent1_tensor = parent1_tensor;
+    p.parent2_tensor = parent2_tensor;
+    p.mm_m = mm_m;
+    p.mm_k = mm_k;
+    p.mm_n = mm_n;
+    p.p1_data = 0 as *const f64;
+    p.p2_data = 0 as *const f64;
+    p.p1_len = 0;
+    p.p2_len = 0;
+    p.c2d_stride_h = 0;
+    p.c2d_stride_w = 0;
+    p.c2d_pad_h = 0;
+    p.c2d_pad_w = 0;
+    p.c2d_ic = 0;
+    p.c2d_oc = 0;
+    p.c2d_kh = 0;
+    p.c2d_kw = 0;
+    p.c2d_oh = 0;
+    p.c2d_ow = 0;
+    p.c2d_n = 0;
+    p.c2d_h = 0;
+    p.c2d_w = 0;
+    p.c2d_bias_data = 0 as *const f64;
+    p.c2d_bias_len = 0;
+    p.b_dims1 = [1, 1, 1, 1];
+    p.b_ndim1 = 0;
+    p.b_dims2 = [1, 1, 1, 1];
+    p.b_ndim2 = 0;
+    p.out_dims = [1, 1, 1, 1];
+    p.out_ndim = 0;
+    p.bmm_leading1 = 0;
+    p.bmm_leading2 = 0;
+    p.bmm_leading_out = 0;
+    return p;
+}
+
+//----- backward 分 op 传播 helper -----------------------------------------------
+
+fn tensor_autograd_propagate_add(
+    node: *mut TensorCtx
+) {
+    if node.parent1 == 0 as *mut TensorCtx || node.parent2 == 0 as *mut TensorCtx { return; }
+    tensor_autograd_bwd_add(
+        node.grad, node.parent1.grad, node.parent2.grad,
+        node.parent1.tensor_len, node.parent2.tensor_len
+    );
+}
+
+fn tensor_autograd_propagate_mul(
+    node: *mut TensorCtx
+) {
+    if node.parent1 == 0 as *mut TensorCtx || node.parent2 == 0 as *mut TensorCtx { return; }
+    let a_data = if node.p1_data != 0 as *const f64 { node.p1_data } else { 0 as *const f64 };
+    let b_data = if node.p2_data != 0 as *const f64 { node.p2_data } else { 0 as *const f64 };
+    let a_len = if node.p1_len != 0 { node.p1_len } else { node.parent1.tensor_len };
+    let b_len = if node.p2_len != 0 { node.p2_len } else { node.parent2.tensor_len };
+    tensor_autograd_bwd_mul(
+        node.grad, a_data, b_data,
+        node.parent1.grad, node.parent2.grad,
+        a_len, b_len,
+        node.tensor_len
+    );
+}
+
+fn tensor_autograd_propagate_relu(
+    node: *mut TensorCtx
+) {
+    if node.parent1 == 0 as *mut TensorCtx { return; }
+    let x_data = if node.p1_data != 0 as *const f64 { node.p1_data } else { 0 as *const f64 };
+    let x_len = if node.p1_len != 0 { node.p1_len } else { node.parent1.tensor_len };
+    tensor_autograd_bwd_relu(
+        node.grad, x_data, node.parent1.grad,
+        x_len
+    );
+}
+
+fn tensor_autograd_propagate_sum(
+    node: *mut TensorCtx
+) {
+    if node.parent1 == 0 as *mut TensorCtx { return; }
+    tensor_autograd_bwd_sum(
+        node.grad, node.parent1.grad,
+        node.parent1.tensor_len
+    );
+}
+
+fn tensor_autograd_propagate_matmul(
+    node: *mut TensorCtx
+) {
+    if node.parent1 == 0 as *mut TensorCtx || node.parent2 == 0 as *mut TensorCtx { return; }
+    let a_data = if node.p1_data != 0 as *const f64 { node.p1_data } else { 0 as *const f64 };
+    let b_data = if node.p2_data != 0 as *const f64 { node.p2_data } else { 0 as *const f64 };
+    tensor_autograd_bwd_matmul(
+        node.grad, a_data, b_data,
+        node.parent1.grad, node.parent2.grad,
+        node.mm_m, node.mm_k, node.mm_n
+    );
+}
+
+//=============================================================================
+// CONV2D backward
+//=============================================================================
+
+/// conv2d weight grad: dW[oc,ic,kh,kw] = sum_{n,oh,ow} dy[n,oc,oh,ow] * X[n,ic,oh*stride_h+kh-pad_h, ow*stride_w+kw-pad_w]
+fn tensor_autograd_bwd_conv2d_weight(
+    dy: *const f64,
+    x_data: *const f64,
+    dw_grad: *mut f64,
+    stride_h: usize, stride_w: usize,
+    pad_h: usize, pad_w: usize,
+    N: usize, C: usize, H: usize, W: usize,
+    IC: usize, OC: usize, KH: usize, KW: usize,
+    OH: usize, OW: usize
+) {
+    let one_v: usize = 1;
+    let mut oc: usize = 0;
+    while oc < OC {
+        let mut ic: usize = 0;
+        while ic < IC {
+            let mut kh: usize = 0;
+            while kh < KH {
+                let mut kw: usize = 0;
+                while kw < KW {
+                    let mut acc: f64 = 0.0;
+                    let mut ni: usize = 0;
+                    while ni < N {
+                        let mut ohi: usize = 0;
+                        while ohi < OH {
+                            let mut owi: usize = 0;
+                            while owi < OW {
+                                let ih = ohi * stride_h + kh - pad_h;
+                                let iw = owi * stride_w + kw - pad_w;
+                                let y_idx = ((ni * OC + oc) * OH + ohi) * OW + owi;
+                                let x_idx = ((ni * C + ic) * H + ih) * W + iw;
+                                let xv = if ih < H && iw < W && ih < H {
+                                    if ih >= 0 && iw >= 0 { x_data[x_idx] } else { 0.0 }
+                                } else { 0.0 };
+                                acc = acc + dy[y_idx] * xv;
+                                owi = owi + one_v;
+                            }
+                            ohi = ohi + one_v;
+                        }
+                        ni = ni + one_v;
+                    }
+                    let w_idx = ((oc * IC + ic) * KH + kh) * KW + kw;
+                    dw_grad[w_idx] = dw_grad[w_idx] + acc;
+                    kw = kw + one_v;
+                }
+                kh = kh + one_v;
+            }
+            ic = ic + one_v;
+        }
+        oc = oc + one_v;
+    }
+}
+
+/// conv2d input grad: dX[n,ic,h,w] = sum_{oc,kh,kw} dy[n,oc,(h+pad_h-kh)/stride_h, (w+pad_w-kw)/stride_w] * W[oc,ic,kh,kw]
+fn tensor_autograd_bwd_conv2d_input(
+    dy: *const f64,
+    w_data: *const f64,
+    dx_grad: *mut f64,
+    stride_h: usize, stride_w: usize,
+    pad_h: usize, pad_w: usize,
+    N: usize, C: usize, H: usize, W: usize,
+    IC: usize, OC: usize, KH: usize, KW: usize,
+    OH: usize, OW: usize
+) {
+    let one_v: usize = 1;
+    let mut ni: usize = 0;
+    while ni < N {
+        let mut ic: usize = 0;
+        while ic < IC {
+            let mut h: usize = 0;
+            while h < H {
+                let mut w: usize = 0;
+                while w < W {
+                    let mut acc: f64 = 0.0;
+                    let mut oc: usize = 0;
+                    while oc < OC {
+                        let mut kh: usize = 0;
+                        while kh < KH {
+                            let mut kw: usize = 0;
+                            while kw < KW {
+                                // 找到 oh,ow 使得 h = oh*stride_h + kh - pad_h
+                                // 即 oh = (h + pad_h - kh) / stride_h
+                                let oh_num: usize = h + pad_h;
+                                if kh > oh_num { kw = kw + one_v; continue; }
+                                if (oh_num - kh) % stride_h != 0 { kw = kw + one_v; continue; }
+                                let ohi = (oh_num - kh) / stride_h;
+                                if ohi >= OH { kw = kw + one_v; continue; }
+                                let ow_num: usize = w + pad_w;
+                                if kw > ow_num { kw = kw + one_v; continue; }
+                                if (ow_num - kw) % stride_w != 0 { kw = kw + one_v; continue; }
+                                let owi = (ow_num - kw) / stride_w;
+                                if owi >= OW { kw = kw + one_v; continue; }
+                                let y_idx = ((ni * OC + oc) * OH + ohi) * OW + owi;
+                                let w_idx = ((oc * IC + ic) * KH + kh) * KW + kw;
+                                acc = acc + dy[y_idx] * w_data[w_idx];
+                                kw = kw + one_v;
+                            }
+                            kh = kh + one_v;
+                        }
+                        oc = oc + one_v;
+                    }
+                    let x_idx = ((ni * IC + ic) * H + h) * W + w;
+                    dx_grad[x_idx] = dx_grad[x_idx] + acc;
+                    w = w + one_v;
+                }
+                h = h + one_v;
+            }
+            ic = ic + one_v;
+        }
+        ni = ni + one_v;
+    }
+}
+
+/// conv2d bias grad: dbias[oc] = sum_{n,oh,ow} dy[n,oc,oh,ow]
+fn tensor_autograd_bwd_conv2d_bias(
+    dy: *const f64,
+    db_grad: *mut f64,
+    N: usize, OC: usize, OH: usize, OW: usize
+) {
+    let one_v: usize = 1;
+    let mut oc: usize = 0;
+    while oc < OC {
+        let mut acc: f64 = 0.0;
+        let mut ni: usize = 0;
+        while ni < N {
+            let mut ohi: usize = 0;
+            while ohi < OH {
+                let mut owi: usize = 0;
+                while owi < OW {
+                    let y_idx = ((ni * OC + oc) * OH + ohi) * OW + owi;
+                    acc = acc + dy[y_idx];
+                    owi = owi + one_v;
+                }
+                ohi = ohi + one_v;
+            }
+            ni = ni + one_v;
+        }
+        db_grad[oc] = db_grad[oc] + acc;
+        oc = oc + one_v;
+    }
+}
+
+fn tensor_autograd_propagate_conv2d(
+    node: *mut TensorCtx
+) {
+    if node.parent1 == 0 as *mut TensorCtx || node.parent2 == 0 as *mut TensorCtx { return; }
+    let w_data = if node.p2_data != 0 as *const f64 { node.p2_data } else { 0 as *const f64 };
+    // weight grad
+    tensor_autograd_bwd_conv2d_weight(
+        node.grad, node.p1_data, node.parent2.grad,
+        node.c2d_stride_h, node.c2d_stride_w,
+        node.c2d_pad_h, node.c2d_pad_w,
+        node.c2d_n, node.c2d_ic, node.c2d_h, node.c2d_w,
+        node.c2d_ic, node.c2d_oc, node.c2d_kh, node.c2d_kw,
+        node.c2d_oh, node.c2d_ow
+    );
+    // input grad
+    tensor_autograd_bwd_conv2d_input(
+        node.grad, w_data, node.parent1.grad,
+        node.c2d_stride_h, node.c2d_stride_w,
+        node.c2d_pad_h, node.c2d_pad_w,
+        node.c2d_n, node.c2d_ic, node.c2d_h, node.c2d_w,
+        node.c2d_ic, node.c2d_oc, node.c2d_kh, node.c2d_kw,
+        node.c2d_oh, node.c2d_ow
+    );
+}
+
+//=============================================================================
+// BROADCAST backward
+//=============================================================================
+
+/// broadcast add: 和普通 add 类似，但用 tensor_broadcast_map_idx 反向累加。
+fn tensor_autograd_bwd_broadcast_add(
+    dy: *const f64,
+    p1_grad: *mut f64, p1_dims: [usize; 4], p1_ndim: usize,
+    p2_grad: *mut f64, p2_dims: [usize; 4], p2_ndim: usize,
+    out_dims: [usize; 4], out_ndim: usize, out_len: usize
+) {
+    let one_v: usize = 1;
+    let mut i: usize = 0;
+    while i < out_len {
+        let si = tensor_broadcast_map_idx(i, out_dims, out_ndim, p1_dims, p1_ndim);
+        let oi = tensor_broadcast_map_idx(i, out_dims, out_ndim, p2_dims, p2_ndim);
+        p1_grad[si] = p1_grad[si] + dy[i];
+        p2_grad[oi] = p2_grad[oi] + dy[i];
+        i = i + one_v;
+    }
+}
+
+/// broadcast mul: dA += dy * B, dB += dy * A（用广播映射）。
+fn tensor_autograd_bwd_broadcast_mul(
+    dy: *const f64,
+    a_data: *const f64, b_data: *const f64,
+    a_grad: *mut f64, a_dims: [usize; 4], a_ndim: usize,
+    b_grad: *mut f64, b_dims: [usize; 4], b_ndim: usize,
+    out_dims: [usize; 4], out_ndim: usize, out_len: usize
+) {
+    let one_v: usize = 1;
+    let mut i: usize = 0;
+    while i < out_len {
+        let ai = tensor_broadcast_map_idx(i, out_dims, out_ndim, a_dims, a_ndim);
+        let bi = tensor_broadcast_map_idx(i, out_dims, out_ndim, b_dims, b_ndim);
+        a_grad[ai] = a_grad[ai] + dy[i] * b_data[bi];
+        b_grad[bi] = b_grad[bi] + dy[i] * a_data[ai];
+        i = i + one_v;
+    }
+}
+
+fn tensor_autograd_propagate_broadcast_add(
+    node: *mut TensorCtx
+) {
+    if node.parent1 == 0 as *mut TensorCtx || node.parent2 == 0 as *mut TensorCtx { return; }
+    tensor_autograd_bwd_broadcast_add(
+        node.grad,
+        node.parent1.grad, node.b_dims1, node.b_ndim1,
+        node.parent2.grad, node.b_dims2, node.b_ndim2,
+        node.out_dims, node.out_ndim, node.tensor_len
+    );
+}
+
+fn tensor_autograd_propagate_broadcast_mul(
+    node: *mut TensorCtx
+) {
+    if node.parent1 == 0 as *mut TensorCtx || node.parent2 == 0 as *mut TensorCtx { return; }
+    tensor_autograd_bwd_broadcast_mul(
+        node.grad,
+        node.p1_data, node.p2_data,
+        node.parent1.grad, node.b_dims1, node.b_ndim1,
+        node.parent2.grad, node.b_dims2, node.b_ndim2,
+        node.out_dims, node.out_ndim, node.tensor_len
+    );
+}
+
+//=============================================================================
+// BROADCAST_MATMUL backward
+//=============================================================================
+
+/// 对单个 batch 做 matmul backward（dA, dB）。
+fn tensor_autograd_bwd_bmm_one(
+    dy: *const f64, dy_off: usize,
+    a_data: *const f64, a_off: usize,
+    b_data: *const f64, b_off: usize,
+    da_grad: *mut f64, da_off: usize,
+    db_grad: *mut f64, db_off: usize,
+    M: usize, K: usize, N: usize
+) {
+    // dA[m,k] += sum_n(dy[m,n] * b[k,n])
+    let one_v: usize = 1;
+    let mut i: usize = 0;
+    while i < M {
+        let mut k: usize = 0;
+        while k < K {
+            let mut n: usize = 0;
+            let mut acc: f64 = 0.0;
+            while n < N {
+                acc = acc + dy[dy_off + i * N + n] * b_data[b_off + k * N + n];
+                n = n + one_v;
+            }
+            da_grad[da_off + i * K + k] = da_grad[da_off + i * K + k] + acc;
+            k = k + one_v;
+        }
+        i = i + one_v;
+    }
+    // dB[k,n] += sum_m(a[m,k] * dy[m,n])
+    let mut k2: usize = 0;
+    while k2 < K {
+        let mut n2: usize = 0;
+        while n2 < N {
+            let mut m: usize = 0;
+            let mut acc2: f64 = 0.0;
+            while m < M {
+                acc2 = acc2 + a_data[a_off + m * K + k2] * dy[dy_off + m * N + n2];
+                m = m + one_v;
+            }
+            db_grad[db_off + k2 * N + n2] = db_grad[db_off + k2 * N + n2] + acc2;
+            n2 = n2 + one_v;
+        }
+        k2 = k2 + one_v;
+    }
+}
+
+fn tensor_autograd_bwd_broadcast_matmul(
+    dy: *const f64,
+    a_data: *const f64, a_dims: [usize; 4], a_ndim: usize,
+    b_data: *const f64, b_dims: [usize; 4], b_ndim: usize,
+    da_grad: *mut f64,
+    db_grad: *mut f64,
+    out_dims: [usize; 4], out_ndim: usize,
+    M: usize, K: usize, N: usize,
+    leading: usize
+) {
+    let lead_ndim = out_ndim - 2;
+    let a_stride = M * K;
+    let b_stride = K * N;
+    let dy_stride = M * N;
+    let one_v: usize = 1;
+    let mut bi: usize = 0;
+    while bi < leading {
+        let a_batch = tensor_broadcast_map_leading_idx(
+            bi, out_dims, lead_ndim, a_dims, a_ndim - 2
+        );
+        let b_batch = tensor_broadcast_map_leading_idx(
+            bi, out_dims, lead_ndim, b_dims, b_ndim - 2
+        );
+        let a_off = a_batch * a_stride;
+        let b_off = b_batch * b_stride;
+        let dy_off = bi * dy_stride;
+        tensor_autograd_bwd_bmm_one(
+            dy, dy_off,
+            a_data, a_off, b_data, b_off,
+            da_grad, a_off, db_grad, b_off,
+            M, K, N
+        );
+        bi = bi + one_v;
+    }
+}
+
+fn tensor_autograd_propagate_broadcast_matmul(
+    node: *mut TensorCtx
+) {
+    if node.parent1 == 0 as *mut TensorCtx || node.parent2 == 0 as *mut TensorCtx { return; }
+    let nd = node.out_ndim;
+    let lead_ndim = nd - 2;
+    let leading = tensor_numel(node.out_dims, lead_ndim);
+    tensor_autograd_bwd_broadcast_matmul(
+        node.grad,
+        node.p1_data, node.b_dims1, node.b_ndim1,
+        node.p2_data, node.b_dims2, node.b_ndim2,
+        node.parent1.grad, node.parent2.grad,
+        node.out_dims, lead_ndim,
+        node.mm_m, node.mm_k, node.mm_n,
+        leading
+    );
+}
+
+/// 确保 node 的 parent 的 grad 缓冲区已分配。
+fn tensor_autograd_ensure_parent_grad(node: *mut TensorCtx) {
+    if node.parent1 != 0 as *mut TensorCtx {
+        if node.parent1.grad == 0 as *mut f64 {
+            node.parent1.grad = tensor_autograd_alloc_grad(node.parent1.tensor_len);
+        }
+    }
+    if node.parent2 != 0 as *mut TensorCtx {
+        if node.parent2.grad == 0 as *mut f64 {
+            node.parent2.grad = tensor_autograd_alloc_grad(node.parent2.tensor_len);
+        }
+    }
+}
+
+/// 对单个节点做梯度传播（根据 op 分派）。
+fn tensor_autograd_apply_bwd(node: *mut TensorCtx) {
+    let op = node.op;
+    if op == TENSOR_OP_LEAF { return; }
+    return;  // 暂时跳过所有传播
+    tensor_autograd_ensure_parent_grad(node);
+    if op == TENSOR_OP_ADD {
+        tensor_autograd_propagate_add(node);
+    } else if op == TENSOR_OP_MUL {
+        tensor_autograd_propagate_mul(node);
+    } else if op == TENSOR_OP_RELU {
+        tensor_autograd_propagate_relu(node);
+    } else if op == TENSOR_OP_SUM {
+        tensor_autograd_propagate_sum(node);
+    } else if op == TENSOR_OP_MATMUL {
+        tensor_autograd_propagate_matmul(node);
+    }
+}
+
+//=============================================================================
+// GPU STUB — 占位实现，未来接 CUDA / Metal
+//=============================================================================
+
+/// GPU 张量句柄（当前仅占位）。
+pub struct GpuHandle {
+    pub ptr: *mut void,
+}
+
+/// GPU 后端是否可用（stub：始终 false）。
+pub fn gpu_available() -> bool {
+    // stub: future CUDA/Metal backend
+    return false;
+}

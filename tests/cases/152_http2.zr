@@ -1,0 +1,236 @@
+//=============================================================================
+// 152_http2.zr — HTTP/2 的纯字节层：HPACK 编解码与帧编码
+//
+// 全部向量取自 RFC 7541 附录 C（HPACK 官方示例），不依赖网络：
+//   C.4.x 请求（默认 4096 动态表，连续请求复用动态表）
+//   C.6.x 响应（动态表上限 256，会触发淘汰）
+// 另外钉住本模块自己的编码格式（索引项 / 不索引字面量 / 帧头字节）。
+//=============================================================================
+
+use http2::{
+    HpackDecoder, h2_encode_headers, h2_encode_frame,
+    H2_HEADERS, H2_FLAG_END_HEADERS,
+};
+use http::HttpHeader;
+use string::String;
+use collections::Vec;
+use core::Result;
+
+/// 字节相等（头字段是 `str`，按指针 + 长度逐字节比）。
+fn bytes_eq(a: str, b: str) -> bool {
+    if a.len != b.len {
+        return false;
+    }
+    let mut i: usize = 0;
+    while i < a.len {
+        if a.ptr[i] != b.ptr[i] {
+            return false;
+        }
+        i = i + 1;
+    }
+    return true;
+}
+
+fn check(h: HttpHeader, name: str, value: str) -> bool {
+    if !bytes_eq(h.name, name) {
+        return false;
+    }
+    return bytes_eq(h.value, value);
+}
+
+/// 解码一个块；失败时返回空 Vec 并把 `ok` 置 false。
+fn decode_block(dec: &mut HpackDecoder, block: []const u8, ok: *mut bool) -> Vec<HttpHeader> {
+    let mut out: Vec<HttpHeader> = Vec::new();
+    match dec.decode(block) {
+        Result::Ok(v) => {
+            out = v;
+            *ok = true;
+        }
+        Result::Err(e) => {
+            *ok = false;
+        }
+    }
+    return out;
+}
+
+fn main() -> i32 {
+    //--------------------------------------------------------------------------
+    // C.4.1 第一个请求：:method GET / :scheme http / :path / / :authority
+    // 动态表写入 `:authority: www.example.com`（索引 62）。
+    //--------------------------------------------------------------------------
+    let c41: [u8; 20] = [
+        0x82, 0x86, 0x84, 0x41, 0x0f, 0x77, 0x77, 0x77, 0x2e, 0x65,
+        0x78, 0x61, 0x6d, 0x70, 0x6c, 0x65, 0x2e, 0x63, 0x6f, 0x6d,
+    ];
+    let mut dec = HpackDecoder::new();
+    let mut ok = false;
+    let h1 = decode_block(&mut dec, c41[0..20], &mut ok as *mut bool);
+    if !ok { return 1; }
+    if h1.len() != 4 { return 2; }
+    let a1 = h1.as_slice();
+    if !check(a1[0], ":method", "GET") { return 3; }
+    if !check(a1[1], ":scheme", "http") { return 4; }
+    if !check(a1[2], ":path", "/") { return 5; }
+    if !check(a1[3], ":authority", "www.example.com") { return 6; }
+
+    //--------------------------------------------------------------------------
+    // C.4.2 第二个请求：`be` = 索引 62，命中上面写进动态表的 :authority。
+    // 预期：cache-control: no-cache 在首位，其后 4 个伪头字段。
+    //--------------------------------------------------------------------------
+    let c42: [u8; 12] = [
+        0x82, 0x86, 0x84, 0xbe, 0x58, 0x86, 0xa8, 0xeb, 0x10, 0x64, 0x9c, 0xbf,
+    ];
+    let h2 = decode_block(&mut dec, c42[0..12], &mut ok as *mut bool);
+    if !ok { return 7; }
+    if h2.len() != 5 { return 8; }
+    let a2 = h2.as_slice();
+    if !check(a2[0], ":method", "GET") { return 9; }
+    if !check(a2[1], ":scheme", "http") { return 10; }
+    if !check(a2[2], ":path", "/") { return 11; }
+    if !check(a2[3], ":authority", "www.example.com") { return 12; }
+    if !check(a2[4], "cache-control", "no-cache") { return 100; }
+
+    //--------------------------------------------------------------------------
+    // C.4.3 第三个请求：:scheme https / :path /index.html / 自定义头
+    // （0x40 + 0x88 "custom-key" + 0x89 "custom-value"，两者都是 Huffman）。
+    //--------------------------------------------------------------------------
+    let c43: [u8; 24] = [
+        0x82, 0x87, 0x85, 0xbf, 0x40, 0x88, 0x25, 0xa8, 0x49, 0xe9, 0x5b, 0xa9,
+        0x7d, 0x7f, 0x89, 0x25, 0xa8, 0x49, 0xe9, 0x5b, 0xb8, 0xe8, 0xb4, 0xbf,
+    ];
+    let h3 = decode_block(&mut dec, c43[0..24], &mut ok as *mut bool);
+    if !ok { return 13; }
+    if h3.len() != 5 { return 14; }
+    let a3 = h3.as_slice();
+    if !check(a3[0], ":method", "GET") { return 15; }
+    if !check(a3[1], ":scheme", "https") { return 16; }
+    if !check(a3[2], ":path", "/index.html") { return 17; }
+    if !check(a3[3], ":authority", "www.example.com") { return 18; }
+    if !check(a3[4], "custom-key", "custom-value") { return 19; }
+
+    //--------------------------------------------------------------------------
+    // C.6.1 响应：动态表上限 256。:status 302 / cache-control / date / location。
+    //--------------------------------------------------------------------------
+    let c61: [u8; 54] = [
+        0x48, 0x82, 0x64, 0x02, 0x58, 0x85, 0xae, 0xc3, 0x77, 0x1a, 0x4b, 0x61,
+        0x96, 0xd0, 0x7a, 0xbe, 0x94, 0x10, 0x54, 0xd4, 0x44, 0xa8, 0x20, 0x05,
+        0x95, 0x04, 0x0b, 0x81, 0x66, 0xe0, 0x82, 0xa6, 0x2d, 0x1b, 0xff, 0x6e,
+        0x91, 0x9d, 0x29, 0xad, 0x17, 0x18, 0x63, 0xc7, 0x8f, 0x0b, 0x97, 0xc8,
+        0xe9, 0xae, 0x82, 0xae, 0x43, 0xd3,
+    ];
+    let mut rdec = HpackDecoder::with_table_size(256);
+    let r1 = decode_block(&mut rdec, c61[0..54], &mut ok as *mut bool);
+    if !ok { return 20; }
+    if r1.len() != 4 { return 21; }
+    let b1 = r1.as_slice();
+    if !check(b1[0], ":status", "302") { return 22; }
+    if !check(b1[1], "cache-control", "private") { return 23; }
+    if !check(b1[2], "date", "Mon, 21 Oct 2013 20:13:21 GMT") { return 24; }
+    if !check(b1[3], "location", "https://www.example.com") { return 25; }
+
+    //--------------------------------------------------------------------------
+    // C.6.2 第二个响应：加 :status 307 时淘汰 :status 302，
+    // 后面的 c1 / c0 / bf 都是动态表索引。
+    //--------------------------------------------------------------------------
+    let c62: [u8; 8] = [0x48, 0x83, 0x64, 0x0e, 0xff, 0xc1, 0xc0, 0xbf];
+    let r2 = decode_block(&mut rdec, c62[0..8], &mut ok as *mut bool);
+    if !ok { return 26; }
+    if r2.len() != 4 { return 27; }
+    let b2 = r2.as_slice();
+    if !check(b2[0], ":status", "307") { return 28; }
+    if !check(b2[1], "cache-control", "private") { return 29; }
+    if !check(b2[2], "date", "Mon, 21 Oct 2013 20:13:21 GMT") { return 30; }
+    if !check(b2[3], "location", "https://www.example.com") { return 31; }
+
+    //--------------------------------------------------------------------------
+    // C.6.3 第三个响应：多个条目被淘汰，含 set-cookie 长值。
+    //--------------------------------------------------------------------------
+    let c63: [u8; 79] = [
+        0x88, 0xc1, 0x61, 0x96, 0xd0, 0x7a, 0xbe, 0x94, 0x10, 0x54, 0xd4, 0x44,
+        0xa8, 0x20, 0x05, 0x95, 0x04, 0x0b, 0x81, 0x66, 0xe0, 0x84, 0xa6, 0x2d,
+        0x1b, 0xff, 0xc0, 0x5a, 0x83, 0x9b, 0xd9, 0xab, 0x77, 0xad, 0x94, 0xe7,
+        0x82, 0x1d, 0xd7, 0xf2, 0xe6, 0xc7, 0xb3, 0x35, 0xdf, 0xdf, 0xcd, 0x5b,
+        0x39, 0x60, 0xd5, 0xaf, 0x27, 0x08, 0x7f, 0x36, 0x72, 0xc1, 0xab, 0x27,
+        0x0f, 0xb5, 0x29, 0x1f, 0x95, 0x87, 0x31, 0x60, 0x65, 0xc0, 0x03, 0xed,
+        0x4e, 0xe5, 0xb1, 0x06, 0x3d, 0x50, 0x07,
+    ];
+    let r3 = decode_block(&mut rdec, c63[0..79], &mut ok as *mut bool);
+    if !ok { return 32; }
+    if r3.len() != 6 { return 33; }
+    let b3 = r3.as_slice();
+    if !check(b3[0], ":status", "200") { return 34; }
+    if !check(b3[1], "cache-control", "private") { return 35; }
+    if !check(b3[2], "date", "Mon, 21 Oct 2013 20:13:22 GMT") { return 36; }
+    if !check(b3[3], "location", "https://www.example.com") { return 37; }
+    if !check(b3[4], "content-encoding", "gzip") { return 38; }
+    if !check(b3[5], "set-cookie", "foo=ASDJKHQKBZXOQWEOPIUAXQWEOIU; max-age=3600; version=1") { return 39; }
+
+    //--------------------------------------------------------------------------
+    // 自己的编码器：
+    //   - 静态表精确匹配 → 单字节索引（(:method GET) = 0x82）；
+    //   - 其余 → 0x00 + 名称len + 名称 + 值len + 值；
+    //   - 超过 127 字节的值走多字节长度前缀。
+    //--------------------------------------------------------------------------
+    let mut one: Vec<HttpHeader> = Vec::new();
+    one.push(HttpHeader { name: ":method", value: "GET" });
+    let enc1 = h2_encode_headers(one.as_slice());
+    if enc1.len() != 1 { return 40; }
+    if enc1.as_slice()[0] != 0x82 { return 41; }
+
+    let mut custom: Vec<HttpHeader> = Vec::new();
+    custom.push(HttpHeader { name: "x-a", value: "b" });
+    let enc2 = h2_encode_headers(custom.as_slice());
+    if enc2.len() != 7 { return 42; }
+    let e2 = enc2.as_slice();
+    if e2[0] != 0x00 { return 43; }
+    if e2[1] != 0x03 { return 44; }
+    if e2[2] != 0x78 { return 45; }
+    if e2[3] != 0x2d { return 46; }
+    if e2[4] != 0x61 { return 47; }
+    if e2[5] != 0x01 { return 48; }
+    if e2[6] != 0x62 { return 49; }
+
+    // 长值（150 字节）+ 常用静态项，整块编码后再解码回来。
+    let mut long_value = String::from_bytes("v");
+    let mut k: usize = 0;
+    while k < 150 {
+        long_value.push_byte(97);
+        k = k + 1;
+    }
+    let mut req: Vec<HttpHeader> = Vec::new();
+    req.push(HttpHeader { name: ":method", value: "POST" });
+    req.push(HttpHeader { name: ":scheme", value: "http" });
+    req.push(HttpHeader { name: ":path", value: "/submit" });
+    req.push(HttpHeader { name: ":authority", value: "example.test" });
+    req.push(HttpHeader { name: "x-long", value: long_value.as_bytes() });
+    let enc3 = h2_encode_headers(req.as_slice());
+    let mut dec2 = HpackDecoder::new();
+    let back = decode_block(&mut dec2, enc3.as_slice(), &mut ok as *mut bool);
+    if !ok { return 50; }
+    if back.len() != 5 { return 51; }
+    let bk = back.as_slice();
+    if !check(bk[0], ":method", "POST") { return 52; }
+    if !check(bk[1], ":scheme", "http") { return 53; }
+    if !check(bk[4], "x-long", long_value.as_bytes()) { return 54; }
+
+    //--------------------------------------------------------------------------
+    // 帧头字节：长度 24 位、类型、标志、流号 31 位。
+    //--------------------------------------------------------------------------
+    let mut payload: Vec<u8> = Vec::new();
+    payload.push(0x82 as u8);
+    let frame = h2_encode_frame(H2_HEADERS, H2_FLAG_END_HEADERS, 1, payload.as_slice());
+    if frame.len() != 10 { return 55; }
+    let fs = frame.as_slice();
+    if fs[0] != 0 { return 56; }
+    if fs[1] != 0 { return 57; }
+    if fs[2] != 1 { return 58; }
+    if fs[3] != 1 { return 59; }
+    if fs[4] != 4 { return 60; }
+    if fs[5] != 0 { return 61; }
+    if fs[6] != 0 { return 62; }
+    if fs[7] != 0 { return 63; }
+    if fs[8] != 1 { return 64; }
+    if fs[9] != 0x82 { return 65; }
+
+    return 0;
+}

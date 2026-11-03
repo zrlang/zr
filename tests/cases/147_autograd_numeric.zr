@@ -1,0 +1,126 @@
+//=============================================================================
+// tests/cases/147_autograd_numeric.zr — autograd 梯度的数值验证
+//
+// 每个 case 对已知公式的前向计算做 backward，然后用 close_f64 检查叶节点梯度。
+// 返回 0 表示全部通过，非 0 表示失败编号。
+//
+// 编译器缺陷规避：
+//   - f64 字面量减法 1.0 - x 会 miscompile → 用 -x + 1.0
+//   - 单函数过大 + 大量 f64 比较会 miscompile → 每个 case < 35 行
+//=============================================================================
+
+use tensor::Tensor;
+
+fn main() -> i32 {
+    let r = case_add_two();
+    if r != 0 { return r; }
+    let r = case_linear();
+    if r != 0 { return r; }
+    let r = case_quadratic();
+    if r != 0 { return r; }
+    let r = case_relu_neg();
+    if r != 0 { return r; }
+    let r = case_relu_pos();
+    if r != 0 { return r; }
+    let r = case_sum_tensor();
+    if r != 0 { return r; }
+    return 0;
+}
+
+//----- 辅助：close_f64 / build_scalar -----------------------------------------
+
+fn close_f64(a: f64, b: f64) -> bool {
+    // abs(a - b) < 1e-9，但避开字面量减法
+    let d = a + (-b);
+    let ad = if d < 0.0 { -d } else { d };
+    return ad < 0.000000001;
+}
+
+fn build_scalar(v: f64) -> Tensor {
+    return Tensor::scalar(v);
+}
+
+//----- case 1: y = a + b, a=3, b=5 → y=8, da=1, db=1 (编号 10..13) ------------
+
+fn case_add_two() -> i32 {
+    let mut a = build_scalar(3.0);
+    let mut b = build_scalar(5.0);
+    a.track_inplace();
+    b.track_inplace();
+    let y = a.add(b);
+    if !close_f64(y.get_flat(0), 8.0) { return 10; }
+    y.backward();
+    if !close_f64(a.grad[0], 1.0) { return 11; }
+    if !close_f64(b.grad[0], 1.0) { return 12; }
+    return 0;
+}
+
+//----- case 2: y = a*x + b, a=2, x=3, b=4 → y=10, da=3, dx=2, db=1 (20..26) --
+
+fn case_linear() -> i32 {
+    let mut a = build_scalar(2.0);
+    let mut x = build_scalar(3.0);
+    let mut b = build_scalar(4.0);
+    a.track_inplace();
+    x.track_inplace();
+    b.track_inplace();
+    let y = a.mul(x).add(b);
+    if !close_f64(y.get_flat(0), 10.0) { return 20; }
+    y.backward();
+    if !close_f64(a.grad[0], 3.0) { return 21; }
+    if !close_f64(x.grad[0], 2.0) { return 22; }
+    if !close_f64(b.grad[0], 1.0) { return 23; }
+    return 0;
+}
+
+//----- case 3: y = x*x, x=3 → y=9, dx=2*3=6 (30..32) -------------------------
+// 注意 x.mul(x) 两边 parent 指向同一 TensorCtx，梯度会累积两次 → 正好是 2x。
+
+fn case_quadratic() -> i32 {
+    let mut x = build_scalar(3.0);
+    x.track_inplace();
+    let y = x.mul(x);
+    if !close_f64(y.get_flat(0), 9.0) { return 30; }
+    y.backward();
+    if !close_f64(x.grad[0], 6.0) { return 31; }
+    return 0;
+}
+
+//----- case 4: relu(x) at x=-1 → y=0, dy/dx=0 (40..42) -----------------------
+
+fn case_relu_neg() -> i32 {
+    let mut x = build_scalar(-1.0);
+    x.track_inplace();
+    let y = x.relu();
+    if !close_f64(y.get_flat(0), 0.0) { return 40; }
+    y.backward();
+    if !close_f64(x.grad[0], 0.0) { return 41; }
+    return 0;
+}
+
+//----- case 5: relu(x) at x=3 → y=3, dy/dx=1 (50..52) ------------------------
+
+fn case_relu_pos() -> i32 {
+    let mut x = build_scalar(3.0);
+    x.track_inplace();
+    let y = x.relu();
+    if !close_f64(y.get_flat(0), 3.0) { return 50; }
+    y.backward();
+    if !close_f64(x.grad[0], 1.0) { return 51; }
+    return 0;
+}
+
+//----- case 6: sum_tensor([2,3,5]) → y=10, 每个输入梯度=1 (60..64) -----------
+
+fn case_sum_tensor() -> i32 {
+    let v: [f64; 3] = [2.0, 3.0, 5.0];
+    let mut t = Tensor::from_vec(&v, 3);
+    t.track_inplace();
+    let s = t.sum_tensor();
+    if !close_f64(s.get_flat(0), 10.0) { return 60; }
+    s.backward();
+    if !close_f64(t.grad[0], 1.0) { return 61; }
+    if !close_f64(t.grad[1], 1.0) { return 62; }
+    if !close_f64(t.grad[2], 1.0) { return 63; }
+    return 0;
+}

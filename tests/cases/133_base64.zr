@@ -1,0 +1,136 @@
+//=============================================================================
+// tests/cases/133_base64.zr — Base64 / Base64URL 正向回归
+//
+// 覆盖 RFC 4648 的经典向量、`+` / `/` 与 `-` / `_` 两套字母表、非法输入
+// （长度不是 4 的倍数 / 缺填充 / 填充位置错 / 字母表外字符）必须返回
+// `Option::None`，以及含 0x00 / 0xFF 等非 ASCII 字节的往返。
+//=============================================================================
+
+use base64::{base64_encode, base64_decode, base64url_encode, base64url_decode};
+use core::Option;
+use collections::Vec;
+use string::String;
+
+/// 逐字节比较编码结果与期望字面量。
+fn b64_same(s: String, want: []const u8) -> bool {
+    if s.len != want.len { return false; }
+    let mut i: usize = 0;
+    while i < s.len {
+        if s.ptr[i] != want[i] { return false; }
+        i = i + 1;
+    }
+    return true;
+}
+
+/// 逐字节比较解码结果与期望字节。
+fn b64_bytes_same(v: Vec<u8>, want: []const u8) -> bool {
+    if v.len != want.len { return false; }
+    let mut i: usize = 0;
+    while i < v.len {
+        if v[i] != want[i] { return false; }
+        i = i + 1;
+    }
+    return true;
+}
+
+/// 断言解码成功且内容等于 `want`。
+fn b64_expect(s: []const u8, want: []const u8) -> bool {
+    match base64_decode(s) {
+        Option::Some(v) => return b64_bytes_same(v, want),
+        Option::None    => return false,
+    }
+}
+
+/// 断言解码失败。
+fn b64_expect_none(s: []const u8) -> bool {
+    match base64_decode(s) {
+        Option::Some(_) => return false,
+        Option::None    => return true,
+    }
+}
+
+/// 断言 URL 版解码成功且内容等于 `want`。
+fn b64url_expect(s: []const u8, want: []const u8) -> bool {
+    match base64url_decode(s) {
+        Option::Some(v) => return b64_bytes_same(v, want),
+        Option::None    => return false,
+    }
+}
+
+fn main() -> i32 {
+    // --- 1) RFC 4648 经典编码向量 ---
+    if base64_encode("").len != 0 { return 1; }
+    if !b64_same(base64_encode("f"), "Zg==") { return 2; }
+    if !b64_same(base64_encode("fo"), "Zm8=") { return 3; }
+    if !b64_same(base64_encode("foo"), "Zm9v") { return 4; }
+    if !b64_same(base64_encode("foob"), "Zm9vYg==") { return 5; }
+    if !b64_same(base64_encode("fooba"), "Zm9vYmE=") { return 6; }
+    if !b64_same(base64_encode("foobar"), "Zm9vYmFy") { return 7; }
+    if !b64_same(base64_encode("><?"), "Pjw/") { return 8; }
+    if !b64_same(base64_encode(">>?"), "Pj4/") { return 8; }
+
+    // --- 2) 编码结果再解码回原文 ---
+    if !b64_expect("", "") { return 9; }
+    if !b64_expect("Zg==", "f") { return 10; }
+    if !b64_expect("Zm8=", "fo") { return 11; }
+    if !b64_expect("Zm9v", "foo") { return 12; }
+    if !b64_expect("Zm9vYg==", "foob") { return 13; }
+    if !b64_expect("Zm9vYmE=", "fooba") { return 14; }
+    if !b64_expect("Zm9vYmFy", "foobar") { return 15; }
+    if !b64_expect("Pjw/", "><?") { return 16; }
+    if !b64_expect("Pj4/", ">>?") { return 16; }
+
+    // --- 3) 非 ASCII 字节往返（0x00 / 0xFF 等） ---
+    let raw: []const u8 = [0 as u8, 255 as u8, 16 as u8, 128 as u8];
+    let enc = base64_encode(raw);
+    if !b64_same(enc, "AP8QgA==") { return 17; }
+    if !b64_expect("AP8QgA==", raw) { return 18; }
+
+    let raw2: []const u8 = [0 as u8, 0 as u8, 0 as u8, 255 as u8, 255 as u8];
+    let enc2 = base64_encode(raw2);
+    let mut back_ok = false;
+    match base64_decode(enc2.as_bytes()) {
+        Option::Some(v) => {
+            if b64_bytes_same(v, raw2) { back_ok = true; }
+        },
+        Option::None => { back_ok = false; },
+    }
+    if !back_ok { return 19; }
+
+    // --- 4) `+` / `/` 与 URL 字母表 ---
+    // 0xFB 0xFF 0xBF 的 6 位组是 62,63,62,63 → 标准 "+/+/"，URL "-_-_"。
+    let hi: []const u8 = [251 as u8, 255 as u8, 191 as u8];
+    if !b64_same(base64_encode(hi), "+/+/") { return 20; }
+    if !b64_same(base64url_encode(hi), "-_-_") { return 21; }
+    if !b64url_expect("-_-_", hi) { return 22; }
+    if !b64_expect("+/+/", hi) { return 23; }
+
+    // "foobar" 不含 +/, 两套字母表一致。
+    if !b64_same(base64url_encode("foobar"), "Zm9vYmFy") { return 24; }
+    if !b64url_expect("Zm9vYmFy", "foobar") { return 25; }
+
+    // 两套解码器互不接受对方的特殊字符。
+    if !b64_expect_none("-_-_") { return 26; }
+    match base64url_decode("+/+/") {
+        Option::Some(_) => { return 27; },
+        Option::None    => {},
+    }
+
+    // --- 5) 非法输入：长度 / 填充 / 字符 ---
+    if !b64_expect_none("Zg") { return 28; }        // 长度 2，不是 4 的倍数
+    if !b64_expect_none("Zg=") { return 29; }       // 长度 3
+    if !b64_expect_none("Zm9vYg=") { return 30; }   // 长度 7
+    if !b64_expect_none("Zg===") { return 31; }     // 长度 5
+    if !b64_expect_none("====") { return 32; }      // 全是填充
+    if !b64_expect_none("A===") { return 33; }      // 填充占了数据位
+    if !b64_expect_none("AA=A") { return 34; }      // 填充在中间
+    if !b64_expect_none("!!!!") { return 35; }      // 字母表外字符
+    if !b64_expect_none("AA AA") { return 36; }     // 空格非法
+
+    // 合法但带填充的短串。
+    if !b64_expect("AA==", [0 as u8]) { return 37; }
+    if !b64_expect("AAA=", [0 as u8, 0 as u8]) { return 38; }
+    if !b64_expect("AAAA", [0 as u8, 0 as u8, 0 as u8]) { return 39; }
+
+    return 0;
+}

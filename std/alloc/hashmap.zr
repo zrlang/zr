@@ -1,0 +1,239 @@
+//==============================================================================
+// std/alloc/hashmap.zr — 哈希表（对应 Rust `std::collections::HashMap`）
+//
+// 开放寻址 + 线性探测；装载因子超过 1/2 时扩容到两倍并重新散列。
+//
+// 键要求 `K: Eq + Hash`。`String` / 各整数 / `bool` / `char` 都已实现
+// 这两个 trait（见 `core.zr` 与 `string.zr`）。
+//
+// 注意：删除是 O(n) 的重建（标记空槽会破坏线性探测的查找链），
+// 常规用法以插入 / 查询为主。
+//==============================================================================
+
+use core::{Option, Eq, Hash, panic, size_of};
+use mem::{zr_alloc, zr_dealloc};
+
+struct Entry<K, V> {
+    pub key: K,
+    pub val: V,
+    pub used: bool,
+}
+
+pub struct HashMap<K, V> {
+    pub data: *mut Entry<K, V>,
+    pub cap: usize,
+    pub size: usize,
+}
+
+impl<K, V> HashMap<K, V> {
+    /// 默认容量（16 个槽）。
+    pub fn new() -> HashMap<K, V> {
+        return HashMap::with_capacity(16);
+    }
+
+    pub fn with_capacity(cap: usize) -> HashMap<K, V> {
+        let c = if cap < 8 { 8 } else { cap };
+        return HashMap { data: alloc_buckets::<K, V>(c), cap: c, size: 0 };
+    }
+
+    pub fn len(self) -> usize { return self.size; }
+    pub fn capacity(self) -> usize { return self.cap; }
+    pub fn is_empty(self) -> bool { return self.size == 0; }
+
+    /// 探测：返回已有键所在下标，或第一个空槽下标。
+    ///
+    /// **空槽里没有有效键**，所以 `eq` 只能在 `used` 为真时求值。zr 的
+    /// `&&` / `||` 不做短路（两侧都会求值），把 `used && !key.eq(k)`
+    /// 写进循环条件会在空槽上读未初始化的 `key`（`String` 的 `ptr` 是
+    /// 垃圾值，直接段错误）。这里先用 `if used { .. }` 把求值守住。
+    fn probe(self: &HashMap<K, V>, key: K) -> usize
+    where K: Eq + Hash
+    {
+        let start = (key.hash() as usize) % self.cap;
+        let mut i = start;
+        loop {
+            let used: bool = self.data[i].used;
+            let mut same: bool = false;
+            if used {
+                same = self.data[i].key.eq(key);
+            }
+            if !used { break; }
+            if same { break; }
+            i = (i + 1) % self.cap;
+            if i == start { break; }
+        }
+        return i;
+    }
+
+    /// 插入或覆盖。
+    pub fn insert(self: &mut HashMap<K, V>, key: K, val: V)
+    where K: Eq + Hash
+    {
+        // 装载因子 > 1/2 先扩容，保证线性探测有空间。
+        if (self.size + 1) * 2 > self.cap {
+            self.rehash(self.cap * 2);
+        }
+        let idx = self.probe(key);
+        if self.data[idx].used {
+            self.data[idx].val = val;
+            return;
+        }
+        self.data[idx].key = key;
+        self.data[idx].val = val;
+        self.data[idx].used = true;
+        self.size = self.size + 1;
+    }
+
+    /// 插入并返回旧值（没有旧值时返回 `Option::None`）。
+    pub fn insert_get(self: &mut HashMap<K, V>, key: K, val: V) -> Option<V>
+    where K: Eq + Hash, V: Copy
+    {
+        if (self.size + 1) * 2 > self.cap {
+            self.rehash(self.cap * 2);
+        }
+        let idx = self.probe(key);
+        if self.data[idx].used {
+            let old = self.data[idx].val;
+            self.data[idx].val = val;
+            return Option::Some(old);
+        }
+        self.data[idx].key = key;
+        self.data[idx].val = val;
+        self.data[idx].used = true;
+        self.size = self.size + 1;
+        return Option::None;
+    }
+
+    /// 取值（值必须可复制）。
+    pub fn get(self: &HashMap<K, V>, key: K) -> Option<V>
+    where K: Eq + Hash, V: Copy
+    {
+        let idx = self.probe(key);
+        if self.data[idx].used { return Option::Some(self.data[idx].val); }
+        return Option::None;
+    }
+
+    /// 取值的只读指针（值不可复制时用这个）。
+    pub fn get_ref(self: &HashMap<K, V>, key: K) -> *const V
+    where K: Eq + Hash
+    {
+        let idx = self.probe(key);
+        if self.data[idx].used { return &self.data[idx].val as *const V; }
+        return 0 as *const V;
+    }
+
+    pub fn contains_key(self: &HashMap<K, V>, key: K) -> bool
+    where K: Eq + Hash
+    {
+        let idx = self.probe(key);
+        return self.data[idx].used;
+    }
+
+    /// 删除键。值为 `Copy` 时返回被删的值。
+    pub fn remove(self: &mut HashMap<K, V>, key: K) -> Option<V>
+    where K: Eq + Hash, V: Copy
+    {
+        let idx = self.probe(key);
+        if !self.data[idx].used { return Option::None; }
+        let old = self.data[idx].val;
+        // 重建表：标记空槽会截断后续键的探测链。
+        let mut fresh: HashMap<K, V> = HashMap::with_capacity(self.cap);
+        let mut i = 0;
+        while i < self.cap {
+            if self.data[i].used && i != idx {
+                fresh.insert(self.data[i].key, self.data[i].val);
+            }
+            i = i + 1;
+        }
+        zr_dealloc(
+            self.data as *mut void,
+            size_of::<Entry<K, V>>() * self.cap,
+            8,
+        );
+        self.data = fresh.data;
+        self.cap = fresh.cap;
+        self.size = fresh.size;
+        return Option::Some(old);
+    }
+
+    pub fn clear(self: &mut HashMap<K, V>) {
+        let mut i = 0;
+        while i < self.cap {
+            self.data[i].used = false;
+            i = i + 1;
+        }
+        self.size = 0;
+    }
+
+    fn rehash(self: &mut HashMap<K, V>, new_cap: usize)
+    where K: Eq + Hash
+    {
+        let old_data = self.data;
+        let old_cap = self.cap;
+        let fresh = alloc_buckets::<K, V>(new_cap);
+        self.data = fresh;
+        self.cap = new_cap;
+        // 逐项搬进新表（长度先清零，插入时重新累计）。
+        self.size = 0;
+        let mut i = 0;
+        while i < old_cap {
+            if old_data[i].used {
+                let idx = self.probe_slot(old_data[i].key);
+                self.data[idx].key = old_data[i].key;
+                self.data[idx].val = old_data[i].val;
+                self.data[idx].used = true;
+                self.size = self.size + 1;
+            }
+            i = i + 1;
+        }
+        zr_dealloc(
+            old_data as *mut void,
+            size_of::<Entry<K, V>>() * old_cap,
+            8,
+        );
+    }
+
+    /// 只找空槽（重建时用；调用方保证键不重复）。
+    fn probe_slot(self: &HashMap<K, V>, key: K) -> usize
+    where K: Eq + Hash
+    {
+        let start = (key.hash() as usize) % self.cap;
+        let mut i = start;
+        while self.data[i].used {
+            i = (i + 1) % self.cap;
+            if i == start { break; }
+        }
+        return i;
+    }
+
+    /// 释放整个表。
+    pub fn destroy(self: &mut HashMap<K, V>) {
+        if self.data != 0 as *mut Entry<K, V> {
+            zr_dealloc(
+                self.data as *mut void,
+                size_of::<Entry<K, V>>() * self.cap,
+                8,
+            );
+            self.data = 0 as *mut Entry<K, V>;
+            self.cap = 0;
+            self.size = 0;
+        }
+    }
+}
+
+/// 分配 `cap` 个空槽并标记为空。
+fn alloc_buckets<K, V>(cap: usize) -> *mut Entry<K, V> {
+    let raw = zr_alloc(size_of::<Entry<K, V>>() * cap, 8) as *mut Entry<K, V>;
+    if raw == 0 as *mut Entry<K, V> { panic("HashMap: out of memory"); }
+    let mut i = 0;
+    while i < cap {
+        raw[i].used = false;
+        i = i + 1;
+    }
+    return raw;
+}
+
+/// 便捷构造。
+pub fn hashmap_new<K, V>() -> HashMap<K, V> {
+    return HashMap::new();
+}
