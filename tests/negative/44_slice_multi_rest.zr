@@ -1,0 +1,7 @@
+// 负向：切片模式里出现多个 `..`（parser 阶段拒绝）。
+fn main() -> i32 {
+    let arr = [1, 2, 3];
+    let [.., ..] = arr;
+    return 0;
+}
+// expect: expected pattern, found DotDot

@@ -1,0 +1,55 @@
+// defer 关键字回归：块退出时按声明顺序逆序执行。
+// 早先 is_block_like() 漏掉了 Expression::Defer 等语句级表达式，
+// 导致 `defer { ... } 下一句;` 把 defer 当成尾表达式 break 出去，
+// 报 "expected '}' to close block"。
+
+use io::*;
+
+static mut order_buf: i32 = 0;
+
+fn defer_inner() -> i32 {
+    // 逆序基础
+    unsafe { order_buf = 0; }
+    {
+        defer { unsafe { order_buf = order_buf * 10 + 1; } }
+        defer { unsafe { order_buf = order_buf * 10 + 2; } }
+        defer { unsafe { order_buf = order_buf * 10 + 3; } }
+    }
+    // 退出时顺序：3 → 2 → 1，所以数字是 321
+    unsafe {
+        if order_buf != 321 { return 1; }
+    }
+
+    // return 触发 defer（先跑 defer 再 return）
+    unsafe { order_buf = 0; }
+    let rv = defer_return();
+    if rv != 42 { return 2; }
+    unsafe {
+        if order_buf != 1 { return 3; } // defer 执行了一次
+    }
+
+    // break 触发 defer
+    unsafe { order_buf = 0; }
+    defer_break();
+    unsafe {
+        if order_buf != 1 { return 4; }
+    }
+
+    return 0;
+}
+
+fn defer_return() -> i32 {
+    defer { unsafe { order_buf = order_buf + 1; } }
+    return 42;
+}
+
+fn defer_break() {
+    defer { unsafe { order_buf = order_buf + 1; } }
+    loop {
+        break;
+    }
+}
+
+fn main() -> i32 {
+    return defer_inner();
+}

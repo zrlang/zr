@@ -213,8 +213,15 @@ struct GenericImplAssoc {
     functions: HashMap<DefId, hir::HirFunction>,
     /// 异步函数的 Future 不透明类型 → `Output` 类型。
     async_outputs: HashMap<DefId, Ty>,
+    /// `-> impl Trait` 返回位置的不透明类型 → trait 边界 DefId 列表。
+    opaque_bounds: HashMap<DefId, Vec<DefId>>,
+    /// 不透明类型 → 函数体推断出的隐藏具体类型。
+    opaque_hidden: HashMap<DefId, Ty>,
     /// trait 表。
     trait_defs: HashMap<DefId, hir::HirTrait>,
+    /// `dyn Trait` 强转点收集到的 vtable 需求表（按 `symbol` 去重）。
+    /// 收尾时整体搬进 `HirModule::vtables`。
+    vtables: Vec<hir::HirVtable>,
     /// trait 名 → DefId，供 `#[derive(Clone)]` 按**名字**声明的实现做求解。
     ///
     /// derive 生成的 impl 块 `trait_id` 是 `None`（属性 args 里只有字符串），
@@ -507,7 +514,10 @@ impl Default for TypeChecker {
             type_defs: HashMap::new(),
             functions: HashMap::new(),
             async_outputs: HashMap::new(),
+            opaque_bounds: HashMap::new(),
+            opaque_hidden: HashMap::new(),
             trait_defs: HashMap::new(),
+            vtables: Vec::new(),
             trait_defs_by_name: HashMap::new(),
             impl_blocks: Vec::new(),
             impl_targets: HashMap::new(),
@@ -897,6 +907,7 @@ impl TypeChecker {
                     const_value: st.const_value.clone(),
                 })
                 .collect(),
+            vtables: std::mem::take(&mut self.vtables),
         })
     }
 
@@ -1314,6 +1325,13 @@ impl TypeChecker {
                     assoc_types: Vec::new(),
                     is_marker,
                     super_traits: Vec::new(),
+                    // vtable 槽位顺序 = 声明顺序（cfg 掉的方法不占槽位）。
+                    methods: t
+                        .methods
+                        .iter()
+                        .filter(|m| self.cfg_enabled(&m.attrs))
+                        .map(|m| m.name.clone())
+                        .collect(),
                 },
             );
             // 名字表：`#[derive(Clone)]` 生成的 impl 块 `trait_id` 是 `None`
@@ -2233,8 +2251,107 @@ impl TypeChecker {
 
     fn check_function_bodies(&mut self, prog: &Program) -> Result<Vec<hir::HirFunction>> {
         let _result: Vec<hir::HirFunction> = Vec::new();
-        // 与 `check_function_signatures` 相同：cfg 过滤后独立计数，逐条取
-        // 本函数自己的 DefId（同名用户/标准库定义不能按名查）。
+
+        // === 预检查：先跑 RPIT 函数体，填好 opaque_hidden，解决前向调用 ===
+        // 两轮间必须重置 self.infer（vars + next_infer + return_ty）——
+        // 预检查创建的推断变量绑定绝不能泄漏到主循环，否则 Option.unwrap()
+        // 等泛型方法的 MIR 生成会拿到脏类型（之前就是这个漏了让 90_glob_import
+        // 的 unwrap 返回 0 而不是 7）。
+        let mut pre_di = 0usize;
+        for f in &prog.functions {
+            if !self.cfg_enabled(&f.attrs) {
+                continue;
+            }
+            let id = self.function_def_ids.get(pre_di).copied().unwrap_or(self.find_def(&f.name)?);
+            pre_di += 1;
+            let is_rpit = self.functions.get(&id).map_or(false, |hf| {
+                matches!(&hf.return_type, Ty::Opaque(oid) if self.opaque_bounds.contains_key(oid))
+            });
+            if !is_rpit { continue; }
+            let impl_gens = self.impl_generics.get(&f.name).cloned().unwrap_or_default();
+            let has_type_param = |gens: &[ast::GenericParam]| {
+                gens.iter().any(|g| !matches!(g, ast::GenericParam::Lifetime(_)))
+            };
+            if has_type_param(&f.generics) || has_type_param(&impl_gens) { continue; }
+
+            self.current_function = Some(id);
+            self.current_is_async = f.is_async;
+            self.current_module = f.module.clone();
+            self.scope_stack.clear();
+            self.live_borrows.clear();
+            self.binding_last_use.clear();
+            self.access_candidates.clear();
+            self.push_scope();
+
+            let declared = self.functions[&id].return_type.clone();
+            let declared_oid = match &declared {
+                Ty::Opaque(oid) => *oid,
+                _ => continue,
+            };
+            let infer_ty = self.infer.fresh_infer(ast::Span::unknown());
+            let ret_ty = infer_ty.clone();
+            self.infer.return_ty = Some(ret_ty.clone());
+
+            if let Some(target) = self.impl_targets.get(&f.name).cloned() {
+                if let Ok(ty) = self.ast_to_hir_type(&target) {
+                    self.push_named_type("Self", ty);
+                }
+            }
+            let mut params = Vec::new();
+            if let Some(ty) = self.receiver_ty(f)? {
+                let (_, local) = self.bind_local("self", &ty);
+                params.push(hir::HirParam { local, ty });
+            }
+            for p in &f.params {
+                let ty = self.ast_to_hir_type(&p.ty)?;
+                let pat = self.lower_pattern(&p.pattern, &ty)?;
+                let local = first_binding(&pat).unwrap_or_else(|| self.alloc_local());
+                params.push(hir::HirParam { local, ty: ty.clone() });
+            }
+            let body = if let Some(b) = &f.body {
+                let b = self.check_block(b, &ret_ty)?;
+                if let Some(tail) = &b.tail {
+                    self.infer.unify(&tail.ty, &ret_ty, tail.span).ok();
+                }
+                self.finish_borrow_accesses()?;
+                Some(b)
+            } else { None };
+            self.pop_scope();
+
+            if let Some(hf) = self.functions.get_mut(&id) {
+                hf.params = params;
+                hf.body = body;
+            }
+            // 存隐藏类型
+            let hidden = self.infer.resolve(&ret_ty);
+            if !matches!(hidden, Ty::Infer(_)) {
+                if let Some(bounds) = self.opaque_bounds.get(&declared_oid).cloned() {
+                    let impls = self.direct_impls(&hidden);
+                    for trait_id in &bounds {
+                        if !impls.contains(trait_id) {
+                            self.errors.push(CompileError::type_error(format!(
+                                "return type `{}` does not implement trait `{}` required by `-> impl Trait`",
+                                self.infer.type_name(&hidden),
+                                self.def_names.get(trait_id).cloned().unwrap_or_default(),
+                            )));
+                        }
+                    }
+                }
+                self.opaque_hidden.insert(declared_oid, hidden);
+            }
+        }
+        // ⚠️ 关键：清空预检查的推断变量绑定，防止泄漏到主循环。
+        //
+        // 但**不能**把 `next_infer` 归零：声明阶段（`record_type_generics` /
+        // 结构体字段 / 泛型签名）早就创建过占位推断变量，它们的 id 仍活在
+        // `type_generic_params` 等表里。归零后主循环的 `fresh_infer` 会从 0
+        // 重新发号，与这些旧占位符**撞号**——`Pair<T>` 的 `T` 被本次函数体
+        // 里无关的新量绑上，`Option::map` 单态化时把 `T` 解成 `Pair<i32>`
+        // （`66_generics.zr` 的 `expected i32, found Pair<i32>`）。
+        self.infer.vars.clear();
+        self.infer.return_ty = None;
+
+        // === 主循环：处理所有函数体 ===
         let mut di = 0usize;
         for f in &prog.functions {
             // cfg 过滤：被 cfg 掉的函数没有符号表条目。
@@ -2283,10 +2400,21 @@ impl TypeChecker {
             self.push_scope();
 
             // 函数体按 async fn 的真实输出类型检查；对外签名仍是 Future。
+            // RPIT（-> impl Trait）类似，但隐藏类型未知——用推断变量让
+            // return / block tail 自然 unify 出具体类型，检查完后 resolve 存 opaque_hidden。
             let declared = self.functions[&id].return_type.clone();
-            let ret_ty = match &declared {
-                Ty::Opaque(opaque) => self.async_outputs.get(opaque).cloned().unwrap_or(declared),
-                _ => declared,
+            let (ret_ty, rpit_opaque) = match &declared {
+                Ty::Opaque(opaque) => {
+                    if let Some(async_out) = self.async_outputs.get(opaque).cloned() {
+                        (async_out, None)
+                    } else if self.opaque_bounds.contains_key(opaque) {
+                        let infer_ty = self.infer.fresh_infer(ast::Span::unknown());
+                        (infer_ty, Some(*opaque))
+                    } else {
+                        (declared.clone(), None)
+                    }
+                }
+                _ => (declared.clone(), None),
             };
             self.infer.return_ty = Some(ret_ty.clone());
 
@@ -2320,9 +2448,12 @@ impl TypeChecker {
             // 检查函数体
             let body = if let Some(b) = &f.body {
                 let b = self.check_block(b, &ret_ty)?;
-                // 借用检查：整个函数体已检查完，所有局部变量的最后使用已知。
-                // 对每个"读写被借用位置"候选按 NLL（借用绑定的最后使用）判定
-                // 是否真冲突，避免 `let r = &mut x; *r = 5; if x != 5` 误报。
+                // RPIT：tail 需要手动 unify（subtype 对 Infer 不绑定）
+                if rpit_opaque.is_some() {
+                    if let Some(tail) = &b.tail {
+                        self.infer.unify(&tail.ty, &ret_ty, tail.span).ok();
+                    }
+                }
                 self.finish_borrow_accesses()?;
                 Some(b)
             } else {
@@ -2333,7 +2464,36 @@ impl TypeChecker {
                 hf.params = params;
                 hf.body = body;
                 if f.is_async {
-                    hf.async_output = Some(ret_ty);
+                    hf.async_output = Some(ret_ty.clone());
+                }
+            }
+            // RPIT：存隐藏类型 + 验证 trait 边界
+            if let Some(opaque_id) = rpit_opaque {
+                let hidden = self.infer.resolve(&ret_ty);
+                if matches!(hidden, Ty::Infer(_)) {
+                    self.errors.push(CompileError::type_error(format!(
+                        "cannot infer return type for function with `-> impl Trait`; \
+                         add an explicit return type annotation or ensure all return paths \
+                         produce the same concrete type"
+                    )));
+                } else {
+                    if let Some(bounds) = self.opaque_bounds.get(&opaque_id).cloned() {
+                        let impls = self.direct_impls(&hidden);
+                        for trait_id in &bounds {
+                            if !impls.contains(trait_id) {
+                                let trait_name = self.def_names.get(trait_id)
+                                    .cloned()
+                                    .unwrap_or_else(|| format!("trait#{}", trait_id.0));
+                                self.errors.push(CompileError::type_error(format!(
+                                    "return type `{}` does not implement trait `{}` \
+                                     required by `-> impl Trait`",
+                                    self.infer.type_name(&hidden),
+                                    trait_name,
+                                )));
+                            }
+                        }
+                    }
+                    self.opaque_hidden.insert(opaque_id, hidden);
                 }
             }
             self.pop_scope();
@@ -2725,7 +2885,140 @@ impl TypeChecker {
     fn check_expr(&mut self, e: &Expression, expected: &Ty) -> Result<HirExpr> {
         let h = self.check_expr_raw(e, expected)?;
         let h = self.coerce_array_to_slice(h, expected);
-        Ok(self.coerce_closure_to_fn(h, expected))
+        let h = self.coerce_closure_to_fn(h, expected);
+        let h = self.coerce_to_dyn(h, expected);
+        self.coerce_to_error_union(h, expected)
+    }
+
+    /// 上下文要求 `dyn Trait` 时，把 `&T` / `&mut T`（`T` 已实现该 trait）
+    /// 就地转成胖指针记录 `{ data, vtable }`。
+    ///
+    /// 运行期布局与 `str` / 函数值同形：偏移 0 是 `data`（源引用本身），
+    /// 偏移 8 是 `vtable`——指向 codegen 按 `HirModule::vtables` 发射的
+    /// 跳转表（`.text` 里的 `jmp <impl 方法>` 序列，槽位间距固定，因此
+    /// 不需要 `.data` 里的绝对地址重定位）。槽位顺序 = trait 声明顺序
+    /// （`HirTrait::methods`）。
+    ///
+    /// 限制（MVP）：目标类型必须是非泛型具名类型或基元——泛型实例的
+    /// impl 方法符号要等单态化后才定，vtable 名字拿不到稳定形式。
+    fn coerce_to_dyn(&mut self, e: HirExpr, expected: &Ty) -> HirExpr {
+        let Ty::Dyn(trait_id) = self.infer.resolve(expected) else {
+            return e;
+        };
+        let actual = self.infer.resolve(&e.ty);
+        // 本语言的 `&x` 产生裸指针（`Ty::Pointer`），`&T` 类型标注才产生
+        // `Ty::Reference`——两种来源都接受，运行期都是"指向 T 的机器字"。
+        let inner = match &actual {
+            Ty::Reference(inner, _) | Ty::Pointer(inner, _) => inner,
+            _ => return e,
+        };
+        let inner = self.infer.resolve(inner);
+        // 已经是 dyn / 未定的推断变量：不属于本强转。
+        if matches!(inner, Ty::Dyn(_) | Ty::Infer(_)) {
+            return e;
+        }
+        if !self.implements_trait(&inner, trait_id) {
+            return e;
+        }
+        let Some(target_name) = self.dyn_target_name(&inner) else {
+            return e;
+        };
+        let Some(trait_name) = self.def_names.get(&trait_id).cloned() else {
+            return e;
+        };
+        let symbol = format!("__vt_{}_{}", target_name, trait_name);
+        if !self.vtables.iter().any(|v| v.symbol == symbol) {
+            // 按 trait 声明顺序（= 槽位顺序）收集 impl 方法。手写方法与
+            // 默认方法体合成的条目都叫 `{Type}__{method}`。
+            let Some(trait_methods) = self.trait_defs.get(&trait_id).map(|t| t.methods.clone())
+            else {
+                return e;
+            };
+            let mut methods = Vec::with_capacity(trait_methods.len());
+            for mname in &trait_methods {
+                let mangled = format!("{}__{}", target_name, mname);
+                let Some(mid) = self.symbols.get(&mangled).copied() else {
+                    // 方法表对不上（泛型 impl 等）：不造半张表，交给 subtype
+                    // 报类型不匹配。
+                    return e;
+                };
+                methods.push(mid);
+            }
+            self.vtables.push(hir::HirVtable {
+                symbol: symbol.clone(),
+                methods,
+            });
+        }
+        let span = e.span;
+        HirExpr {
+            kind: ExprKind::DynCoerce {
+                value: Box::new(e),
+                vtable_symbol: symbol,
+            },
+            ty: expected.clone(),
+            span,
+        }
+    }
+
+    /// `dyn` 强转目标类型的符号名：具名类型用定义名，基元用 Display。
+    /// 泛型实例（`Pair<i32>`）返回 `None`——MVP 不支持。
+    fn dyn_target_name(&self, ty: &Ty) -> Option<String> {
+        match ty {
+            Ty::Named(id, args) if args.is_empty() => self.def_names.get(id).cloned(),
+            Ty::Named(..) => None,
+            Ty::Int(_) | Ty::Uint(_) | Ty::Float(_) | Ty::Bool | Ty::Char | Ty::Str => {
+                Some(format!("{}", ty))
+            }
+            _ => None,
+        }
+    }
+
+    /// 上下文要求 `T!E` 时，把普通值就地包成 ok / err 载荷。
+    ///
+    /// 方向判定（顺序很重要）：先与 `T` **精确**相等（ok），再与 `E` 精确
+    /// 相等（err），之后才退化到子类型（整型拓宽）。否则 `i64!i32` 里的
+    /// `i32` 错误值会被 `i32 <: i64` 拓宽误判成 ok。`T` 与 `E` 同型时一律
+    /// ok——这种联合无法区分两侧，错误只能经 `!` 传播进来。
+    fn coerce_to_error_union(&mut self, e: HirExpr, expected: &Ty) -> Result<HirExpr> {
+        let exp = self.infer.resolve(expected);
+        let Ty::ErrorUnion(ok, err) = &exp else {
+            return Ok(e);
+        };
+        let (ok, err) = ((**ok).clone(), (**err).clone());
+        let actual = self.infer.resolve(&e.ty);
+        // 已经是联合（含发散值）就不包装。
+        if matches!(actual, Ty::ErrorUnion(..) | Ty::Never) {
+            return Ok(e);
+        }
+        let ok_ty = self.infer.resolve(&ok);
+        let err_ty = self.infer.resolve(&err);
+        let span = e.span;
+        let is_err = if ok_ty == err_ty {
+            false
+        } else if actual == ok_ty {
+            false
+        } else if actual == err_ty {
+            true
+        } else if self.infer.subtype(&actual, &ok_ty, span).is_ok() {
+            false
+        } else if self.infer.subtype(&actual, &err_ty, span).is_ok() {
+            true
+        } else {
+            return Err(CompileError::type_error(format!(
+                "expected `{}`, found `{}`",
+                self.infer.type_name(&exp),
+                self.infer.type_name(&actual)
+            ))
+            .with_span(span));
+        };
+        Ok(HirExpr {
+            kind: ExprKind::ErrorUnionWrap {
+                value: Box::new(e),
+                is_err,
+            },
+            ty: exp,
+            span,
+        })
     }
 
     /// 上下文要求 `fn(..)` 时，把带捕获闭包（值模型是环境结构体 `__env_N`）
@@ -4197,6 +4490,9 @@ impl TypeChecker {
                     span,
                 });
             }
+            Expression::PostfixBang(inner, span) => {
+                return self.check_postfix_bang(inner, expected, *span);
+            }
         };
         // 走到这里的表达式大多已经自己算好了类型；只有引用（局部变量 /
         // 全局定义）需要在这里补上——之前统一发一个全新的推断变量，导致
@@ -4269,6 +4565,35 @@ impl TypeChecker {
         _expected: &Ty,
         span: ast::Span,
     ) -> Result<HirExpr> {
+        // `catch` 不是普通二元运算：要读错误联合的判别式并分两条路径。
+        if matches!(op, ast::BinaryOp::Catch) {
+            return self.check_catch(lhs, rhs, _expected, span);
+        }
+        // `&&` / `||` 必须短路：脱糖成 `if`，rhs 只放进需要求值的那条分支。
+        // 早先直接落成 `Binary(And/Or)`，MIR 同时算两侧——`ptr != null &&
+        // ptr.data[i].used` 在空指针上照样解引用，直接 SIGSEGV。
+        if matches!(op, ast::BinaryOp::And | ast::BinaryOp::Or) {
+            let cond = self.check_expr(lhs, &Ty::Bool)?;
+            let right = self.check_expr(rhs, &Ty::Bool)?;
+            let (then_tail, else_tail) = if matches!(op, ast::BinaryOp::And) {
+                (right, bool_lit(false, span))
+            } else {
+                (bool_lit(true, span), right)
+            };
+            let block = |tail: HirExpr| hir::HirBlock {
+                stmts: Vec::new(),
+                tail: Some(Box::new(tail)),
+            };
+            return Ok(HirExpr {
+                kind: ExprKind::If(
+                    Box::new(cond),
+                    block(then_tail),
+                    Some(block(else_tail)),
+                ),
+                ty: Ty::Bool,
+                span,
+            });
+        }
         let bin_op = self.ast_binary_op(*op);
         let l_ty = self.infer_expr_ty(lhs)?;
         let l = self.check_expr(lhs, &l_ty)?;
@@ -4417,10 +4742,104 @@ impl TypeChecker {
             ast::BinaryOp::Range | ast::BinaryOp::RangeInclusive => {
                 Ty::Reference(Box::new(l.ty.clone()), hir::Mutability::Immutable)
             }
+            // `catch` 在 `check_binary` 入口就被拦下，走 `check_catch`。
+            ast::BinaryOp::Catch => unreachable!("catch is handled by check_catch"),
         };
         Ok(HirExpr {
             kind: ExprKind::Binary(bin_op, Box::new(l), Box::new(r)),
             ty,
+            span,
+        })
+    }
+
+    /// `x catch y`：ok 取载荷，err 取 fallback。
+    ///
+    /// 脱糖成 `if tag == 0 { ok载荷 } else { y }`。`y` 本身也可以是错误联合
+    /// （右结合链式 `a catch b catch c`），此时结果类型仍是错误联合，成功
+    /// 分支的载荷要重新包成 ok。
+    fn check_catch(
+        &mut self,
+        lhs: &Expression,
+        rhs: &Expression,
+        expected: &Ty,
+        span: ast::Span,
+    ) -> Result<HirExpr> {
+        let l_hint = self.infer_expr_ty(lhs)?;
+        let union_ty = match self.infer.resolve(&l_hint) {
+            ty @ Ty::ErrorUnion(..) => ty,
+            other => {
+                return Err(CompileError::type_error(format!(
+                    "`catch` lhs must be an error union `T!E`, found `{}`",
+                    self.infer.type_name(&other)
+                ))
+                .with_span(span));
+            }
+        };
+        let l = self.check_expr(lhs, &union_ty)?;
+        let (ok_ty, _err_ty) = match self.infer.resolve(&l.ty) {
+            Ty::ErrorUnion(ok, err) => ((*ok).clone(), (*err).clone()),
+            _ => unreachable!("lhs checked as error union above"),
+        };
+
+        // fallback 本身是联合就链式：结果仍是联合。
+        let r_hint = self.infer_expr_ty(rhs)?;
+        let rhs_is_union = matches!(self.infer.resolve(&r_hint), Ty::ErrorUnion(..));
+        let (r, result_ty) = if rhs_is_union {
+            (self.check_expr(rhs, &r_hint)?, union_ty.clone())
+        } else {
+            (self.check_expr(rhs, &ok_ty)?, ok_ty.clone())
+        };
+
+        let tag = HirExpr {
+            kind: ExprKind::ErrorUnionTag(Box::new(l.clone())),
+            ty: Ty::Uint(8),
+            span,
+        };
+        let cond = HirExpr {
+            kind: ExprKind::Binary(
+                hir::BinaryOp::Eq,
+                Box::new(tag),
+                Box::new(HirExpr {
+                    kind: ExprKind::Literal(hir::HirLiteral::Int(0)),
+                    ty: Ty::Uint(8),
+                    span,
+                }),
+            ),
+            ty: Ty::Bool,
+            span,
+        };
+        let payload = HirExpr {
+            kind: ExprKind::ErrorUnionPayload {
+                value: Box::new(l.clone()),
+                is_err: false,
+            },
+            ty: ok_ty.clone(),
+            span,
+        };
+        let then_tail = if rhs_is_union {
+            HirExpr {
+                kind: ExprKind::ErrorUnionWrap {
+                    value: Box::new(payload),
+                    is_err: false,
+                },
+                ty: union_ty.clone(),
+                span,
+            }
+        } else {
+            payload
+        };
+        let then_block = hir::HirBlock {
+            stmts: Vec::new(),
+            tail: Some(Box::new(then_tail)),
+        };
+        let else_block = hir::HirBlock {
+            stmts: Vec::new(),
+            tail: Some(Box::new(r)),
+        };
+        self.infer.unify(&result_ty, expected, span).ok();
+        Ok(HirExpr {
+            kind: ExprKind::If(Box::new(cond), then_block, Some(else_block)),
+            ty: result_ty,
             span,
         })
     }
@@ -4880,6 +5299,12 @@ impl TypeChecker {
             Ty::Reference(inner, _) | Ty::Pointer(inner, _) => {
                 return self.lookup_method(inner, name);
             }
+            Ty::Opaque(id) => {
+                if let Some(hidden) = self.opaque_hidden.get(id) {
+                    return self.lookup_method(hidden, name);
+                }
+                return None;
+            }
             _ => return None,
         };
         let mangled = format!("{target}__{name}");
@@ -5136,6 +5561,111 @@ impl TypeChecker {
                 result: self.alloc_local(),
             },
             ty: sig.return_type.clone(),
+            span,
+        })
+    }
+
+    /// receiver 类型是 `dyn Trait` / `&dyn Trait` / `&mut dyn Trait` 时返回
+    /// 其中的 trait DefId（vtable 分派的入口判定）。
+    fn dyn_receiver_trait(&self, ty: &Ty) -> Option<DefId> {
+        match self.infer.resolve(ty) {
+            Ty::Dyn(id) => Some(id),
+            // `&dyn` / `*const dyn`：指向胖指针记录的指针（`&x` 产生裸指针）。
+            Ty::Reference(inner, _) | Ty::Pointer(inner, _) => {
+                match self.infer.resolve(&inner) {
+                    Ty::Dyn(id) => Some(id),
+                    _ => None,
+                }
+            }
+            _ => None,
+        }
+    }
+
+    /// `dyn Trait` 的 vtable 方法调用。
+    ///
+    /// 与 `check_method_call` 平行：静态类型是 dyn 胖指针，方法地址运行期
+    /// 才知道，所以落成 `ExprKind::DynCall`（槽位下标 + 实参）而不是静态
+    /// `Call`。实参个数 / 类型与返回类型按 trait 方法**声明**核验——动态
+    /// 分派的类型安全由"vtable 只能来自 `coerce_to_dyn`（已实现该 trait
+    /// 的类型）"保证。
+    fn check_dyn_method_call(
+        &mut self,
+        trait_id: DefId,
+        recv: HirExpr,
+        name: &str,
+        args: &[ast::Argument],
+        span: ast::Span,
+    ) -> Result<HirExpr> {
+        let (trait_name, methods) = {
+            let Some(t) = self.trait_defs.get(&trait_id) else {
+                return Err(CompileError::internal("dyn receiver with unknown trait"));
+            };
+            let tn = self.def_names.get(&trait_id).cloned().unwrap_or_default();
+            (tn, t.methods.clone())
+        };
+        let Some(index) = methods.iter().position(|m| m == name) else {
+            return Err(CompileError::type_error(format!(
+                "no method `{}` in trait `{}`",
+                name, trait_name
+            ))
+            .with_span(span));
+        };
+        // trait 方法声明（`Trait::method`）提供签名：实参按它核验。
+        // 注意 `functions` 里的声明桩不记参数（`fn_to_hir` 只填名字），
+        // 签名要从 AST（`ast_fns`）现算。
+        let decl_name = format!("{}::{}", trait_name, name);
+        let decl = self
+            .ast_fns
+            .get(&decl_name)
+            .cloned()
+            .ok_or_else(|| CompileError::internal("trait method declaration missing"))?;
+        let mut sig_params: Vec<Ty> = Vec::with_capacity(decl.params.len() + 1);
+        match self.receiver_ty(&decl)? {
+            Some(rt) => sig_params.push(rt),
+            None => {
+                return Err(CompileError::type_error(format!(
+                    "method `{}` of trait `{}` has no receiver; cannot call it on `dyn {}`",
+                    name, trait_name, trait_name
+                ))
+                .with_span(span));
+            }
+        }
+        for p in &decl.params {
+            sig_params.push(self.ast_to_hir_type(&p.ty)?);
+        }
+        let ret_ty = self.ast_to_hir_type(&decl.return_type)?;
+        if args.len() + 1 != sig_params.len() {
+            let want = sig_params.len() - 1;
+            return Err(CompileError::type_error(format!(
+                "method `{}` takes {} argument{}, but {} {} supplied",
+                name,
+                want,
+                if want == 1 { "" } else { "s" },
+                args.len(),
+                if args.len() == 1 { "was" } else { "were" },
+            ))
+            .with_span(span));
+        }
+        let mut hir_args = Vec::with_capacity(args.len());
+        for (i, arg) in args.iter().enumerate() {
+            let a = match arg {
+                ast::Argument::Pos(e) | ast::Argument::Named(_, e) => e,
+            };
+            let param_ty = sig_params[i + 1].clone();
+            let arg = self.check_expr(a, &param_ty)?;
+            let arg = self.check_call_arg(arg, &param_ty, a.span())?;
+            hir_args.push(arg);
+        }
+        let result = self.alloc_local();
+        self.locals.insert(result, ret_ty.clone());
+        Ok(HirExpr {
+            kind: ExprKind::DynCall {
+                receiver: Box::new(recv),
+                index: index as u32,
+                args: hir_args,
+                result,
+            },
+            ty: ret_ty,
             span,
         })
     }
@@ -5399,6 +5929,12 @@ impl TypeChecker {
             if !field_is_fn {
                 if let Some(method_id) = self.lookup_method(&recv_ty, name) {
                     return self.check_method_call(method_id, recv, args, span);
+                }
+                // `dyn Trait` receiver：vtable 分派。`lookup_method` 查不到
+                // dyn 的方法（它不是具名类型），不能掉进字段查找报
+                // `cannot access field`。
+                if let Some(trait_id) = self.dyn_receiver_trait(&recv_ty) {
+                    return self.check_dyn_method_call(trait_id, recv, name, args, span);
                 }
             }
             if let Some((ty, _)) = field {
@@ -5838,31 +6374,10 @@ impl TypeChecker {
             ty: scrut_ty0.clone(),
             span,
         };
-        // 模式匹配 `&T` / `*const T` 时自动穿透一层：聚合值在运行期本来
-        // 就是地址，引用可以直接当值；标量才需要显式解引用。
-        let (scrut_ty, s_local) = match &scrut_ty0 {
-            Ty::Reference(inner, _) | Ty::Pointer(inner, _) => {
-                let inner = self.infer.resolve(inner);
-                if self.ty_is_aggregate(&inner) {
-                    (
-                        inner.clone(),
-                        HirExpr {
-                            kind: ExprKind::Local(scrut_local),
-                            ty: inner,
-                            span,
-                        },
-                    )
-                } else {
-                    let d = HirExpr {
-                        kind: ExprKind::Deref(Box::new(s_local)),
-                        ty: inner.clone(),
-                        span,
-                    };
-                    (inner, d)
-                }
-            }
-            _ => (scrut_ty0, s_local),
-        };
+        // 模式匹配不再自动穿透引用——Ref pattern (`&p`) 自己处理穿透。
+        // 这与 Rust 语义一致：`match &x { v }` 报错，要匹配内部值必须显式写 `&v`。
+        let scrut_ty = scrut_ty0.clone();
+        let s_local = s_local;
         // 或模式先在臂级展开：`3 | 4 => b` 变成两条"3 => b"、"4 => b"。
         //
         // 每条臂记四样东西：模式（穷尽性检查用）、模式自身的匹配条件、
@@ -6128,6 +6643,38 @@ impl TypeChecker {
         pat: &hir::HirPattern,
         span: ast::Span,
     ) -> Result<(Option<HirExpr>, Vec<(hir::LocalId, HirExpr)>)> {
+        // Rust 的 match ergonomics：结构模式（变体 / 结构体 / 元组 / 切片 /
+        // 字面量）的 scrutinee 若是引用 / 指针，先自动穿透一层——标准库的
+        // `fn is_some(self)` 体内是 `match self { Option::Some(_) => .. }`，
+        // 而 `self` 实际是 `&Option<T>`；不穿透的话 `EnumTag` 会把指针本身
+        // 当枚举值读偏移 0，判别式永远是垃圾。绑定 / 通配 / Ref 模式不穿透
+        // ——`match rs { v => v }` 的 v 仍是引用本身，要匹配内部值必须显式
+        // 写 `&v`。
+        let auto_deref = matches!(
+            pat,
+            hir::HirPattern::Struct(_)
+                | hir::HirPattern::Tuple(_)
+                | hir::HirPattern::Variant { .. }
+                | hir::HirPattern::Slice(_)
+                | hir::HirPattern::Literal(_)
+        );
+        let peeled = if auto_deref {
+            match self.infer.resolve(&scrutinee.ty) {
+                Ty::Reference(inner, _) | Ty::Pointer(inner, _) => Some((*inner).clone()),
+                _ => None,
+            }
+        } else {
+            None
+        };
+        let scrutinee = match peeled {
+            Some(inner_ty) => hir::HirExpr {
+                kind: ExprKind::Deref(Box::new(scrutinee.clone())),
+                ty: inner_ty,
+                span,
+            },
+            None => scrutinee.clone(),
+        };
+        let scrutinee = &scrutinee;
         match pat {
             hir::HirPattern::Wildcard => Ok((None, Vec::new())),
             hir::HirPattern::Binding(local) => Ok((None, vec![(*local, scrutinee.clone())])),
@@ -6298,9 +6845,20 @@ impl TypeChecker {
                     },
                     _ => None,
                 };
-                let n = elems.len() as i128;
+                // Rest pattern 不计入固定元素数
+                let n = elems.iter().filter(|p| !matches!(p, hir::HirPattern::Rest)).count() as i128;
+                let has_rest = elems.iter().any(|p| matches!(p, hir::HirPattern::Rest));
                 if let Some(len) = static_len {
-                    if len != n {
+                    if has_rest {
+                        // 有 Rest：长度必须 >= 固定端元素数量
+                        if len < n {
+                            return Err(CompileError::type_error(format!(
+                                "slice pattern has {} fixed element(s), but array has {} — need at least {}",
+                                n, len, n
+                            ))
+                            .with_span(span));
+                        }
+                    } else if len != n {
                         return Err(CompileError::type_error(format!(
                             "slice pattern has {} element(s), but array has {}",
                             n, len
@@ -6309,12 +6867,13 @@ impl TypeChecker {
                     }
                 }
                 let mut conds: Vec<HirExpr> = Vec::new();
+                let len_expr = || hir::HirExpr {
+                    kind: ExprKind::Field(Box::new(scrutinee.clone()), "len".to_string()),
+                    ty: Ty::Uint(64),
+                    span,
+                };
                 if static_len.is_none() {
-                    let len_expr = hir::HirExpr {
-                        kind: ExprKind::Field(Box::new(scrutinee.clone()), "len".to_string()),
-                        ty: Ty::Uint(64),
-                        span,
-                    };
+                    // 有 rest 时只要 `len >= 固定元素数`，否则要精确相等。
                     let want = hir::HirExpr {
                         kind: ExprKind::Literal(hir::HirLiteral::Int(n)),
                         ty: Ty::Uint(64),
@@ -6322,8 +6881,12 @@ impl TypeChecker {
                     };
                     conds.push(hir::HirExpr {
                         kind: ExprKind::Binary(
-                            hir::BinaryOp::Eq,
-                            Box::new(len_expr),
+                            if has_rest {
+                                hir::BinaryOp::Ge
+                            } else {
+                                hir::BinaryOp::Eq
+                            },
+                            Box::new(len_expr()),
                             Box::new(want),
                         ),
                         ty: Ty::Bool,
@@ -6331,21 +6894,58 @@ impl TypeChecker {
                     });
                 }
                 let mut binds: Vec<(hir::LocalId, HirExpr)> = Vec::new();
-                for (i, sub) in elems.iter().enumerate() {
-                    // 子值 = `scrutinee[下标]`。
-                    let sub_value = hir::HirExpr {
-                        kind: ExprKind::Index(
-                            Box::new(scrutinee.clone()),
-                            Box::new(hir::HirExpr {
-                                kind: ExprKind::Literal(hir::HirLiteral::Int(i as i128)),
+                // 取第 `idx` 个元素；rest 之后的元素下标依赖运行期长度，
+                // 用 `len - from_end` 的表达式形式。
+                let elem_at = |idx: hir::HirExpr| hir::HirExpr {
+                    kind: ExprKind::Index(Box::new(scrutinee.clone()), Box::new(idx)),
+                    ty: elem_ty.clone(),
+                    span,
+                };
+                let const_idx = |i: i128| hir::HirExpr {
+                    kind: ExprKind::Literal(hir::HirLiteral::Int(i)),
+                    ty: Ty::Uint(64),
+                    span,
+                };
+                let seq: Vec<&hir::HirPattern> = if has_rest {
+                    let rest_idx = elems
+                        .iter()
+                        .position(|p| matches!(p, hir::HirPattern::Rest))
+                        .unwrap();
+                    elems[..rest_idx].iter().chain(elems[rest_idx + 1..].iter()).collect()
+                } else {
+                    elems.iter().collect()
+                };
+                let rest_idx = if has_rest {
+                    elems
+                        .iter()
+                        .position(|p| matches!(p, hir::HirPattern::Rest))
+                        .unwrap()
+                } else {
+                    elems.len()
+                };
+                for (pos, sub) in seq.iter().enumerate() {
+                    let at = if has_rest && pos >= rest_idx {
+                        // rest 之后的元素：从尾部倒着取
+                        let from_end = (seq.len() - pos) as i128;
+                        if let Some(len) = static_len {
+                            elem_at(const_idx(len - from_end))
+                        } else {
+                            // 运行期：len - from_end
+                            let idx = hir::HirExpr {
+                                kind: ExprKind::Binary(
+                                    hir::BinaryOp::Sub,
+                                    Box::new(len_expr()),
+                                    Box::new(const_idx(from_end)),
+                                ),
                                 ty: Ty::Uint(64),
                                 span,
-                            }),
-                        ),
-                        ty: elem_ty.clone(),
-                        span,
+                            };
+                            elem_at(idx)
+                        }
+                    } else {
+                        elem_at(const_idx(pos as i128))
                     };
-                    let (cond, sub_binds) = self.pat_match(&sub_value, sub, span)?;
+                    let (cond, sub_binds) = self.pat_match(&at, sub, span)?;
                     conds.extend(cond);
                     binds.extend(sub_binds);
                 }
@@ -6387,8 +6987,29 @@ impl TypeChecker {
                 let cond = conds.into_iter().reduce(|a, b| and_expr(a, b, span));
                 Ok((cond, Vec::new()))
             }
-            hir::HirPattern::Ref => Err(CompileError::type_error(
-                "match on reference patterns is not implemented yet",
+            hir::HirPattern::Ref(inner) => {
+                // 穿透 scrutinee 的一层引用/指针，然后用 inner pattern 匹配目标值。
+                let resolved = self.infer.resolve(&scrutinee.ty);
+                let target = match &resolved {
+                    Ty::Reference(inner_ty, _) | Ty::Pointer(inner_ty, _) => (**inner_ty).clone(),
+                    other => {
+                        return Err(CompileError::type_error(format!(
+                            "reference pattern requires a reference / pointer, found `{}`",
+                            self.infer.type_name(other)
+                        ))
+                        .with_span(span));
+                    }
+                };
+                // 构造解引用表达式（用 ExprKind::Deref 而不是 Unary(Deref)）
+                let deref = hir::HirExpr {
+                    kind: ExprKind::Deref(Box::new(scrutinee.clone())),
+                    ty: target.clone(),
+                    span,
+                };
+                self.pat_match(&deref, inner, span)
+            }
+            hir::HirPattern::Rest => Err(CompileError::type_error(
+                "rest patterns are only valid inside slice patterns",
             )
             .with_span(span)),
         }
@@ -6774,6 +7395,119 @@ impl TypeChecker {
         })
     }
 
+    /// `x!`：错误联合解包 + 传播。
+    ///
+    /// 语义：`x` 必须是 `T!E`。成功（tag=0）时取值 T，失败（tag=1）时把 E
+    /// 从当前函数传播出去——当前函数必须返回某个 ErrorUnion `_ ! E2`，
+    /// 且错误类型 E 与 E2 兼容。
+    fn check_postfix_bang(&mut self, inner: &Expression, expected: &Ty, span: ast::Span) -> Result<HirExpr> {
+        // 先拿到 inner 的真实类型
+        let inferred_ty = self.infer_expr_ty(inner)?;
+        let src_ty = self.infer.resolve(&inferred_ty);
+        let (ok_ty, err_ty) = match &src_ty {
+            Ty::ErrorUnion(ok, err) => ((**ok).clone(), (**err).clone()),
+            other => {
+                return Err(CompileError::type_error(format!(
+                    "`!` can only be used on an error union `T!E`, found `{}`",
+                    self.infer.type_name(other)
+                ))
+                .with_span(span));
+            }
+        };
+
+        // 当前函数必须返回某个 ErrorUnion，且错误类型兼容（暂要求精确一致，不做 From）
+        let ret_ty = self.infer.return_ty.clone().unwrap_or(Ty::Unit);
+        match &self.infer.resolve(&ret_ty) {
+            Ty::ErrorUnion(_, ret_err) => {
+                // 错误类型必须兼容（subtype 双向检查）
+                if self.infer.subtype(&err_ty, ret_err, span).is_err()
+                    && self.infer.subtype(ret_err, &err_ty, span).is_err()
+                {
+                    return Err(CompileError::type_error(format!(
+                        "`!` propagation: error type `{}` does not match enclosing function's error type `{}`",
+                        self.infer.type_name(&err_ty),
+                        self.infer.type_name(ret_err),
+                    ))
+                    .with_span(span));
+                }
+            }
+            _ => {
+                return Err(CompileError::type_error(format!(
+                    "`!` requires the enclosing function to return an error union (found `{}`)",
+                    self.infer.type_name(&ret_ty)
+                ))
+                .with_span(span));
+            }
+        }
+
+        // 让 inner 真正被 type-checked（resolve infer 变量）
+        let expr = self.check_expr(inner, &src_ty)?;
+
+        self.infer.unify(&ok_ty, expected, span).ok();
+
+        // 脱糖成 `if tag == 0 { ok载荷 } else { return err载荷 }`。
+        // err 侧要把错误载荷重新包成**当前函数**的错误联合再 return。
+        let ret_ty_resolved = self.infer.resolve(&ret_ty);
+        let tag = HirExpr {
+            kind: ExprKind::ErrorUnionTag(Box::new(expr.clone())),
+            ty: Ty::Uint(8),
+            span,
+        };
+        let cond = HirExpr {
+            kind: ExprKind::Binary(
+                hir::BinaryOp::Eq,
+                Box::new(tag),
+                Box::new(HirExpr {
+                    kind: ExprKind::Literal(hir::HirLiteral::Int(0)),
+                    ty: Ty::Uint(8),
+                    span,
+                }),
+            ),
+            ty: Ty::Bool,
+            span,
+        };
+        let then_block = hir::HirBlock {
+            stmts: Vec::new(),
+            tail: Some(Box::new(HirExpr {
+                kind: ExprKind::ErrorUnionPayload {
+                    value: Box::new(expr.clone()),
+                    is_err: false,
+                },
+                ty: ok_ty.clone(),
+                span,
+            })),
+        };
+        let err_value = HirExpr {
+            kind: ExprKind::ErrorUnionWrap {
+                value: Box::new(HirExpr {
+                    kind: ExprKind::ErrorUnionPayload {
+                        value: Box::new(expr),
+                        is_err: true,
+                    },
+                    ty: err_ty,
+                    span,
+                }),
+                is_err: true,
+            },
+            ty: ret_ty_resolved,
+            span,
+        };
+        let else_block = hir::HirBlock {
+            stmts: Vec::new(),
+            tail: Some(Box::new(HirExpr {
+                kind: ExprKind::Return(Some(Box::new(err_value))),
+                ty: Ty::Never,
+                span,
+            })),
+        };
+
+        Ok(HirExpr {
+            kind: ExprKind::If(Box::new(cond), then_block, Some(else_block)),
+            ty: ok_ty.clone(),
+            span,
+        })
+    }
+
     /// 移动一个 Drop 字段时，禁止从直接实现 Drop 的类型（或引用/指针后面）
     /// 移出。Rust 在 E0509/E0507 中同样禁止这类部分移动。
     fn check_partial_move(&self, expr: &HirExpr, span: ast::Span) -> Result<()> {
@@ -7006,8 +7740,8 @@ impl TypeChecker {
                     self.mutable_locals.insert(local);
                 }
                 if let Some(s) = sub {
-                    let _ = self.lower_pattern(s, ty)?;
-                    Ok(hir::HirPattern::Ref)
+                    let inner_pat = self.lower_pattern(s, ty)?;
+                    Ok(hir::HirPattern::Ref(Box::new(inner_pat)))
                 } else {
                     Ok(hir::HirPattern::Binding(local))
                 }
@@ -7136,9 +7870,15 @@ impl TypeChecker {
                 })
             }
             AstPattern::Ref(inner, mutability, _) => {
-                let _ = self.lower_pattern(inner, ty)?;
+                // Ref pattern：inner pattern 匹配的是解引用后的目标类型。
+                // 所以需要先从 ty 里去掉一层 Reference/Pointer。
+                let target_ty = match &ty {
+                    Ty::Reference(inner_ty, _) | Ty::Pointer(inner_ty, _) => (**inner_ty).clone(),
+                    _ => ty.clone(), // 让 pat_match 里报 "requires a reference / pointer"
+                };
+                let inner_pat = self.lower_pattern(inner, &target_ty)?;
                 let _ = mutability;
-                Ok(hir::HirPattern::Ref)
+                Ok(hir::HirPattern::Ref(Box::new(inner_pat)))
             }
             AstPattern::Or(_) => {
                 // 或模式需要拆成多条分支条件，只有 match 能做到；其他位置
@@ -7148,6 +7888,7 @@ impl TypeChecker {
                         .with_span(ast::Span::unknown()),
                 )
             }
+            AstPattern::Rest(_) => Ok(hir::HirPattern::Rest),
         }
     }
 
@@ -7455,6 +8196,15 @@ impl TypeChecker {
     /// `fn id<T: Ord>` 配一个只实现了 `Eq` 的类型能静默编过——边界被削弱，
     /// 是类型安全漏洞。
     fn implements_trait(&self, ty: &Ty, trait_id: DefId) -> bool {
+        if let Ty::Opaque(oid) = ty {
+            if let Some(bounds) = self.opaque_bounds.get(oid) {
+                for b in bounds {
+                    if self.expand_trait(*b).contains(&trait_id) {
+                        return true;
+                    }
+                }
+            }
+        }
         for id in self.direct_impls(ty) {
             if self.expand_trait(id).contains(&trait_id) {
                 return true;
@@ -8953,8 +9703,20 @@ impl TypeChecker {
             | ExprKind::EnumField { value: v, .. }
             | ExprKind::EnumTag(v)
             | ExprKind::ArrayToSlice(v)
+            | ExprKind::ErrorUnionWrap { value: v, .. }
+            | ExprKind::ErrorUnionTag(v)
+            | ExprKind::ErrorUnionPayload { value: v, .. }
             | ExprKind::Spawn(v)
-            | ExprKind::FnToCodePtr(v) => self.rewrite_fn_values_expr(v, fns),
+            | ExprKind::FnToCodePtr(v)
+            | ExprKind::DynCoerce { value: v, .. } => self.rewrite_fn_values_expr(v, fns),
+            ExprKind::DynCall {
+                receiver, args, ..
+            } => {
+                self.rewrite_fn_values_expr(receiver, fns);
+                for arg in args {
+                    self.rewrite_fn_values_expr(arg, fns);
+                }
+            }
             ExprKind::IndexRange(v, start, end, _) => {
                 self.rewrite_fn_values_expr(v, fns);
                 if let Some(s) = start {
@@ -9760,20 +10522,17 @@ impl TypeChecker {
             // 那是活的推断变量（见架构红线 §3.2），大文件里会被绑定掉。
             AstType::Infer => self.infer.fresh_infer(crate::parser::ast::Span::unknown()),
             AstType::ImplTrait(bounds) => {
-                // `impl Trait` 降级为不透明类型：
-                // - RPIT（返回位置）：隐藏类型由函数体推断，外部不可见
-                // - APIT（参数位置）：等价于一个新的泛型参数
-                // 这里统一创建一个 OpaqueTy，其隐藏类型在后续推断中确定
                 let opaque_id = self.alloc_def(format!("impl_trait_{}", self.next_def));
-                // 记录 trait 边界到约束集合
+                let mut trait_ids: Vec<DefId> = Vec::new();
                 for bound in bounds {
                     if let AstType::Named { path, .. } = bound {
                         if let Ok(trait_id) = self.resolve_type_path(path) {
-                            // 约束：opaque 类型必须实现该 trait
-                            // 这里简化为 Infer，实际的 trait 约束在推断阶段检查
-                            let _ = trait_id;
+                            trait_ids.push(trait_id);
                         }
                     }
+                }
+                if !trait_ids.is_empty() {
+                    self.opaque_bounds.insert(opaque_id, trait_ids);
                 }
                 Ty::Opaque(opaque_id)
             }
@@ -10799,6 +11558,8 @@ impl TypeChecker {
             ast::BinaryOp::Or => hir::BinaryOp::Or,
             ast::BinaryOp::Range => hir::BinaryOp::Range,
             ast::BinaryOp::RangeInclusive => hir::BinaryOp::RangeInclusive,
+            // `catch` 在 `check_binary` 入口就被 `check_catch` 拦下脱糖，不会到这里。
+            ast::BinaryOp::Catch => unreachable!("catch is desugared by check_catch"),
         }
     }
 
@@ -11223,7 +11984,10 @@ fn ty_name(ty: &Ty) -> String {
         Ty::Infer(_) => "_".into(),
         Ty::Opaque(id) => format!("opaque({})", id.0),
         Ty::Pin(inner) => format!("Pin<{}>", ty_name(inner)),
-        Ty::Dyn(trait_id) => format!("dyn trait#{}", trait_id.0),
+        Ty::Dyn(trait_id) => match infer::lookup_def_name(*trait_id) {
+            Some(n) => format!("dyn {}", n),
+            None => format!("dyn trait#{}", trait_id.0),
+        },
         // const 泛型：报错时按值 / 名字打印。
         Ty::ConstVal(n) => n.to_string(),
         Ty::ConstParam(name) => name.clone(),
@@ -11449,7 +12213,19 @@ fn substitute_local(e: &mut hir::HirExpr, target: LocalId, with: &hir::HirExpr) 
         | ExprKind::EnumField { value: v, .. }
         | ExprKind::EnumTag(v)
         | ExprKind::ArrayToSlice(v)
-        | ExprKind::Spawn(v) => substitute_local(v, target, with),
+        | ExprKind::ErrorUnionWrap { value: v, .. }
+        | ExprKind::ErrorUnionTag(v)
+        | ExprKind::ErrorUnionPayload { value: v, .. }
+        | ExprKind::Spawn(v)
+        | ExprKind::DynCoerce { value: v, .. } => substitute_local(v, target, with),
+        ExprKind::DynCall {
+            receiver, args, ..
+        } => {
+            substitute_local(receiver, target, with);
+            for arg in args {
+                substitute_local(arg, target, with);
+            }
+        }
         ExprKind::IndexRange(v, start, end, _) => {
             substitute_local(v, target, with);
             if let Some(s) = start {
@@ -11610,7 +12386,19 @@ fn remap_lifted_body(
             | ExprKind::EnumField { value: v, .. }
             | ExprKind::EnumTag(v)
             | ExprKind::ArrayToSlice(v)
-            | ExprKind::Spawn(v) => remap_expr(v, map, next),
+            | ExprKind::ErrorUnionWrap { value: v, .. }
+            | ExprKind::ErrorUnionTag(v)
+            | ExprKind::ErrorUnionPayload { value: v, .. }
+            | ExprKind::Spawn(v)
+            | ExprKind::DynCoerce { value: v, .. } => remap_expr(v, map, next),
+            ExprKind::DynCall {
+                receiver, args, ..
+            } => {
+                remap_expr(receiver, map, next);
+                for arg in args {
+                    remap_expr(arg, map, next);
+                }
+            }
             ExprKind::IndexRange(v, start, end, _) => {
                 remap_expr(v, map, next);
                 if let Some(s) = start {

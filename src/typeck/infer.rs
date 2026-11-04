@@ -93,7 +93,7 @@ pub fn clear_def_names() {
     DEF_NAMES.with(|m| m.borrow_mut().clear());
 }
 
-fn lookup_def_name(id: DefId) -> Option<String> {
+pub fn lookup_def_name(id: DefId) -> Option<String> {
     DEF_NAMES.with(|m| m.borrow().get(&id).cloned())
 }
 
@@ -417,6 +417,15 @@ impl<'a> InferCtxt<'a> {
             (Ty::Infer(i), _) => self.bind_infer(*i, &b, span),
             (_, Ty::Infer(j)) => self.bind_infer(*j, &a, span),
 
+            // ErrorUnion 隐式包装：`T` ↔ `T!E` 可通过（任一方向）。
+            // 联合与联合之间走下面的结构统一。
+            (other, Ty::ErrorUnion(ok, err)) if !matches!(other, Ty::ErrorUnion(..)) => {
+                self.unify_wrap_value(other, ok, err, span)
+            }
+            (Ty::ErrorUnion(ok, err), other) if !matches!(other, Ty::ErrorUnion(..)) => {
+                self.unify_wrap_value(other, ok, err, span)
+            }
+
             // 同构构造子
             (Ty::Int(w1), Ty::Int(w2)) if w1 == w2 => Ok(()),
             (Ty::Uint(w1), Ty::Uint(w2)) if w1 == w2 => Ok(()),
@@ -469,6 +478,9 @@ impl<'a> InferCtxt<'a> {
                 }
                 Ok(())
             }
+            // `dyn Trait`：同一 trait 才统一。不同 trait 的 dyn 之间没有
+            // 协变——vtable 槽位布局不同，放行就是运行期调错方法。
+            (Ty::Dyn(t1), Ty::Dyn(t2)) if t1 == t2 => Ok(()),
             // `const` 泛型实参：值相等才统一（`Arr<3>` 与 `Arr<4>` 是不同类型）。
             (Ty::ConstVal(a), Ty::ConstVal(b)) if a == b => Ok(()),
             // 值不等：走通用 `expected`/`found` 只会打出两个光秃秃的数字
@@ -484,6 +496,20 @@ impl<'a> InferCtxt<'a> {
             (Ty::Opaque(_), _) | (_, Ty::Opaque(_)) => Ok(()),
             _ => Err(self.type_mismatch(&a, &b, span)),
         }
+    }
+
+    /// 把一个普通值类型的统一结果落到 `T!E` 上：`T` 与 `E` 同型时一律按 ok，
+    /// 否则先试 ok 再试 err（都走子类型，允许整型拓宽）。
+    fn unify_wrap_value(&mut self, other: &Ty, ok: &Ty, err: &Ty, span: Span) -> Result<()> {
+        let ok = self.resolve(ok);
+        let err = self.resolve(err);
+        if ok == err {
+            return self.unify(&ok, other, span);
+        }
+        if self.subtype(other, &ok, span).is_ok() {
+            return Ok(());
+        }
+        self.subtype(other, &err, span)
     }
 
     /// 将推断变量绑定到一个非推断类型。
@@ -540,6 +566,22 @@ impl<'a> InferCtxt<'a> {
         // Never 是底类型：可以赋值给任何类型
         if matches!(sub, Ty::Never) {
             return Ok(());
+        }
+
+        // ErrorUnion 隐式包装：`T` / `E` 可以赋值给 `T!E`
+        // T 和 E 同型时一律 ok；否则先试 ok 侧（精确）再试 err 侧
+        if !matches!(sub, Ty::ErrorUnion(..)) {
+            if let Ty::ErrorUnion(ok, err) = &sup {
+                let ok = self.resolve(ok);
+                let err = self.resolve(err);
+                if ok == err {
+                    return self.subtype(&sub, &ok, span);
+                }
+                if self.subtype(&sub, &ok, span).is_ok() {
+                    return Ok(());
+                }
+                return self.subtype(&sub, &err, span);
+            }
         }
 
         // 推断变量：还没有真正的变量绑定机制，`Infer` 只是个占位，
@@ -747,9 +789,12 @@ impl<'a> InferCtxt<'a> {
                 format!("{}!{}", self.type_name(t), self.type_name(e))
             }
             Ty::Dyn(trait_id) => {
-                // 暂用 DefId 编号显示 trait 名；完整实现应在类型定义表
-                // 里反查 trait 名称。
-                format!("dyn trait#{}", trait_id.0)
+                // trait 不在 `type_defs` 里（`type_id_name` 查不到），走
+                // `alloc_def` 维护的诊断登记表反查名字。
+                match lookup_def_name(*trait_id) {
+                    Some(n) => format!("dyn {}", n),
+                    None => format!("dyn trait#{}", trait_id.0),
+                }
             }
             Ty::Infer(_) => "_".into(),
             Ty::Opaque(id) => format!("opaque({})", self.type_id_name(*id)),
@@ -827,7 +872,10 @@ impl fmt::Display for Ty {
             Ty::Infer(_) => "_".to_string(),
             Ty::Opaque(_) => "opaque".to_string(),
             Ty::Pin(inner) => format!("Pin<{}>", inner),
-            Ty::Dyn(trait_id) => format!("dyn trait#{}", trait_id.0),
+            Ty::Dyn(trait_id) => match lookup_def_name(*trait_id) {
+                Some(n) => format!("dyn {}", n),
+                None => format!("dyn trait#{}", trait_id.0),
+            },
             // const 泛型实参 / 声明期参数：报错时按值或名字打印，便于定位。
             Ty::ConstVal(n) => n.to_string(),
             Ty::ConstParam(name) => name.clone(),

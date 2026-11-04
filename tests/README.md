@@ -16,9 +16,9 @@ cargo test --test zr_language
 属性、断言内建这些设施编译器目前还不支持（闭包已可用，见 `83_closure_fnptr.zr`
 与 `84_closure_capture_value.zr`；见下方"尚未覆盖"）。
 
-`tests/cases/` 现有 152 个用例，每个在 `-O0/-O1/-O2/-O3/-Oz` 各跑一遍。
+`tests/cases/` 现有 162 个用例，每个在 `-O0/-O1/-O2/-O3/-Oz` 各跑一遍。
 
-"该报错的还在报错"由另一半套件补上：`tests/negative/*.zr`（37 个）每个都必须
+"该报错的还在报错"由另一半套件补上：`tests/negative/*.zr`（48 个）每个都必须
 **编译失败**，且报错文本要含文件里 `// expect: <子串>` 标注的期望子串
 （子串匹配，行号/列号漂移不会把套件变红）：
 
@@ -176,6 +176,16 @@ cargo test --test zr_negative
 | `150_std_alloc_ext.zr` | alloc 层按 Rust `alloc` 补齐：`Box`（`new` / `get` / `get_mut` / `replace` / `free`），`Vec`（`first` / `last` / `truncate` / `retain` / `reverse` / `swap` / `extend_from_slice` / `dedup`），`String`（`trim*` / `to_lowercase` / `to_uppercase` / `find_str` / `rfind_byte` / `split` / `split_whitespace` / `replace` / `parse_i64` / `parse_i32` / `clone` / `Eq` / `Hash`），`VecDeque`（双端出入/索引/`destroy`），`HashMap`（String 与 i64 键、覆盖、删除、扩容 rehash）。该用例同时钉住了两处编译器缺陷：`size_of` 对泛型类型未按实参实例化（`Entry<K,V>` 被算成 1 字节）与结构体尺寸未按对齐补齐 |
 | `151_std_fs_time.zr` | std 层 OS 抽象按 Rust `std` 补齐：`fs` 的 `create_dir_all` / `exists` / `is_dir` / `write_string` / `append_string` / `read_to_string` / `read_bytes` / `copy_file` / `read_dir` / `file_size` / `remove_file` / `remove_dir`，`io` 的 `File::read_line` / `File::read_to_string` / `File::write_string` / `stdout()` / `stdin()` / `stderr()`，`time` 的 `Duration` / `Instant` / `sleep` 与 `DateTime` 日历换算（含纪元前负秒） |
 | `152_http2.zr` | `std/std/http2.zr`：HPACK 解码对 RFC 7541 附录 C 的六组向量（C.4.1–C.4.3 默认 4096 动态表连续解码、C.6.1–C.6.3 用 `with_table_size(256)` 触发淘汰）、自研编码器的字面量/静态索引格式、150 字节长值的多字节长度前缀往返、9 字节帧头的逐字节断言。全部离线，不发真实网络请求（h2c 端到端往返靠人工探针验证） |
+| `153_large_array.zr` | 大数组 `[v; N]`（N > 16）：`[0; 1000]` / `[42; 100]` / 恰好 17 的边界、按值复制的副本语义。回归 `copy_array_into` 的运行期循环路径（早先对任意 N 展开成 N 条 load-store，`[0; 65536]` 编译要 2:44） |
+| `154_ref_vec_index.zr` | `&Vec<T>` / `&mut Vec<T>` 的下标：`read_ref(&v)` / `write_ref(&mut v)` / 直接 `(&v)[0]`。早先 `check_index_scalar` 只认 `Ty::Named`，引用形态绕过 `v.data[i]` 脱糖、对 Vec 结构体本身做指针算术 |
+| `155_short_circuit.zr` | `&&` / `||` 短路：`false && f()` / `true && f()` / `true || f()` / `false || f()` 用副作用计数验证 rhs 是否执行，含 lhs 为字面量的常量折叠路径。早先两侧都求值，`ptr != null && ptr.data[i].used` 在空指针上直接 SIGSEGV |
+| `156_defer.zr` | `defer`：块退出时按声明顺序**逆序**执行、嵌套块、`return` / `break` 路径。早先 `is_block_like()` 漏掉 `Expression::Defer`，`defer { .. } 下一句` 被当尾表达式而报 `expected '}'` |
+| `157_error_union.zr` | 错误联合 `T!E`：后缀 `!` 解包 + 错误传播（多级穿透）、中缀 `catch`（含 rhs 为同型联合的链式写法）、`T` / `E` 的隐式 ok/err 包装（`i64!i32` 的 `i32` 错误值不会被整型拓宽误判成 ok）。运行期布局同两变体枚举：偏移 0 是 `u8` 判别式、载荷区按 `max(align T, align E)` 对齐 |
+| `158_slice_rest_pattern.zr` | 切片模式 `..` 剩余：`[a, .., b]` 在定长数组与动态切片上、`..` 跳过 0 个或多个、尾部元素倒序取下标、`let` / `match` / `if let` 各位置。`len` 条件从 `== n` 改为 `>= n`；`[.., ..]` / 多个 `..` 在 parser 报错（负向 `44`） |
+| `159_ref_pattern.zr` | 引用模式 `&p` / `&mut p`（与 `ref p` 等价）：标量 / 聚合 / 嵌套 `&&p`、切片与结构体组合。`check_match` 移除自动穿透（与 Rust 一致，`match &x { v }` 要显式 `&v`）；`&非引用` 报错（负向 `46`） |
+| `160_rpit_impl_trait.zr` | `impl Trait` 返回位置（RPIT）：`-> impl Trait` 降成真存在类型 `opaque(impl_trait_N)`，体内用推断变量检查、返回后把隐藏类型记进 `opaque_hidden`，调用方按隐藏类型做方法查找，边界真校验。隐藏类型不实现边界 / 无返回值各有负向用例（`47` / `48`） |
+| `161_dyn_dispatch.zr` | `dyn Trait` vtable 分派（x86-64 MVP）：`dyn` 是 16 字节值 `{data, vtable}`，vtable 是 `.text` 跳转表（槽位 `jmp rel32` ×5 字节）。多类型分派、默认方法进表与覆盖、dyn 值作函数参数、`&dyn` receiver、带参方法、`str` 聚合 sret 返回。未实现 trait 强转 / 调 trait 外方法各有负向用例（`49` / `50`） |
+| `162_dyn_std_error.zr` | `dyn` 与 `std/error.zr` 集成：`description() -> String`（24 字节聚合 sret 返回）、`cause() / backtrace()` 默认方法经 vtable 分派返回 `None`、dyn 值跨函数传递 |
 
 ## 尚未覆盖（编译器还不支持）
 
@@ -193,15 +203,15 @@ Rust Book 的其余章节目前一个都测不了，因为对应特性尚未实�
 | 枚举 | ✅ `57_enum.zr`：变体构造 / 判别式 / 变体模式 / 穷尽性 / 拷贝语义；`80_match_value.zr` 钉 match 返回值 |
 | 浮点（仅 ARM32 / Thumb / RISC-V / wasm） | x86-64 与 aarch64 已支持；其余后端遇到浮点字面量会**明确报错**（不再静默发射 0） |
 | 字符串字面量（仅 ARM32 / Thumb / RISC-V / wasm） | x86-64 与 aarch64 已落 `.rodata`（可取址、按地址比较），并可通过 `extern "C"` 调用运行时的 `zr_write` 输出；其余后端遇到字符串字面量会**明确报错**。尚无解引用 / 索引（需要 SSA 内存模型） |
-| 模式匹配（`match` / `if let` / 解构） | ✅ `25_match.zr`（字面量/绑定/或/guard）、`52_if_let.zr`、`54_struct_pattern.zr`、`55_tuple_pattern.zr`、`56_range_pattern.zr`、`62_while_let.zr`、`121_let_destructure.zr`（`let` 解构 + 切片模式）；`match` 脱糖成 if/else 链。**缺臂报错已改进**（枚举列出缺失变体名） |
+| 模式匹配（`match` / `if let` / 解构） | ✅ `25_match.zr`（字面量/绑定/或/guard）、`52_if_let.zr`、`54_struct_pattern.zr`、`55_tuple_pattern.zr`、`56_range_pattern.zr`、`62_while_let.zr`、`121_let_destructure.zr`（`let` 解构 + 切片模式）、`158_slice_rest_pattern.zr`（`[a, .., b]` 剩余模式）、`159_ref_pattern.zr`（`&p` / `&mut p` / `&&p`）；`match` 脱糖成 if/else 链。**缺臂报错已改进**（枚举列出缺失变体名）；`..` 重复、`&` 非引用各在 parser / 类型检查报错（负向 `44` / `46`） |
 | 包管理与 Cargo | 🟡 模块系统已支持 `mod` / `use` / `use a::{b,c}` / `use x as y`（`75_use_alias.zr`）/ `use foo::*`（`90_glob_import.zr`）；但无 Cargo 等价物 |
 | 集合（Vector / String / HashMap） | 🟡 `std/collections` 与 `std/string` 已加载，但 `String` 无 `BufRead::read_line` 形态的 API；无 `HashMap` |
-| 错误处理（`panic!` / `Result` / `?`） | ✅ `69_question.zr`：`?` 对 `Result`/`Option` 生效；`Option`/`Result`（含变体）已在 prelude（`89_prelude_variant.zr`）。`panic!` 未实现 |
-| 泛型 / Trait / 生命周期 | ✅ 泛型函数/impl 与 `T: Trait` 边界校验已实现（`66_generics.zr`、`74_generic_alias.zr`）；trait 方法/关联类型/`Self` 可用。**生命周期标注 `'a` 解析后丢弃**，无借用/存活检查 |
+| 错误处理（`panic!` / `Result` / `?` / `T!E` / `catch`） | ✅ `69_question.zr`：`?` 对 `Result`/`Option` 生效；`157_error_union.zr`：错误联合 `T!E` 的后缀 `!` 传播与中缀 `catch`、隐式 ok/err 包装（非法的 `!` / `catch` / 错误类型不一致由负向 `40`–`43` 钉住）；`Option`/`Result`（含变体）已在 prelude（`89_prelude_variant.zr`）。`panic!` 未实现 |
+| 泛型 / Trait / 生命周期 | ✅ 泛型函数/impl 与 `T: Trait` 边界校验已实现（`66_generics.zr`、`74_generic_alias.zr`）；trait 方法/关联类型/`Self` 可用；`impl Trait` 参数位置（APIT，`120_apit.zr`）与返回位置（RPIT，`160_rpit_impl_trait.zr`）均已实现；`dyn Trait` vtable 分派已落地（x86-64，`161_dyn_dispatch.zr` / `162_dyn_std_error.zr`）。**生命周期标注 `'a` 解析后丢弃**，无借用/存活检查 |
 | 函数式（闭包 / 迭代器） | 🟡 **无捕获**闭包已可存进变量/当实参/返回（`83_closure_fnptr.zr`）；**带捕获**闭包已可存进变量/嵌套/多次调用（`84_closure_capture_value.zr`）、按值传给泛型形参 / 从泛型返回值透传（`109` / `110`）；**带捕获闭包也能转成裸 `fn(..)` 值**——传给 `fn(..)` 形参、作 `fn(..)` 返回值、`let f: fn(..) = |..|` 都可用（`125_closure_to_fn.zr`：函数值 = 16 字节记录 `{code, env}`，统一 shim 多传一个 env）。泛型 / 异步函数当值明确报错（负向 `38` / `39`）；迭代器未实现 |
 | 智能指针（`Box` / `Rc` / `RefCell`） | ❌ 未实现 |
 | 并发（线程 / 通道 / `Mutex` / `Send`） | 🟡 线程已覆盖（`59_threads.zr`）；无通道 / `Mutex` / `Send` |
-| 面向对象 / 状态模式 | ✅ `trait` 与 `enum` 都已实现；trait 对象 `dyn` 骨架已搭（`88_dyn_keyword.zr`），vtable 分派未完工 |
+| 面向对象 / 状态模式 | ✅ `trait` 与 `enum` 都已实现；trait 对象 `dyn` 可用（`88_dyn_keyword.zr` 语法骨架、`161_dyn_dispatch.zr` vtable 分派） |
 | `async` / 协程 | ✅ `29_async.zr` / `47..51` 覆盖 `.await` / future / `spawn`；`123_yield_cooperative.zr` 覆盖 `yield` 协作让出（交错顺序 / 操作数副作用 / 循环多轮 + 聚合活跃值）；负向 `35` / `36` 钉住同步函数与闭包体里的 `yield` 报错 |
 
 | 32 位目标上的宽整数（`i64` / `u64` / `i128`） | 32 位寄存器放不下，多字长（寄存器对）尚未实现；**写出来会在类型检查阶段报错** |

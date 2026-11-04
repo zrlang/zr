@@ -1,0 +1,10 @@
+// 负向：引用模式 `&v` 用在非引用类型上。
+fn main() -> i32 {
+    let x: i32 = 42;
+    let v = match x {
+        &v_ => v_,
+        _ => 0,
+    };
+    return v;
+}
+// expect: requires a reference / pointer

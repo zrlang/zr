@@ -118,6 +118,32 @@ impl Parser {
             return Ok(Pattern::Ref(Box::new(inner), mutability, span));
         }
 
+        // `&p` / `&mut p`（Rust 风格引用模式，与 `ref p` 等价）
+        //
+        // 注意：词法器把 `&&` 连成 AmpAmp（位与），pattern 里的 `&&pat`
+        // 是两层 ref pattern。这里先处理 AmpAmp 特例。
+        if self.check(&TokenKind::AmpAmp) {
+            let first_span = self.peek().span;
+            self.advance(); // 消费 AmpAmp
+            // 手动处理成两层 Ref：先构造 inner pattern，然后包两层 Ref
+            let inner = self.parse_pattern_single()?;
+            let mutability = crate::parser::ast::Mutability::Immutable;
+            return Ok(Pattern::Ref(
+                Box::new(Pattern::Ref(Box::new(inner), mutability, first_span)),
+                mutability,
+                first_span,
+            ));
+        }
+        if self.match_kind(&TokenKind::Amp) {
+            let mutability = if self.match_kind(&TokenKind::KwMut) {
+                crate::parser::ast::Mutability::Mutable
+            } else {
+                crate::parser::ast::Mutability::Immutable
+            };
+            let inner = self.parse_pattern_single()?;
+            return Ok(Pattern::Ref(Box::new(inner), mutability, span));
+        }
+
         // 否定模式 `~p`（预留）
         if self.match_kind(&TokenKind::Tilde) {
             let inner = self.parse_pattern_single()?;
@@ -187,8 +213,23 @@ impl Parser {
         // 切片模式 `[p1, .., p2]`
         if self.match_kind(&TokenKind::LBracket) {
             let mut pats = Vec::new();
+            let mut seen_rest = false;
             while !self.check(&TokenKind::RBracket) && !self.is_at_end() {
-                pats.push(self.parse_pattern()?);
+                // `..` rest pattern（只能有一个）
+                if self.check(&TokenKind::DotDot) {
+                    let rest_span = self.peek().span;
+                    if seen_rest {
+                        return Err(self.expected(
+                            "expected pattern, found DotDot",
+                            &self.peek().kind,
+                        ));
+                    }
+                    seen_rest = true;
+                    self.advance(); // ..
+                    pats.push(Pattern::Rest(rest_span));
+                } else {
+                    pats.push(self.parse_pattern()?);
+                }
                 if !self.match_kind(&TokenKind::Comma) {
                     break;
                 }

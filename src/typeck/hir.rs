@@ -33,6 +33,23 @@ pub struct HirModule {
     /// 全局 `static` 变量（按 DefId 排序）。只有标量、且初值能折成字面量
     /// 的静态量才会生成数据符号。
     pub statics: Vec<HirStaticDef>,
+    /// `dyn Trait` 强转点收集到的 vtable 需求表（按符号去重）。
+    ///
+    /// 每个强转点（`ExprKind::DynCoerce`）引用这里的符号；codegen 按这张表
+    /// 在 `.text` 末尾发射跳转表。方法用 `DefId` 存，最终符号名
+    /// （`z_` 前缀 + 单态化后缀）到 MIR 降级时才定得下来。
+    pub vtables: Vec<HirVtable>,
+}
+
+/// 一张 `dyn Trait` vtable 的需求描述：符号 + 按 trait 声明顺序排列的
+/// impl 方法。
+#[derive(Debug, Clone)]
+pub struct HirVtable {
+    /// 最终符号名（`__vt_<类型>_<trait>`），跳转表与强转点都按它索引，
+    /// 去重也按它（符号里已经编码了 `(具体类型, trait)` 对）。
+    pub symbol: String,
+    /// impl 方法，顺序 = trait 声明顺序 = vtable 槽位顺序。
+    pub methods: Vec<DefId>,
 }
 
 /// 一个全局静态量。
@@ -406,6 +423,47 @@ pub enum ExprKind {
         variant: usize,
         index: usize,
     },
+    /// 错误联合构造：把 `value` 包进 `T!E` 的 ok / err 载荷。
+    ///
+    /// 运行期布局与两变体枚举同形：偏移 0 是 u8 判别式（0 = ok / 1 = err），
+    /// 载荷区按 `max(align T, align E)` 对齐。
+    ErrorUnionWrap {
+        value: Box<HirExpr>,
+        is_err: bool,
+    },
+    /// 错误联合的判别式（0 = ok / 1 = err）。
+    ErrorUnionTag(Box<HirExpr>),
+    /// 错误联合载荷读取：`is_err` 决定取哪一侧的载荷。
+    ErrorUnionPayload {
+        value: Box<HirExpr>,
+        is_err: bool,
+    },
+    /// `&concrete` → `dyn Trait` 强制转换：构造 16 字节胖指针记录
+    /// `{ data, vtable }`（运行期布局与 `str` / 函数值同形，`data` 在偏移 0，
+    /// `vtable` 在偏移 8）。
+    ///
+    /// `value` 是源引用（`&T` / `&mut T`，`T` 已实现目标 trait）；
+    /// `vtable_symbol` 是 vtable 跳转表的最终符号名（`__vt_<类型>_<trait>`）。
+    /// 跳转表本身由 codegen 按 `HirModule::vtables` 发射——一段 `.text`
+    /// 里的 `jmp <impl 方法>` 序列，槽位间距固定（x86-64 为 5 字节），
+    /// 因此不需要 `.data` 里的绝对地址重定位。
+    DynCoerce {
+        value: Box<HirExpr>,
+        vtable_symbol: String,
+    },
+    /// `dyn Trait` 的 vtable 方法调用。
+    ///
+    /// `receiver` 是胖指针记录（`dyn Trait` 值）或指向它的引用（`&dyn Trait`，
+    /// 此时其值就是记录地址，两种形态降级后相同）；`index` 是方法在 trait
+    /// 声明里的序号（vtable 槽位）；`args` 是不含 receiver 的实参。
+    /// MIR 降级：`vt = load [fat+8]`、`code = vt + index*槽宽`、
+    /// `CallIndirect(code, [load [fat+0], args..])`。
+    DynCall {
+        receiver: Box<HirExpr>,
+        index: u32,
+        args: Vec<HirExpr>,
+        result: LocalId,
+    },
     /// 结构体字面量：字段按源码书写顺序保存。
     Struct(Vec<(String, HirExpr)>),
     /// Lambda / 闭包。
@@ -600,6 +658,8 @@ pub enum HirPattern {
     /// 元素模式必须留下来：匹配时既要按**长度**判条件，绑定也要落在
     /// 各下标上（`scrut[i]`），而不是整个切片。早先只留一个无载荷的
     /// `Slice`，`let [a, b] = arr;` 的子绑定永不初始化。
+    ///
+    /// `..` rest pattern 在 Vec 里以 `HirPattern::Rest` 表示。
     Slice(Vec<HirPattern>),
     /// 范围模式：`start..=end`（`inclusive` 为真）或 `start..end`。
     Range {
@@ -607,8 +667,10 @@ pub enum HirPattern {
         end: Box<HirExpr>,
         inclusive: bool,
     },
-    /// 引用模式 `ref mut? p`。
-    Ref,
+    /// 引用模式 `ref mut? p` 或 `&p`。
+    Ref(Box<HirPattern>),
+    /// `..` rest pattern（只在 Slice 的 Vec 内部出现，匹配 0+ 元素）。
+    Rest,
 }
 
 // ======================================================================
@@ -832,6 +894,13 @@ pub struct HirTrait {
     /// 必须有：实现 `Ord` 蕴含实现 `Eq`，所以查 `T: Eq` 时，`T` 实现了
     /// `Ord` 也算数。没有这个字段，`Ord: Eq` 那层继承关系就断了。
     pub super_traits: Vec<DefId>,
+    /// 方法名，按声明顺序。
+    ///
+    /// `dyn Trait` 的 vtable 槽位顺序就是它：方法 `m` 的槽位 =
+    /// `methods.iter().position(|n| n == m)`。没有它 vtable 布局无从谈起
+    /// （`HirTrait` 原本只存关联类型 / marker / 超类型，方法只在
+    /// `functions` 里以 `Trait::method` 为名注册，顺序信息会丢）。
+    pub methods: Vec<String>,
 }
 
 /// 关联类型。

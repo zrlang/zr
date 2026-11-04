@@ -273,6 +273,7 @@ pub fn compile(
     target: &Target,
     module: &SsaModule,
     statics: &[crate::mir::MirStatic],
+    vtables: &[crate::mir::MirVtable],
 ) -> Result<CompilationUnit, String> {
     let mut unit = CompilationUnit::new();
     unit.is_thumb = target.is_arm32_thumb();
@@ -308,6 +309,22 @@ pub fn compile(
     } else {
         for func in &module.functions {
             emit_one(target, arch, &mut unit, func, &callees);
+        }
+    }
+
+    // 1.5 `dyn Trait` vtable 跳转表：`.text` 末尾一串定长 `jmp <impl>`。
+    //     槽位宽度必须与 MIR `DynCall` 降级的 `VT_ENTRY_BYTES` 一致。
+    if !vtables.is_empty() {
+        match arch {
+            Arch::X86_64 => emit_vtables_x86(&mut unit, vtables),
+            // 其它后端的 `FuncAddr` / `CallIndirect` 本就走不通（函数值同样
+            // 不支持），这里给出明确的错误而不是等到链接期报"未定义符号"。
+            _ => {
+                return Err(format!(
+                    "`dyn Trait` vtable dispatch requires x86-64; target {} is not supported yet",
+                    target.describe()
+                ));
+            }
         }
     }
 
@@ -360,6 +377,39 @@ fn callee_params(module: &SsaModule) -> regalloc::CalleeParams {
         .iter()
         .map(|f| (f.name.clone(), f.param_types.clone()))
         .collect()
+}
+
+/// 发射 `dyn Trait` vtable 跳转表（x86-64）：`.text` 末尾，每张表一串
+/// `jmp <impl 方法>`（`E9 <rel32>`，定长 5 字节 = 一个槽位）。
+///
+/// 槽位地址 = 表地址 + 槽位号 * 5——MIR 的 `DynCall` 降级正是这么算的
+/// （`VT_ENTRY_BYTES`）。用跳转表而不是 `.data` 函数指针数组，是为了复用
+/// 现成的 PC 相对重定位（绝对地址重定位目前不存在）。`call` 到槽位后
+/// `jmp` 进方法体，间接一次跳转，ABI 与直接调用完全一致。
+fn emit_vtables_x86(unit: &mut CompilationUnit, vtables: &[crate::mir::MirVtable]) {
+    for vt in vtables {
+        let offset = unit.code.len();
+        unit.symbols.push(Symbol {
+            name: vt.symbol.clone(),
+            section: SymbolSection::Text,
+            offset,
+            size: vt.methods.len() * 5,
+            global: true,
+            kind: SymbolKind::Function,
+        });
+        for method in &vt.methods {
+            let instr_start = unit.code.len();
+            unit.code.push(0xE9); // jmp rel32
+            unit.code.extend_from_slice(&[0, 0, 0, 0]);
+            unit.relocations.push(Relocation::new(
+                instr_start + 1,
+                instr_start,
+                5,
+                method.clone(),
+                RelocationKind::PcRel32,
+            ));
+        }
+    }
 }
 
 /// 一个函数分派给对应架构的后端发射。

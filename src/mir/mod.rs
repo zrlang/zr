@@ -39,6 +39,21 @@ pub struct MirModule {
     pub functions: Vec<MirFunction>,
     /// 全局静态量（`.data` 里的数据符号）。只有标量、初值可折叠的才有。
     pub statics: Vec<MirStatic>,
+    /// `dyn Trait` vtable 需求表：codegen 按它在 `.text` 末尾发射跳转表。
+    pub vtables: Vec<MirVtable>,
+}
+
+/// 一张 `dyn Trait` vtable 跳转表：符号 + 按槽位顺序排列的 impl 方法符号。
+///
+/// 用跳转表（`.text` 里一串定长 `jmp <方法>`）而不是数据表（`.data` 里的
+/// 函数指针数组）：后者需要 64 位绝对重定位（`R_X86_64_64` 等），现有
+/// 重定位机制只有指令级 PC 相对种类；跳转表复用现成的 `PcRel32`。
+#[derive(Debug, Clone)]
+pub struct MirVtable {
+    /// 表自身的符号（`__vt_<类型>_<trait>`），`DynCoerce` 用 `FuncAddr` 取址。
+    pub symbol: String,
+    /// 按槽位顺序排列的方法符号（`z_` 前缀的最终名字）。
+    pub methods: Vec<String>,
 }
 
 /// 一个已初始化的全局静态量。
@@ -377,7 +392,31 @@ pub fn lower(hir: &HirModule) -> MirModule {
         functions.push(narrow::narrow_to_f32_fn(bits));
     }
 
-    let mut module = MirModule { functions, statics };
+    // vtable 需求表：impl 方法 DefId → 最终符号（`def_names` 已是改名后
+    // 的名字——与上面函数发射同一套 `z_` 前缀规则）。
+    let mut vtables = Vec::with_capacity(hir.vtables.len());
+    for vt in &hir.vtables {
+        let methods = vt
+            .methods
+            .iter()
+            .map(|mid| {
+                def_names
+                    .get(mid)
+                    .cloned()
+                    .unwrap_or_else(|| "<unknown>".to_string())
+            })
+            .collect();
+        vtables.push(MirVtable {
+            symbol: vt.symbol.clone(),
+            methods,
+        });
+    }
+
+    let mut module = MirModule {
+        functions,
+        statics,
+        vtables,
+    };
     async_lower::lower_module(&mut module);
     // `#[test]`：用合成的测试桩替换掉用户写的 `main`
     let names: Vec<String> = hir

@@ -33,8 +33,9 @@ zr 是一门系统编程语言（Rust/Zig 混合取向），编译器用 Rust �
 `lto`（`src/opt/lto.rs` 有完整实现，但 `opt/mod.rs` 未声明、CLI 无开关）、
 `pgo`（`src/opt/pgo.rs`，同上）、`macro_system`（`src/macro_system/`，`main.rs` 未 `mod` 声明；
 `macro_rules!` 走的是 `src/macros.rs`）、`negative_bounds` / `higher_ranked`（trait 求解里查无实现）、
-`impl_trait`（**参数位置 APIT 已实现**——`x: impl Trait` 脱糖成匿名泛型参数；
-`-> impl Trait`（RPIT）仍只是骨架：能解析，但值是 `opaque(impl_trait_N)`，任何访问都报错）。
+`impl_trait`（**APIT 与 RPIT 均已实现**——参数位置 `x: impl Trait` 脱糖成匿名泛型参数；
+返回位置 `-> impl Trait` 是真存在类型 `opaque(impl_trait_N)`：体内先以 `Infer` 检查、
+返回后把隐藏类型记进 `opaque_hidden`，方法查找 / 边界校验都按隐藏类型走）。
 **已接线且确实可用**：`const_generics`（`<const N: usize>` 全链路，见 §5 的在途工作）、
 `coherence_rules`（`check_orphan_rule` / `check_overlap`，
 `src/typeck/mod.rs:1812-1814`）、`c_backend`（`--emit-c`）、`specialization` 的**选择**
@@ -59,11 +60,11 @@ target/debug/zr prog.zr -O1 -o /tmp/prog   # 编译单个程序
   `ld` 直接断言崩溃（`atomShouldReplaceExisting`）。先 `nm` 看目标文件有没有
   重复符号，再下结论。已修复（提交 `1ef4a02`：MIR 按最终符号名去重，保留首个
   用户定义）。
-- 测试：`tests/zr_language.rs` 把 152 个 `tests/cases/*.zr` 各在
-  `-O0/-O1/-O2/-O3/-Oz` 跑一遍（760 次编译+运行）。退出码 0 = 过，非 0 = 失败（编号指向失败的断言）。
+- 测试：`tests/zr_language.rs` 把 160 个 `tests/cases/*.zr` 各在
+  `-O0/-O1/-O2/-O3/-Oz` 跑一遍（800 次编译+运行）。退出码 0 = 过，非 0 = 失败（编号指向失败的断言）。
   宿主端另有 `io_print_matches_rust` 等 Rust 对照用例。
 - **负向测试机制是 `tests/zr_negative.rs`**（`cargo test --test zr_negative`，
-  37 个用例）。`tests/negative/*.zr` 每个都必须**编译失败**，且报错文本里含
+  46 个用例）。`tests/negative/*.zr` 每个都必须**编译失败**，且报错文本里含
   文件里 `// expect: <子串>` 标注的期望子串；没有 `// expect:` 的行只要求
   "确实报错"。子串而非精确匹配，是为了不让行号/列号漂移把整个套件变红。
   `tests/cases/` 下每个 `.zr` 仍然必须编译通过并返回 0，**两边不要混放**
@@ -110,8 +111,8 @@ lexer → parser(ast) → typeck(hir, infer) → mir → ssa → opt → codegen
   `time` / `tz` / `os` / `posix` / `http` / `http2` / `pdb` / `simd` / `tensor` / `tls` 均有正向用例
   126/131–152 覆盖；`cli` 已重命名为 `argparse`）。
   另有 `error` 因类型核验落地而可加载——`as *const _` 推断占位、字面量传 `push_bytes`
-  的切片放行均已补上；`(&dyn Error).cause()` 的 vtable 分派仍不可用，模块里没有走它
-  的路径就能加载。`async` 仍不可用——`Box` 类型未实现 + `*mut dyn Wake` 需要 vtable
+  的切片放行均已补上；`(&dyn Error).cause()` 的 vtable 分派已可用（x86-64，
+  见第 4 节 dyn 条）。`async` 仍不可用——`Box` 类型未实现 + `*mut dyn Wake` 需要 vtable
   分派（结构体 `where` 子句、`F::Output` 关联类型投影已在本分支补上，不再是阻塞项），
   因此它暂不并入 `std` 门面。
 - 运行时 `runtime/*.s`：每平台一份汇编（Linux/macOS/Windows 的 x86-64+aarch64，裸机 ARM/RISC-V）。
@@ -145,6 +146,10 @@ lexer → parser(ast) → typeck(hir, infer) → mir → ssa → opt → codegen
    拿它当"未知类型"的占位返回值会让 `subtype` resolve 出旧值，报出完全无中生有的错
    （曾导致 `std/std/io.zr` 报 `expected (), found u8` 且报错位置与真实问题无关）。
    **不一致时应返回 `Unit` 或显式报错，绝不复用已有 `InferId`。**
+   同理，**不要把 `infer.next_infer` 归零当"重置"**：声明阶段（`record_type_generics`
+   等）创建的占位推断变量仍活在 `type_generic_params` 里，归零会让主循环的
+   `fresh_infer` 与旧占位符撞号（`66_generics.zr` 的 `expected i32, found Pair<i32>`）。
+   重置只需 `vars.clear()`，别动发号器（见 `check_function_bodies` 的两遍检查）。
 3. **`tail.is_none()` ≠ 发散。** 两种情况 tail 都是 `None`：块以 `return;` 结尾（真发散），
    或块最后一句带了分号（`f(x);` 后直接 `}`，不产生值但**不**发散，类型是 `()`）。
    混同会让 `if` 分支被误判成 `Never`。发散要按 AST 形状判（`block_diverges` / `expr_diverges`）。
@@ -188,6 +193,13 @@ lexer → parser(ast) → typeck(hir, infer) → mir → ssa → opt → codegen
     `Let`"展开（复用 `pat_match`）。只取 `first_binding(...)` 当唯一绑定会让
     子绑定**永不初始化**——`let (a, b) = (3, 4); a + b` 编译通过、读到栈上垃圾。
     `HirParam` 同样只有一个 local，函数形参上的解构模式仍是这个限制。
+14. **vtable 槽宽 `VT_ENTRY_BYTES`（`src/mir/builder.rs`）必须与 x86-64 后端的
+   vtable 发射（`src/codegen/mod.rs::emit_vtables_x86`）逐字节同步。**
+   vtable 是 `.text` 跳转表：每槽位定长 `jmp rel32`（E9，5 字节），
+   MIR 侧按 `表址 + index × VT_ENTRY_BYTES` 算槽址、codegen 侧按同样宽度发射。
+   现有重定位全是指令级 PC 相对（无 64 位绝对项），所以**不要**把 vtable 改成
+   `.data` 函数指针数组——那需要先引入 `R_X86_64_64` 之类的重定位种类。
+   槽宽改了只改一侧：跳错地址，运行期 SIGSEGV 且难以定位。
 
 ---
 
@@ -197,10 +209,20 @@ README 里"指针与 unsafe"一节目前是**愿景**：
 
 - **`unsafe` 是关键字、`unsafe { ... }` 能解析并通过类型检查，但不改变语义**
   （`src/lexer/mod.rs:815` `KwUnsafe`、`src/parser/expr.rs:449`；按块表达式透传）。
-- **`dyn` 是关键字、`&dyn Trait` 能解析，但没有 vtable 分派**（`src/lexer/token.rs:97`
-  `KwDyn`、`src/parser/ty.rs` 的 `Type::Dyn`；类型检查把它当 `dyn trait#N`）。
-  方法/字段访问一律报 `cannot access field `..` on type `dyn trait#N``，所以
-  `std/std/error.zr`（`(&dyn Error).cause()`）仍加载不了；`dyn` 值也构造不出来。
+- **`dyn Trait` vtable 分派已落地（x86-64 MVP，2026-11-04）**：`Ty::Dyn` 是
+  16 字节**值类型** `{ data@0, vtable@8 }`（与 `str` / 切片 / 函数值同布局惯例），
+  `&dyn Trait` 是指向该记录的 8 字节指针。`let d: dyn Tr = &x;` 由
+  `coerce_to_dyn` 触发：源类型须实现 `Tr`（未实现报
+  `type mismatch: expected `dyn Tr``，负向 `49`）；`&x` 产生的 `*const` 裸指针
+  也放行。vtable 符号 `__vt_<Type>_<Trait>`，槽位顺序 = trait 方法声明顺序
+  （cfg 掉的不占槽位），默认方法按类型合成进表。调用经 `ExprKind::DynCall`
+  降级为间接调用（见红线 14 的槽宽同步约束）；聚合返回（`String` / `str` /
+  枚举）与 `CallIndirect` 同约定，实参末尾追加 sret 槽。
+  **MVP 边界**：仅 x86-64 后端（其它架构在 `compile` 入口明确报错）；目标类型限
+  非泛型具名类型 / 基元；方法签名除 receiver 外含 `Self` 的不可 dyn 调用；
+  vtable 无 drop / size / align 元数据（`Box<dyn Trait>` 析构仍缺）。
+  正向 `161_dyn_dispatch.zr` / `162_dyn_std_error.zr`（`std/error.zr` 的
+  `description() / cause() / backtrace()` 经 dyn 分派可用）；负向 `49` / `50`。
 - **切片/数组索引不做越界检查**：`check_index_scalar` 不检查边界。
 - **借用检查是最小切片**：同位置的借用与已有借用重叠（`&mut` 独占、`&` 可共享，
   至少一个可变）报 `cannot borrow ... while already borrowed`；**写被借用位置**
@@ -295,7 +317,7 @@ README 里"指针与 unsafe"一节目前是**愿景**：
 ### `cargo test` 当前基线（2026-11-03，全绿）
 
 - `cargo test --bin zr`：269 项（含标准库三层重组的 2 个 `layer_tests`）。
-- `cargo test --test zr_language`：152 个用例 × 5 个优化等级 = 760 项，另有 3 个宿主端
+- `cargo test --test zr_language`：160 个用例 × 5 个优化等级 = 800 项，另有 3 个宿主端
   对照用例（`io_print_matches_rust`——逐字符对比 Rust 的格式化输出，含 `{:e}` / `{:E}`
   与大浮点 Display（`|v| ≥ 2⁶⁴` 不带 `.0`）的回归；`extern_c_write_prints_string_literal`；
   `toolchain_subcommands_emit`——`zr fmt` / `zr fmt --check` / `zr pkg init` / `zr lsp`
@@ -366,8 +388,8 @@ README 里"指针与 unsafe"一节目前是**愿景**：
   `Self` / `Self::Output` 在实例化重降低时找不到）。覆盖 `Self::Output`
   （泛型 impl 内）、`F::Output`（泛型参数）、非泛型 impl 的 `Type::Output`，
   回归 `tests/cases/118_assoc_projection.zr`。`std/alloc/async.zr` 的 `block_on<F:
-  Future>` 签名现在能过类型检查；剩余阻塞是 `Box` 类型未实现与 `*mut dyn Wake`
-  的 vtable 分派（`dyn` 仍未接）。`<T as Tr>::Item` 限定写法已支持，见下一条。
+  Future>` 签名现在能过类型检查；剩余阻塞是 `Box` 类型未实现（`*mut dyn Wake`
+  的 vtable 分派已随 dyn MVP 落地，x86-64）。`<T as Tr>::Item` 限定写法已支持，见下一条。
 - **限定路径 `<T as Trait>::Item`**：✅ 已实现（2026-11-02）——早先类型位置
   见到 `<` 就掉进基础类型分派，报 `expected type, found Lt`，所以只能在泛型参数
   上用双段命名路径 `F::Output`（它按基类型的 impl 表查 `Output`，**不校验 trait**，

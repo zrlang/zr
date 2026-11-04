@@ -1,0 +1,7 @@
+// 负向：`!` 用在非错误联合类型上。
+fn main() -> i32 {
+    let x = 5;
+    let y = x!;
+    return y;
+}
+// expect: `!` can only be used on an error union

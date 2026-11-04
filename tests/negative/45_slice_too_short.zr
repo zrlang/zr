@@ -1,0 +1,7 @@
+// 负向：数组长度不足以覆盖切片模式的固定端元素。
+fn main() -> i32 {
+    let arr = [1];
+    let [a, .., b] = arr;
+    return 0;
+}
+// expect: slice pattern has

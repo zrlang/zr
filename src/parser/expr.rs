@@ -221,6 +221,13 @@ impl Parser {
                     continue;
                 }
 
+                // 后缀 `!`：错误联合解包 + 传播。
+                if op_kind == TokenKind::Bang {
+                    self.advance();
+                    left = Expression::PostfixBang(Box::new(left), op_span);
+                    continue;
+                }
+
                 // 范围运算符 `..` / `..=`
                 if matches!(op_kind, TokenKind::DotDot | TokenKind::DotDotEq) {
                     self.advance();
@@ -577,19 +584,21 @@ impl Parser {
             // 参数按**记号序列**原样收集：宏的匹配模式是记号级的
             // （`($x:expr)`），要等整份程序解析完、宏定义都齐了之后
             // 才能匹配并展开，所以这里不能直接解析成表达式。
-            if self.check(&TokenKind::Bang) {
+            //
+            // 注意：`name!` 后面不是 `(`, `{`, `[` 时，不是宏调用而是
+            // postfix bang（错误传播），留给 postfix 循环处理。
+            if self.check(&TokenKind::Bang)
+                && matches!(
+                    self.peek_n(1).map(|t| &t.kind),
+                    Some(TokenKind::LParen | TokenKind::LBrace | TokenKind::LBracket)
+                )
+            {
                 self.advance(); // !
-                // 允许 `name! { ... }` 与 `name! [ ... ]` 两种定界符。
                 let close = match self.peek().kind {
                     TokenKind::LParen => TokenKind::RParen,
                     TokenKind::LBrace => TokenKind::RBrace,
                     TokenKind::LBracket => TokenKind::RBracket,
-                    _ => {
-                        return Err(self.expected(
-                            "expected '(', '{' or '[' after macro name",
-                            &self.peek().kind,
-                        ))
-                    }
+                    _ => unreachable!("guarded above"),
                 };
                 self.advance(); // 开定界符
                 let mut args: Vec<TokenKind> = Vec::new();
@@ -1068,6 +1077,10 @@ impl Parser {
             | TokenKind::ShlEq
             | TokenKind::ShrEq => (Prec::ASSIGN, Prec(0)),
 
+            // `catch` 右结合（`a catch b catch c` = `a catch (b catch c)`）
+            // 优先级比赋值稍高，比逻辑或低。
+            TokenKind::KwCatch => (Prec(3), Prec(2)),
+
             TokenKind::PipePipe => (Prec::OR, Prec(Prec::OR.0 + 1)),
             TokenKind::AmpAmp => (Prec::AND, Prec(Prec::AND.0 + 1)),
 
@@ -1097,7 +1110,7 @@ impl Parser {
 
             TokenKind::KwAs => (Prec::CAST, Prec::UNARY),
 
-            TokenKind::Dot | TokenKind::LParen | TokenKind::LBracket | TokenKind::Question => {
+            TokenKind::Dot | TokenKind::LParen | TokenKind::LBracket | TokenKind::Question | TokenKind::Bang => {
                 (Prec::CALL, Prec::CALL)
             }
 
@@ -1126,6 +1139,7 @@ impl Parser {
             TokenKind::Le => BinaryOp::Le,
             TokenKind::Ge => BinaryOp::Ge,
             TokenKind::KwIn => BinaryOp::Range,
+            TokenKind::KwCatch => BinaryOp::Catch,
             _ => return None,
         })
     }

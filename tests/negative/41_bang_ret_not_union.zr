@@ -1,0 +1,9 @@
+// 负向：`!` 传播要求当前函数返回错误联合。
+fn f(x: i32) -> i32!i32 {
+    return x;
+}
+fn main() -> i32 {
+    let v = f(1)!;
+    return v;
+}
+// expect: requires the enclosing function to return an error union

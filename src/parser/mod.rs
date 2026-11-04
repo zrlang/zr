@@ -823,6 +823,10 @@ fn is_block_like(expr: &Expression) -> bool {
         // `unsafe { ... }` 也是块形状：语句位置不需要分号，且它自带块
         // （`unsafe { let y = 1; } 下一句;` 会把 unsafe 块整个吞掉）。
         Expression::Unsafe(_, _) => true,
+        // `defer { ... }` 同样自带块、语句位置不需要分号。漏掉它会让
+        // `defer { .. } 下一句;` 的 defer 被当成尾表达式，后面的语句
+        // 落到块外，报 "expected '}' to close block"。
+        Expression::Defer(_, _) => true,
         _ => false,
     }
 }

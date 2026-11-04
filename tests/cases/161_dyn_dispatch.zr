@@ -1,0 +1,84 @@
+// `dyn Trait`：vtable 动态分派。
+//
+// 表示：`dyn Trait` 是 16 字节值类型 `{ data@0, vtable@8 }`（与 `str` /
+// 切片 / 函数值同布局惯例），`&dyn Trait` 是指向该记录的 8 字节指针。
+// `let da: dyn Animal = &d;` 触发 `coerce_to_dyn`：要求源类型实现了
+// 目标 trait，按 trait 方法声明顺序收集 impl 方法展开符号（含默认方法的
+// 按类型合成体）注册 vtable。
+//
+// vtable 是 `.text` 跳转表：每槽位定长 `jmp rel32`（5 字节，
+// `VT_ENTRY_BYTES`），槽位地址 = 表址 + index × 5——复用现有指令级
+// PC 相对重定位，不引入 64 位绝对重定位。调用降级为
+// `CallIndirect(vt + index*5, [data, args..])`，聚合返回与
+// `CallIndirect` 一样在实参末尾追加隐式 sret 槽。
+//
+// 现状（MVP）：仅 x86-64 后端；目标类型限非泛型具名类型 / 基元；
+// 方法签名的非 receiver 参数与返回值不能含 `Self`。
+
+trait Animal {
+    fn speak(self) -> i32;
+    fn legs(self) -> i32 { 4 }
+}
+
+struct Dog { loud: i32 }
+struct Bird { wings: i32 }
+
+impl Animal for Dog {
+    fn speak(self) -> i32 { 10 + self.loud }
+    fn legs(self) -> i32 { 2 }
+}
+
+impl Animal for Bird {
+    fn speak(self) -> i32 { 20 + self.wings }
+}
+
+trait Shape {
+    fn area(self, scale: i32) -> i32;
+    fn name(self) -> str;
+}
+
+struct Square { side: i32 }
+
+impl Shape for Square {
+    fn area(self, scale: i32) -> i32 { self.side * self.side * scale }
+    fn name(self) -> str { "square" }
+}
+
+// dyn 值作函数参数：16 字节聚合按值传入。
+fn describe(a: dyn Animal) -> i32 {
+    a.speak() + a.legs()
+}
+
+fn main() -> i32 {
+    let d = Dog { loud: 1 };
+    let b = Bird { wings: 2 };
+    let da: dyn Animal = &d;
+    let ba: dyn Animal = &b;
+    let mut total = 0;
+    total = total + da.speak();    // 11（impl 方法）
+    if total != 11 { return 1; }
+    total = total + da.legs();     // 2（Dog 覆盖默认方法）
+    if total != 13 { return 2; }
+    total = total + ba.speak();    // 22
+    if total != 35 { return 3; }
+    total = total + ba.legs();     // 4（默认方法进 vtable）
+    if total != 39 { return 4; }
+    total = total + describe(&d);  // 11 + 2
+    if total != 52 { return 5; }
+
+    // `&dyn`（指向 16 字节记录的指针）作 receiver，与 dyn 值同路径分派。
+    let r = &da;
+    total = total + r.speak();     // 11
+    if total != 63 { return 6; }
+
+    // 带参方法 + `str` 聚合返回（sret 槽走 CallIndirect 同一约定）。
+    let s = Square { side: 3 };
+    let ds: dyn Shape = &s;
+    total = total + ds.area(2);    // 18
+    if total != 81 { return 7; }
+    let n = ds.name();
+    total = total + n[0] as i32;   // 's' = 115
+    if total != 196 { return 8; }
+
+    0
+}

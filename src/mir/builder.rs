@@ -81,7 +81,16 @@ pub fn lower_function(
                 b.hidden_ret = Some(hidden);
             }
         }
-    } else if matches!(actual_ret, hir::Ty::Array(..) | hir::Ty::Named(..)) {
+        // 错误联合同理：按值返回必须由调用方提供返回槽。
+        if let hir::Ty::ErrorUnion(..) = actual_ret {
+            if let Some((size, align, _)) = error_union_layout(&b, actual_ret) {
+                let hidden = format!("arg_{}", func.params.len());
+                b.param_names.push(hidden.clone());
+                b.ret_bytes = Some((size, align));
+                b.hidden_ret = Some(hidden);
+            }
+        }
+    } else if matches!(actual_ret, hir::Ty::Array(..) | hir::Ty::Named(..) | hir::Ty::ErrorUnion(..)) {
         // 异步函数没有调用方返回槽：结果先写进堆帧的输出区，await 再把
         // 字节复制到调用方存储。因此这里只需要知道输出大小。
         if let Some((size, _)) = type_size_align(&b, actual_ret, 0) {
@@ -307,6 +316,13 @@ fn place_move_path(b: &Builder, expr: &HirExpr) -> Option<(LocalId, Vec<usize>)>
         _ => None,
     }
 }
+
+/// vtable 跳转表条目的固定字节数：x86-64 的 `jmp rel32` = 5 字节。
+///
+/// `DynCall` 降级按 `vtable + index * VT_ENTRY_BYTES` 算槽位地址，必须与
+/// `src/codegen/mod.rs` 里 vtable 跳转表的实际发射宽度一致——两者任何
+/// 一边改了都要同步另一边。
+const VT_ENTRY_BYTES: i128 = 5;
 
 /// 降级一个表达式，返回其产生的值。
 fn lower_expr(b: &mut Builder, expr: &HirExpr) -> MirValue {
@@ -793,6 +809,71 @@ fn lower_expr(b: &mut Builder, expr: &HirExpr) -> MirValue {
                 MirValue::Var(name)
             }
         }
+        hir::ExprKind::ErrorUnionWrap { value, is_err } => {
+            // 布局同两变体枚举：偏移 0 是 u8 判别式，载荷区按两侧最大对齐。
+            let hir::Ty::ErrorUnion(ok, err) = &expr.ty else {
+                return MirValue::Unit;
+            };
+            let Some((size, _, payload_off)) = error_union_layout(b, &expr.ty) else {
+                return MirValue::Unit;
+            };
+            let payload_ty = if *is_err {
+                (**err).clone()
+            } else {
+                (**ok).clone()
+            };
+            let addr = b.synthetic_storage(size);
+            let tag_at = offset_addr(b, MirValue::Var(addr.clone()), 0);
+            b.current_block_mut().instrs.push(MirInstr::Store(
+                tag_at,
+                MirValue::Int(if *is_err { 1 } else { 0 }),
+                NumTy::Uint(8),
+            ));
+            b.mark_aggregate_move(value);
+            let v = lower_expr(b, value);
+            let at = offset_addr(b, MirValue::Var(addr.clone()), payload_off);
+            store_value(b, at, v, &payload_ty);
+            b.register_temp(MirValue::Var(addr.clone()), &expr.ty);
+            MirValue::Var(addr)
+        }
+        hir::ExprKind::ErrorUnionTag(value) => {
+            let base = lower_expr(b, value);
+            let at = offset_addr(b, base, 0);
+            let name = b.temp();
+            b.current_block_mut().instrs.push(MirInstr::Load(
+                name.clone(),
+                at,
+                NumTy::Uint(8),
+            ));
+            MirValue::Var(name)
+        }
+        hir::ExprKind::ErrorUnionPayload { value, is_err } => {
+            let hir::Ty::ErrorUnion(ok, err) = &value.ty else {
+                return MirValue::Unit;
+            };
+            let payload_ty = if *is_err {
+                (**err).clone()
+            } else {
+                (**ok).clone()
+            };
+            let Some((_, _, payload_off)) = error_union_layout(b, &value.ty) else {
+                return MirValue::Unit;
+            };
+            let base = lower_expr(b, value);
+            let at = offset_addr(b, base, payload_off);
+            // 聚合载荷的值就是它的地址，与 `EnumField` 的分支一致。
+            if is_aggregate(b, &payload_ty) {
+                at
+            } else {
+                let name = b.temp();
+                b.current_block_mut().instrs.push(MirInstr::Load(
+                    name.clone(),
+                    at,
+                    reg_ty_of(&payload_ty),
+                ));
+                MirValue::Var(name)
+            }
+        }
         Field(recv, name) => {
             let base = lower_expr(b, recv);
             let Some(layout) = struct_layout(b, &recv.ty) else {
@@ -1103,6 +1184,13 @@ fn lower_expr(b: &mut Builder, expr: &HirExpr) -> MirValue {
                     mir_args.push(MirValue::Var(dst.clone()));
                     dest = Some(MirValue::Var(dst));
                 }
+            } else if let hir::Ty::ErrorUnion(..) = &expr.ty {
+                // 错误联合也按字节返回，需要调用方提供返回槽。
+                if let Some((size, _, _)) = error_union_layout(b, &expr.ty) {
+                    let dst = b.synthetic_storage(size);
+                    mir_args.push(MirValue::Var(dst.clone()));
+                    dest = Some(MirValue::Var(dst));
+                }
             }
             // 调用表达式的类型就是被调函数的返回类型
             let ty = num_ty_of(&expr.ty);
@@ -1175,11 +1263,126 @@ fn lower_expr(b: &mut Builder, expr: &HirExpr) -> MirValue {
                     mir_args.push(MirValue::Var(dst.clone()));
                     dest = Some(MirValue::Var(dst));
                 }
+            } else if let hir::Ty::ErrorUnion(..) = &expr.ty {
+                if let Some((size, _, _)) = error_union_layout(b, &expr.ty) {
+                    let dst = b.synthetic_storage(size);
+                    mir_args.push(MirValue::Var(dst.clone()));
+                    dest = Some(MirValue::Var(dst));
+                }
             }
             let ty = num_ty_of(&expr.ty);
             b.current_block_mut().instrs.push(MirInstr::CallIndirect(
                 name.clone(),
                 MirValue::Var(code),
+                mir_args,
+                ty,
+            ));
+            let value = dest.unwrap_or(MirValue::Var(name));
+            b.register_temp(value.clone(), &expr.ty);
+            value
+        }
+        // `&T` → `dyn Trait` 强转：构造 16 字节胖指针记录 `{data, vtable}`。
+        //
+        // `data` 就是源引用本身（`&T` 的值 = 指向 `T` 的指针，正好就是
+        // impl 方法要的 receiver）；`vtable` 指向 codegen 发射的跳转表
+        // （`.text` 里的 `jmp <impl>` 序列，符号见 `HirVtable::symbol`）。
+        DynCoerce {
+            value,
+            vtable_symbol,
+        } => {
+            let data = lower_expr(b, value);
+            let storage = b.synthetic_storage(16);
+            let rec = MirValue::Var(storage.clone());
+            b.current_block_mut()
+                .instrs
+                .push(MirInstr::Store(rec.clone(), data, NumTy::Uint(64)));
+            let vt = b.temp();
+            b.current_block_mut()
+                .instrs
+                .push(MirInstr::FuncAddr(vt.clone(), vtable_symbol.clone()));
+            let vt_at = offset_addr(b, rec, 8);
+            b.current_block_mut().instrs.push(MirInstr::Store(
+                vt_at,
+                MirValue::Var(vt),
+                NumTy::Uint(64),
+            ));
+            b.register_temp(MirValue::Var(storage.clone()), &expr.ty);
+            MirValue::Var(storage)
+        }
+        // `dyn Trait` 的 vtable 方法调用。
+        //
+        // receiver 降级后就是胖指针记录的**地址**（dyn 值是 16 字节聚合，
+        // 按地址传递；`&dyn` 的值 = 指向记录的指针）——两种形态到这里统一。
+        // 分派序列：`data = [rec+0]`、`vt = [rec+8]`、
+        // `code = vt + index*VT_ENTRY_BYTES`，最后 `CallIndirect(code,
+        // [data, args..])`。跳转表条目是定长 `jmp`（宽度由
+        // `VT_ENTRY_BYTES` 给，必须与 codegen 的发射一致）。
+        DynCall {
+            receiver,
+            index,
+            args,
+            result,
+        } => {
+            let rec = lower_expr(b, receiver);
+            let data = b.temp();
+            b.current_block_mut()
+                .instrs
+                .push(MirInstr::Load(data.clone(), rec.clone(), NumTy::Uint(64)));
+            let vt_at = offset_addr(b, rec, 8);
+            let vt = b.temp();
+            b.current_block_mut()
+                .instrs
+                .push(MirInstr::Load(vt.clone(), vt_at, NumTy::Uint(64)));
+            let code = if *index == 0 {
+                MirValue::Var(vt)
+            } else {
+                let c = b.temp();
+                b.current_block_mut().instrs.push(MirInstr::Binary(
+                    c.clone(),
+                    MirValue::Var(vt),
+                    MirBinaryOp::Add,
+                    MirValue::Int((*index as i128) * VT_ENTRY_BYTES),
+                    NumTy::Uint(64),
+                ));
+                MirValue::Var(c)
+            };
+            let name = format!("v{}", result.0);
+            let mut mir_args = Vec::with_capacity(args.len() + 2);
+            // 第一个实参是 receiver：impl 方法的 `self` 降级成 `&Concrete`，
+            // 胖指针里的 data 指针正好就是它。
+            mir_args.push(MirValue::Var(data));
+            for a in args {
+                let v = lower_expr(b, a);
+                let v = copy_array_value(b, v, &a.ty);
+                let v = copy_struct_value(b, v, &a.ty);
+                mir_args.push(v);
+            }
+            let mut dest = None;
+            if let Some((_elem, n, size)) = array_info(b, &expr.ty) {
+                let dst = b.synthetic_storage(n * size);
+                mir_args.push(MirValue::Var(dst.clone()));
+                dest = Some(MirValue::Var(dst));
+            } else if let Some(layout) = aggregate_layout(b, &expr.ty) {
+                let dst = b.synthetic_storage(layout.size);
+                mir_args.push(MirValue::Var(dst.clone()));
+                dest = Some(MirValue::Var(dst));
+            } else if let hir::Ty::Named(id, args) = &expr.ty {
+                if let Some(el) = enum_layout(b, *id, args) {
+                    let dst = b.synthetic_storage(el.size);
+                    mir_args.push(MirValue::Var(dst.clone()));
+                    dest = Some(MirValue::Var(dst));
+                }
+            } else if let hir::Ty::ErrorUnion(..) = &expr.ty {
+                if let Some((size, _, _)) = error_union_layout(b, &expr.ty) {
+                    let dst = b.synthetic_storage(size);
+                    mir_args.push(MirValue::Var(dst.clone()));
+                    dest = Some(MirValue::Var(dst));
+                }
+            }
+            let ty = num_ty_of(&expr.ty);
+            b.current_block_mut().instrs.push(MirInstr::CallIndirect(
+                name.clone(),
+                code,
                 mir_args,
                 ty,
             ));
@@ -2573,6 +2776,8 @@ fn element_size(ty: &hir::Ty) -> i128 {
         Ty::Str | Ty::Slice(..) => 16,
         // 函数值是 `{code, env}` 记录——16 字节（与 `type_size_align` 一致）。
         Ty::Function { .. } => 16,
+        // `dyn Trait` 胖指针：`{data, vtable}`。
+        Ty::Dyn(_) => 16,
         Ty::Pointer(..) | Ty::Reference(..) => 8,
         _ => 1,
     }
@@ -2718,6 +2923,8 @@ fn type_size_align(b: &Builder, ty: &hir::Ty, depth: usize) -> Option<(i128, i12
         Ty::Unit | Ty::Never => (0, 1),
         // 函数值是 `{code, env}` 记录：两个机器字，8 字节对齐。
         Ty::Function { .. } => (16, 8),
+        // `dyn Trait` 胖指针：`{data, vtable}`。
+        Ty::Dyn(_) => (16, 8),
         Ty::Pointer(..) | Ty::Reference(..) => (8, 8),
         // `str` / 切片是 `{ptr, len}` 的 16 字节聚合，**不是**一个瘦指针。
         // `struct_layout` 早就按 16 字节算（`size: 16, fields: [(0, ptr), (8, u64)]`），
@@ -2730,6 +2937,10 @@ fn type_size_align(b: &Builder, ty: &hir::Ty, depth: usize) -> Option<(i128, i12
             let n = hir::array_len_value(len)?;
             let (sz, al) = type_size_align(b, elem, depth + 1)?;
             (sz * n, al)
+        }
+        Ty::ErrorUnion(..) => {
+            let (size, align, _) = error_union_layout(b, ty)?;
+            (size, align)
         }
         Ty::Tuple(elems) => {
             // 与结构体同布局：逐字段对齐，末尾补齐到最大对齐。
@@ -2813,6 +3024,20 @@ fn struct_layout(b: &Builder, ty: &hir::Ty) -> Option<StructLayout> {
             names,
         });
     }
+    // `dyn Trait` 胖指针：`{data, vtable}` 记录——16 字节，与函数值同布局。
+    if matches!(ty, hir::Ty::Dyn(_)) {
+        let mut names = HashMap::new();
+        names.insert("data".to_string(), 0usize);
+        names.insert("vtable".to_string(), 1usize);
+        return Some(StructLayout {
+            size: 16,
+            fields: vec![
+                (0, hir::Ty::Uint(64)),
+                (8, hir::Ty::Uint(64)),
+            ],
+            names,
+        });
+    }
     let (id, args) = match ty {
         hir::Ty::Named(id, args) => (*id, args.clone()),
         hir::Ty::Reference(inner, _) | hir::Ty::Pointer(inner, _) => {
@@ -2862,6 +3087,22 @@ fn struct_layout(b: &Builder, ty: &hir::Ty) -> Option<StructLayout> {
         fields,
         names,
     })
+}
+
+/// 错误联合的布局：`u8` 判别式 + 对齐到两侧载荷最大对齐的载荷区。
+///
+/// 返回 `(总大小, 对齐, 载荷区偏移)`。判别式在偏移 0（0 = ok / 1 = err），
+/// 载荷区从 `align_up(1, max(align T, align E))` 开始，大小为两侧较大者。
+fn error_union_layout(b: &Builder, ty: &hir::Ty) -> Option<(i128, i128, i128)> {
+    let hir::Ty::ErrorUnion(ok, err) = ty else {
+        return None;
+    };
+    let (ok_size, ok_align) = type_size_align(b, ok, 0)?;
+    let (err_size, err_align) = type_size_align(b, err, 0)?;
+    let align = ok_align.max(err_align).max(1);
+    let off = align_up(1, align);
+    let payload = ok_size.max(err_size);
+    Some((align_up(off + payload, align), align, off))
 }
 
 /// **值聚合**的布局：结构体 / 元组 / 字符串 / 切片。
@@ -3005,7 +3246,7 @@ fn is_aggregate(b: &Builder, ty: &hir::Ty) -> bool {
         // 标量加载——`s.a[0]` 读到的是垃圾（`arr_idx.zr`：`x=0 y=0`）。
         // `Index`/`copy_struct_into` 早已用 `array_info` 特判数组，这里补齐，
         // 让字段访问与它们一致。
-        hir::Ty::Array(..) => true,
+        hir::Ty::Array(..) | hir::Ty::ErrorUnion(..) => true,
         _ => false,
     }
 }

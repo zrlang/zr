@@ -1,0 +1,5 @@
+// RPIT 负向：无法推断返回类型（函数体没 return，tail 类型也不确定）。
+trait Show { fn show(self) -> str; }
+fn make() -> impl Show { }
+fn main() {}
+// expect: block missing value

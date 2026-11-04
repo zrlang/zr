@@ -278,6 +278,8 @@ pub enum Pattern {
     Ref(Box<Pattern>, Mutability, Span),
     /// 或模式 `p1 | p2`（只在 match 位置有效）。
     Or(Vec<Pattern>),
+    /// `..` rest pattern（只在切片模式内部出现，匹配 0+ 元素）。
+    Rest(Span),
 }
 
 /// 结构体模式中的字段。
@@ -340,6 +342,8 @@ pub enum Expression {
     Unary(UnaryOp, Box<Expression>, Span),
     /// 后缀 `?`：错误传播（`Result` / `Option`）。
     Question(Box<Expression>, Span),
+    /// 后缀 `!`：错误联合解包 + 传播（`T!E` → `T`，错误从当前函数传播出去）。
+    PostfixBang(Box<Expression>, Span),
     /// 赋值（含复合赋值 `+=` 等）。
     Assign(Box<Expression>, AssignOp, Box<Expression>, Span),
     /// 调用。
@@ -499,6 +503,8 @@ pub enum BinaryOp {
     // 范围
     Range,
     RangeInclusive,
+    // 错误联合：`x catch y`——ok 取值，err 取 fallback
+    Catch,
 }
 
 /// 一元运算符。
@@ -904,6 +910,7 @@ impl Spanned for Expression {
             Expression::Binary(_, _, _, s) => *s,
             Expression::Unary(_, _, s) => *s,
             Expression::Question(_, s) => *s,
+            Expression::PostfixBang(_, s) => *s,
             Expression::Assign(_, _, _, s) => *s,
             Expression::Call(_, _, s) => *s,
             Expression::Turbofish(_, _, s) => *s,
@@ -960,6 +967,7 @@ impl Spanned for Pattern {
                 Some(first) => first.span(),
                 None => Span::unknown(),
             },
+            Pattern::Rest(s) => *s,
         }
     }
 }

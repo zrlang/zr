@@ -1,0 +1,36 @@
+// `dyn Trait` 与 `std/error.zr` 的集成：`(&dyn Error).cause()` 可用。
+//
+// 覆盖点：
+// - `description() -> String`：24 字节聚合返回值经 dyn 分派（sret 约定）。
+// - `cause()`：trait 默认方法进 vtable，返回 `Option<&'static dyn Error>`
+//   的 `None`（构造 `Some` 需要生命周期转换，MVP 不支持）。
+// - dyn 值作函数参数跨函数传递。
+
+use std::*;
+
+struct SimpleErr { msg: str }
+
+impl SimpleErr {
+    fn new(m: str) -> SimpleErr { SimpleErr { msg: m } }
+}
+
+impl Error for SimpleErr {
+    fn description(self) -> String { String::from_bytes(self.msg) }
+}
+
+fn first_byte(e: dyn Error) -> i32 {
+    e.description().as_bytes()[0] as i32
+}
+
+fn main() -> i32 {
+    let e = SimpleErr::new("boom");
+    let de: dyn Error = &e;
+    let d = de.description();
+    let mut code = d.as_bytes()[0] as i32;   // 'b' = 98
+    if code != 98 { return 1; }
+    code = code + first_byte(&e);            // + 98
+    if code != 196 { return 2; }
+    if de.cause().is_some() { return 3; }    // 默认方法返回 None
+    if de.backtrace().is_some() { return 4; }
+    0
+}

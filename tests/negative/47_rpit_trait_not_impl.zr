@@ -1,0 +1,6 @@
+// RPIT 负向：返回类型没实现 trait 边界。
+trait Greet { fn greet(self) -> str; }
+struct NoGreet;
+fn make() -> impl Greet { NoGreet {} }
+fn main() {}
+// expect: does not implement trait

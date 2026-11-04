@@ -336,6 +336,7 @@ fn expand_in_expr(
             }
             Ok(())
         }
+        Expression::PostfixBang(inner, _) => expand_in_expr(inner, defs, def_lines, changed),
     }
 }
 

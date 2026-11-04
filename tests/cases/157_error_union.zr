@@ -1,0 +1,73 @@
+// 错误联合 `T!E`：后缀 `!` 解包 + 错误传播、中缀 `catch`（unwrap_or）、
+// 隐式 ok/err 包装。
+//
+// 运行期布局：与两变体枚举同形——偏移 0 是 u8 判别式（0 = ok / 1 = err），
+// 载荷区对齐到 `max(align T, align E)`，大小取两侧载荷的较大者。
+//
+// 方向判定（`coerce_to_error_union`）：值类型先与 `T` 精确统一（ok），再与
+// `E` 精确统一（err），最后才退化到子类型（整型拓宽）——否则 `i64!i32`
+// 里的 i32 错误值会被 `i32 <: i64` 拓宽误判成 ok。`T` 与 `E` 同型时一律
+// ok（这种联合无法区分两侧，错误只能经 `!` 传播进来）。
+
+// --- 基础：ok 路径 + err 路径（T ≠ E，错误值可显式构造）---
+
+fn parse_sign(x: i64) -> i64!i32 {
+    if x < 0 {
+        return 0 - 7; // i32 与 i64 只能统一到 err 侧 → err 包装
+    }
+    return x * 10; // i64 → ok 包装
+}
+
+// `!` 解包：成功取值，失败把错误从当前函数传播出去（当前函数必须返回
+// 错误联合，且错误类型一致，不做转换）。
+fn add_one(x: i64) -> i64!i32 {
+    let v = parse_sign(x)!;
+    return v + 1;
+}
+
+// 多级传播：err 穿过两层 `!`。
+fn double(x: i64) -> i64!i32 {
+    let v = add_one(x)!;
+    return v * 2;
+}
+
+fn main() -> i32 {
+    // ok 路径经 `catch` 取原值
+    let a = parse_sign(3) catch 0;
+    if a != 30 { return 1; }
+
+    // err 路径经 `catch` 取 fallback
+    let b = parse_sign(0 - 1) catch 0 - 99;
+    if b != 0 - 99 { return 2; }
+
+    // `!` 传播后 `catch` 接住：fallback 生效
+    let c = double(0 - 5) catch 1234;
+    if c != 1234 { return 3; }
+
+    // `!` 传播 ok 值：21 * 2 = 42
+    let d = double(2) catch 0;
+    if d != 42 { return 4; }
+
+    // 注解位置的隐式 ok 包装（`let x: T!E = t;`）。
+    // 注意字面量默认 i32 会精确匹配到 `i64!i32` 的 err 侧，ok 侧要显式后缀。
+    let e: i64!i32 = 42i64;
+    let f = e catch 0;
+    if f != 42 { return 5; }
+
+    // `catch` 右结合：`a catch (b catch c)`——fallback 本身是联合类型
+    let g = parse_sign(0 - 1) catch parse_sign(2) catch 0;
+    if g != 20 { return 6; }
+    let h = parse_sign(0 - 1) catch parse_sign(0 - 2) catch 77;
+    if h != 77 { return 7; }
+
+    // `catch` 的 fallback 可以是发散表达式
+    let i = parse_sign(4) catch return 8;
+    if i != 40 { return 9; }
+
+    // 同型联合（i32!i32）：值包装一律按 ok 处理
+    let j: i32!i32 = 5;
+    let k = j catch 0;
+    if k != 5 { return 10; }
+
+    return 0;
+}

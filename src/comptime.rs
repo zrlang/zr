@@ -1274,6 +1274,8 @@ fn hir_binary_op(op: crate::parser::ast::BinaryOp) -> BinaryOp {
         // 范围运算符不是真运算（只出现在模式里），映射过去只为穷尽性。
         A::Range => BinaryOp::Range,
         A::RangeInclusive => BinaryOp::RangeInclusive,
+        // `catch` 依赖错误联合的运行期判别式，编译期求值不支持（与旧行为一致）。
+        A::Catch => unreachable!("catch not supported in comptime"),
     }
 }
 
@@ -1357,6 +1359,7 @@ fn pattern_kind(p: &crate::parser::ast::Pattern) -> &'static str {
         Pattern::Literal(..) => "literal",
         Pattern::Range(..) => "range",
         Pattern::Or(_) => "or-pattern",
+        Pattern::Rest(_) => "rest-pattern",
     }
 }
 

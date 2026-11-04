@@ -1,0 +1,9 @@
+// dyn 负向：未实现目标 trait 的类型不能强转成 `dyn Trait`。
+trait Animal { fn speak(self) -> i32; }
+struct Rock { hardness: i32 }
+fn main() -> i32 {
+    let r = Rock { hardness: 9 };
+    let d: dyn Animal = &r;
+    d.speak()
+}
+// expect: type mismatch: expected `dyn Animal`

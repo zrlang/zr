@@ -1,0 +1,10 @@
+// dyn 负向：vtable 槽位按 trait 声明查，调 trait 里不存在的方法直接报错。
+trait Animal { fn speak(self) -> i32; }
+struct Dog { loud: i32 }
+impl Animal for Dog { fn speak(self) -> i32 { self.loud } }
+fn main() -> i32 {
+    let d = Dog { loud: 1 };
+    let da: dyn Animal = &d;
+    da.bark()
+}
+// expect: no method `bark` in trait `Animal`

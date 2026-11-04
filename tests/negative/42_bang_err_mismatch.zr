@@ -1,0 +1,12 @@
+// 负向：`!` 传播要求错误类型一致（没有 `From` 转换）。
+fn f(x: i32) -> i32!i32 {
+    return x;
+}
+fn g(x: i32) -> i64!str {
+    let v = f(x)!;
+    return v;
+}
+fn main() -> i32 {
+    return 0;
+}
+// expect: error type

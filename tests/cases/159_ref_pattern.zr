@@ -1,0 +1,71 @@
+// 引用模式 `&p` / `&mut p`（Rust 风格）与原有的 `ref p` / `ref mut p` 等价。
+//
+// 实现要点：
+// - parser 在 parse_pattern_single 里新增 `Amp` 分支，与 `KwRef` 共用同一 AST 变体
+// - HirPattern::Ref 从 unit variant 扩展为 { inner, mutability }（原 inner pattern 被整段丢弃，绑定永不初始化）
+// - check_match **移除了自动穿透**（早先标量自动 Deref、聚合直接当值）——
+//   引用/指针 scrutinee 保持原样，由 pat_match 里的 HirPattern::Ref 统一处理穿透
+// - lower_pattern 的 AstPattern::Ref 分支先穿透一层引用/指针再 lower inner
+//   （否则 `&[a, ..]` 的 inner Slice 拿到 `*const [i32; 3]` 类型报错）
+// - 与 Rust 语义一致：`match &x { v }` 报错——要匹配内部值必须显式写 `&v` 或 `ref v`
+
+fn main() -> i32 {
+    // --- 标量引用模式 ---
+    let x: i32 = 42;
+    let r = &x;
+    let v = match r {
+        &v_ => v_,
+        _ => 0,
+    };
+    if v != 42 { return 1; }
+
+    // --- 聚合引用 + 切片模式（组合穿透）---
+    let arr = [10, 20, 30, 40];
+    let ra = &arr;
+    let a = match ra {
+        &[a1, .., a2] => a1 + a2,
+        _ => 0,
+    };
+    if a != 10 + 40 { return 2; }
+
+    // --- 元组引用 ---
+    let t = (7i64, "hi");
+    let rt = &t;
+    let t1 = match rt {
+        &(a, _) => a as i32,
+        _ => 0,
+    };
+    if t1 != 7 { return 3; }
+
+    // --- 裸指针（*const T / *mut T）也能穿透 ---
+    let x2 = 100;
+    let p: *const i32 = &x2;
+    let pv = match p {
+        &pv_ => pv_, // 穿透 *const i32 拿到 i32
+        _ => 0,
+    };
+    if pv != 100 { return 4; }
+
+    // --- 多层嵌套引用：pattern 里 `&&pat` 匹配双层引用 ---
+    // 构造方式：`&(&value)` 把值包成双层 `*const *const T`
+    let nested = ((1, 2), (3, 4));
+    let rn_inner = &nested;
+    let rn = &rn_inner;
+    let sum = match rn {
+        &&((a, b), (c, d)) => a + b + c + d,
+        _ => 0,
+    };
+    if sum != 10 { return 5; }
+
+    // --- 不可变引用的 Binding 臂（匹配引用本身，拿到指针） ---
+    let s = "hello";
+    let rs = &s;
+    match rs {
+        v => {
+            // v 是 *const str，Binding 拿到指针值
+            if v as i64 == 0 { return 6; }
+        }
+    }
+
+    return 0;
+}

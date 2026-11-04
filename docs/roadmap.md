@@ -99,17 +99,24 @@ Rust 的借用检查是**线性化 + 借用区间 + 生命周期子类型**三�
 
 ### 3.2 `dyn Trait`（阶段 E）
 
-现状：词法表里没 `KwDyn`；`fn f(x: dyn A)` 报 `expected ')'`。
+现状（2026-11-04）：**vtable 分派已落地（x86-64 MVP）**——`dyn Trait` 是 16 字节值类型
+`{ data@0, vtable@8 }`；强转经 `coerce_to_dyn`，vtable 是 `.text` 跳转表
+（槽位 `jmp rel32` ×5 字节，复用 PC 相对重定位），调用降级为
+`CallIndirect(vt + index*5, [data, args..])`（聚合返回追加 sret 槽）。
+正向 `161_dyn_dispatch.zr` / `162_dyn_std_error.zr`（`std/error.zr` 的
+`(&dyn Error).cause()` 可用），负向 `49` / `50`。
 
-- **词法**：`KwDyn` 加进 `token.rs`。
-- **语法**：`dyn Trait` / `&dyn Trait` / `&mut dyn Trait` / `Box<dyn Trait>`（`Box` 是 `std::mem::Box<T>`，独占堆对象）。
-- **运行时表示**：`(data_ptr: *mut T, vtable: *const Vtable)`，vtable 是编译器生成的方法表 `{ method1, method2, drop, size, align, name }`。
-- **代码生成**：
-  - `x.method()` 变成 `(**x.vtable).method(x.data)`。
-  - 虚调用的寄存器分配要单独处理（不能用调用方约定的固定寄存器）。
-  - `Drop` 通过 vtable 调用，`Box<dyn Trait>` 析构时走 `vtable.drop`。
-- **诊断**：没有 `dyn` 但试图做动态分派时报错，指向正确的语法：`error[E0716]: dynamic dispatch requires `dyn Trait`; use `fn f(x: dyn Trait)` or wrap in `Box<dyn Trait>``.
-- **前置依赖**：这个做完 `std/error` 才能导入（现在因为 `dyn` 不存在导入不了）。
+- **词法 / 语法**：✅ `KwDyn`、`dyn Trait` / `&dyn Trait` / `&'static dyn Trait` 解析（`88_dyn_keyword.zr`）。
+- **运行时表示**：✅ `{ data, vtable }` 胖指针（16 字节值）；vtable 为跳转表。
+  ⏳ `drop` / `size` / `align` 元数据未入表——`Box<dyn Trait>` 析构仍缺。
+- **代码生成**：✅ x86-64；其它架构（aarch64 / arm / thumb / riscv / wasm）在
+  `compile` 入口明确报错，待各后端补 `FuncAddr` / `CallIndirect` 后放开。
+- **MVP 边界**：目标类型限非泛型具名类型 / 基元（泛型实例暂无 vtable 符号规则）；
+  方法签名除 receiver 外含 `Self` 的不可 dyn 调用；`Option<&'static dyn Error>`
+  只能由默认方法返回 `None`，构造 `Some` 需要生命周期转换（未实现）。
+- **诊断**：✅ 未实现 trait 强转报 `type mismatch: expected `dyn Tr``；
+  调 trait 外方法报 `no method `m` in trait `Tr``。
+  ⏳ "用了动态分派但没写 `dyn`" 的引导性诊断（E0716 形态）未做。
 
 ### 3.3 `comptime`（阶段 F）
 
@@ -373,15 +380,15 @@ zr 0.8.0 shell — :help 查看元命令，Ctrl-D 退出
 ### v0.11.0 — 类型系统（3 周）
 
 - 生命周期 `'a` 保留 + 子类型判定（§2.3）。— **已部分完成**：`'a` 全链路解析并跑通（`115_lifetime_args.zr`），但类型检查仍整体丢弃标注，无存活检查。
-- `dyn Trait` + vtable（§3.2）。— **未完成**：词法+解析+类型检查骨架已落地（`88_dyn_keyword.zr`），vtable 分派仍缺。
+- `dyn Trait` + vtable（§3.2）。— **已完成（x86-64 MVP，2026-11-04）**：16 字节胖指针 + `.text` 跳转表 vtable + `CallIndirect` 降级（`161` / `162`，负向 `49` / `50`）；vtable 元数据（drop/size/align）与非 x86-64 后端仍未做。
 - 关联类型解析 + 求解（`HirAssocType` 从空结构体升级）。— **已完成**：`resolve_assoc_type` + `generic_impl_assocs`，覆盖 `Self::Output` / `F::Output` / `Type::Output` / `<T as Trait>::Item`（限定写法带 trait 校验，`118` / `119`，负向 `29`）。
-- `impl Trait` 在参数位置（APIT）真作为泛型参数处理。— **已完成**：`x: impl Trait` 脱糖成匿名泛型参数（`__apit_N`），按实参单态化、边界真校验；`&impl Trait` / `Vec<impl Trait>` 绑内层类型（`120_apit.zr`，负向 `30`）。返回位置（RPIT）仍是 `opaque` 占位。
+- `impl Trait` 在参数位置（APIT）真作为泛型参数处理。— **已完成**：`x: impl Trait` 脱糖成匿名泛型参数（`__apit_N`），按实参单态化、边界真校验；`&impl Trait` / `Vec<impl Trait>` 绑内层类型（`120_apit.zr`，负向 `30`）。返回位置（RPIT）同样已完成：真正的存在类型，先以 `Infer` 检查函数体、返回后固定隐藏类型，方法查找与边界校验按隐藏类型进行（`160_rpit_impl_trait.zr`，负向 `47` / `48`）。
 - `for<'a>` 高阶边界保留 + 求解。— **未完成**。
-- **目标**：`std/error` 能导入。— **已达成**（2026-11-02，随调用实参 / 字段值类型核验落地；`(&dyn Error).cause()` 的 vtable 分派仍不可用，模块里没有走它的路径）。
+- **目标**：`std/error` 能导入。— **已达成**（2026-11-02，随调用实参 / 字段值类型核验落地）；`(&dyn Error).cause()` 的 vtable 分派亦已可用（2026-11-04，`162_dyn_std_error.zr`）。
 
 ### v0.12.0 — 易用性（2 周）
 
-- `?` / `!` / `catch` 三种错误解包语义统一（§4.1）。
+- `?` / `!` / `catch` 三种错误解包语义统一（§4.1）。— **已部分完成**：三者在类型检查层都通；`!` 与 `catch` 已在 MIR 层脱糖成控制流（`157_error_union.zr`，负向 `40`-`43`）。`?` 仍是旧路径，未与 `!` 共用同一脱糖实现。
 - `println!` 升级为 `macro_rules!` + 编译期规格检查（§4.2）。
 - `Iterator` combinator 全上（§4.3 第 2 项）。
 - `Arc / Mutex / OnceCell / Lazy` 进标准库（§4.3 第 4 项）。

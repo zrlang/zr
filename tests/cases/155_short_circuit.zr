@@ -1,0 +1,101 @@
+// 短路求值回归：&& / || 只在必要时才计算 rhs。
+// 早先两侧都会被求值（Binary 指令同时算 lhs 和 rhs），写:
+//   if ptr != null && ptr.data[i].used { ... }
+// 在空 ptr 上会先算 ptr.data[i].used 直接 SIGSEGV。
+// 本用例用函数调用副作用计数验证：每侧应在该短路条件下不执行。
+//
+// 覆盖：
+// - false && f() — f 不应执行
+// - true && f()  — f 应执行
+// - true || f()  — f 不应执行
+// - false || f() — f 应执行
+// - 常量折叠路径（lhs 是字面量时直接走 MirValue::Bool 或跳过）
+
+use io::*;
+
+static mut sc_count: i32 = 0;
+
+fn sc_yes(x: i32) -> bool {
+    unsafe { sc_count = sc_count + x; }
+    return true;
+}
+
+fn sc_no(x: i32) -> bool {
+    unsafe { sc_count = sc_count + x; }
+    return false;
+}
+
+fn main() -> i32 {
+    let mut failed: i32 = 0;
+
+    // === && 测试 ===
+    // 1. false && f() — f 不应执行
+    unsafe { sc_count = 0; }
+    let r = false && sc_yes(1);
+    unsafe {
+        if r { println("FAIL T1a"); failed = failed + 1; }
+        if sc_count != 0 { println_fmt("FAIL T1b && 短路失效 count={}\n", &[fmt_int(sc_count)], 1); failed = failed + 1; }
+    }
+
+    // 2. true && f() — f 必须执行
+    unsafe { sc_count = 0; }
+    let r = true && sc_yes(1);
+    unsafe {
+        if !r { println("FAIL T2a"); failed = failed + 1; }
+        if sc_count != 1 { println_fmt("FAIL T2b && 应执行 count={}\n", &[fmt_int(sc_count)], 1); failed = failed + 1; }
+    }
+
+    // 3. false && sc_no() — f 不应执行
+    unsafe { sc_count = 0; }
+    let r = false && sc_no(1);
+    unsafe {
+        if r { println("FAIL T3a"); failed = failed + 1; }
+        if sc_count != 0 { println_fmt("FAIL T3b count={}\n", &[fmt_int(sc_count)], 1); failed = failed + 1; }
+    }
+
+    // === || 测试 ===
+    // 4. true || f() — f 不应执行
+    unsafe { sc_count = 0; }
+    let r = true || sc_no(1);
+    unsafe {
+        if !r { println("FAIL T4a"); failed = failed + 1; }
+        if sc_count != 0 { println_fmt("FAIL T4b || 短路失效 count={}\n", &[fmt_int(sc_count)], 1); failed = failed + 1; }
+    }
+
+    // 5. false || f() — f 必须执行
+    unsafe { sc_count = 0; }
+    let r = false || sc_yes(1);
+    unsafe {
+        if !r { println("FAIL T5a"); failed = failed + 1; }
+        if sc_count != 1 { println_fmt("FAIL T5b || 应执行 count={}\n", &[fmt_int(sc_count)], 1); failed = failed + 1; }
+    }
+
+    // 6. false || sc_no() — f 必须执行
+    unsafe { sc_count = 0; }
+    let r = false || sc_no(1);
+    unsafe {
+        if r { println("FAIL T6a"); failed = failed + 1; }
+        if sc_count != 1 { println_fmt("FAIL T6b count={}\n", &[fmt_int(sc_count)], 1); failed = failed + 1; }
+    }
+
+    // === 嵌套短路 ===
+    // 7. (false && f1) || f2 — f1 不执行，f2 执行（因为 false && ... = false，|| 继续算）
+    unsafe { sc_count = 0; }
+    let r = (false && sc_yes(2)) || sc_no(3);
+    unsafe {
+        if r { println("FAIL T7a"); failed = failed + 1; }
+        // sc_yes(2) 不应执行（&& 短路），sc_no(3) 应执行（|| 不短路）
+        if sc_count != 3 { println_fmt("FAIL T7b count={}\n", &[fmt_int(sc_count)], 1); failed = failed + 1; }
+    }
+
+    // 8. (true && f1) || f2 — f1 执行，f2 不执行（因为 true && sc_yes = true，|| 短路）
+    unsafe { sc_count = 0; }
+    let r = (true && sc_yes(2)) || sc_no(3);
+    unsafe {
+        if !r { println("FAIL T8a"); failed = failed + 1; }
+        // sc_yes(2) 应执行，sc_no(3) 不应执行（|| 短路）
+        if sc_count != 2 { println_fmt("FAIL T8b count={}\n", &[fmt_int(sc_count)], 1); failed = failed + 1; }
+    }
+
+    return failed;
+}

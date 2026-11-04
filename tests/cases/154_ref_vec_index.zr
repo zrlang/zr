@@ -1,0 +1,36 @@
+// tests/cases/154_ref_vec_index.zr — `&Vec<T>` / `&mut Vec<T>` 的下标
+//
+// 回归钉住 `check_index_scalar` 对引用形态的脱糖：早先只匹配 `Ty::Named`，
+// `&Vec<T>` 绕过了 `v.data[i]` 脱糖，`v[i]` 直接对 Vec 结构体本身做指针
+// 算术，读到的是 `data`/`len`/`cap` 的字节（全是垃圾）。现在把外层引用/
+// 裸指针剥开一层再脱糖，`Field` 在类型检查里自动解引用得到 `*mut T`。
+use collections::Vec;
+
+fn read_ref(v: &Vec<i32>) -> i32 {
+    return v[0] + v[1];
+}
+
+fn write_ref(v: &mut Vec<i32>, idx: usize, val: i32) {
+    v[idx] = val;
+}
+
+fn main() -> i32 {
+    let mut v = Vec::with_capacity(4);
+    v.push(10i32);
+    v.push(20i32);
+    v.push(30i32);
+
+    // `&Vec<T>` 读：脱糖到 `(*v).data[i]`。
+    if read_ref(&v) != 30 { return 1; }
+    if read_ref(&v) != 30 { return 2; }
+
+    // `&mut Vec<T>` 写：通过引用修改底层元素。
+    write_ref(&mut v, 1, 999);
+    if v[1] != 999 { return 3; }
+    if v[0] != 10 || v[2] != 30 { return 4; }
+
+    // 直接对 `&Vec` 表达式下标（不绑定到变量）。
+    if (&v)[0] != 10 { return 5; }
+
+    return 0;
+}

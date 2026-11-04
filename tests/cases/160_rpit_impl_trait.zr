@@ -1,0 +1,91 @@
+// `impl Trait` 在**返回位置**（RPIT）。
+//
+// 实现机制：
+// 1. `ast_to_hir_type` 把 `-> impl Trait` 降成 `Ty::Opaque(opaque_id)`，同时把
+//    trait 边界 DefId 存进 `opaque_bounds[opaque_id]`。
+// 2. 函数体预检查（两轮的第一轮）：RPIT 函数体用推断变量代替 opaque 的 ret_ty，
+//    让所有 `return X` / block tail 自然 unify 出隐藏类型，检查完 resolve 存进
+//    `opaque_hidden[opaque_id]`。
+// 3. trait 边界验证：隐藏类型必须实现 `opaque_bounds` 里的所有 trait。
+// 4. `lookup_method` 对 `Ty::Opaque(id)` 查 `opaque_hidden[id]`（通过隐藏类型
+//    做方法查找），所以调用方能用隐藏类型的 impl 方法。
+//
+// 多轮检查：预检查 RPIT 函数体先填好 `opaque_hidden`，主循环再处理所有函数——
+// 这样前向调用（调用方源码在被调方之前）也能正确 resolve。
+
+use io::println;
+
+trait AddOne {
+    fn add_one(self) -> i64;
+}
+
+struct Seven;
+impl AddOne for Seven {
+    fn add_one(self) -> i64 { 8 }
+}
+
+struct Val { n: i64 }
+impl AddOne for Val {
+    fn add_one(self) -> i64 { self.n + 1 }
+}
+
+// 1. 基本 RPIT：返回 Seven（block tail 隐式返回）。
+fn make_seven() -> impl AddOne {
+    Seven {}
+}
+
+// 2. RPIT 用显式 return。
+fn make_val(n: i64) -> impl AddOne {
+    return Val { n: n };
+}
+
+// 3. 条件分支返回同一隐藏类型（两个分支都是 Val）。
+fn choose_val(n: i64) -> impl AddOne {
+    if n > 0 {
+        Val { n: n }
+    } else {
+        Val { n: -n }
+    }
+}
+
+// 4. 前向调用测试：main 在源码里先于这个函数定义（预检查先跑）。
+fn make_zero() -> impl AddOne {
+    Val { n: 0 }
+}
+
+// 5. APIT 参数与 RPIT 返回混合。
+fn take_addone(x: impl AddOne) -> i64 {
+    x.add_one()
+}
+
+fn main() -> i32 {
+    // 基本 RPIT + 方法调用
+    let s = make_seven();
+    let v1 = s.add_one();
+    if v1 != 8 { return 1; }
+
+    // 显式 return 的 RPIT
+    let v = make_val(10);
+    let v2 = v.add_one();
+    if v2 != 11 { return 2; }
+
+    // 条件分支（两个分支都是 Val，隐藏类型确定）
+    let c = choose_val(-5);
+    let v3 = c.add_one();
+    if v3 != 6 { return 3; }
+
+    // 前向调用
+    let z = make_zero();
+    let v4 = z.add_one();
+    if v4 != 1 { return 4; }
+
+    // RPIT 返回值传给 APIT 参数
+    let v5 = take_addone(make_seven());
+    if v5 != 8 { return 5; }
+
+    // RPIT 返回值直接链式调用
+    let v6 = make_val(42).add_one();
+    if v6 != 43 { return 6; }
+
+    return 0;
+}
