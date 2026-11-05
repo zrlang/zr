@@ -1,0 +1,63 @@
+//=============================================================================
+// tests/cases/171_box_from_raw.zr — `Box::from_raw` 关联函数路径调用
+//
+// 早先 `pub fn from_raw<T>(ptr: *mut T)` 在 `impl<T> Box<T>` 里**重新声明**
+// 了方法泛型参数 `T`，与 impl 的 `T` 冲突——路径调用 `Box::from_raw(raw)`
+// 期望 2 个泛型参数（impl `T` + 方法 `T`），报
+// `expected 2 generic argument(s) for Box__from_raw, found 1`；而方法自身
+// 泛型参数无法从实参推断 `T`（返回 `Box<T>`，`T` 不参与实参），
+// `Box::from_raw(raw)` 因此完全不可用。
+//
+// 现在 `from_raw` 去掉方法泛型参数（`from_raw(ptr: *mut T)`，`T` 来自 impl），
+// 与 Rust 的 `impl<T> Box<T> { fn from_raw(raw: *mut T) -> Box<T> }` 一致。
+//
+// 覆盖：
+//   - `Box::from_raw(raw)` 纯路径调用（`T` 从实参 `*mut i32` 推断）
+//   - `Box::<i32>::from_raw(raw)` turbofish 显式
+//   - `let b: Box<i32> = Box::from_raw(raw)` 显式类型标注
+//   - `Box::from_raw` 返回的 `Box` 点调用 `get` / `as_ptr`（自身方法表）
+//   - `Waker::wake` 内部的 `Box::from_raw(self.wake)`（`*mut dyn Wake` 重建）
+//=============================================================================
+use std::*;
+
+struct MyTask {
+    count: i32,
+}
+
+impl Wake for MyTask {
+    fn wake(self: Box<MyTask>) {
+        let t = self;
+        let p = t.ptr;
+        let mut v = p[0];
+        v.count = v.count + 1;
+        p[0] = v;
+    }
+    fn wake_by_ref(self: &MyTask) {}
+}
+
+fn main() -> i32 {
+    // 纯路径调用：`T` 从实参 `*mut i32` 推断。
+    let b = Box::new(42);
+    let raw = b.into_raw();
+    let b2 = Box::from_raw(raw);
+    if b2.get() != 42 { return 1; }
+    if b2.as_ptr() != raw { return 2; }
+
+    // turbofish 显式。
+    let b3 = Box::<i32>::from_raw(raw);
+    if b3.get() != 42 { return 3; }
+
+    // 显式类型标注。
+    let b4: Box<i32> = Box::from_raw(raw);
+    if b4.get() != 42 { return 4; }
+
+    // `Waker::wake` 内部的 `Box::from_raw(self.wake)`：`*mut dyn Wake` 重建。
+    let task = Box::new(MyTask { count: 0 });
+    let drows = task.into_raw() as *mut dyn Wake;
+    let w = Waker::new(drows);
+    w.wake();
+    let p = drows as *mut MyTask;
+    if p[0].count != 1 { return 5; }
+
+    return 0;
+}

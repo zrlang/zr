@@ -63,7 +63,7 @@ impl<T> Box<T> {
 
     /// 从裸指针重建 `Box`，由 `into_raw` 产生（关联函数形式，对应 Rust 的
     /// `Box::from_raw`）。
-    pub fn from_raw<T>(ptr: *mut T) -> Box<T> {
+    pub fn from_raw(ptr: *mut T) -> Box<T> {
         return Box { ptr };
     }
 }
