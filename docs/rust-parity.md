@@ -57,11 +57,11 @@
 | 泛型函数 | 可用 | ✅ | 按调用点单态化（含递归泛型）；类型实参从实参 / 期望返回类型推断。泛型约束（`T: Ord`、`where`）在**单态化时**校验（`check_trait_bounds`，含超类型展开）；实例化后再按具体类型检查方法调用 |
 | 泛型类型 | 可用 | ✅ | 泛型结构体 / 枚举 + `impl<T> Type<T>` 的方法均可用（`Vec<T>`、`Option<T>` 等）；字段与载荷类型按类型实参替换 |
 | `trait` | 可用 | ✅ | `trait` + `impl Trait for Type` 正常（`std::core` 的 `Eq`/`Ord`/`Copy`/`Clone`/`Display` 都在用）。**trait 默认方法已实现**（`124_trait_default_methods.zr`）：trait 里带方法体的方法（含 `default fn` 拼写）在 impl 未覆盖时按目标类型合成；没有默认体的方法缺失在 impl 块报 `not all trait items implemented`（负向 `37`）。局限：泛型 impl 的毯覆方法解析与"具体 impl 部分覆盖、其余继承毯覆默认体"的两级特化未做 |
-| 关联类型 | 可用 | ✅ | `type Output;` + `type Output = i32;` 正常；`Self::Output`（impl 内）、`F::Output`（`F: Trait` 泛型参数）、`Type::Output`（具体类型）均可投影，含泛型 impl `impl<T> Tr for S<T> { type Item = T; }`；**限定写法 `<T as Trait>::Item` 已支持**（`119_qualified_assoc.zr`），相对 `F::Output` 多出的是 trait 校验（没实现就报 `the trait `X` is not implemented for `Y``，负向 `29`）。**仍不支持**：投影不按 trait 过滤 impl 表，两个 trait 同名关联类型时无法真正消歧 |
+| 关联类型 | 可用 | ✅ | `type Output;` + `type Output = i32;` 正常；`Self::Output`（impl 内）、`F::Output`（`F: Trait` 泛型参数）、`Type::Output`（具体类型）均可投影，含泛型 impl `impl<T> Tr for S<T> { type Item = T; }`；**限定写法 `<T as Trait>::Item` 已支持**（`119_qualified_assoc.zr`），相对 `F::Output` 多出的是 trait 校验（没实现就报 `the trait `X` is not implemented for `Y``，负向 `29`）。**同名关联类型消歧已支持**（`163_assoc_disambig.zr`）：`<Both as HasA>::Item` 与 `<Both as HasB>::Item` 按限定路径里的 trait 过滤 impl 表，不再取先收集者 |
 | `impl` 块 | 可用 | ✅ | 关联函数、`self` / `&self` / `&mut self` 三种接收者、`Self` 类型均可 |
 | `type` 别名 | 可用（含泛型） | ✅ | 在**使用点展开**：`let x: MyInt`、结构体字段、数组 / 指针、`Vec<MyInt>`、别名套别名、前向引用都正常；**泛型别名 `type V<T> = Vec<T>` 已支持**（`74_generic_alias.zr`，提交 `8d6c475`：保留参数并登记占位符，展平按实参替换） |
 | 生命周期标注 `'a` | 解析后丢弃 | 🟡 | `&'a T`、`&'a mut T`、`&'static dyn Tomb`、`struct S<'a>`、`impl<'a> S<'a>`、`S<'a>` / `S<'_>` 都能解析（生命周期实参在 `parse_generic_args` 里跳过、不登记，见 `115_lifetime_args.zr`），类型检查阶段直接丢掉标注（`src/parser/ty.rs`），**没有生命周期 / 存活检查**（借用检查只是 §2.4 的最小切片）。结构体 `where` 子句与 `as *const _` 推断占位已补上。**仍不支持**：`'_` 作为**必须**的实参（会被跳过，`Foo<'_>` 等于 `Foo`） |
-| `dyn Trait` / trait 对象 | 骨架可用 | 🔧 | 词法+解析+类型检查三层已实现（`88_dyn_keyword.zr`：参数/局部注解里出现 `&dyn Error` 不再报错）；**完整 vtable 分派与 trait-object 转换仍在未实现状态**，调用 trait 方法不在此用例范围 |
+| `dyn Trait` / trait 对象 | 可用（x86-64 MVP） | ✅ | `Ty::Dyn` 是 16 字节值类型 `{data, vtable}`，`&dyn Trait` 是指向该记录的指针；`let d: dyn Tr = &x;` 由 `coerce_to_dyn` 触发（源类型须实现 `Tr`）。vtable 符号 `__vt_<Type>_<Trait>`，槽位 = trait 方法声明顺序，默认方法按类型合成进表；调用经 `ExprKind::DynCall` 降级为间接调用（槽宽与 MIR `VT_ENTRY_BYTES` 同步，见 AGENTS.md 红线 14）；聚合返回追加 sret 槽。MVP 边界：仅 x86-64（其它后端 `compile` 入口报错）、目标类型限非泛型具名类型/基元、vtable 无 drop/size/align 元数据。回归 `161_dyn_dispatch.zr` / `162_dyn_std_error.zr` / `169_box_dyn.zr`（`Box<dyn Wake>` 两种接收者、`Box::into_raw`/`from_raw`）；负向 `49` / `50` |
 | auto trait | 不支持 | ❌ | 无 auto trait 机制、无 blanket impl 语法 |
 | `PhantomData<T>` | 不存在 | ❌ | `std::core` 里没有 `PhantomData`，也没有等价物 |
 
@@ -73,7 +73,7 @@
 | `fn f(x: Option<i32>)` | 可用 | ✅ | 签名与函数体一致 |
 | `Option::<i32>::None` | 可用 | ✅ | turbofish 后面继续吃路径段，类型实参挂在整条路径上：无载荷变体（`Option::<i32>::None`）、关联函数（`Box::<i32>::new(7)`）、元组结构体（`Wrap::<i32>(7)`）、结构体载荷变体（`Shape::<u8>::Circle { r: 7 }`）都可用。显式实参当期望类型喂给构造器；无上下文的 `Option::None` 仍需 `let` 注解 |
 | `Vec<Vec<i32>>`（嵌套泛型，`>>` 收尾） | 可用 | ✅ | 词法器把 `>>` / `<<` 切成 `Shr` / `Shl`（为移位表达式），类型位置原先解析不了嵌套泛型。现在 `Parser::split_angle` 只在类型语境内把 `Shl`→`Lt Lt`、`Shr`→`Gt Gt`，`Vec<Vec<i32>>`、`Option<<T as Tr>::Item>` 都能解析（`119_qualified_assoc.zr`） |
-| `struct Arr<const N: usize> { data: [i32; N] }` | 可用 | ✅ | `const` 参数进类型作用域（占位 `Ty::ConstParam`），数组长度记 `ArrayLen::Param(N)`，单态化时按名字换成具体值。声明 / 注解（`Arr<3>`）/ turbofish（`f::<4>`）/ 从实参数组长度反推都可用；`impl<const N: usize> Arr<N>` 的方法、`[0; N]` 重复、`N` 在值位置（`while i < N`）也可用（`122_const_generic.zr`，负向 `32`/`33`/`34`）。**仍缺**：表达式位置更复杂的常量（`[T; N + 1]`）与省略实参时的类型侧推断（结构体字面量只能从字段数组字面量长度反推） |
+| `struct Arr<const N: usize> { data: [i32; N] }` | 可用 | ✅ | `const` 参数进类型作用域（占位 `Ty::ConstParam`），数组长度记 `ArrayLen::Param(N)`，单态化时按名字换成具体值。声明 / 注解（`Arr<3>`）/ turbofish（`f::<4>`）/ 从实参数组长度反推都可用；`impl<const N: usize> Arr<N>` 的方法、`[0; N]` 重复、`N` 在值位置（`while i < N`）也可用（`122_const_generic.zr`，负向 `32`/`33`/`34`）。**长度表达式已实现**（`167_const_len_expr.zr`）：`[T; N + 1]` 返回类型、`[0; N + 1]` 重复、`[i32; 2 * N]` / `[i32; N - 1]` 加减乘、结构体字段类型里的长度表达式、数组 `.len` 发射编译期常量。**仍缺**：多参数长度表达式（`[T; N + M]`，长度表达式按编译期常量求值、只认 `ConstParamRef` 换值的单参数形式）与省略实参时的类型侧推断（结构体字面量只能从字段数组字面量长度反推） |
 
 ---
 
@@ -89,7 +89,7 @@
 | `let ... else` | 可用 | ✅ | `let Step::Value(v) = s else { return 1; };`；else 必须发散 |
 | `let` 解构 `let (a, b) = ...` | 可用 | ✅ | 元组 / 结构体 / 定长数组切片都能解构，子绑定逐个初始化；可反驳模式在 `let` 位置报 `refutable pattern in local binding; use \`let ... else\``。**函数形参上的解构模式仍只取一个 local** |
 | `while let` | 可用 | ✅ | 脱糖成 `loop { let tmp = EXPR; if let PAT = tmp { .. } else { break; } }`，每轮只求值一次 |
-| `loop` / `while` / `for` | 可用 | ✅ | `for i in 0..10`、`for i in 1..=10`、`for x in array` 均正常 |
+| `loop` / `while` / `for` | 可用 | ✅ | `for i in 0..10`、`for i in 1..=10`、`for x in array` 均正常；**`for x in it`（Iterator 协议）已实现**（`165_iterator.zr`）：`it.next() -> *mut Item` 脱糖成 `loop { let p = it.next(); if p == 0 { break; } let x = *p; body }`，`Range`（含 `inclusive` / `range_step` 步长）与 `SliceIter`（数组值 / 数组引用）可用 |
 | `break` 带值 | 可用 | ✅ | `let v = loop { break 42; };` |
 | 带标签的 `break` / `continue` | 可用 | ✅ | 同时支持 Zig 风格 `outer: loop { break outer; }` 与 Rust 风格 `'outer: loop { break 'outer; }`；标签属于 `loop` / `while` / `for` |
 
@@ -117,8 +117,8 @@
 | 块表达式 | 可用 | ✅ | `let v = { let a = 1; a + 1 };` |
 | 函数指针 `fn(T) -> R` | 可用 | ✅ | 取址、传参、返回值、存进结构体字段都行（x86-64 专属，其它后端明确报错） |
 | 闭包 `\|x\| x * factor` | 基本可用 | 🟡 | 无捕获闭包可存变量 / 当实参 / 返回；带捕获闭包也可存变量 / 嵌套 / 多次调用、按值传给**泛型**形参 / 从泛型返回值透传（`84_closure_capture_value.zr`、`109_closure_env_cross_fn.zr`、`110_closure_env_generic_passthrough.zr`）。**带捕获闭包也能转成裸 `fn(..)` 值**（传给 `fn(..)` 形参 / 作 `fn(..)` 返回值 / `let f: fn(..) = |..|`）：函数值 = 16 字节记录 `{code, env}`，调用统一多传一个 env（`125_closure_to_fn.zr`）；泛型 / 异步函数当值明确报错（负向 `38` / `39`） |
-| `impl Trait` 参数位置（APIT） | 可用 | ✅ | `fn f(x: impl Trait)` 在声明收集前脱糖成匿名泛型参数（`fn f<__apit_1: Trait>(x: __apit_1)`），按实参单态化、边界真的被校验（`120_apit.zr`，负向 `30_apit_bound.zr`）。`&impl Trait` 绑**内层**类型（`&T`），`Vec<impl Trait>` 是 `Vec<T>`，支持 `impl A + B` 多边界、与显式泛型参数共存。trait **声明**里的方法签名不做这个改写（声明本身不参与单态化） |
-| `impl Trait` 返回值（RPIT） | 仅语法骨架 | ❌ | `-> impl Trait` 能解析、能构造返回值，但返回的类型是 `opaque(impl_trait_N)`——任何字段访问 / 方法调用都报 `cannot access field ... on type opaque(impl_trait_N)`，实质不可用（异步用例 `29`/`49`/`50` 只把它当 Future 句柄轮询，不走字段访问）；`impl Fn(T) -> T` 这种带括号的 trait 路径仍解析失败（`expected RParen, found LParen`） |
+| `impl Trait` 参数位置（APIT） | 可用 | ✅ | `fn f(x: impl Trait)` 在声明收集前脱糖成匿名泛型参数（`fn f<__apit_1: Trait>(x: __apit_1)`），按实参单态化、边界真的被校验（`120_apit.zr`，负向 `30_apit_bound.zr`）。`&impl Trait` 绑**内层**类型（`&T`），`Vec<impl Trait>` 是 `Vec<T>`，支持 `impl A + B` 多边界、与显式泛型参数共存。**trait 声明方法签名里的 APIT 也已脱糖**（`170_trait_apit.zr`：带 `&self` 接收者 / 默认方法 / 关联函数三种形态，参数与 impl 方法一致） |
+| `impl Trait` 返回值（RPIT） | 可用 | ✅ | `-> impl Trait` 是真存在类型 `opaque(impl_trait_N)`：体内先以 `Infer` 检查、返回后把隐藏类型记进 `opaque_hidden`，**字段访问（`r.x`）与方法访问（`r.area()`）都按隐藏类型解析**、MIR 布局按隐藏类型传/返回（`167_rpit_field.zr`；负向 `47` 未实现边界 / `48` 无返回值）。**仍不支持**：`impl Fn(T) -> T`（带括号的 trait 路径，无 `Fn` trait 语法）；trait 方法签名里的 RPIT |
 | `?` 运算符 | 可用 | ✅ | 对 `Result<T, E>` / `Option<T>` 生效：成功取载荷，失败从当前函数 `return Err(e)` / `return None`。返回类型必须是同一种枚举，错误类型必须一致（没有 `From` 转换） |
 | `try` / `catch` | 明确报错 | ❌ | 语法能解析，类型检查报 `` `try` / `catch` is not implemented yet; use the postfix `?` operator ... `` |
 | `throw` | 明确报错 | ❌ | 类型检查报 `` `throw` is not implemented yet; return `Err(...)` instead `` |
@@ -228,7 +228,9 @@ alloc 不能 import std）。
 | `core::char` | `char::is_ascii_digit` / `is_ascii_alphabetic` / `is_ascii_alphanumeric` / `is_ascii_whitespace` / `is_ascii_uppercase` / `is_ascii_lowercase` / `is_ascii_graphic` / `to_ascii_lowercase` / `to_ascii_uppercase` / `ascii_to_digit` / `ascii_from_digit` | ✅ | zr 不能给内建类型写固有 `impl`（orphan rule），所以全部是**自由函数** |
 | `core::num` | `num::abs_i64` / `abs_i32` / `sign_*` / `pow_*` / `saturating_*` / `checked_*` / `wrapping_*` / `count_ones_u64` / `leading_zeros_u64` / `trailing_zeros_u64` / `gcd_u64` / `lcm_u64` / `clamp_i64` / `i64_min()` / `i64_max()` | ✅ | 同样用带类型后缀的自由函数；`i64_min/max` 是**函数不是常量**（跨模块引用的大整数字面量 `const` 不会折叠，会留下未定义符号） |
 | `core::option` / `core::result` | `Option` 的 `expect` / `unwrap_or_else` / `map_or` / `ok_or` / `filter` / `or`；`Result` 的 `unwrap_or` / `unwrap_or_else` / `ok` / `err` / `map_err` | ✅ | 回归 `tests/cases/149_std_core_ext.zr` |
-| `alloc::boxed::Box` | `Box<T>`：`new` / `get` / `get_mut` / `as_ptr` / `into_raw` / `replace` / `free`；`box_new` / `box_from_raw` | 🟡 | 值语义，**没有 `Drop`**，要显式 `free` |
+| `alloc::boxed::Box` | `Box<T>`：`new` / `get` / `get_mut` / `as_ptr` / `into_raw` / `replace` / `free`；`box_new` / `box_from_raw` | ✅ | 值语义，**没有 `Drop`**，要显式 `free`。`Box<dyn Trait>` 的 vtable 分派可用（`169_box_dyn.zr`：`Box<Self>` 与 `&Self` 两种接收者、`*mut T as *mut dyn Tr` 指针 fatten、`into_raw` / `from_raw` 重建）；`Box<T>` 自身方法表不被无条件 deref 屏蔽（`lookup_method` 先查 `Box` 再 deref 到 `T`） |
+| `alloc::rc::Rc` / `cell::RefCell` | `Rc<T>`：`new` / `clone` / `get` / `strong_count` / `free`；`rc_new`；`RefCell<T>`：`new` / `borrow_mut` / `replace`；`refcell_new` | 🟡 | `Rc` 引用计数共享所有权（堆上 `{strong, value}`，栈上只留指针），`free` 递减计数、归零释放；`RefCell` 内部可变性（`borrow_mut` 给裸指针）。无自动析构，用完必须显式 `free`（`167_rc_refcell.zr`）。无借用运行期检查（`borrow_mut` 不 panic） |
+| `sync::Mutex` / `marker::Send` | `Mutex<T>`：`new` / `lock` / `unlock` / `free`；`Send`（marker trait） | 🟡 | 两线程各 1000 次持锁递增共享计数器精确等于 2000（`168_mutex.zr`）；`Send` 是空 marker trait（无编译期自动推导）。无通道 |
 | `alloc::vec::Vec` | 在原有 API 上补 `first` / `last` / `truncate` / `retain` / `reverse` / `swap` / `extend_from_slice` / `dedup` | ✅ | 回归 `tests/cases/150_std_alloc_ext.zr` |
 | `alloc::string::String` | 补 `trim` / `trim_start` / `trim_end` / `to_lowercase` / `to_uppercase` / `find_str` / `rfind_byte` / `split` / `split_whitespace` / `replace` / `parse_i64` / `parse_i32`，并实现 `Eq` / `Ord` / `Hash` / `Clone` / `Default` | ✅ | `Eq` 手写字节比较（不能在 trait impl 里调同名方法，会递归成栈溢出）；`Hash` 用 FNV-1a |
 | `alloc::collections::VecDeque` | `VecDeque<T>`：`new` / `with_capacity` / `push_back` / `push_front` / `pop_front` / `pop_back` / `front` / `back` / `get` / `set` / `clear` / `destroy` / `into_vec` | ✅ | 环形缓冲，字段叫 `size` / `capac` 以避开同名方法 |

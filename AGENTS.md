@@ -32,14 +32,17 @@ zr 是一门系统编程语言（Rust/Zig 混合取向），编译器用 Rust �
 `future/README.md` 的状态列在 2026-11-01 已按源码重排，当前的不接线 / 空壳项：
 `lto`（`src/opt/lto.rs` 有完整实现，但 `opt/mod.rs` 未声明、CLI 无开关）、
 `pgo`（`src/opt/pgo.rs`，同上）、`macro_system`（`src/macro_system/`，`main.rs` 未 `mod` 声明；
-`macro_rules!` 走的是 `src/macros.rs`）、`negative_bounds` / `higher_ranked`（trait 求解里查无实现）、
-`impl_trait`（**APIT 与 RPIT 均已实现**——参数位置 `x: impl Trait` 脱糖成匿名泛型参数；
-返回位置 `-> impl Trait` 是真存在类型 `opaque(impl_trait_N)`：体内先以 `Infer` 检查、
-返回后把隐藏类型记进 `opaque_hidden`，方法查找 / 边界校验都按隐藏类型走）。
-**已接线且确实可用**：`const_generics`（`<const N: usize>` 全链路，见 §5 的在途工作）、
-`coherence_rules`（`check_orphan_rule` / `check_overlap`，
-`src/typeck/mod.rs:1812-1814`）、`c_backend`（`--emit-c`）、`specialization` 的**选择**
-（更 specific 的 impl 优先，但无 `default fn` 特化）。
+`macro_rules!` 走的是 `src/macros.rs`）、`impl_trait` 的**返回位置（RPIT）**仍有限：
+`-> impl Trait` 是真存在类型 `opaque(impl_trait_N)`，隐藏类型记进 `opaque_hidden`，
+方法查找 / 字段访问 / 边界校验都按隐藏类型走（`167_rpit_field.zr`，负向 `47`/`48`），
+但 `impl Fn(T) -> T`（无 `Fn` trait 语法）与 trait 方法签名里的 RPIT 仍不支持。
+**已接线且确实可用**：`const_generics`（`<const N: usize>` 全链路，长度表达式
+`[T; N + 1]` 也已支持，见 §5 的在途工作）、`coherence_rules`（`check_orphan_rule` /
+`check_overlap`，`src/typeck/mod.rs:1812-1814`）、`c_backend`（`--emit-c`）、
+`specialization` 的**选择**（更 specific 的 impl 优先，但无 `default fn` 特化）、
+`negative_bounds`（`where T: !Trait`，`168_negative_bounds.zr`，负向 `38`）、
+`higher_ranked`（`for<'a> T: Trait<'a>`，`169_hrtb.zr`）、`zr0`（`zr0-check` /
+`zr0-c` 子命令已接线，`main.rs` `mod zr0`）。
 
 ---
 
