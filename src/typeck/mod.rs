@@ -5954,30 +5954,38 @@ impl TypeChecker {
 
     /// 查 `impl` 方法。方法已展开成普通函数 `Type__method`。
     fn lookup_method(&self, ty: &Ty, name: &str) -> Option<hir::DefId> {
-        // 基本类型也能有 `impl` 方法（`impl i32 { fn lt .. }`）：目标类型
-        // 名字就是类型名 `i32` / `u8` / `f64` / `bool` / `str`。
-        let target = match ty {
+        match ty {
             Ty::Named(id, _) => {
-                // `Box<T>` 自动解引用到 `T`（Rust 语义）：`b.method()` 在
-                // `Box<T>` 上找不到方法时，deref 到 `T` 再查。
+                // `Box<T>` 有自动解引用语义（Rust `Deref`）：`b.method()`
+                // 先查 `Box` 自身的方法表（`into_raw` / `get` / `as_ptr` /
+                // `get_mut` / `replace` / `free`），查不到才 deref 到 `T`
+                // 再查（`Box<dyn Wake>` 的 `wake()` 穿透 Box 到 `dyn Wake`）。
+                //
+                // 早先这里**无条件** deref 到 `T` 并 return，`Box` 自身的
+                // 方法表永远查不到——`b.into_raw()` / `b.get()` 一律报
+                // `no field ... on type Box<T>`（`bfaf849` 引入的回归，
+                // `169_box_dyn.zr` 五档编译失败）。
                 if self.def_names.get(id).map(|n| n == "Box").unwrap_or(false) {
-                    if let Some(ty) = match ty {
-                        Ty::Named(_, args) => args.first(),
-                        _ => None,
-                    } {
-                        return self.lookup_method(ty, name);
+                    if let Some(m) = self.lookup_named_method("Box", name) {
+                        return Some(m);
                     }
+                    if let Ty::Named(_, args) = ty {
+                        if let Some(inner) = args.first() {
+                            return self.lookup_method(inner, name);
+                        }
+                    }
+                    return None;
                 }
-                self.def_names.get(id)?.clone()
+                self.lookup_named_method(&self.def_names.get(id)?.clone(), name)
             }
-            Ty::Int(w) => format!("i{w}"),
-            Ty::Uint(w) => format!("u{w}"),
-            Ty::Float(w) => format!("f{w}"),
-            Ty::Bool => "bool".to_string(),
-            Ty::Char => "char".to_string(),
-            Ty::Str => "str".to_string(),
+            Ty::Int(w) => self.lookup_named_method(&format!("i{w}"), name),
+            Ty::Uint(w) => self.lookup_named_method(&format!("u{w}"), name),
+            Ty::Float(w) => self.lookup_named_method(&format!("f{w}"), name),
+            Ty::Bool => self.lookup_named_method("bool", name),
+            Ty::Char => self.lookup_named_method("char", name),
+            Ty::Str => self.lookup_named_method("str", name),
             Ty::Reference(inner, _) | Ty::Pointer(inner, _) => {
-                return self.lookup_method(inner, name);
+                self.lookup_method(inner, name)
             }
             Ty::Opaque(id) => {
                 if let Some(hidden) = self.opaque_hidden.get(id) {
@@ -5993,10 +6001,17 @@ impl TypeChecker {
                         return Some(method);
                     }
                 }
-                return None;
+                None
             }
-            _ => return None,
-        };
+            _ => None,
+        }
+    }
+
+    /// 按具名类型名查方法表（`Type__method`），只匹配**有 receiver** 的方法。
+    ///
+    /// `lookup_method` 先算出目标类型名（基本类型名 / `Box` / 具名类型名）
+    /// 再在这里查表，避免各分支重复尾部逻辑。
+    fn lookup_named_method(&self, target: &str, name: &str) -> Option<hir::DefId> {
         let mangled = format!("{target}__{name}");
         if !self.impl_targets.contains_key(&mangled) {
             return None;
