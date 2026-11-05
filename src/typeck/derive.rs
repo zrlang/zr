@@ -1058,6 +1058,7 @@ fn make_fn(
             tail: Some(Box::new(body)),
             span: SPAN,
         }),
+        where_clause: Vec::new(),
     }
 }
 

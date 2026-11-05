@@ -86,7 +86,6 @@ impl Parser {
     /// 解析类型前缀（基础类型 + 一元类型）。
     fn parse_type_prefix(&mut self) -> Result<Type, crate::error::CompileError> {
         // 生命周期标注：`&'a T` / `&'static dyn Error` 里的 `'a`。
-        // 类型检查阶段直接丢弃（生命周期不影响代码生成），但**必须**在
         // `impl` / `dyn` 这些前缀之前吃掉：早先这行在基础类型分派前、
         // `dyn` 分支之后，于是 `&'static dyn Error` 先跳过 `'static`、
         // 再落到基础类型分派，`dyn` 不是基础类型——报 `expected type,

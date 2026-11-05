@@ -26,6 +26,9 @@ pub fn lower_function(
     fn_params: &HashMap<String, Vec<hir::Ty>>,
     generic_params: &HashMap<hir::DefId, Vec<hir::Ty>>,
     statics: &HashMap<hir::DefId, (String, hir::Ty)>,
+    synthetic_polls: &HashMap<hir::DefId, String>,
+    opaque_hidden: &HashMap<hir::DefId, hir::Ty>,
+    user_fn_names: &HashSet<String>,
 ) -> MirFunction {
     let mut b = Builder::new(
         func.name.clone(),
@@ -36,6 +39,9 @@ pub fn lower_function(
         fn_params.clone(),
         generic_params.clone(),
         statics.clone(),
+        synthetic_polls.clone(),
+        opaque_hidden.clone(),
+        user_fn_names.clone(),
     );
     // 先扫出被取地址的局部变量：它们不能住在寄存器里，必须固定到栈槽。
     if let Some(body) = &func.body {
@@ -112,6 +118,7 @@ pub fn lower_function(
             b.track_drop(p.local, &p.ty);
         }
     }
+
 
     // 降级函数体：根块暂不析构，先把尾表达式移进返回槽。
     let mut tail = lower_block_opts(&mut b, body, false);
@@ -701,6 +708,7 @@ fn lower_expr(b: &mut Builder, expr: &HirExpr) -> MirValue {
                 };
                 b.mark_aggregate_move(e);
                 let v = lower_expr(b, e);
+
                 let at = offset_addr(b, MirValue::Var(addr.clone()), off);
                 store_value(b, at, v, elem_ty);
             }
@@ -875,6 +883,16 @@ fn lower_expr(b: &mut Builder, expr: &HirExpr) -> MirValue {
             }
         }
         Field(recv, name) => {
+            // 数组的 `len` 是编译期常量（typeck 把它当字段访问但值固定）：
+            // `let r = [0; N + 1]; r.len` 直接发射常量，不读内存——数组
+            // 本身是内联定长存储，没有 len 字段可读。
+            if let hir::Ty::Array(_, len) = &recv.ty {
+                if name == "len" {
+                    if let Some(n) = hir::array_len_value(len) {
+                        return MirValue::Int(n);
+                    }
+                }
+            }
             let base = lower_expr(b, recv);
             let Some(layout) = struct_layout(b, &recv.ty) else {
                 return MirValue::Unit;
@@ -1135,6 +1153,92 @@ fn lower_expr(b: &mut Builder, expr: &HirExpr) -> MirValue {
                 .get(callee)
                 .cloned()
                 .unwrap_or_else(|| "<unknown>".to_string());
+            // 合成 poll（async opaque 的 `poll()` 方法）：调真实状态机
+            // `{f}__poll`（返回 i64：0=Pending, 非0=Ready），把结果包装成
+            // `Poll<T>` 枚举。真实状态机把结果写在帧 `RESULT_OFF`（8）处。
+            if let Some(fname) = b.synthetic_polls.get(callee).cloned() {
+                // 用户函数的符号名加 `z_` 前缀（async_lower 生成的
+                // `{mangled}__poll`）；标准库函数保持原名。
+                let poll_sym = if b.user_fn_names.contains(&fname) {
+                    format!("z_{fname}__poll")
+                } else {
+                    format!("{fname}__poll")
+                };
+                // receiver 是 `&mut F`（自动取引用），但 args[0] 的 HIR 是
+                // `fut`（值，check_method_call 的 check_call_arg 保持值）。
+                // future 的值就是堆帧指针（async_lower 把 async fn 降成
+                // "返回帧指针"），`{f}__poll` 直接收帧指针——不需要从槽里
+                // Load（那会把帧 [0]（state）当地址用，poll(0) SIGSEGV）。
+                let recv = lower_expr(b, &args[0]);
+                let frame = recv;
+                let status = b.temp();
+                b.current_block_mut().instrs.push(MirInstr::Call(
+                    status.clone(),
+                    poll_sym,
+                    vec![frame.clone()],
+                    NumTy::Int(64),
+                ));
+                let hir::Ty::Named(poll_id, poll_args) = &expr.ty else {
+                    return MirValue::Unit;
+                };
+                let Some(layout) = enum_layout(b, *poll_id, poll_args) else {
+                    return MirValue::Unit;
+                };
+                let poll_storage = b.synthetic_storage(layout.size);
+                let cond = b.temp();
+                b.current_block_mut().instrs.push(MirInstr::Binary(
+                    cond.clone(),
+                    MirValue::Var(status.clone()),
+                    MirBinaryOp::Ne,
+                    MirValue::Int(0),
+                    NumTy::Uint(64),
+                ));
+                let ready_b = b.new_block();
+                let pending_b = b.new_block();
+                let join_b = b.new_block();
+                b.current_block_mut().term = Some(MirTerminator::Branch {
+                    cond: MirValue::Var(cond),
+                    then_block: ready_b,
+                    else_block: pending_b,
+                });
+                // Ready：tag = Ready 判别式，载荷从帧 RESULT_OFF 读。
+                b.current = ready_b;
+                let tag_at = offset_addr(b, MirValue::Var(poll_storage.clone()), 0);
+                let ready_disc = variant_discriminant(b, *poll_id, 1);
+                b.current_block_mut().instrs.push(MirInstr::Store(
+                    tag_at,
+                    MirValue::Int(ready_disc),
+                    reg_ty_of(&layout.tag_ty),
+                ));
+                let field_tys = variant_field_tys_of(b, *poll_id, 1, poll_args);
+                if let Some(ft) = field_tys.first() {
+                    let out_addr = offset_addr(b, frame.clone(), 8);
+                    let payload_at =
+                        offset_addr(b, MirValue::Var(poll_storage.clone()), layout.payload_off);
+                    let v = b.temp();
+                    b.current_block_mut().instrs.push(MirInstr::Load(
+                        v.clone(),
+                        out_addr,
+                        num_ty_of(ft),
+                    ));
+                    store_value(b, payload_at, MirValue::Var(v), ft);
+                }
+                b.current_block_mut().term = Some(MirTerminator::Goto(join_b));
+                // Pending：tag = Pending 判别式，无载荷。
+                b.current = pending_b;
+                let tag_at = offset_addr(b, MirValue::Var(poll_storage.clone()), 0);
+                let pending_disc = variant_discriminant(b, *poll_id, 0);
+                b.current_block_mut().instrs.push(MirInstr::Store(
+                    tag_at,
+                    MirValue::Int(pending_disc),
+                    reg_ty_of(&layout.tag_ty),
+                ));
+                b.current_block_mut().term = Some(MirTerminator::Goto(join_b));
+                b.current = join_b;
+                let value = MirValue::Var(poll_storage);
+                b.register_temp(value.clone(), &expr.ty);
+                return value;
+            }
             let mut mir_args = Vec::with_capacity(args.len() + 1);
             for (i, a) in args.iter().enumerate() {
                 // `&self` / `&T` 形参只借用存储：不能复制结构体，更不能把
@@ -1309,6 +1413,55 @@ fn lower_expr(b: &mut Builder, expr: &HirExpr) -> MirValue {
             b.register_temp(MirValue::Var(storage.clone()), &expr.ty);
             MirValue::Var(storage)
         }
+        // `Box<T>` → `Box<dyn Trait>`：`Box<T>` 的 `{ptr}` 指向堆上 `T`，
+        // coerce 后 `Box<dyn Trait>` 的 `{ptr}` 应指向堆上 `{data, vtable}`
+        // 记录（`data` 是 `&T`）。读 `Box.ptr`（`T` 地址）、分配 16 字节、
+        // 写 `{&T, vtable}`、`Box.ptr` 指向新记录。
+        BoxDynCoerce {
+            value,
+            vtable_symbol,
+        } => {
+            let box_addr = lower_expr(b, value);
+            // `Box<T>` 的 `ptr` 字段在偏移 0（`struct Box<T> { ptr: *mut T }`）。
+            let ptr = b.temp();
+            b.current_block_mut().instrs.push(MirInstr::Load(
+                ptr.clone(),
+                box_addr.clone(),
+                NumTy::Uint(64),
+            ));
+            let heap = b.temp();
+            b.current_block_mut().instrs.push(MirInstr::Call(
+                heap.clone(),
+                "zr_alloc".to_string(),
+                vec![MirValue::Int(16), MirValue::Int(8)],
+                NumTy::Uint(64),
+            ));
+            // `data = &T`（堆上 `T` 的地址，即原 `Box.ptr`）。
+            b.current_block_mut().instrs.push(MirInstr::Store(
+                MirValue::Var(heap.clone()),
+                MirValue::Var(ptr),
+                NumTy::Uint(64),
+            ));
+            let vt = b.temp();
+            b.current_block_mut()
+                .instrs
+                .push(MirInstr::FuncAddr(vt.clone(), vtable_symbol.clone()));
+            let vt_at = offset_addr(b, MirValue::Var(heap.clone()), 8);
+            b.current_block_mut().instrs.push(MirInstr::Store(
+                vt_at,
+                MirValue::Var(vt),
+                NumTy::Uint(64),
+            ));
+            // `Box.ptr = new_record`。
+            b.current_block_mut().instrs.push(MirInstr::Store(
+                box_addr.clone(),
+                MirValue::Var(heap),
+                NumTy::Uint(64),
+            ));
+            b.register_temp(box_addr.clone(), &expr.ty);
+            box_addr
+        }
+
         // `dyn Trait` 的 vtable 方法调用。
         //
         // receiver 降级后就是胖指针记录的**地址**（dyn 值是 16 字节聚合，
@@ -1322,6 +1475,7 @@ fn lower_expr(b: &mut Builder, expr: &HirExpr) -> MirValue {
             index,
             args,
             result,
+            box_receiver,
         } => {
             let rec = lower_expr(b, receiver);
             let data = b.temp();
@@ -1348,9 +1502,22 @@ fn lower_expr(b: &mut Builder, expr: &HirExpr) -> MirValue {
             };
             let name = format!("v{}", result.0);
             let mut mir_args = Vec::with_capacity(args.len() + 2);
-            // 第一个实参是 receiver：impl 方法的 `self` 降级成 `&Concrete`，
-            // 胖指针里的 data 指针正好就是它。
-            mir_args.push(MirValue::Var(data));
+            // 第一个实参是 receiver。普通情形：impl 方法的 `self` 降级成
+            // `&Concrete`，胖指针里的 data 指针正好就是它。`Box<Self>` 接收者
+            // （`wake(self: Box<Self>)`）：impl 方法期望 `Box<Self>` 的存储
+            // 地址，而胖指针的 data 是 `Self` 的地址——构造 `{ptr: data}`
+            // 临时，传它的地址。
+            if *box_receiver {
+                let box_slot = b.synthetic_storage(8);
+                b.current_block_mut().instrs.push(MirInstr::Store(
+                    MirValue::Var(box_slot.clone()),
+                    MirValue::Var(data),
+                    NumTy::Uint(64),
+                ));
+                mir_args.push(MirValue::Var(box_slot));
+            } else {
+                mir_args.push(MirValue::Var(data));
+            }
             for a in args {
                 let v = lower_expr(b, a);
                 let v = copy_array_value(b, v, &a.ty);
@@ -1489,10 +1656,29 @@ fn lower_expr(b: &mut Builder, expr: &HirExpr) -> MirValue {
         Cast(inner) => {
             // 源类型取自内层表达式，目标类型是节点的 ty。
             let v = lower_expr(b, inner);
+            // `*mut dyn Tr` → `*mut T` 瘦化：胖指针（16 字节 `{data, vtable}`）
+            // 的 data 就是瘦指针。直接 `Cast` 会把胖指针当 8 字节转，读到垃圾。
+            let src_fat = matches!(
+                &inner.ty,
+                hir::Ty::Pointer(a, _) | hir::Ty::Reference(a, _)
+                    if matches!(a.as_ref(), hir::Ty::Dyn(_))
+            );
+            let dst_thin = matches!(
+                &expr.ty,
+                hir::Ty::Pointer(..) | hir::Ty::Reference(..)
+            );
+            if src_fat && dst_thin {
+                let data = b.temp();
+                b.current_block_mut().instrs.push(MirInstr::Load(
+                    data.clone(),
+                    v,
+                    NumTy::Uint(64),
+                ));
+                return MirValue::Var(data);
+            }
             let src_narrow = narrow_bits_of(&inner.ty);
             let dst_narrow = narrow_bits_of(&expr.ty);
             match (src_narrow, dst_narrow) {
-                // 窄 → 窄且宽度相同：值已经是精确的 f32 形态，不用动。
                 (Some(a), Some(d)) if a == d => v,
                 // → 窄：先转成 f32，再舍入到窄格式。
                 (_, Some(bits)) => {
@@ -1608,6 +1794,30 @@ fn lower_expr(b: &mut Builder, expr: &HirExpr) -> MirValue {
             b.current_block_mut().instrs.push(MirInstr::Store(
                 MirValue::Var(addr.clone()),
                 arr,
+                NumTy::Uint(64),
+            ));
+            b.current_block_mut()
+                .instrs
+                .push(MirInstr::Store(len_at, MirValue::Int(n), NumTy::Uint(64)));
+            b.register_temp(MirValue::Var(addr.clone()), &expr.ty);
+            MirValue::Var(addr)
+        }
+        // `*const [T; N]` / `&[T; N]` 隐式转 `[]const T`：指针本身就是数组
+        // 首元素地址，补上长度 N 即可（`SliceIter::new(&arr)`）。
+        PtrToSlice(inner) => {
+            let p = lower_expr(b, inner);
+            let n = match &inner.ty {
+                hir::Ty::Pointer(a, _) => match &**a {
+                    hir::Ty::Array(_, len) => hir::array_len_value(len).unwrap_or(0),
+                    _ => 0,
+                },
+                _ => 0,
+            };
+            let addr = b.synthetic_storage(16);
+            let len_at = offset_addr(b, MirValue::Var(addr.clone()), 8);
+            b.current_block_mut().instrs.push(MirInstr::Store(
+                MirValue::Var(addr.clone()),
+                p,
                 NumTy::Uint(64),
             ));
             b.current_block_mut()
@@ -1886,7 +2096,15 @@ pub(super) struct Builder {
     types: HashMap<hir::DefId, hir::HirTypeDef>,
     /// 类型 DefId → 用户 Drop 析构函数名。
     drops: HashMap<hir::DefId, String>,
-    /// 泛型类型定义的占位符参数（布局 / 字段偏移按实参替换）。
+    /// 合成的 `{f}__poll` 函数 DefId → 源 async fn 名。`poll()` 方法调用在
+    /// async opaque 上要调真实状态机（返回 i64）并包装成 `Poll<T>`。
+    synthetic_polls: HashMap<hir::DefId, String>,
+    /// `impl Trait`（RPIT/APIT opaque）的隐藏类型。opaque 的布局 / 聚合性
+    /// 按隐藏类型算（`-> impl Tr` 返回的具体结构体上的字段访问要按它布局）。
+    opaque_hidden: HashMap<hir::DefId, hir::Ty>,
+    /// 用户函数名（符号名加 `z_` 前缀）。合成 poll 的状态机名是
+    /// `z_{f}__poll`（用户函数）或 `{f}__poll`（标准库函数）。
+    user_fn_names: HashSet<String>,
     generic_params: HashMap<hir::DefId, Vec<hir::Ty>>,
     /// 词法作用域栈，每层记录该作用域内需要 Drop 的局部量与 `defer`。
     drop_scopes: Vec<DropScope>,
@@ -1966,6 +2184,9 @@ impl Builder {
         fn_params: HashMap<String, Vec<hir::Ty>>,
         generic_params: HashMap<hir::DefId, Vec<hir::Ty>>,
         statics: HashMap<hir::DefId, (String, hir::Ty)>,
+        synthetic_polls: HashMap<hir::DefId, String>,
+        opaque_hidden: HashMap<hir::DefId, hir::Ty>,
+        user_fn_names: HashSet<String>,
     ) -> Self {
         let _ = name;
         Self {
@@ -1981,6 +2202,43 @@ impl Builder {
             types,
             drops,
             generic_params,
+            synthetic_polls,
+            opaque_hidden,
+            user_fn_names,
+            drop_scopes: Vec::new(),
+            addr_taken: HashSet::new(),
+            ret_array: None,
+            hidden_ret: None,
+            ret_struct: None,
+            ret_bytes: None,
+            temp_drops: Vec::new(),
+            async_ret_bytes: None,
+        }
+    }
+
+    /// 布局计算专用构造器：只填 `types` 与 `generic_params`，其余字段留空。
+    /// `lower`（mod.rs）在编码聚合 `static` 初值字节时用——它只查布局，
+    /// 不降级任何函数体。
+    pub(super) fn for_layout(
+        types: HashMap<hir::DefId, hir::HirTypeDef>,
+        generic_params: HashMap<hir::DefId, Vec<hir::Ty>>,
+    ) -> Self {
+        Self {
+            blocks: Vec::new(),
+            current: 0,
+            param_names: Vec::new(),
+            next_temp: 0,
+            loops: Vec::new(),
+            functions: HashMap::new(),
+            statics: HashMap::new(),
+            fn_params: HashMap::new(),
+            const_values: HashMap::new(),
+            types,
+            drops: HashMap::new(),
+            generic_params,
+            synthetic_polls: HashMap::new(),
+            opaque_hidden: HashMap::new(),
+            user_fn_names: HashSet::new(),
             drop_scopes: Vec::new(),
             addr_taken: HashSet::new(),
             ret_array: None,
@@ -2643,16 +2901,21 @@ fn is_float_arith(op: hir::BinaryOp) -> bool {
 /// `Ty::Function` **不在**此列：函数值是 16 字节记录 `{code, env}`，MIR 里
 /// 按聚合值处理（表达式求值结果是它的存储地址，按值传递时整块复制）。
 fn is_scalar_ty(ty: &hir::Ty) -> bool {
-    matches!(
-        ty,
-        hir::Ty::Int(_)
-            | hir::Ty::Uint(_)
-            | hir::Ty::Float(_)
-            | hir::Ty::Bool
-            | hir::Ty::Char
-            | hir::Ty::Pointer(..)
-            | hir::Ty::Reference(..)
-    )
+    // 指向 trait 对象的指针（`*mut dyn Tr` / `&dyn Tr`）是 16 字节胖指针
+    // `{data, vtable}`，不是 8 字节标量——按聚合（地址）传递。
+    match ty {
+        hir::Ty::Pointer(inner, _) | hir::Ty::Reference(inner, _) => {
+            !matches!(inner.as_ref(), hir::Ty::Dyn(_))
+        }
+        _ => matches!(
+            ty,
+            hir::Ty::Int(_)
+                | hir::Ty::Uint(_)
+                | hir::Ty::Float(_)
+                | hir::Ty::Bool
+                | hir::Ty::Char
+        ),
+    }
 }
 
 fn num_ty_of(ty: &hir::Ty) -> NumTy {
@@ -2784,12 +3047,12 @@ fn element_size(ty: &hir::Ty) -> i128 {
 }
 
 /// 结构体布局：字段偏移、尺寸与对齐。
-struct StructLayout {
+pub(super) struct StructLayout {
     /// (字节偏移, 字段类型)，按声明顺序。
-    fields: Vec<(i128, hir::Ty)>,
+    pub(super) fields: Vec<(i128, hir::Ty)>,
     /// 字段名 → 声明下标（元组字段写成 `"0"`、`"1"`）。
-    names: HashMap<String, usize>,
-    size: i128,
+    pub(super) names: HashMap<String, usize>,
+    pub(super) size: i128,
 }
 
 impl StructLayout {
@@ -2803,7 +3066,7 @@ impl StructLayout {
     }
 }
 
-fn align_up(n: i128, align: i128) -> i128 {
+pub(super) fn align_up(n: i128, align: i128) -> i128 {
     if align <= 1 {
         n
     } else {
@@ -2821,7 +3084,7 @@ fn const_array_len(n: i128) -> hir::ArrayLen {
 }
 
 /// 用类型定义的泛型实参替换类型里的占位符。
-fn subst_generic(
+pub(super) fn subst_generic(
     b: &Builder,
     def_id: DefId,
     args: &[hir::Ty],
@@ -2875,6 +3138,11 @@ fn subst_infer_ty(
                     Some(v) => const_array_len(*v),
                     None => len.clone(),
                 },
+                // `[T; N + 1]`：长度表达式里 `ConstParamRef` 引用 const 参数
+                // 名，实例化期按名字换成具体值后由 `const_expr_value` 折叠。
+                hir::ArrayLen::Const(e) => {
+                    hir::ArrayLen::Const(Box::new(subst_const_expr(e, consts)))
+                }
                 other => other.clone(),
             };
             Ty::Array(Box::new(subst_infer_ty(t, map, consts)), len)
@@ -2908,8 +3176,32 @@ fn subst_infer_ty(
         _ => ty.clone(),
     }
 }
+/// 递归替换常量表达式里的 `ConstParamRef`：`[T; N + 1]` 在实例化期把
+/// `N` 换成具体值，`const_expr_value` 随后折叠出长度。`ConstParamRef`
+/// 之外的结构原样保留（字面量 / 二元运算递归）。
+fn subst_const_expr(e: &hir::HirExpr, consts: &HashMap<String, i128>) -> hir::HirExpr {
+    use hir::ExprKind;
+    let mut out = e.clone();
+    match &mut out.kind {
+        ExprKind::ConstParamRef(name) => {
+            if let Some(v) = consts.get(name) {
+                out.kind = ExprKind::Literal(hir::HirLiteral::Int(*v));
+            }
+        }
+        ExprKind::Binary(op, l, r) => {
+            out.kind = ExprKind::Binary(
+                *op,
+                Box::new(subst_const_expr(l, consts)),
+                Box::new(subst_const_expr(r, consts)),
+            );
+        }
+        _ => {}
+    }
+    out
+}
 
-fn type_size_align(b: &Builder, ty: &hir::Ty, depth: usize) -> Option<(i128, i128)> {
+pub(super) fn type_size_align(b: &Builder, ty: &hir::Ty, depth: usize) -> Option<(i128, i128)> {
+
     use hir::Ty;
     if depth > 32 {
         return None;
@@ -2925,8 +3217,16 @@ fn type_size_align(b: &Builder, ty: &hir::Ty, depth: usize) -> Option<(i128, i12
         Ty::Function { .. } => (16, 8),
         // `dyn Trait` 胖指针：`{data, vtable}`。
         Ty::Dyn(_) => (16, 8),
-        Ty::Pointer(..) | Ty::Reference(..) => (8, 8),
-        // `str` / 切片是 `{ptr, len}` 的 16 字节聚合，**不是**一个瘦指针。
+        // 指向 trait 对象的指针 / 引用是 16 字节胖指针 `{data, vtable}`，
+        // 不是 8 字节瘦指针。`*mut dyn Wake` 当 `Waker` 字段时布局必须是
+        // 16 字节，否则 `Waker { wake: w }` 只拷 data、丢 vtable。
+        Ty::Pointer(inner, _) | Ty::Reference(inner, _) => {
+            if matches!(inner.as_ref(), Ty::Dyn(_)) {
+                (16, 8)
+            } else {
+                (8, 8)
+            }
+        }
         // `struct_layout` 早就按 16 字节算（`size: 16, fields: [(0, ptr), (8, u64)]`），
         // 这里却返回 8——结构体里 `str` 字段后面的字段会落在偏移 8，盖住 `len`，
         // 于是 `s.name.len` 读到**下一个字段的值**（`str3.zr`：`S { name: str, x: i64 }`
@@ -2986,11 +3286,20 @@ fn type_size_align(b: &Builder, ty: &hir::Ty, depth: usize) -> Option<(i128, i12
             }
             (align_up(off, align), align)
         }
+        // `impl Trait`（RPIT/APIT opaque）：按隐藏类型算大小 / 对齐。
+        // opaque 的机器表示就是隐藏类型的表示（`-> impl Tr` 返回的具体
+        // 结构体按值传/返回时是地址表示，与隐藏类型一致）。
+        Ty::Opaque(id) => {
+            if let Some(hidden) = b.opaque_hidden.get(id) {
+                return type_size_align(b, hidden, depth + 1);
+            }
+            return None;
+        }
         _ => return None,
     })
 }
 
-fn struct_layout(b: &Builder, ty: &hir::Ty) -> Option<StructLayout> {
+pub(super) fn struct_layout(b: &Builder, ty: &hir::Ty) -> Option<StructLayout> {
     // 元组与结构体同一套布局。
     if let hir::Ty::Tuple(elems) = ty {
         return tuple_layout(b, elems);
@@ -3043,6 +3352,13 @@ fn struct_layout(b: &Builder, ty: &hir::Ty) -> Option<StructLayout> {
         hir::Ty::Reference(inner, _) | hir::Ty::Pointer(inner, _) => {
             return struct_layout(b, inner);
         }
+        // `impl Trait`（RPIT/APIT opaque）：布局按隐藏类型。
+        hir::Ty::Opaque(id) => {
+            if let Some(hidden) = b.opaque_hidden.get(id) {
+                return struct_layout(b, hidden);
+            }
+            return None;
+        }
         _ => return None,
     };
     let hs = match b.types.get(&id)? {
@@ -3093,7 +3409,7 @@ fn struct_layout(b: &Builder, ty: &hir::Ty) -> Option<StructLayout> {
 ///
 /// 返回 `(总大小, 对齐, 载荷区偏移)`。判别式在偏移 0（0 = ok / 1 = err），
 /// 载荷区从 `align_up(1, max(align T, align E))` 开始，大小为两侧较大者。
-fn error_union_layout(b: &Builder, ty: &hir::Ty) -> Option<(i128, i128, i128)> {
+pub(super) fn error_union_layout(b: &Builder, ty: &hir::Ty) -> Option<(i128, i128, i128)> {
     let hir::Ty::ErrorUnion(ok, err) = ty else {
         return None;
     };
@@ -3114,7 +3430,29 @@ fn error_union_layout(b: &Builder, ty: &hir::Ty) -> Option<(i128, i128, i128)> {
 /// 都必须用本函数，否则 `*mut T` 会被错当成 `T` 整块拷贝。
 fn aggregate_layout(b: &Builder, ty: &hir::Ty) -> Option<StructLayout> {
     match ty {
-        hir::Ty::Pointer(..) | hir::Ty::Reference(..) => None,
+        // 指向 trait 对象的胖指针（`*mut dyn Tr` / `&dyn Tr`）是 16 字节
+        // `{data, vtable}` 聚合，不是 8 字节标量。`Waker { wake: w }` 这类
+        // 字段赋值必须整块拷 16 字节，否则只拷 data、丢 vtable。
+        hir::Ty::Pointer(inner, _) | hir::Ty::Reference(inner, _) => {
+            if matches!(inner.as_ref(), hir::Ty::Dyn(_)) {
+                let ptr = |name: &str| (hir::Ty::Pointer(
+                    Box::new(hir::Ty::Uint(8)),
+                    hir::Mutability::Immutable,
+                ), name.to_string());
+                let (f0, n0) = ptr("data");
+                let (f1, n1) = ptr("vtable");
+                let mut names = HashMap::new();
+                names.insert(n0, 0usize);
+                names.insert(n1, 1usize);
+                Some(StructLayout {
+                    size: 16,
+                    fields: vec![(0, f0), (8, f1)],
+                    names,
+                })
+            } else {
+                None
+            }
+        }
         _ => struct_layout(b, ty),
     }
 }
@@ -3122,7 +3460,7 @@ fn aggregate_layout(b: &Builder, ty: &hir::Ty) -> Option<StructLayout> {
 /// 元组的布局：字段按序排、各自对齐，末尾补齐到最大对齐。
 ///
 /// 字段名用下标的十进制写法（"0" / "1" …），与 `t.0` 的访问方式一致。
-fn tuple_layout(b: &Builder, elems: &[hir::Ty]) -> Option<StructLayout> {
+pub(super) fn tuple_layout(b: &Builder, elems: &[hir::Ty]) -> Option<StructLayout> {
     let mut fields = Vec::with_capacity(elems.len());
     let mut names = HashMap::new();
     let mut off = 0i128;
@@ -3153,15 +3491,15 @@ fn tuple_layout(b: &Builder, elems: &[hir::Ty]) -> Option<StructLayout> {
 /// 判别式放在偏移 0，载荷区紧跟其后（按载荷区的对齐补齐）。载荷区的大小
 /// 取各变体载荷的最大值——不同变体的载荷类型不同，但值的形状必须一样，
 /// 这样枚举值才能按值拷贝。
-struct EnumLayout {
+pub(super) struct EnumLayout {
     /// 判别式的类型。
-    tag_ty: hir::Ty,
+    pub(super) tag_ty: hir::Ty,
     /// 载荷区的起始偏移。
-    payload_off: i128,
+    pub(super) payload_off: i128,
     /// 枚举值的总大小。
-    size: i128,
+    pub(super) size: i128,
     /// 枚举值的对齐。
-    align: i128,
+    pub(super) align: i128,
 }
 
 /// 枚举的判别式类型。
@@ -3195,7 +3533,7 @@ fn variant_field_tys(v: &hir::HirVariant) -> Vec<hir::Ty> {
 }
 
 /// 枚举的布局。
-fn enum_layout(b: &Builder, def_id: DefId, args: &[hir::Ty]) -> Option<EnumLayout> {
+pub(super) fn enum_layout(b: &Builder, def_id: DefId, args: &[hir::Ty]) -> Option<EnumLayout> {
     let hir::HirTypeDef::Enum(he) = b.types.get(&def_id)? else {
         return None;
     };
@@ -3247,6 +3585,11 @@ fn is_aggregate(b: &Builder, ty: &hir::Ty) -> bool {
         // `Index`/`copy_struct_into` 早已用 `array_info` 特判数组，这里补齐，
         // 让字段访问与它们一致。
         hir::Ty::Array(..) | hir::Ty::ErrorUnion(..) => true,
+        // `impl Trait`（RPIT/APIT opaque）：聚合性按隐藏类型。
+        hir::Ty::Opaque(id) => b
+            .opaque_hidden
+            .get(id)
+            .is_some_and(|hidden| is_aggregate(b, hidden)),
         _ => false,
     }
 }

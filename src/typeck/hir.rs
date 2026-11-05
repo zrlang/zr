@@ -10,7 +10,7 @@
 //! HIR 是后续 MIR 降级、借用检查、模式穷尽性检查、闭包转换的输入。
 
 pub use crate::parser::ast::{Abi, Span};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 /// 一个 HIR 程序（已通过类型检查）。
 #[derive(Debug, Clone, Default)]
@@ -37,11 +37,19 @@ pub struct HirModule {
     ///
     /// 每个强转点（`ExprKind::DynCoerce`）引用这里的符号；codegen 按这张表
     /// 在 `.text` 末尾发射跳转表。方法用 `DefId` 存，最终符号名
-    /// （`z_` 前缀 + 单态化后缀）到 MIR 降级时才定得下来。
     pub vtables: Vec<HirVtable>,
+    /// 合成的 `{f}__poll` 函数 DefId → 源 async fn 名。MIR 降级时识别合成
+    /// poll 调用（真实状态机返回 i64，需包装成 `Poll<T>`）。
+    pub synthetic_polls: HashMap<DefId, String>,
+    /// `impl Trait`（RPIT/APIT opaque）的隐藏类型。MIR 降级对 opaque 的
+    /// 布局 / 聚合性判定必须知道隐藏类型（`-> impl Tr` 返回的是具体结构体，
+    /// 字段访问 `r.x` 按隐藏类型布局走），否则 opaque 被当 8 字节标量。
+    pub opaque_hidden: HashMap<DefId, Ty>,
+    /// 用户定义的函数名（body 非空、非 `main`、无 `#[no_mangle]`）。
+    /// MIR 降级时对这些函数的符号名加 `z_` 前缀（`mangled_symbol`）。
+    pub user_fn_names: HashSet<String>,
 }
 
-/// 一张 `dyn Trait` vtable 的需求描述：符号 + 按 trait 声明顺序排列的
 /// impl 方法。
 #[derive(Debug, Clone)]
 pub struct HirVtable {
@@ -149,20 +157,42 @@ pub enum ArrayLen {
     Dynamic,
 }
 
-/// 取数组长度的编译期整数值（只认字面量；复杂常量表达式留给后续版本）。
+/// 取数组长度的编译期整数值。`[T; N + 1]` 这类表达式在实例化后 `N` 已
+/// 是字面量，`const_expr_value` 递归折出具体长度；声明期参数名
+/// （`ConstParamRef`）与其它非字面量形状返回 `None`。
 pub fn array_len_value(len: &ArrayLen) -> Option<i128> {
     match len {
-        ArrayLen::Const(e) => match &e.kind {
-            ExprKind::Literal(HirLiteral::Int(n)) => Some(*n),
-            ExprKind::Comptime(lit) => match &**lit {
-                HirLiteral::Int(n) => Some(*n),
-                _ => None,
-            },
-            _ => None,
-        },
+        ArrayLen::Const(e) => const_expr_value(e),
         // 参数尚未代入具体值（声明期），求不出来。
         ArrayLen::Param(_) => None,
         ArrayLen::Dynamic => None,
+    }
+}
+
+/// 编译期求一个数组长度表达式的值。
+///
+/// 支持字面量 / `comptime` 折叠值与二元算术（`N + 1`、`2 * N` 在实例化后
+/// `N` 已是字面量，这里递归折出具体长度）。
+pub fn const_expr_value(e: &HirExpr) -> Option<i128> {
+    match &e.kind {
+        ExprKind::Literal(HirLiteral::Int(n)) => Some(*n),
+        ExprKind::Comptime(lit) => match &**lit {
+            HirLiteral::Int(n) => Some(*n),
+            _ => None,
+        },
+        ExprKind::Binary(op, l, r) => {
+            let l = const_expr_value(l)?;
+            let r = const_expr_value(r)?;
+            match op {
+                BinaryOp::Add => Some(l + r),
+                BinaryOp::Sub => Some(l - r),
+                BinaryOp::Mul => Some(l * r),
+                BinaryOp::Div if r != 0 => Some(l / r),
+                BinaryOp::Rem if r != 0 => Some(l % r),
+                _ => None,
+            }
+        }
+        _ => None,
     }
 }
 
@@ -224,7 +254,12 @@ pub struct BasicBlockId;
 
 /// Where 谓词。
 #[derive(Debug, Clone)]
-pub struct WherePred;
+pub struct WherePred {
+    /// 左边类型（已降成 HIR 类型）。
+    pub lhs: Ty,
+    /// 边界：(trait id, 是否否定)。`!Trait` 是 `(id, true)`。
+    pub bounds: Vec<(DefId, bool)>,
+}
 
 // ======================================================================
 // HIR 表达式
@@ -249,7 +284,15 @@ pub enum ExprKind {
     Def(DefId),
     /// 二元运算（运算符已确定、操作数已类型检查）。
     Binary(BinaryOp, Box<HirExpr>, Box<HirExpr>),
-    /// 一元运算。
+    /// `const` 泛型参数在**数组长度表达式**里的引用（声明期）。
+    ///
+    /// 声明期 `N` 是 `Ty::ConstParam` 占位、没有具体值，但 `[T; N + 1]` 这类
+    /// 长度表达式必须能降级（否则 `fn f<const N: usize>(a: [i32; N]) ->
+    /// [i32; N + 1]` 的签名直接报 `const generic parameter `N` has no value`）。
+    /// 降成这个节点保留名字；实例化期 `ast_to_hir_type` 重新降级时作用域里
+    /// `N` 已是 `Ty::ConstVal(n)`，走普通字面量路径，`array_len_value` 再
+    /// 递归求值。
+    ConstParamRef(String),
     Unary(UnaryOp, Box<HirExpr>),
     /// 赋值（含复合赋值，已脱糖为普通赋值）。
     Assign(Box<HirExpr>, Box<HirExpr>),
@@ -329,7 +372,12 @@ pub enum ExprKind {
     ///
     /// 运行期要补出 `(ptr, len)` 这对胖指针，不是空操作。
     ArrayToSlice(Box<HirExpr>),
-    /// 切片：`receiver[start..end]` / `[..end]` / `[start..]` / `[..]`。
+    /// 数组引用到切片的隐式转换：`*const [T; N]` / `&[T; N]` -> `[]const T`。
+    ///
+    /// 运行期要补出 `(ptr, len)` 这对胖指针：ptr = 数组地址（解引用指针），
+    /// len = N。与 `ArrayToSlice` 的区别是源是**指针**（指向数组首元素），
+    /// 不是数组值本身。
+    PtrToSlice(Box<HirExpr>),
     ///
     /// 结果在运行期是 `(ptr, len)` 一对。缺失的边界是 `None`；
     /// `inclusive` 表示源语法用了 `..=`。
@@ -451,6 +499,15 @@ pub enum ExprKind {
         value: Box<HirExpr>,
         vtable_symbol: String,
     },
+    /// `Box<T>` → `Box<dyn Trait>` 强制转换（unsize）：`Box<T>` 的 `ptr`
+    /// 指向堆上 `T`，`Box<dyn Trait>` 的 `ptr` 应指向堆上 `{data, vtable}`
+    /// 记录。MIR 降级：读 `box.ptr[0]`（`T` 值）、分配 16 字节、写
+    /// `{T 值, vtable}`、`box.ptr` 指向新记录。
+    BoxDynCoerce {
+        value: Box<HirExpr>,
+        vtable_symbol: String,
+    },
+
     /// `dyn Trait` 的 vtable 方法调用。
     ///
     /// `receiver` 是胖指针记录（`dyn Trait` 值）或指向它的引用（`&dyn Trait`，
@@ -463,6 +520,10 @@ pub enum ExprKind {
         index: u32,
         args: Vec<HirExpr>,
         result: LocalId,
+        /// receiver 是 `Box<Self>`（`wake(self: Box<Self>)` 这类）：胖指针的
+        /// `data` 是 `Self` 的地址，而 impl 方法期望 `Box<Self>`（`{ptr}` 的
+        /// 存储地址）。降级时构造 `{ptr: data}` 临时，传它的地址。
+        box_receiver: bool,
     },
     /// 结构体字面量：字段按源码书写顺序保存。
     Struct(Vec<(String, HirExpr)>),

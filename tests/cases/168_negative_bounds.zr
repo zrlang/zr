@@ -1,0 +1,65 @@
+//=============================================================================
+// tests/cases/168_negative_bounds.zr — 否定 trait 边界（`where T: !Trait`）
+//
+// 早先 `where T: !Clone` 解析后被丢弃（`WherePred` 是空结构，整个 where
+// 子句没有语义）。现在：
+//   - 解析：`Type::Not(inner)`（`!Trait`）+ `WherePred { lhs, bounds }`；
+//   - 检查：`check_impl_where_bounds`（impl 方法）与泛型函数 where 校验
+//     都按 `(trait_id, negated)` 求解——positive 要求实现、negative 要求
+//     不实现，违反即报错。
+//
+// 覆盖（正向）：
+//   - 泛型函数 `fn f<T>() where T: !Marker`：T 不实现 Marker 时可用
+//   - impl 方法 `fn get(self) where T: !Marker`
+//   - 多边界混合（`T: Clone + !Marker`）
+//   - 具体类型满足 negative bound
+// （负向见 tests/negative/38_negative_bound.zr：T 实现 Marker 却要求 !Marker。）
+//=============================================================================
+
+trait Marker {}
+trait Marker2 {}
+struct A;
+struct B;
+struct C;
+
+impl Marker for A {}
+impl Marker2 for C {}
+
+// T 不实现 Marker（negative bound）。
+fn f<T>(x: T) -> i32 where T: !Marker {
+    return 1;
+}
+
+// 多边界混合：T 不实现 Marker 且不实现 Marker2。
+fn g<T>(x: T) -> i32 where T: !Marker + !Marker2 {
+    return 2;
+}
+
+struct W<T> { v: T }
+
+impl<T> W<T> {
+    // impl 方法的 negative where。
+    fn get(self) -> i32 where T: !Marker {
+        return 3;
+    }
+
+    // 混合边界。
+    fn both(self) -> i32 where T: !Marker + !Marker2 {
+        return 4;
+    }
+}
+
+fn main() -> i32 {
+    // B 不实现 Marker / Marker2：全部满足。
+    if f(B{}) != 1 { return 1; }
+    if g(B{}) != 2 { return 2; }
+    let w = W { v: B{} };
+    if w.get() != 3 { return 3; }
+    if w.both() != 4 { return 4; }
+
+    // A 实现 Marker：`f(A{})` 编译失败（负向 38 验证），这里只用 B/C。
+    // C 实现 Marker2 但不实现 Marker：`f` 可用、`g` 不可用（负向 38 验证）。
+    if f(C{}) != 1 { return 5; }
+
+    return 0;
+}

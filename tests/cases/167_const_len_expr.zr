@@ -1,0 +1,85 @@
+//=============================================================================
+// tests/cases/167_const_len_expr.zr — `const` 泛型参数的**长度表达式**
+//
+// 早先 `[T; N + 1]` / `[0; N + 1]` 只能写 `[T; N]`（单参数名）：
+//   - `[i32; N + 1]` 返回类型解析不了（长度表达式只认 `ArrayLen::Param`）；
+//   - `[0; N + 1]` 重复次数报 `array repeat length must be an integer
+//     literal`（只认字面量 / 单变量）；
+//   - `infer_expr_ty` 对 `[0; N + 1]` 预推断成 `[i32; 1]`，`let r = [0; N+1]`
+//     的绑定类型停在 1，与 `check_expr` 求值出的 `[i32; 4]` unify 报错；
+//   - 数组 `.len` 的 MIR 降级走 `struct_layout`（数组没有布局），读到栈上
+//     垃圾（`r.len` 实测返回 1）。
+//
+// 现在：
+//   - `lower_const_len_expr` 把长度表达式降成 `ConstParamRef` 保留参数名，
+//     实例化期 `subst_const_expr` 按名换成具体值、`const_expr_value` 折叠；
+//   - `check_expr` / `infer_expr_ty` 的重复长度用 `eval_const_expr` 求值
+//     （`N` 在实例化期是 `Ty::ConstVal`）；
+//   - 数组 `.len` 在 MIR 直接发射编译期常量（不读内存）。
+//
+// 覆盖：
+//   - `fn f<const N: usize>(a: [i32; N]) -> [i32; N + 1]` 的返回类型表达式
+//   - `[0; N + 1]` 重复（`let mut r = [0; N + 1]` 的绑定类型推断）
+//   - `[i32; 2 * N]`、`[i32; N - 1]` 的加减乘表达式
+//   - 数组 `.len` 编译期常量字段
+//   - 结构体字段类型里的长度表达式
+//=============================================================================
+
+// `N + 1` 在返回类型、`[0; N + 1]` 重复、`.len` 常量字段。
+fn extend<const N: usize>(a: [i32; N]) -> [i32; N + 1] {
+    let mut r = [0; N + 1];
+    let mut i: i32 = 0;
+    while i < N {
+        r[i] = a[i];
+        i = i + 1;
+    }
+    r[N] = 99;
+    return r;
+}
+
+// `2 * N` 长度表达式。
+fn doubled<const N: usize>(v: i32) -> [i32; 2 * N] {
+    let mut r = [v; 2 * N];
+    let mut i: i32 = 0;
+    while i < 2 * N {
+        r[i] = v + i;
+        i = i + 1;
+    }
+    return r;
+}
+
+// 结构体字段类型里的长度表达式。
+struct Holder<const N: usize> {
+    data: [i32; N + 2],
+}
+
+fn main() -> i32 {
+    let a = [1, 2, 3];
+
+    // `[i32; N + 1]` 返回 + `[0; N + 1]` 重复 + `.len` 常量字段。
+    let r = extend(a);
+    if r.len != 4 { return 1; }
+    if r[0] != 1 { return 2; }
+    if r[3] != 99 { return 3; }
+
+    // `2 * N` 表达式。
+    let d = doubled::<3>(5);
+    if d.len != 6 { return 4; }
+    if d[5] != 10 { return 5; }
+
+    // 结构体字段长度表达式：`N + 2` 从 `N=3` 推出 5。
+    let h: Holder<3> = Holder { data: [0, 1, 2, 3, 4] };
+    if h.data.len != 5 { return 6; }
+    if h.data[4] != 4 { return 7; }
+
+    // `[0; N]`（单参数，回归 122）仍然可用。
+    let mut i: i32 = 0;
+    let mut s = 0;
+    while i < 4 {
+        s = s + 1;
+        i = i + 1;
+    }
+    if s != 4 { return 8; }
+
+    return 0;
+}

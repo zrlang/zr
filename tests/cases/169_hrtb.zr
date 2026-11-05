@@ -1,0 +1,55 @@
+//=============================================================================
+// tests/cases/169_hrtb.zr — 高阶 trait 边界（`for<'a> T: Trait<'a>`）
+//
+// 早先 `for<'a> T: Trait` 解析时 `'a`（Lifetime token）被 `consume_ident`
+// 拒绝，报 `expected lifetime name, found Lifetime("a")`；且 `for<'a>` 的
+// 收尾 `>` 没被消费，`T` 解析后直接撞 `>`。
+//
+// 现在：
+//   - `parse_lifetime_name` 认 `TokenKind::Lifetime`（`'a` / `'static`）；
+//   - `for<'a>` 的 `'>'` 正确消费；
+//   - zr 生命周期参数整体跳过（类型检查丢弃），`'a` 绑定器无语义，但
+//     语法完整——`for<'a, 'b>` 多生命周期、`impl<'a> Tr<'a>` 都可用。
+//
+// 覆盖：
+//   - `where for<'a> T: Trait<'a>`（单 / 多生命周期）
+//   - `impl<'a> Trait<'a> for Type`
+//   - 生命周期标注类型 `&'a i32` 作实参
+//=============================================================================
+
+trait FnLike<'a> {
+    fn call(&self, x: &'a i32) -> i32;
+}
+
+struct Adder;
+struct Doubler;
+
+impl<'a> FnLike<'a> for Adder {
+    fn call(&self, x: &'a i32) -> i32 {
+        return x[0] + 1;
+    }
+}
+
+impl<'a> FnLike<'a> for Doubler {
+    fn call(&self, x: &'a i32) -> i32 {
+        return x[0] * 2;
+    }
+}
+
+// 单生命周期绑定器。
+fn apply<T>(f: T, x: i32) -> i32 where for<'a> T: FnLike<'a> {
+    return f.call(&x);
+}
+
+// 多生命周期绑定器（`'b` 未用也接受）。
+fn apply2<T>(f: T, x: i32) -> i32 where for<'a, 'b> T: FnLike<'a> {
+    return f.call(&x);
+}
+
+fn main() -> i32 {
+    if apply(Adder{}, 41) != 42 { return 1; }
+    if apply(Doubler{}, 21) != 42 { return 2; }
+    if apply2(Adder{}, 40) != 41 { return 3; }
+    if apply2(Doubler{}, 20) != 40 { return 4; }
+    return 0;
+}

@@ -1,0 +1,62 @@
+// for 循环的 Iterator 协议支持：`for x in it`（`it` 有 `next() -> *mut Item`）。
+//
+// Range（整数区间）与 SliceIter（切片）都实现 `next`；`for` 把 next 循环
+// 脱糖成 `loop { let p = it.next(); if p == 0 { break; } let x = *p; body }`。
+// 回归 `Range::next` 的"返回 &current 但 current 已递增"bug（读到递增后
+// 的值）与泛型 next 的单态化（`SliceIter<i32>::next` 必须实例化发射）。
+
+use std::*;
+use slice::{Range, SliceIter, range_step};
+
+fn main() -> i32 {
+    // Range：0..5 累加得 10。
+    let mut sum = 0;
+    for i in Range::new(0, 5) {
+        sum = sum + i;
+    }
+    if sum != 10 { return 1; }
+
+    // 带步长 range_step：0,2,4 → 6。
+    let mut sum2 = 0;
+    for i in range_step(0, 6, 2) {
+        sum2 = sum2 + i;
+    }
+    if sum2 != 6 { return 2; }
+
+    // SliceIter（数组值 → 切片）：1+2+3 = 6。
+    let arr = [1, 2, 3];
+    let mut it = SliceIter::new(arr);
+    let mut cnt = 0;
+    for v in it {
+        cnt = cnt + v;
+    }
+    if cnt != 6 { return 3; }
+
+    // SliceIter 里 `continue` 也要推进（next 每次迭代执行）。
+    let mut skipped = 0;
+    let mut it2 = SliceIter::new([10, 20, 30]);
+    for v in it2 {
+        if v == 20 { continue; }
+        skipped = skipped + v;
+    }
+    if skipped != 40 { return 4; }
+
+    // SliceIter 接受数组引用（`*const [T; N]` → `[]const T` 退化）。
+    let arr2 = [4, 5, 6];
+    let mut it3 = SliceIter::new(&arr2);
+    let mut sum3 = 0;
+    for v in it3 {
+        sum3 = sum3 + v;
+    }
+    if sum3 != 15 { return 6; }
+
+    // Range 含尾迭代。
+    let mut inclusive = 0;
+    let mut r3 = Range::inclusive(0, 3);
+    for i in r3 {
+        inclusive = inclusive + i;
+    }
+    if inclusive != 6 { return 5; }
+
+    return 0;
+}

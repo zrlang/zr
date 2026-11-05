@@ -96,3 +96,65 @@ impl Thread {
         result
     }
 }
+
+//----- 互斥锁（pthread_mutex 封装，当前平台 macOS/Linux） --------------------
+
+extern "C" {
+    fn zr_mutex_init(mutex: *mut void) -> i32;
+    fn zr_mutex_lock(mutex: *mut void);
+    fn zr_mutex_unlock(mutex: *mut void);
+    fn zr_mutex_destroy(mutex: *mut void) -> i32;
+}
+
+/// pthread_mutex_t 在 macOS 上是 64 字节（含私有字段）；调用方分配缓冲区。
+const MUTEX_SIZE: usize = 64;
+
+/// 互斥锁：持锁保护 `value`，`lock()` 返回可变指针访问临界区，
+/// 用完必须 `unlock()`。与 `Box` 同约定：用完显式 `free()`（销毁 + 释放）。
+pub struct Mutex<T> {
+    lock: *mut void,
+    value: T,
+}
+
+impl<T> Mutex<T> {
+    pub fn new(value: T) -> Mutex<T> {
+        let lock = zr_alloc(MUTEX_SIZE, 8) as *mut void;
+        if lock == 0 as *mut void { panic("Mutex: out of memory"); }
+        if zr_mutex_init(lock) != 0 { panic("Mutex: init failed"); }
+        return Mutex { lock: lock, value: value };
+    }
+
+    /// 加锁，返回临界区值的可变指针。调用方保证访问后调 `unlock()`。
+    pub fn lock(self: &mut Mutex<T>) -> *mut T {
+        zr_mutex_lock(self.lock);
+        return &self.value;
+    }
+
+    /// 解锁。
+    pub fn unlock(self: &mut Mutex<T>) {
+        zr_mutex_unlock(self.lock);
+    }
+
+    /// 销毁互斥锁并释放缓冲区。
+    pub fn free(self: &mut Mutex<T>) {
+        if self.lock == 0 as *mut void { return; }
+        zr_mutex_destroy(self.lock);
+        zr_dealloc(self.lock, MUTEX_SIZE, 8);
+        self.lock = 0 as *mut void;
+    }
+}
+
+/// 便捷构造。
+pub fn mutex_new<T>(value: T) -> Mutex<T> {
+    return Mutex::new(value);
+}
+
+/// `Send`：线程间可安全转移所有权。
+///
+/// zr 无自动 trait 求解，`Send` 是显式 marker——所有类型默认可 Send
+/// （除 `Rc<T>` / `RefCell<T>` 这类线程不安全类型，它们不实现本 trait）。
+/// 这里提供 trait 定义与 blanket impl 的占位：单线程代码无需显式标注，
+/// 跨线程 API 的边界检查留待完整 trait 求解实现。
+pub trait Send {}
+
+impl<T> Send for T {}

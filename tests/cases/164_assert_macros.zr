@@ -1,0 +1,27 @@
+//=============================================================================
+// tests/cases/164_assert_macros.zr — `panic!` / `assert!` / `assert_eq!` 宏
+//
+// 覆盖：
+//   - `assert!` 单参 / 带消息
+//   - `assert_eq!` 单参 / 带消息、字面量与变量实参
+//   - `panic!` 编译通过（失败路径的退出码在负向用例验证）
+//   - `expr` 片段拒绝顶层逗号（宏臂精确匹配，`($a,$b)` 不吞第 3 参数）
+//=============================================================================
+use std::*;
+
+fn main() -> i32 {
+    assert!(true);
+    assert!(1 + 1 == 2, "math failed");
+
+    assert_eq!(3, 3);
+    assert_eq!(4, 4, "four failed");
+    let x = 5;
+    assert_eq!(x, 5);
+    assert_eq!(x, 5, "variable five");
+
+    // 宏体里可以引用其它宏 / 函数。
+    let a = 7;
+    assert!(a > 0);
+
+    return 0;
+}

@@ -1,0 +1,16 @@
+// `#[no_mangle]` 符号名语义：函数符号保持原名（不加 `z_` 前缀）。
+// 普通 zr 函数加 `z_` 前缀避开 C 符号空间；`#[no_mangle]` 显式要求原名，
+// 以便从 C / 动态链接器可见。
+
+use std::*;
+
+#[no_mangle]
+fn my_exported() -> i32 {
+    return 42;
+}
+
+fn main() -> i32 {
+    // 调用点也解析到原名符号（def_names 不改名）。
+    if my_exported() != 42 { return 1; }
+    return 0;
+}

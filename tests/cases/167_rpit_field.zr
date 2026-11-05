@@ -1,0 +1,56 @@
+//=============================================================================
+// tests/cases/167_rpit_field.zr — `-> impl Trait`（RPIT）的字段访问
+//
+// 覆盖：
+//   - `-> impl Tr` 返回的具体结构体上的字段读（`r.x` / `r.y`）
+//   - 字段访问与隐藏类型方法访问（`r.area()`）混合
+//   - 隐藏类型是聚合（结构体）时按隐藏类型布局传/返回
+//
+// 早先 RPIT 只实现了方法访问（lookup_method 按 opaque_hidden 递归），
+// 字段访问落到 `check_field_access` 的 `_ =>` 报
+// `cannot access field ... on type opaque(...)`；MIR 侧 opaque 被当 8 字节
+// 标量（type_size_align / struct_layout / is_aggregate 无 opaque 分支），
+// 字段偏移全错。现在 typeck 把 opaque_hidden 传进 MIR，布局按隐藏类型。
+//=============================================================================
+
+trait Shape {
+    fn area(&self) -> i32;
+}
+
+struct Point {
+    x: i32,
+    y: i32,
+}
+
+impl Shape for Point {
+    fn area(&self) -> i32 {
+        return self.x * self.y;
+    }
+}
+
+fn make() -> impl Shape {
+    return Point { x: 3, y: 4 };
+}
+
+fn main() -> i32 {
+    let p = make();
+    if p.x != 3 {
+        return 1;
+    }
+    if p.y != 4 {
+        return 2;
+    }
+    if p.area() != 12 {
+        return 3;
+    }
+    // 字段可写吗？RPIT 隐藏类型的可变字段访问（`let mut q = make(); q.x = 5`）。
+    let mut q = make();
+    q.x = 5;
+    if q.x != 5 {
+        return 4;
+    }
+    if q.y != 4 {
+        return 5;
+    }
+    return 0;
+}

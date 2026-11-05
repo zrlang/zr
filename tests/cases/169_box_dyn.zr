@@ -1,0 +1,41 @@
+// `Box<dyn Wake>` 的 vtable 分派：`Box<Self>` 接收者（`wake(self: Box<Self>)`）
+// 与 `&Self` 接收者（`wake_by_ref(self: &Self)`）都经 vtable 槽分派。
+// 覆盖：`*mut T as *mut dyn Tr` 指针 fatten、`Box::into_raw`、`Box::from_raw`
+// 重建、`Waker` 消费 / 借用两种路径。
+
+use std::*;
+
+struct MyTask {
+    count: i32,
+}
+
+impl Wake for MyTask {
+    fn wake(self: Box<MyTask>) {
+        let t = self;
+        let p = t.ptr;
+        let mut v = p[0];
+        v.count = v.count + 1;
+        p[0] = v;
+    }
+    fn wake_by_ref(self: &MyTask) {
+    }
+}
+
+fn main() -> i32 {
+    // wake_by_ref（借用路径）。
+    let b = Box::new(MyTask { count: 0 });
+    let raw = b.into_raw() as *mut dyn Wake;
+    let w = Waker::new(raw);
+    w.wake_by_ref();
+
+    // wake（消费路径）：Box::from_raw 重建后 vtable 槽 0。
+    let b2 = Box::new(MyTask { count: 5 });
+    let raw2 = b2.into_raw() as *mut dyn Wake;
+    let mut w2 = Waker::new(raw2);
+    w2.wake();
+    // 消费后 data 指向的 MyTask.count 递增为 6。
+    let p = raw2 as *mut MyTask;
+    if p[0].count != 6 { return 1; }
+
+    return 0;
+}

@@ -1,0 +1,40 @@
+trait HasA {
+    type Item;
+    fn get_a(&self) -> i32;
+}
+
+trait HasB {
+    type Item;
+    fn get_b(&self) -> i32;
+}
+
+struct Both;
+
+impl HasA for Both {
+    type Item = i32;
+    fn get_a(&self) -> i32 { return 1; }
+}
+
+impl HasB for Both {
+    type Item = u8;
+    fn get_b(&self) -> i32 { return 2; }
+}
+
+fn need_a() -> <Both as HasA>::Item {
+    return 42;
+}
+
+fn need_b() -> <Both as HasB>::Item {
+    return 7;
+}
+
+fn main() -> i32 {
+    let a: <Both as HasA>::Item = need_a();
+    let b: <Both as HasB>::Item = need_b();
+    if a != 42 { return 1; }
+    if b != 7 { return 2; }
+    let x = Both {};
+    if x.get_a() != 1 { return 3; }
+    if x.get_b() != 2 { return 4; }
+    return 0;
+}

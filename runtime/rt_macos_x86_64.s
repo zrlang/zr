@@ -1395,3 +1395,60 @@ _zr_errno:
     mov     rsp, rbp
     pop     rbp
     ret
+
+#==============================================================================
+# 互斥锁（pthread_mutex 封装）
+#
+# pthread_mutex_t 在 macOS 上是 64 字节（含私有字段）。调用方分配
+# 64 字节缓冲区（`zr_alloc(64, 8)`），把指针传给 init。
+#==============================================================================
+
+# zr_mutex_init(mutex_ptr) -> i32
+#   rdi = pthread_mutex_t*（调用方分配的 64 字节缓冲区）
+#   返回 pthread_mutex_init 的结果（0 = 成功）。
+    .globl _zr_mutex_init
+_zr_mutex_init:
+    push    rbp
+    mov     rbp, rsp
+    and     rsp, -16
+    xor     esi, esi          // attr = NULL
+    call    _pthread_mutex_init
+    mov     rsp, rbp
+    pop     rbp
+    ret
+
+# zr_mutex_lock(mutex_ptr)
+#   rdi = pthread_mutex_t*
+    .globl _zr_mutex_lock
+_zr_mutex_lock:
+    push    rbp
+    mov     rbp, rsp
+    and     rsp, -16
+    call    _pthread_mutex_lock
+    mov     rsp, rbp
+    pop     rbp
+    ret
+
+# zr_mutex_unlock(mutex_ptr)
+#   rdi = pthread_mutex_t*
+    .globl _zr_mutex_unlock
+_zr_mutex_unlock:
+    push    rbp
+    mov     rbp, rsp
+    and     rsp, -16
+    call    _pthread_mutex_unlock
+    mov     rsp, rbp
+    pop     rbp
+    ret
+
+# zr_mutex_destroy(mutex_ptr) -> i32
+#   rdi = pthread_mutex_t*
+    .globl _zr_mutex_destroy
+_zr_mutex_destroy:
+    push    rbp
+    mov     rbp, rsp
+    and     rsp, -16
+    call    _pthread_mutex_destroy
+    mov     rsp, rbp
+    pop     rbp
+    ret

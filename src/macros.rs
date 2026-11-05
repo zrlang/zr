@@ -239,6 +239,7 @@ fn expand_in_expr(
         Expression::AddrOf(a, _, _) => expand_in_expr(a, defs, def_lines, changed),
         Expression::Cast(a, _, _) => expand_in_expr(a, defs, def_lines, changed),
         Expression::Block(b, _) => expand_in_block(b, defs, def_lines, changed),
+        Expression::AsyncBlock(b, _) => expand_in_block(b, defs, def_lines, changed),
         Expression::If(c, t, e, _) => {
             expand_in_expr(c, defs, def_lines, changed)?;
             expand_in_block(t, defs, def_lines, changed)?;
@@ -508,6 +509,23 @@ fn validate_fragment(kind: FragKind, toks: &[TokenKind], name: &str) -> Result<(
         FragKind::Expr => {
             if toks.is_empty() {
                 return Err(format!("`${name}` must be an expression"));
+            }
+            // `expr` 片段**不能**含顶层逗号：元组必须写 `(a, b)`。
+            // 否则 `($a:expr, $b:expr)` 会拿 `$b` 贪心吃掉剩余
+            // `4, "msg"`，`validate_fragment` 若把它当元组放行，第一条
+            // 臂就错误匹配了 3 参数调用（`eq(4, "msg")` 实参错位）。
+            let mut depth = 0i32;
+            for t in toks {
+                match t {
+                    TokenKind::LParen | TokenKind::LBrace | TokenKind::LBracket => depth += 1,
+                    TokenKind::RParen | TokenKind::RBrace | TokenKind::RBracket => depth -= 1,
+                    TokenKind::Comma if depth == 0 => {
+                        return Err(format!(
+                            "`${name}` must be an expression (top-level `,` separates arguments)"
+                        ));
+                    }
+                    _ => {}
+                }
             }
             // 用"能不能解析成一个表达式"来校验。
             parse_expansion(toks, Span::default())

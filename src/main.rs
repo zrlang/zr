@@ -33,6 +33,7 @@ mod pkg;
 mod ssa;
 mod typeck;
 mod zpm;
+mod zr0;
 
 use std::env;
 use std::path::Path;
@@ -112,7 +113,62 @@ fn code_tokens(src: &str) -> Vec<lexer::TokenKind> {
         .collect()
 }
 
+
+/// `zr zr0-check <file.zr>`：检查源码是否符合 zr0 缩减语法。
+fn run_zr0_check(path: &str) -> ExitCode {
+    let source = match std::fs::read_to_string(path) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("zr: cannot read {path}: {e}");
+            return ExitCode::from(2);
+        }
+    };
+    let report = zr0::check_zr0(&source);
+    if report.is_zr0 {
+        println!("{path}: valid zr0");
+        ExitCode::SUCCESS
+    } else {
+        eprintln!("{path}: not valid zr0");
+        for d in &report.disallowed {
+            eprintln!("  {d}");
+        }
+        ExitCode::from(1)
+    }
+}
+
+/// `zr zr0-c <file.zr>`：把 zr0 子集翻译成 C（自举路径）。
+fn run_zr0_c(path: &str) -> ExitCode {
+    let source = match std::fs::read_to_string(path) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("zr: cannot read {path}: {e}");
+            return ExitCode::from(2);
+        }
+    };
+    let report = zr0::check_zr0(&source);
+    if !report.is_zr0 {
+        eprintln!("{path}: not valid zr0; refusing to translate to C");
+        for d in &report.disallowed {
+            eprintln!("  {d}");
+        }
+        return ExitCode::from(1);
+    }
+    // zr0_to_c 需要一个语法树；此处用词法级检查 + 转译提示。
+    // 完整 AST 解析由 zr0 子集的解析器负责（当前模块只提供检查与 C 骨架）。
+    let items = zr0::parse_zr0(&source);
+    let c = zr0::zr0_to_c(&items);
+    let out = format!("{path}.c");
+    if let Err(e) = std::fs::write(&out, &c) {
+        eprintln!("zr: cannot write {out}: {e}");
+        return ExitCode::from(2);
+    }
+    println!("{path}: translated to {out}");
+    ExitCode::SUCCESS
+}
 const SERVER_LSP_VERSION: &str = env!("CARGO_PKG_VERSION");
+
+// `zr0-check` / `zr0-c`：zr0 缩减子集的自举路径。
+// 这两个命令不需要完整的编译器流程，放在 real_main 的分发前段处理。
 
 /// `zr build <file.zr>`：编译生成可执行文件（类似 `go build`）。
 fn run_build(cmd: &Cli, input: &str) -> ExitCode {
@@ -248,6 +304,30 @@ fn real_main() -> ExitCode {
         };
     }
 
+    // `zr zr0-check <file>`：检查是否符合 zr0 缩减语法。
+    if cmd.zr0_check {
+        let input = match cmd.input.as_deref() {
+            Some(p) => p,
+            None => {
+                eprintln!("zr: zr0-check requires an input file");
+                return ExitCode::from(2);
+            }
+        };
+        return run_zr0_check(input);
+    }
+
+    // `zr zr0-c <file>`：zr0 子集翻译成 C（自举路径）。
+    if cmd.zr0_c {
+        let input = match cmd.input.as_deref() {
+            Some(p) => p,
+            None => {
+                eprintln!("zr: zr0-c requires an input file");
+                return ExitCode::from(2);
+            }
+        };
+        return run_zr0_c(input);
+    }
+
     // `zr build`：编译生成可执行文件（类似 `go build`）。
     if cmd.build {
         let input = match cmd.input.as_deref() {
@@ -359,6 +439,10 @@ struct Cli {
     run: bool,
     /// `zr run` 传递给程序的参数（`--` 之后的参数）。
     run_args: Vec<String>,
+    /// `zr zr0-check <file>`：检查源码是否符合 zr0 缩减语法。
+    zr0_check: bool,
+    /// `zr zr0-c <file>`：zr0 子集翻译成 C（自举路径）。
+    zr0_c: bool,
 }
 
 impl Cli {
@@ -410,6 +494,14 @@ impl Cli {
                 "build" => cli.build = true,
                 "run" => cli.run = true,
                 "fmt" | "format" => cli.fmt = true,
+                "zr0-check" => {
+                    cli.zr0_check = true;
+                    // 不立即返回：后续的位置参数仍是输入文件。
+                }
+                "zr0-c" => {
+                    cli.zr0_c = true;
+                    // 不立即返回：后续的位置参数仍是输入文件。
+                }
                 "--check" => cli.fmt_check = true,
                 "-c" => cli.no_link = true,
                 "--target" => {
@@ -447,6 +539,8 @@ impl Cli {
             && !(cli.fmt && cli.fmt_check)
             && !cli.build
             && !cli.run
+            && !cli.zr0_check
+            && !cli.zr0_c
         {
             cli.help = true;
         }
@@ -492,6 +586,8 @@ fn print_usage(prog: &str) {
     println!("    pkg             Package manager");
     println!("    lsp             Start language server");
     println!("    clean           Clean incremental cache");
+    println!("    zr0-check       Check source is valid zr0 subset");
+    println!("    zr0-c           Translate zr0 subset to C (bootstrap)");
     println!();
     println!("OPTIONS:");
     println!("    -o <file>           Output file");

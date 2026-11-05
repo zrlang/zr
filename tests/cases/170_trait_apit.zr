@@ -1,0 +1,51 @@
+//=============================================================================
+// tests/cases/170_trait_apit.zr — trait 声明方法签名里的 `impl Trait`（APIT）
+//
+// 覆盖：
+//   - trait 方法带 `&self` 接收者 + APIT 参数（`fn apply(&self, x: impl
+//     Clone) -> i32`）
+//   - trait 默认方法带 APIT（合成到 impl 目标类型后参数正确传递）
+//   - 关联函数（trait 方法无 `self`）的 `S::apply(..)` 路径调用
+//   - 无 receiver 的方法**不能**点调用（`s.apply(..)` 报
+//     `no field apply on type S`，早先静默把 receiver 当实参传、运行得垃圾）
+//
+// 早先 trait 声明的方法签名不做 APIT 脱糖：`fn apply(x: impl Clone)` 的
+// 参数保持 `opaque`，而 impl 方法脱糖成 `__apit_N`，两者签名不一致，
+// `s.apply(41)` 的实参核验错位、方法体读到未初始化值（实测返回 217/249）。
+// 现在 trait 方法参数与 impl 方法一样脱糖，且 `lookup_method` 只匹配有
+// receiver 的方法——关联函数必须走 `Type::method(..)` 路径调用。
+//=============================================================================
+use std::*;
+
+trait Tr {
+    // 带 `&self` 接收者的 APIT 方法。
+    fn apply(&self, x: impl Clone) -> i32;
+    // 关联函数：无 `self`。
+    fn make(x: impl Clone) -> i32;
+    // 默认方法带 APIT。
+    fn twice(&self, x: impl Clone) -> i32 {
+        return x as i32 * 2;
+    }
+}
+
+struct S;
+
+impl Tr for S {
+    fn apply(&self, x: impl Clone) -> i32 {
+        return x as i32 + 1;
+    }
+    fn make(x: impl Clone) -> i32 {
+        return x as i32 + 10;
+    }
+}
+
+fn main() -> i32 {
+    let s = S {};
+    // 带 receiver 的 APIT 方法。
+    if s.apply(41) != 42 { return 1; }
+    // 默认方法带 APIT（合成到 `S__twice`）。
+    if s.twice(21) != 42 { return 2; }
+    // 关联函数路径调用。
+    if S::make(5) != 15 { return 3; }
+    return 0;
+}

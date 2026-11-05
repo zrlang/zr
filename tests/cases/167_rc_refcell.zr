@@ -1,0 +1,43 @@
+// `Rc<T>`（引用计数共享所有权）与 `RefCell<T>`（内部可变性）。
+// zr 无自动析构，`Rc` 用完显式 `free()`（计数减一、归零释放）。
+
+use std::*;
+
+fn main() -> i32 {
+    // Rc 共享计数。
+    let r = Rc::new(42);
+    if r.get() != 42 { return 1; }
+    let r2 = r.clone();
+    if r2.strong_count() != 2 { return 2; }
+    if r.strong_count() != 2 { return 3; }
+    r.free();
+    if r2.strong_count() != 1 { return 4; }
+    r2.free();
+
+    // Rc 共享字符串（聚合浅拷贝）。
+    let s = Rc::new("hello");
+    let s2 = s.clone();
+    if s2.get() != "hello" { return 5; }
+    if s2.strong_count() != 2 { return 6; }
+    s.free();
+    s2.free();
+
+    // RefCell 内部可变性。
+    let mut c = RefCell::new(10);
+    let p = c.borrow_mut();
+    p[0] = 99;
+    if c.value != 99 { return 7; }
+    let old = c.replace(5);
+    if old != 99 { return 8; }
+    if c.value != 5 { return 9; }
+
+    // 便捷构造。
+    let r3 = rc_new(7);
+    if r3.get() != 7 { return 10; }
+    r3.free();
+    let mut c2 = refcell_new(1);
+    if c2.value != 1 { return 11; }
+    c2.replace(2);
+
+    return 0;
+}

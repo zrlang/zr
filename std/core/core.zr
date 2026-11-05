@@ -177,6 +177,25 @@ impl<T> Option<T> {
             Option::None    => return other,
         }
     }
+
+    /// 为空时调用 `f` 生成新的 `Option`（对应 Rust `Option::or_else`）。
+    pub fn or_else(self, f: fn() -> Option<T>) -> Option<T> {
+        match self {
+            Option::Some(v) => return Option::Some(v),
+            Option::None    => return f(),
+        }
+    }
+
+    /// 两个 `Option` 都有值时组合成元组（对应 Rust `Option::zip`）。
+    pub fn zip<U>(self, other: Option<U>) -> Option<(T, U)> {
+        match self {
+            Option::Some(v) => match other {
+                Option::Some(w) => return Option::Some((v, w)),
+                Option::None    => return Option::None,
+            },
+            Option::None => return Option::None,
+        }
+    }
 }
 
 //=============================================================================
@@ -458,3 +477,28 @@ pub fn size_of<T>() -> usize;
 
 /// 编译期内建：类型 `T` 的对齐。
 pub fn align_of<T>() -> usize;
+
+//=============================================================================
+// 断言与 panic 宏（`macro_rules!` 版本）
+//
+// `panic!` / `assert!` / `assert_eq!` 是宏不是函数：函数版需要把消息当
+// 普通参数传递，宏版可以接受任意表达式并在展开点计算。函数版保留
+// （`core::panic` 仍是底层入口），宏版提供 Rust 风格的调用语法。
+//=============================================================================
+
+/// 无条件终止并打印消息。展开为 `panic` 函数调用。
+macro_rules! panic {
+    ($msg:expr) => { panic($msg) };
+}
+
+/// 条件为假时终止程序。无消息版。
+macro_rules! assert {
+    ($cond:expr) => { if !($cond) { panic("assertion failed"); } };
+    ($cond:expr, $msg:expr) => { if !($cond) { panic($msg); } };
+}
+
+/// 两个值不等时终止程序（要求实现 `Eq`）。
+macro_rules! assert_eq {
+    ($a:expr, $b:expr) => { if !($a).eq($b) { panic("assertion failed: left != right"); } };
+    ($a:expr, $b:expr, $msg:expr) => { if !($a).eq($b) { panic($msg); } };
+}

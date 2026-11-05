@@ -1,0 +1,17 @@
+// tests/negative/38_negative_bound.zr — `where T: !Trait` 违反时报错
+//
+// `A` 实现 `Marker`，但 `where T: !Marker` 要求**不**实现。调用 `f(A{})`
+// 必须报错（编译失败）。
+//
+// expect: unexpectedly implements trait `Marker`
+trait Marker {}
+struct A;
+impl Marker for A {}
+
+fn f<T>(x: T) -> i32 where T: !Marker {
+    return 1;
+}
+
+fn main() -> i32 {
+    return f(A{});
+}

@@ -1,0 +1,20 @@
+// 关联函数（无 `self` 的 impl 方法）不能点调用：`s.apply(41)` 必须报错。
+// 早先 `lookup_method` 无差别返回 `S__apply`，`check_method_call` 把
+// receiver `s` 当第一个实参传给期望 `x: i32` 的形参，静默错位、运行得垃圾。
+// expect: no field `apply` on type `S`
+trait Tr {
+    fn apply(x: impl Clone) -> i32;
+}
+
+struct S;
+
+impl Tr for S {
+    fn apply(x: impl Clone) -> i32 {
+        return x as i32 + 1;
+    }
+}
+
+fn main() -> i32 {
+    let s = S {};
+    return s.apply(41);
+}

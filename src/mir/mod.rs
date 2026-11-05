@@ -300,6 +300,11 @@ pub fn lower(hir: &HirModule) -> MirModule {
         if f.name == "main" {
             continue; // 入口符号
         }
+        // `#[no_mangle]` 的函数保持原名：用户显式要求符号名不前缀，以便
+        // 从 C / 动态链接器可见（`zr_` 前缀只用于普通 zr 函数）。
+        if f.has_attr("no_mangle") {
+            continue;
+        }
         user_fns.insert(f.name.clone());
     }
     let mut def_names = hir.def_names.clone();
@@ -324,13 +329,17 @@ pub fn lower(hir: &HirModule) -> MirModule {
         })
         .collect();
 
-    // 静态量：标量 + 可折叠初值 → 直接编码成数据字节。其它静态量没有
-    // 数据符号，读取时类型检查阶段已经报错。
+    // 静态量：标量 + 可折叠初值 → 直接编码成数据字节。聚合静态量（如
+    // `static G: Executor = Executor { .. }`）的初值折成 `Composite` 后按
+    // 结构体布局递归编码，同样落到数据段。其它折不出来的静态量没有数据
+    // 符号，读取时类型检查阶段已经报错。
     let mut statics = Vec::new();
     let mut static_metas: HashMap<hir::DefId, (String, hir::Ty)> = HashMap::new();
+    // 布局计算用的临时 Builder（只填类型表与泛型参数，不降级函数体）。
+    let layout_b = builder::Builder::for_layout(hir.type_defs.clone(), hir.generic_params.clone());
     for st in &hir.statics {
         let Some(lit) = &st.const_value else { continue };
-        let Some(bytes) = scalar_bytes(&st.ty, lit) else { continue };
+        let Some(bytes) = static_bytes(&layout_b, &st.ty, lit) else { continue };
         static_metas.insert(st.id, (st.name.clone(), st.ty.clone()));
         statics.push(MirStatic {
             name: st.name.clone(),
@@ -382,6 +391,9 @@ pub fn lower(hir: &HirModule) -> MirModule {
                 &fn_params,
                 &hir.generic_params,
                 &static_metas,
+                &hir.synthetic_polls,
+                &hir.opaque_hidden,
+                &hir.user_fn_names,
             ));
         }
     }
@@ -427,6 +439,35 @@ pub fn lower(hir: &HirModule) -> MirModule {
         .collect();
     test_harness::install(&mut module, &names);
     module
+}
+
+/// 把静态量初值编码成小端字节。支持标量与聚合（`Composite`）字面量。
+///
+/// 聚合静态量（`static G: Executor = Executor { .. }`）的初值折成
+/// `Composite` 后按结构体布局递归编码——每个字段写入它在布局里的偏移，
+/// 未写出的字段保持零。无法编码（如静态字符串需要 `.rodata` 引用）返回
+/// `None`，该静态量不生成数据符号。
+fn static_bytes(b: &builder::Builder, ty: &hir::Ty, lit: &hir::HirLiteral) -> Option<Vec<u8>> {
+    match lit {
+        // 聚合值：按布局把每个字段写进对应偏移。
+        hir::HirLiteral::Composite(items) => {
+            let layout = builder::struct_layout(b, ty)?;
+            let mut bytes = vec![0u8; layout.size as usize];
+            for (name, val) in items {
+                let idx = layout.names.get(name).copied()?;
+                let (off, fty) = layout.fields.get(idx)?;
+                let off = *off as usize;
+                let field_bytes = static_bytes(b, fty, val)?;
+                if off + field_bytes.len() > bytes.len() {
+                    return None;
+                }
+                bytes[off..off + field_bytes.len()].copy_from_slice(&field_bytes);
+            }
+            Some(bytes)
+        }
+        // 标量：按位宽编码。
+        _ => scalar_bytes(ty, lit),
+    }
 }
 
 /// 把标量字面量编码成小端字节。非标量返回 `None`。

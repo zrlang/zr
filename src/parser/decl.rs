@@ -291,10 +291,14 @@ impl Parser {
             Type::Void
         };
 
-        // `where` 子句（解析以消费 token，但不存储）
-        if self.match_kind(&TokenKind::KwWhere) {
-            let _ = self.parse_where_clause()?;
-        }
+        // `where` 子句：原样保留到 AST。早先 `let _ = parse_where_clause()`
+        // 丢弃后 `where T: Clone` 等于没写——单态化时不校验实参，是类型
+        // 安全漏洞（`f(A{})` 传一个没实现 `Clone` 的类型静默通过）。
+        let where_clause = if self.match_kind(&TokenKind::KwWhere) {
+            self.parse_where_clause()?
+        } else {
+            vec![]
+        };
 
         // 函数体（可省略 = 声明 / 外部函数）
         let body = if self.check(&TokenKind::Semicolon) {
@@ -324,6 +328,7 @@ impl Parser {
             receiver,
             return_type,
             body,
+            where_clause,
         })
     }
 
@@ -374,12 +379,12 @@ impl Parser {
             self.consume(&TokenKind::Lt, "expected '<' after 'for'")?;
             let mut lts = Vec::new();
             if !self.check(&TokenKind::Gt) {
-                lts.push(self.consume_ident("expected lifetime name")?);
+                lts.push(self.parse_lifetime_name()?);
                 while self.match_kind(&TokenKind::Comma) {
                     if self.check(&TokenKind::Gt) {
                         break;
                     }
-                    lts.push(self.consume_ident("expected lifetime name")?);
+                    lts.push(self.parse_lifetime_name()?);
                 }
             }
             self.consume(&TokenKind::Gt, "expected '>' to close lifetime parameters")?;
@@ -387,31 +392,74 @@ impl Parser {
         } else {
             Vec::new()
         };
-        let _lhs = self.parse_type()?;
+        let lhs = self.parse_type()?;
         self.consume(&TokenKind::Colon, "expected ':' in where predicate")?;
-        self.parse_where_bound()?;
+        let mut bounds = vec![self.parse_where_bound()?];
         // 多边界 `T: Copy + Clone`
         while self.match_kind(&TokenKind::Plus) {
-            self.parse_where_bound()?;
+            bounds.push(self.parse_where_bound()?);
         }
-        Ok(WherePred)
+        Ok(WherePred { lhs, bounds })
     }
+    /// 解析生命周期名：`for<'a>` 的 `'a` 是 `TokenKind::Lifetime`，不是
+    /// 普通标识符（`consume_ident` 只认 Ident，会报 `expected lifetime name`）。
+    fn parse_lifetime_name(&mut self) -> Result<String, CompileError> {
+        match &self.peek().kind {
+            TokenKind::Lifetime(n) => {
+                let name = n.clone();
+                self.advance();
+                Ok(name)
+            }
+            _ => Err(CompileError::type_error(format!(
+                "expected lifetime name, found {:?}",
+                self.peek().kind
+            ))),
+        }
+    }
+
 
     /// 解析单个 trait / 生命周期边界。
     ///
     /// `'a` / `'static` 不是类型，`parse_type` 会把它当"生命周期前缀"跳过
     /// 然后去解析本不存在的类型（`where T: 'static {` 报 `expected type,
     /// found LBrace`）。这里单独消费。
-    fn parse_where_bound(&mut self) -> Result<(), CompileError> {
-        let _negated = self.match_kind(&TokenKind::Bang);
+    /// 解析单个 trait / 生命周期边界，返回边界类型。
+    ///
+    /// `'a` / `'static` 不是类型，`parse_type` 会把它当"生命周期前缀"跳过
+    /// 然后去解析本不存在的类型（`where T: 'static {` 报 `expected type,
+    /// found LBrace`）。这里单独消费。
+    ///
+    /// `!Trait`（negative bound）解析成 `Type::Not`，保留"否定"信息供
+    /// `check_trait_bounds` 校验。
+    fn parse_where_bound(&mut self) -> Result<Type, CompileError> {
+        let negated = self.match_kind(&TokenKind::Bang);
         if let TokenKind::Lifetime(_) = self.peek().kind {
             self.advance();
-            return Ok(());
+            return Ok(Type::Void);
         }
-        let _ = self.parse_type()?;
-        Ok(())
+        let t = self.parse_type()?;
+        if negated {
+            Ok(Type::Not(Box::new(t)))
+        } else {
+            Ok(t)
+        }
     }
 
+
+    /// 解析单个边界类型，`!Trait` 成 `Type::Not`。
+    ///
+    /// 泛型参数（`fn f<T: !Clone>`）与 where 子句共用。生命周期边界
+    /// （`T: 'a`）这里不出现（泛型参数位置用 `parse_type`，生命周期参数
+    /// 走 `GenericParam::Lifetime`）。
+    fn parse_bound_type(&mut self) -> Result<Type, CompileError> {
+        let negated = self.match_kind(&TokenKind::Bang);
+        let t = self.parse_type()?;
+        if negated {
+            Ok(Type::Not(Box::new(t)))
+        } else {
+            Ok(t)
+        }
+    }
     // ==================================================================
     // const / static
     // ==================================================================
@@ -478,14 +526,15 @@ impl Parser {
         };
 
         // `where` 子句：`struct S<T> where T: Ord { .. }`。
-        // 与函数 / impl 上的 where 子句一致——**解析并消费，但暂不强制**
-        // （边界在泛型单态化时由 `check_trait_bounds` 校验）。早先这里没有
-        // where 分支，`pub struct Join2<..> where ..` 直接撞上 `{` 分派，
-        // 报 `expected '{' after struct name: found KwWhere`，`std/alloc/async.zr`
-        // 整模块加载不了。
-        if self.match_kind(&TokenKind::KwWhere) {
-            let _ = self.parse_where_clause()?;
-        }
+        // 原样保留到 AST（早先 `let _ = parse_where_clause()` 丢弃后等于
+        // 没写——单态化时不校验实参）。没有 where 分支时 `pub struct
+        // Join2<..> where ..` 直接撞上 `{` 分派，报 `expected '{' after
+        // struct name: found KwWhere`，`std/alloc/async.zr` 整模块加载不了。
+        let where_clause = if self.match_kind(&TokenKind::KwWhere) {
+            self.parse_where_clause()?
+        } else {
+            vec![]
+        };
 
         if self.match_kind(&TokenKind::LParen) {
             // 元组结构体 `struct Point(u32, u32)`
@@ -521,6 +570,7 @@ impl Parser {
                 attrs,
                 fields,
                 span,
+                where_clause,
             }));
         }
 
@@ -534,6 +584,7 @@ impl Parser {
                 attrs,
                 fields: Vec::new(),
                 span,
+                where_clause,
             }));
         }
 
@@ -568,6 +619,7 @@ impl Parser {
             attrs,
             fields,
             span,
+            where_clause,
         }))
     }
 
@@ -593,6 +645,12 @@ impl Parser {
         } else {
             None
         };
+        // `where` 子句：`enum E<T> where T: Clone`。原样保留到 AST。
+        let where_clause = if self.match_kind(&TokenKind::KwWhere) {
+            self.parse_where_clause()?
+        } else {
+            vec![]
+        };
         self.consume(&TokenKind::LBrace, "expected '{' after enum name")?;
         let mut variants = Vec::new();
         if !self.check(&TokenKind::RBrace) {
@@ -614,6 +672,7 @@ impl Parser {
             repr,
             variants,
             span,
+            where_clause,
         }))
     }
 
@@ -950,9 +1009,9 @@ impl Parser {
             // `T: Clone + Ord` 的多边界也一并收集。
             let mut bounds = Vec::new();
             if self.match_kind(&TokenKind::Colon) {
-                bounds.push(self.parse_type()?);
+                bounds.push(self.parse_bound_type()?);
                 while self.match_kind(&TokenKind::Plus) {
-                    bounds.push(self.parse_type()?);
+                    bounds.push(self.parse_bound_type()?);
                 }
             }
             if self.match_kind(&TokenKind::Eq) {

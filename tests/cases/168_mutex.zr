@@ -1,0 +1,34 @@
+// `Mutex<T>`（线程互斥锁）与 `Send`（marker trait）。
+// 两个线程各 1000 次持锁递增共享计数器，最终必须精确等于 2000——
+// 没有锁会丢更新，锁本身也不能死锁。
+
+use std::*;
+
+static mut MP: *mut void = 0 as *mut void;
+
+fn worker() {
+    let m = MP as *mut Mutex<i32>;
+    let mut i = 0;
+    while i < 1000 {
+        let v = (*m).lock();
+        v[0] = v[0] + 1;
+        (*m).unlock();
+        i = i + 1;
+    }
+}
+
+fn main() -> i32 {
+    let mut m = Mutex::new(0);
+    MP = &mut m as *mut Mutex<i32> as *mut void;
+    let t1 = start_thread(worker);
+    let t2 = start_thread(worker);
+    let r1 = t1.join();
+    let r2 = t2.join();
+    {
+        let v = m.lock();
+        if v[0] != 2000 { m.unlock(); return 1; }
+        m.unlock();
+    }
+    m.free();
+    return r1 + r2;
+}

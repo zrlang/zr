@@ -4,6 +4,10 @@
 // `Box<T>` 把值放在堆上，栈上只留一个指针。与 `Vec` / `String` 一样，
 // 释放需要显式调用 `free()`（zr 的 `Drop` 只走编译期内建，标准库类型
 // 不做自动析构）。
+//
+// 本模块还提供 `Rc<T>`（引用计数共享所有权）与 `RefCell<T>`（内部可变
+// 性）——与 `Box` 同属"智能指针"家族。zr 没有自动析构，`Rc` 的释放
+// 显式调 `free()`（计数减一，归零时释放堆内存）。
 //==============================================================================
 
 use core::{panic, size_of, align_of};
@@ -56,6 +60,12 @@ impl<T> Box<T> {
             self.ptr = 0 as *mut T;
         }
     }
+
+    /// 从裸指针重建 `Box`，由 `into_raw` 产生（关联函数形式，对应 Rust 的
+    /// `Box::from_raw`）。
+    pub fn from_raw<T>(ptr: *mut T) -> Box<T> {
+        return Box { ptr };
+    }
 }
 
 /// 便捷构造（对应 Rust 的 `Box::new` 自由函数形式）。
@@ -66,4 +76,102 @@ pub fn box_new<T>(value: T) -> Box<T> {
 /// 从裸指针重建 `Box`，由 `into_raw` 产生。
 pub fn box_from_raw<T>(ptr: *mut T) -> Box<T> {
     return Box { ptr };
+}
+
+//==============================================================================
+// Rc<T> — 引用计数共享所有权
+//
+// 堆上放 `{ strong, value }`，栈上只留指针。`clone` 递增计数（共享同一
+// 值），`free` 递减计数、归零时释放。zr 没有自动析构，`Rc` 用完必须
+// 显式调 `free()`——与 `Box` 同一约定。
+//==============================================================================
+
+struct RcInner<T> {
+    strong: usize,
+    value: T,
+}
+
+pub struct Rc<T> {
+    pub ptr: *mut RcInner<T>,
+}
+
+impl<T> Rc<T> {
+    /// 在堆上分配 `{ strong: 1, value }`。
+    pub fn new(value: T) -> Rc<T> {
+        let p = zr_alloc(size_of::<RcInner<T>>(), align_of::<RcInner<T>>()) as *mut RcInner<T>;
+        if p == 0 as *mut RcInner<T> { panic("Rc: out of memory"); }
+        p[0] = RcInner { strong: 1, value: value };
+        return Rc { ptr: p };
+    }
+
+    /// 递增引用计数，共享同一值（浅共享；聚合 `T` 不做深拷贝）。
+    pub fn clone(self) -> Rc<T> {
+        self.ptr[0].strong = self.ptr[0].strong + 1;
+        return Rc { ptr: self.ptr };
+    }
+
+    /// 取共享值（`T` 为聚合类型时是浅拷贝）。
+    pub fn get(self) -> T {
+        return self.ptr[0].value;
+    }
+
+    /// 当前强引用计数。
+    pub fn strong_count(self) -> usize {
+        return self.ptr[0].strong;
+    }
+
+    /// 递减引用计数；归零时释放堆内存。
+    pub fn free(self: &mut Rc<T>) {
+        if self.ptr == 0 as *mut RcInner<T> { return; }
+        let n = self.ptr[0].strong - 1;
+        self.ptr[0].strong = n;
+        if n == 0 {
+            zr_dealloc(self.ptr as *mut void, size_of::<RcInner<T>>(), align_of::<RcInner<T>>());
+            self.ptr = 0 as *mut RcInner<T>;
+        }
+    }
+}
+
+//==============================================================================
+// RefCell<T> — 运行期内部可变性
+//
+// 借用规则（`borrow` / `borrow_mut`）由调用方维护；zr 的借用检查是
+// 编译期近似，这里直接暴露裸指针让运行期代码自行保证不重叠借用。
+//==============================================================================
+
+pub struct RefCell<T> {
+    pub value: T,
+}
+
+impl<T> RefCell<T> {
+    pub fn new(value: T) -> RefCell<T> {
+        return RefCell { value: value };
+    }
+
+    /// 不可变借用（裸指针；调用方保证不再可变借用）。
+    pub fn borrow(self: &RefCell<T>) -> *const T {
+        return &self.value;
+    }
+
+    /// 可变借用（裸指针；调用方保证不再有其它借用）。
+    pub fn borrow_mut(self: &mut RefCell<T>) -> *mut T {
+        return &self.value;
+    }
+
+    /// 替换内部值，返回旧值。
+    pub fn replace(self: &mut RefCell<T>, value: T) -> T {
+        let old = self.value;
+        self.value = value;
+        return old;
+    }
+}
+
+/// 便捷构造（对应 Rust 的 `Rc::new` 自由函数形式）。
+pub fn rc_new<T>(value: T) -> Rc<T> {
+    return Rc::new(value);
+}
+
+/// 便捷构造（对应 Rust 的 `RefCell::new` 自由函数形式）。
+pub fn refcell_new<T>(value: T) -> RefCell<T> {
+    return RefCell::new(value);
 }

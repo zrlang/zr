@@ -179,7 +179,6 @@ pub enum Zr0Stmt {
     Break,
     Continue,
 }
-
 #[derive(Debug, Clone)]
 pub enum Zr0Expr {
     IntLit(i128),
@@ -191,6 +190,8 @@ pub enum Zr0Expr {
     Field { object: Box<Zr0Expr>, field: String },
     Index { array: Box<Zr0Expr>, index: Box<Zr0Expr> },
     Assign { target: Box<Zr0Expr>, value: Box<Zr0Expr> },
+    /// 结构体字面量：`Point { x: 3, y: 4 }`。
+    StructLit { name: String, fields: Vec<(String, Zr0Expr)> },
 }
 
 #[derive(Debug, Clone)]
@@ -371,6 +372,522 @@ fn zr0_expr_to_c(expr: &Zr0Expr) -> String {
         }
         Zr0Expr::Assign { target, value } => {
             format!("{} = {}", zr0_expr_to_c(target), zr0_expr_to_c(value))
+        }
+        Zr0Expr::StructLit { name, fields } => {
+            let fields_str = fields
+                .iter()
+                .map(|(fname, val)| format!(".{} = {}", fname, zr0_expr_to_c(val)))
+                .collect::<Vec<_>>()
+                .join(", ");
+            format!("({}) {{ {} }}", name, fields_str)
+        }
+    }
+}
+
+// =============================================================================
+// zr0 解析器：把源码解析成 zr0 语法树（供 `zr0-c` 翻译成 C）。
+//
+// 用主 lexer 的 token 流做递归下降。zr0 子集很小，解析器可以直接复用
+// `crate::lexer`，不依赖主 parser 的 AST（那是全语言，zr0 只要最小子集）。
+// =============================================================================
+
+use crate::lexer::{Lexer, Token, TokenKind};
+
+/// 把源码解析成 zr0 语法树。语法错误返回 `Err(消息)`。
+pub fn parse_zr0(source: &str) -> Vec<Zr0Item> {
+    let tokens = Lexer::new(source).tokenize();
+    let mut p = Zr0Parser {
+        tokens,
+        pos: 0,
+    };
+    p.parse_items()
+}
+
+/// 递归下降解析器（zr0 子集）。
+struct Zr0Parser {
+    tokens: Vec<Token>,
+    pos: usize,
+}
+
+impl Zr0Parser {
+    fn peek(&self) -> &TokenKind {
+        &self.tokens[self.pos.min(self.tokens.len() - 1)].kind
+    }
+
+    fn next(&mut self) -> TokenKind {
+        let k = self.peek().clone();
+        if self.pos < self.tokens.len() - 1 {
+            self.pos += 1;
+        }
+        k
+    }
+
+    fn expect(&mut self, kind: TokenKind) -> bool {
+        if self.peek() == &kind {
+            self.next();
+            true
+        } else {
+            false
+        }
+    }
+
+    fn parse_items(&mut self) -> Vec<Zr0Item> {
+        let mut items = Vec::new();
+        while self.peek() != &TokenKind::Eof {
+            match self.peek() {
+                TokenKind::KwFn => {
+                    if let Some(f) = self.parse_fn() {
+                        items.push(Zr0Item::FnDecl(f));
+                    }
+                }
+                TokenKind::KwStruct => {
+                    if let Some(s) = self.parse_struct() {
+                        items.push(Zr0Item::StructDecl(s));
+                    }
+                }
+                TokenKind::KwExtern => {
+                    if let Some(e) = self.parse_extern() {
+                        items.push(Zr0Item::ExternDecl(e));
+                    }
+                }
+                TokenKind::LexError(msg) => {
+                    let msg = msg.clone();
+                    self.next();
+                    let _ = msg;
+                }
+                _ => {
+                    self.next();
+                }
+            }
+        }
+        items
+    }
+
+    fn parse_fn(&mut self) -> Option<Zr0FnDecl> {
+        self.next(); // fn
+        let name = match self.next() {
+            TokenKind::Ident(n) => n,
+            _ => return None,
+        };
+        if !self.expect(TokenKind::LParen) {
+            return None;
+        }
+        let mut params = Vec::new();
+        while self.peek() != &TokenKind::RParen && self.peek() != &TokenKind::Eof {
+            if let TokenKind::Ident(pname) = self.next() {
+                let ty = self.parse_type();
+                if let Some(ty) = ty {
+                    params.push(Zr0Param { name: pname, ty });
+                }
+            } else {
+                self.next();
+            }
+            if !self.expect(TokenKind::Comma) {
+                break;
+            }
+        }
+        self.expect(TokenKind::RParen);
+        let return_type = if self.expect(TokenKind::Arrow) {
+            self.parse_type().unwrap_or(Zr0Type::Named("void".to_string()))
+        } else {
+            Zr0Type::Named("void".to_string())
+        };
+        if !self.expect(TokenKind::LBrace) {
+            return None;
+        }
+        let body = self.parse_block();
+        Some(Zr0FnDecl {
+            name,
+            params,
+            return_type,
+            body,
+        })
+    }
+
+    fn parse_struct(&mut self) -> Option<Zr0StructDecl> {
+        self.next(); // struct
+        let name = match self.next() {
+            TokenKind::Ident(n) => n,
+            _ => return None,
+        };
+        if !self.expect(TokenKind::LBrace) {
+            return None;
+        }
+        let mut fields = Vec::new();
+        while self.peek() != &TokenKind::RBrace && self.peek() != &TokenKind::Eof {
+            if let TokenKind::Ident(fname) = self.next() {
+                self.expect(TokenKind::Colon);
+                let ty = self.parse_type();
+                if let Some(ty) = ty {
+                    fields.push(Zr0Field { name: fname, ty });
+                }
+            } else {
+                self.next();
+            }
+            self.expect(TokenKind::Comma);
+            self.expect(TokenKind::Semicolon);
+        }
+        self.expect(TokenKind::RBrace);
+        Some(Zr0StructDecl { name, fields })
+    }
+
+    fn parse_extern(&mut self) -> Option<Zr0ExternDecl> {
+        self.next(); // extern
+        // 可选 "C" 字符串
+        if let TokenKind::StringLiteral(_) = self.peek() {
+            self.next();
+        }
+        if !self.expect(TokenKind::LBrace) {
+            return None;
+        }
+        let mut decls = Vec::new();
+        while self.peek() != &TokenKind::RBrace && self.peek() != &TokenKind::Eof {
+            if let TokenKind::KwFn = self.peek() {
+                self.next();
+                if let TokenKind::Ident(name) = self.next() {
+                    self.expect(TokenKind::LParen);
+                    let mut params = Vec::new();
+                    while self.peek() != &TokenKind::RParen && self.peek() != &TokenKind::Eof {
+                        let ty = self.parse_type();
+                        if let Some(ty) = ty {
+                            params.push(ty);
+                        } else {
+                            self.next();
+                        }
+                        if !self.expect(TokenKind::Comma) {
+                            break;
+                        }
+                    }
+                    self.expect(TokenKind::RParen);
+                    let ret = if self.expect(TokenKind::Arrow) {
+                        self.parse_type().unwrap_or(Zr0Type::Named("void".to_string()))
+                    } else {
+                        Zr0Type::Named("void".to_string())
+                    };
+                    decls.push(Zr0ExternDecl { name, params, return_type: ret });
+                }
+            } else {
+                self.next();
+            }
+            self.expect(TokenKind::Semicolon);
+        }
+        self.expect(TokenKind::RBrace);
+        decls.into_iter().next()
+    }
+
+    fn parse_type(&mut self) -> Option<Zr0Type> {
+        match self.peek().clone() {
+            TokenKind::Ident(n) => {
+                self.next();
+                // 指针 / 数组后缀
+                let mut ty = Zr0Type::Named(n);
+                while let TokenKind::Star = self.peek() {
+                    self.next();
+                    ty = Zr0Type::Pointer(Box::new(ty));
+                }
+                Some(ty)
+            }
+            TokenKind::TyI(w) => {
+                self.next();
+                Some(Zr0Type::Named(format!("i{w}")))
+            }
+            TokenKind::TyU(w) => {
+                self.next();
+                Some(Zr0Type::Named(format!("u{w}")))
+            }
+            TokenKind::TyF(w) => {
+                self.next();
+                Some(Zr0Type::Named(format!("f{w}")))
+            }
+            TokenKind::TyBool => {
+                self.next();
+                Some(Zr0Type::Named("bool".to_string()))
+            }
+            TokenKind::TyStr => {
+                self.next();
+                Some(Zr0Type::Named("str".to_string()))
+            }
+            TokenKind::TyChar => {
+                self.next();
+                Some(Zr0Type::Named("char".to_string()))
+            }
+            TokenKind::KwVoid => {
+                self.next();
+                Some(Zr0Type::Named("void".to_string()))
+            }
+            TokenKind::LBracket => {
+                // 数组类型：`[T; N]`
+                self.next();
+                let inner = self.parse_type()?;
+                let len = if self.expect(TokenKind::Semicolon) {
+                    match self.next() {
+                        TokenKind::IntLiteral(v, _) => v as u64,
+                        _ => 0,
+                    }
+                } else {
+                    0
+                };
+                self.expect(TokenKind::RBracket);
+                Some(Zr0Type::Array(Box::new(inner), len))
+            }
+            _ => None,
+        }
+    }
+
+    fn parse_block(&mut self) -> Vec<Zr0Stmt> {
+        let mut stmts = Vec::new();
+        while self.peek() != &TokenKind::RBrace && self.peek() != &TokenKind::Eof {
+            if let Some(s) = self.parse_stmt() {
+                stmts.push(s);
+            } else {
+                self.next();
+            }
+        }
+        self.expect(TokenKind::RBrace);
+        stmts
+    }
+
+    fn parse_stmt(&mut self) -> Option<Zr0Stmt> {
+        match self.peek() {
+            TokenKind::KwLet => {
+                self.next();
+                // 可选 `mut`
+                if self.peek() == &TokenKind::KwMut {
+                    self.next();
+                }
+                let name = match self.next() {
+                    TokenKind::Ident(n) => n,
+                    _ => return None,
+                };
+                let ty = if self.expect(TokenKind::Colon) {
+                    self.parse_type()
+                } else {
+                    None
+                };
+                let init = if self.expect(TokenKind::Eq) {
+                    self.parse_expr()
+                } else {
+                    None
+                };
+                self.expect(TokenKind::Semicolon);
+                Some(Zr0Stmt::Let { name, ty, init })
+            }
+            TokenKind::KwIf => {
+                self.next();
+                let cond = self.parse_expr().unwrap_or(Zr0Expr::BoolLit(false));
+                self.expect(TokenKind::LBrace);
+                let then_branch = self.parse_block();
+                let else_branch = if self.expect(TokenKind::KwElse) {
+                    if self.expect(TokenKind::KwIf) {
+                        // else if 链：合成嵌套 if
+                        let cond2 = self.parse_expr().unwrap_or(Zr0Expr::BoolLit(false));
+                        self.expect(TokenKind::LBrace);
+                        let b2 = self.parse_block();
+                        let tail = if self.expect(TokenKind::KwElse) {
+                            self.expect(TokenKind::LBrace);
+                            Some(self.parse_block())
+                        } else {
+                            None
+                        };
+                        Some(vec![Zr0Stmt::If { cond: cond2, then_branch: b2, else_branch: tail }])
+                    } else {
+                        self.expect(TokenKind::LBrace);
+                        Some(self.parse_block())
+                    }
+                } else {
+                    None
+                };
+                Some(Zr0Stmt::If { cond, then_branch, else_branch })
+            }
+            TokenKind::KwWhile => {
+                self.next();
+                let cond = self.parse_expr().unwrap_or(Zr0Expr::BoolLit(false));
+                self.expect(TokenKind::LBrace);
+                let body = self.parse_block();
+                Some(Zr0Stmt::While { cond, body })
+            }
+            TokenKind::KwReturn => {
+                self.next();
+                let expr = if self.peek() != &TokenKind::Semicolon {
+                    self.parse_expr()
+                } else {
+                    None
+                };
+                self.expect(TokenKind::Semicolon);
+                Some(Zr0Stmt::Return(expr))
+            }
+            TokenKind::KwBreak => {
+                self.next();
+                self.expect(TokenKind::Semicolon);
+                Some(Zr0Stmt::Break)
+            }
+            TokenKind::KwContinue => {
+                self.next();
+                self.expect(TokenKind::Semicolon);
+                Some(Zr0Stmt::Continue)
+            }
+            _ => {
+                let e = self.parse_expr();
+                self.expect(TokenKind::Semicolon);
+                e.map(Zr0Stmt::Expr)
+            }
+        }
+    }
+
+    fn parse_expr(&mut self) -> Option<Zr0Expr> {
+        self.parse_assign()
+    }
+
+    fn parse_assign(&mut self) -> Option<Zr0Expr> {
+        let lhs = self.parse_binary(0)?;
+        if self.expect(TokenKind::Eq) {
+            let rhs = self.parse_assign()?;
+            return Some(Zr0Expr::Assign { target: Box::new(lhs), value: Box::new(rhs) });
+        }
+        Some(lhs)
+    }
+
+    fn parse_binary(&mut self, min_prec: u8) -> Option<Zr0Expr> {
+        let mut lhs = self.parse_unary()?;
+        loop {
+            let prec = match self.peek() {
+                TokenKind::Plus | TokenKind::Minus => 1,
+                TokenKind::Star | TokenKind::Slash | TokenKind::Percent => 2,
+                TokenKind::EqEq | TokenKind::BangEq | TokenKind::Lt | TokenKind::Gt
+                | TokenKind::Le | TokenKind::Ge => 3,
+                TokenKind::AmpAmp => 4,
+                TokenKind::PipePipe => 5,
+                _ => break,
+            };
+            if prec < min_prec {
+                break;
+            }
+            let op = match self.next() {
+                TokenKind::Plus => "+",
+                TokenKind::Minus => "-",
+                TokenKind::Star => "*",
+                TokenKind::Slash => "/",
+                TokenKind::Percent => "%",
+                TokenKind::EqEq => "==",
+                TokenKind::BangEq => "!=",
+                TokenKind::Lt => "<",
+                TokenKind::Gt => ">",
+                TokenKind::Le => "<=",
+                TokenKind::Ge => ">=",
+                TokenKind::AmpAmp => "&&",
+                TokenKind::PipePipe => "||",
+                _ => break,
+            }.to_string();
+            let rhs = self.parse_binary(prec + 1)?;
+            lhs = Zr0Expr::Binary { op, lhs: Box::new(lhs), rhs: Box::new(rhs) };
+        }
+        Some(lhs)
+    }
+
+    fn parse_unary(&mut self) -> Option<Zr0Expr> {
+        match self.peek() {
+            TokenKind::Minus => {
+                self.next();
+                let operand = self.parse_unary()?;
+                Some(Zr0Expr::Unary { op: "-".to_string(), operand: Box::new(operand) })
+            }
+            TokenKind::Bang => {
+                self.next();
+                let operand = self.parse_unary()?;
+                Some(Zr0Expr::Unary { op: "!".to_string(), operand: Box::new(operand) })
+            }
+            TokenKind::Star => {
+                self.next();
+                let operand = self.parse_unary()?;
+                Some(Zr0Expr::Unary { op: "*".to_string(), operand: Box::new(operand) })
+            }
+            _ => self.parse_postfix(),
+        }
+    }
+
+    fn parse_postfix(&mut self) -> Option<Zr0Expr> {
+        let mut e = self.parse_primary()?;
+        loop {
+            match self.peek() {
+                TokenKind::Dot => {
+                    self.next();
+                    if let TokenKind::Ident(field) = self.next() {
+                        e = Zr0Expr::Field { object: Box::new(e), field };
+                    } else {
+                        break;
+                    }
+                }
+                TokenKind::LBracket => {
+                    self.next();
+                    let idx = self.parse_expr()?;
+                    self.expect(TokenKind::RBracket);
+                    e = Zr0Expr::Index { array: Box::new(e), index: Box::new(idx) };
+                }
+                TokenKind::LParen => {
+                    self.next();
+                    let mut args = Vec::new();
+                    while self.peek() != &TokenKind::RParen && self.peek() != &TokenKind::Eof {
+                        if let Some(a) = self.parse_expr() {
+                            args.push(a);
+                        } else {
+                            self.next();
+                        }
+                        if !self.expect(TokenKind::Comma) {
+                            break;
+                        }
+                    }
+                    self.expect(TokenKind::RParen);
+                    e = Zr0Expr::Call { callee: Box::new(e), args };
+                }
+                _ => break,
+            }
+        }
+        Some(e)
+    }
+
+    fn parse_primary(&mut self) -> Option<Zr0Expr> {
+        match self.peek().clone() {
+            TokenKind::IntLiteral(v, _) => {
+                self.next();
+                Some(Zr0Expr::IntLit(v))
+            }
+            TokenKind::KwTrue => {
+                self.next();
+                Some(Zr0Expr::BoolLit(true))
+            }
+            TokenKind::KwFalse => {
+                self.next();
+                Some(Zr0Expr::BoolLit(false))
+            }
+            TokenKind::Ident(name) => {
+                self.next();
+                // 结构体字面量：`Point { x: 3, y: 4 }`
+                if self.peek() == &TokenKind::LBrace {
+                    self.next();
+                    let mut fields = Vec::new();
+                    while self.peek() != &TokenKind::RBrace && self.peek() != &TokenKind::Eof {
+                        if let TokenKind::Ident(fname) = self.next() {
+                            self.expect(TokenKind::Colon);
+                            if let Some(val) = self.parse_expr() {
+                                fields.push((fname, val));
+                            }
+                        } else {
+                            self.next();
+                        }
+                        self.expect(TokenKind::Comma);
+                    }
+                    self.expect(TokenKind::RBrace);
+                    return Some(Zr0Expr::StructLit { name, fields });
+                }
+                Some(Zr0Expr::Var(name))
+            }
+            TokenKind::LParen => {
+                self.next();
+                let e = self.parse_expr();
+                self.expect(TokenKind::RParen);
+                e
+            }
+            _ => None,
         }
     }
 }

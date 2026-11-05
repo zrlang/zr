@@ -434,6 +434,12 @@ impl Parser {
             let expr = self.parse_expression()?;
             return Ok(Expression::Spawn(Box::new(expr), span));
         }
+        // `async { ... }`：异步块。`async` 后必须紧跟 `{`——`async fn` 是
+        // 项级，不在这里出现。生成一个匿名 async 块的 future。
+        if self.match_kind(&TokenKind::KwAsync) && self.check(&TokenKind::LBrace) {
+            let block = self.parse_block()?;
+            return Ok(Expression::AsyncBlock(block, span));
+        }
 
         // ===== comptime =====
         if self.match_kind(&TokenKind::KwComptime) {
@@ -478,6 +484,8 @@ impl Parser {
         }
 
         // ===== Lambda：`|a, b| body` =====
+        // `||` 被 lexer 切成 PipePipe（短路或）；前缀位置的 PipePipe
+        // 只能是空参闭包（中缀位置由 infix 处理，不会到 prefix）。
         if self.match_kind(&TokenKind::Pipe) {
             let mut params = Vec::new();
             if !self.check(&TokenKind::Pipe) {
@@ -487,6 +495,25 @@ impl Parser {
                 }
             }
             self.consume(&TokenKind::Pipe, "expected '|' after lambda parameters")?;
+            let ret = if self.match_kind(&TokenKind::Arrow) {
+                Some(self.parse_type()?)
+            } else {
+                None
+            };
+            let body = if self.check(&TokenKind::LBrace) {
+                self.parse_block()?
+            } else {
+                let expr = self.parse_expression()?;
+                Block {
+                    stmts: Vec::new(),
+                    tail: Some(Box::new(expr)),
+                    span,
+                }
+            };
+            return Ok(Expression::Lambda(params, ret, body, span));
+        }
+        if self.match_kind(&TokenKind::PipePipe) {
+            let params = Vec::new();
             let ret = if self.match_kind(&TokenKind::Arrow) {
                 Some(self.parse_type()?)
             } else {

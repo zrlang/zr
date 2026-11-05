@@ -8,6 +8,7 @@
 use core::{Option, Result, panic};
 use collections::Vec;
 use mem::{memcmp, NULL};
+use boxed::Box;
 
 //=============================================================================
 // Future 协议
@@ -202,12 +203,18 @@ pub fn spawn(frame: *mut void) -> u64 {
     // 此处直接访问；待语言支持 unsafe 块后迁移为 unsafe { ... }。
     return GLOBAL_EXECUTOR.spawn(frame);
 }
-
 /// 运行全局执行器直到所有任务完成。
 pub fn run_all() {
     // 注：访问全局可变状态。zr 当前未实现 `unsafe` 关键字，
     // 此处直接访问；待语言支持 unsafe 块后迁移为 unsafe { ... }。
     GLOBAL_EXECUTOR.run();
+}
+
+/// 阻塞执行单个 future 到完成（Rust `futures::executor::block_on` 风格）。
+/// 用全局执行器轮询；与 `Executor::block_on` 等价，但不用显式构造
+/// `Executor`——业务代码 `let v = block_on(my_async());` 即可。
+pub fn block_on<F: Future>(future: F) -> F::Output {
+    return GLOBAL_EXECUTOR.block_on(future);
 }
 
 //=============================================================================

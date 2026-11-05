@@ -213,6 +213,11 @@ pub enum Type {
     /// 于是借这个变体把它们带进类型检查；`ast_to_hir_type` 把它降成
     /// `Ty::ConstVal`，由 `const` 泛型参数的替换逻辑消费。
     ConstInt(i128),
+    /// 否定边界：`!Trait`（`where T: !Clone`）。
+    ///
+    /// 只出现在 trait 边界位置（泛型参数 / where 子句），表示"T **不**实现
+    /// Trait"（Rust 的 negative bounds）。
+    Not(Box<Type>),
 }
 
 /// 数组长度（可以是编译期常量表达式）。
@@ -427,6 +432,12 @@ pub enum Expression {
     /// 外部函数调用等）。zr 目前无借用检查，`unsafe` 是显式边界标记，检查
     /// 阶段按块表达式透传（块的值即 unsafe 块的值）。
     Unsafe(Box<Expression>, Span),
+    /// `async { ... }` 块：生成一个 future（块体为异步执行体）。
+    ///
+    /// 脱糖为"立即调用的匿名 async fn"：生成隐藏函数
+    /// `__async_block_N`（体是块内容），表达式变成 `__async_block_N()`。
+    /// 这样 async 块与 `async fn` 走同一条状态机降级路径，不需要新机制。
+    AsyncBlock(Block, Span),
     /// `sizeof(T)` / `typeof(e)` / `alignof(T)`
     /// `intrinsic!(op types... args...)`
     ///
@@ -654,6 +665,12 @@ pub struct Function {
     pub receiver: Option<Receiver>, // `self` / `&self` / `&mut self`
     pub return_type: Type,
     pub body: Option<Block>, // `None` = 声明（extern）
+    /// `where` 子句（`fn f<T>(..) where T: Clone`）。
+    ///
+    /// 早先解析后丢弃（`decl.rs` 的 `let _ = parse_where_clause()`），于是
+    /// `where T: Clone` 等于没写——单态化时不校验实参，是类型安全漏洞。
+    /// 现在原样保留，类型检查把它并入 `generic_bounds` 一起校验。
+    pub where_clause: Vec<WherePred>,
 }
 
 /// 泛型参数。
@@ -677,7 +694,12 @@ pub enum GenericParam {
 
 /// `where` 子句谓词。
 #[derive(Debug, Clone)]
-pub struct WherePred;
+pub struct WherePred {
+    /// 左边类型（`where T: Clone` 的 `T`）。
+    pub lhs: Type,
+    /// 边界列表。`!Trait` 解析成 `Type::Not`（negative bound）。
+    pub bounds: Vec<Type>,
+}
 
 /// 函数参数。
 #[derive(Debug, Clone)]
@@ -750,6 +772,11 @@ pub struct StructDef {
     /// 定义所在源码区间。derive 生成的比较/哈希方法用它在诊断里指出
     /// "哪个类型缺 trait"，避免报 `0:0:0`。
     pub span: Span,
+    /// `where` 子句（`struct S<T> where T: Clone`）。
+    ///
+    /// 早先解析后丢弃，等于没写。现在原样保留，类型检查并入
+    /// `generic_bounds` 一起校验（泛型函数同一套机制）。
+    pub where_clause: Vec<WherePred>,
 }
 
 /// 闭包的一个参数：模式 + 可选的类型标注。
@@ -802,6 +829,11 @@ pub struct EnumDef {
     /// 定义所在源码区间。derive 生成的比较/哈希方法用它在诊断里指出
     /// "哪个类型缺 trait"，避免报 `0:0:0`。
     pub span: Span,
+    /// `where` 子句（`enum E<T> where T: Clone`）。
+    ///
+    /// 早先解析后丢弃，等于没写。现在原样保留，类型检查并入
+    /// `generic_bounds` 一起校验（泛型函数同一套机制）。
+    pub where_clause: Vec<WherePred>,
 }
 
 /// 联合体定义。
@@ -920,6 +952,7 @@ impl Spanned for Expression {
             Expression::AddrOf(_, _, s) => *s,
             Expression::Cast(_, _, s) => *s,
             Expression::Block(_b, s) => *s,
+            Expression::AsyncBlock(_b, s) => *s,
             Expression::If(_, _, _, s) => *s,
             Expression::Match(_, _, s) => *s,
             Expression::While(_, _, _, s) => *s,

@@ -40,8 +40,9 @@ use sha256::*;
 use crypto::*;
 use tensor::*;
 use pdb::*;
-// `async` 仍是实验性模块（生成器 / Future 协议骨架），暂不并入 `std` 门面，
-// 需要时显式 `use async::{...}`。
+use async::*;
+// `async` 协程 / Future 运行时已可用（含 `Box<dyn Wake>` 自动解引用分派、
+// 聚合 `static mut` 发射），显式 `use async::{...}` 或 `use std::*` 都行。
 
 //----- std 层（OS 抽象）-------------------------------------------------------
 
