@@ -16,7 +16,7 @@ cargo test --test zr_language
 属性、断言内建这些设施编译器目前还不支持（闭包已可用，见 `83_closure_fnptr.zr`
 与 `84_closure_capture_value.zr`；见下方"尚未覆盖"）。
 
-`tests/cases/` 现有 174 个用例，每个在 `-O0/-O1/-O2/-O3/-Oz` 各跑一遍。
+`tests/cases/` 现有 175 个用例，每个在 `-O0/-O1/-O2/-O3/-Oz` 各跑一遍。
 
 "该报错的还在报错"由另一半套件补上：`tests/negative/*.zr`（50 个）每个都必须
 **编译失败**，且报错文本要含文件里 `// expect: <子串>` 标注的期望子串
@@ -198,6 +198,7 @@ cargo test --test zr_negative
 | `169_box_dyn.zr` | `Box<dyn Wake>` 的 vtable 分派：`Box<Self>` 接收者（`wake(self: Box<Self>)`）与 `&Self` 接收者（`wake_by_ref(self: &Self)`）都经 vtable 槽分派；`*mut T as *mut dyn Tr` 指针 fatten、`Box::into_raw` / `Box::from_raw` 重建、`Waker` 消费 / 借用两种路径。同时钉住 `Box<T>` 自身方法表（`into_raw` / `get` / `as_ptr` / `get_mut` / `replace` / `free`）不被无条件 deref 屏蔽（早先 `b.into_raw()` 报 `no field on type Box<T>`） |
 | `169_hrtb.zr` | 高阶 trait 边界（`for<'a> T: Trait<'a>`）：`parse_lifetime_name` 认 `TokenKind::Lifetime`（`'a` / `'static`）、`for<'a>` 收尾 `>` 正确消费；单 / 多生命周期绑定器、`impl<'a> Trait<'a> for Type`、生命周期标注类型 `&'a i32` 作实参。zr 生命周期参数整体跳过（类型检查丢弃），`'a` 绑定器无语义但语法完整 |
 | `170_trait_apit.zr` | trait 声明方法签名里的 `impl Trait`（APIT）：带 `&self` 接收者（`fn apply(&self, x: impl Clone)`）、trait 默认方法带 APIT（合成到 impl 目标类型后参数正确传递）、关联函数（`S::apply(..)` 路径调用）三种形态；无 receiver 的方法不能点调用（`s.apply(..)` 报 `no field apply on type S`，负向 `51`）。早先 trait 方法参数保持 `opaque` 与 impl 方法脱糖后的签名不一致、实参核验错位 |
+| `171_box_from_raw.zr` | `Box::from_raw` 关联函数路径调用：`from_raw` 去掉方法泛型参数（`from_raw(ptr: *mut T)`，`T` 来自 impl，与 Rust `impl<T> Box<T>` 一致）后，纯路径调用（`T` 从实参 `*mut i32` 推断）、turbofish `Box::<i32>::from_raw`、显式类型标注三种形式都可用；返回的 `Box` 点调用 `get` / `as_ptr`；`Waker::wake` 内部的 `Box::from_raw(self.wake)`（`*mut dyn Wake` 重建）真正执行。早先方法 `from_raw<T>` 重新声明 `T` 与 impl `T` 冲突，`Box::from_raw(raw)` 报 `expected 2 generic argument(s)` |
 
 ## 尚未覆盖（编译器还不支持）
 
