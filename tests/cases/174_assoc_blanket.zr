@@ -1,0 +1,77 @@
+//=============================================================================
+// tests/cases/174_assoc_blanket.zr - 关联类型的毯覆提供
+//
+// `impl<T> Tr for T { type Item = i32; }`（泛型 impl 提供关联类型）的
+// `Item` 投影。`resolve_assoc_type` 的路径 2（`generic_impl_assocs`）遍历
+// 泛型 impl 的关联类型 AST，`match_generic_ast` 匹配基类型后用替换作用域
+// 降低——早先 `future/README.md` 记录"关联类型仍需具体 impl 显式写"，
+// 实际 `generic_impl_assocs` 已走通（`1c67952` 起）。
+//
+// 覆盖：
+// - 纯泛型参数目标 `impl<T> Tr for T`：`S::Item` / 方法体 `Self::Item`
+//   / 跨函数返回类型投影到 `i32`
+// - 泛型具名目标 `impl<T> Tr for Vec<T>`：`<Vec<i32> as Tr>::Item` 投影到
+//   `u8`（目标 `Vec<T>` 匹配 `Vec<i32>`）
+// - 具体 impl 覆盖关联类型时优先（`<S as Tr>::Item` 走具体 `i64`）
+// - 方法体 `Self::Item` 在具体 impl 里解析（`fn get(&self) -> Self::Item`）
+//=============================================================================
+use std::*;
+
+trait Tr {
+    type Item;
+    fn get_item(&self) -> Self::Item;
+}
+
+// 毯覆：纯泛型参数目标，Item = i32。
+impl<T> Tr for T {
+    type Item = i32;
+    fn get_item(&self) -> Self::Item {
+        return 42;
+    }
+}
+
+// 毯覆：泛型具名目标 Vec<T>，Item = u8。
+impl<T> Tr for Vec<T> {
+    type Item = u8;
+    fn get_item(&self) -> Self::Item {
+        return 5;
+    }
+}
+
+struct S;
+
+// 具体 impl：覆盖关联类型（i64），get_item 返回 9。
+impl Tr for S {
+    type Item = i64;
+    fn get_item(&self) -> Self::Item {
+        return 9;
+    }
+}
+
+// 跨函数：S::Item 投影（i64）。
+fn use_s_item() -> S::Item {
+    let s = S {};
+    return s.get_item();
+}
+
+fn main() -> i32 {
+    // 纯泛型目标：S::Item 是具体 impl 的 i64（覆盖优先）。
+    let s = S {};
+    let a: <S as Tr>::Item = s.get_item();
+    if a != 9 {
+        return 1;
+    }
+    // 跨函数投影。
+    let b: i64 = use_s_item();
+    if b != 9 {
+        return 2;
+    }
+    // 泛型具名目标：Vec<i32> 匹配 impl<T> Tr for Vec<T>，Item = u8。
+    let v: Vec<i32> = Vec::new();
+    let c: <Vec<i32> as Tr>::Item = v.get_item();
+    if c != 5 {
+        return 3;
+    }
+    return 0;
+}
+

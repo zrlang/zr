@@ -558,9 +558,14 @@ README 里"指针与 unsafe"一节目前是**愿景**：
   毯覆覆盖无默认体的必需方法时也不算缺失（`impl Tr for W {}` + 毯覆
   `required_b` 合法，缺了才报 `not all trait items implemented`）。
   回归 `tests/cases/173_two_level_default.zr`；负向
-  `tests/negative/53_blanket_required_missing.zr`。**仍不支持**：trait 关联
-  类型的毯覆提供（`impl<T> Tr for T { type Item = ... }` 的关联类型继承）——
-  关联类型仍需具体 impl 显式写。
+  **关联类型毯覆已支持**：`resolve_assoc_type` 的路径 2
+  （`generic_impl_assocs`）遍历泛型 impl 的关联类型 AST，`match_generic_ast`
+  匹配基类型后用替换作用域降低——`impl<T> Tr for T { type Item = i32 }`
+  的 `Item` 对 `S::Item` / `<Vec<i32> as Tr>::Item` / 方法体 `Self::Item` /
+  跨函数返回类型都正确投影（含泛型具名目标 `Vec<T>` 的 `type Item = u8`；
+  具体 impl 覆盖关联类型时优先）。回归 `tests/cases/174_assoc_blanket.zr`。
+  **仍不支持**：`Vec<i32>::Item`（带泛型实参的路径后接关联类型）的表达式
+  位置解析——需用限定路径 `<Vec<i32> as Tr>::Item`。
 - **借用检查**：🟡 最小切片已实现——同位置借用重叠（`&mut`+`&mut` / `&`+`&mut`）
   报 `cannot borrow ... while already borrowed`；**写被借用位置**（`x = 5` 而
   `&x`/`&mut x` 存活）报 `cannot assign to ... while it is borrowed`；**读被借用
