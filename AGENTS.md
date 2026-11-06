@@ -317,10 +317,10 @@ README 里"指针与 unsafe"一节目前是**愿景**：
 3. **栈上传参的偏移要跟着 `rsp` 走**：`Src::Mem(slot)` 是 `[rsp + 8*slot]` 的原始帧偏移，
    压入实参后必须整体加 `released/8`；被调方读 `[rbp + 16 + 8k]`（`rbp` 才是稳定基准）。
 
-### `cargo test` 当前基线（2026-11-03，全绿）
+### `cargo test` 当前基线（2026-11-06，全绿）
 
 - `cargo test --bin zr`：269 项（含标准库三层重组的 2 个 `layer_tests`）。
-- `cargo test --test zr_language`：160 个用例 × 5 个优化等级 = 800 项，另有 3 个宿主端
+- `cargo test --test zr_language`：175 个用例 × 5 个优化等级 = 875 项，另有 3 个宿主端
   对照用例（`io_print_matches_rust`——逐字符对比 Rust 的格式化输出，含 `{:e}` / `{:E}`
   与大浮点 Display（`|v| ≥ 2⁶⁴` 不带 `.0`）的回归；`extern_c_write_prints_string_literal`；
   `toolchain_subcommands_emit`——`zr fmt` / `zr fmt --check` / `zr pkg init` / `zr lsp`
@@ -564,6 +564,19 @@ README 里"指针与 unsafe"一节目前是**愿景**：
   的 `Item` 对 `S::Item` / `<Vec<i32> as Tr>::Item` / 方法体 `Self::Item` /
   跨函数返回类型都正确投影（含泛型具名目标 `Vec<T>` 的 `type Item = u8`；
   具体 impl 覆盖关联类型时优先）。回归 `tests/cases/174_assoc_blanket.zr`。
+  **关联函数毯覆已实现**（2026-11-06）：`S::make(..)` 路径调用早先静默丢失
+  （`resolve_path(["S","make"])` 按 `S__make` 查不到——毯覆的 `make` 被
+  mangle 成 `T__make`，`S` 被当类型路径解析，调用没进 HIR，`-c` 无 `make`
+  符号、运行读到未初始化值）。现在 `check_call` 拦截 `Path` 调用：
+  `lookup_blanket_assoc_fn` 扫泛型 impl 的关联函数（`impl_generics` 非空、
+  方法**无** receiver），`ast_blanket_matches` 判断目标匹配类型名；
+  `check_blanket_assoc_fn_call` 按类型名单态化（`try_instantiate_call` 从
+  实参推 `T` 会错绑 `i32`，故用 `impl_targets` 的目标匹配 `S` 绑泛型参数）；
+  具体 impl 的 `S__make` 优先（`resolve_path` 能解析成函数时不走毯覆）、
+  多候选选最 specific、方法与关联函数在同一毯覆 impl 各自正确分派
+  （`lookup_blanket_method` 匹配有 receiver、`lookup_blanket_assoc_fn`
+  排除 receiver；点调用关联函数 `s.make()` 仍报 `no field`）。
+  回归 `tests/cases/175_blanket_assoc_fn.zr`。
   **仍不支持**：`Vec<i32>::Item`（带泛型实参的路径后接关联类型）的表达式
   位置解析——需用限定路径 `<Vec<i32> as Tr>::Item`。
 - **借用检查**：🟡 最小切片已实现——同位置借用重叠（`&mut`+`&mut` / `&`+`&mut`）

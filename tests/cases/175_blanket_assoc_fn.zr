@@ -1,0 +1,103 @@
+//=============================================================================
+// tests/cases/175_blanket_assoc_fn.zr - 毯覆 impl 的关联函数路径调用
+//
+// 早先 `S::make(..)`（`S` 是类型、`make` 是泛型 impl 的**关联函数**）静默
+// 丢失：`resolve_path(["S","make"])` 按 `S__make` 查不到（毯覆的 `make` 被
+// mangle 成 `T__make`），把 `S` 当类型路径解析返回类型 DefId，调用整体没
+// 进 HIR——`-c` 目标文件无 `make` 符号，运行读到未初始化值（`main` 返回
+// 127）。
+//
+// 现在 `check_call` 拦截 `Path` 调用：路径首段是类型名、末段是关联函数名，
+// `lookup_blanket_assoc_fn` 扫泛型 impl 的关联函数（`impl_generics` 非空、
+// 方法**无** receiver），`ast_blanket_matches` 判断目标匹配类型名；
+// `check_blanket_assoc_fn_call` 按类型名单态化（`try_instantiate_call` 不
+// 适合：它从**实参**推泛型参数，`41` 会把 `T` 绑成 `i32` 而非 `S`）。
+//
+// 覆盖：
+// - 纯泛型参数目标 `impl<T> Tr for T`：`S::make(41)` 得 `41+1`
+// - 泛型具名目标 `impl<T> Tr for Vec<T>`：`Vec::<i32>::make(1)` 得 `101`
+// - 具体 impl 覆盖关联函数时优先（`S` 显式写了 `make` 走具体）
+// - 方法（`s.get_val()` 点调用）与关联函数（`S::make` 路径调用）在同一毯覆
+//   impl 里各自正确分派（`lookup_blanket_method` 匹配有 receiver、
+//   `lookup_blanket_assoc_fn` 排除 receiver）
+// - 多候选选最 specific（`for T` 与 `for Vec<T>`）
+//=============================================================================
+use std::*;
+
+trait Tr {
+    fn make(x: i32) -> i32;
+    fn get_val(&self) -> i32;
+}
+
+// 毯覆：纯泛型参数目标。
+impl<T> Tr for T {
+    fn make(x: i32) -> i32 {
+        return x + 1;
+    }
+    fn get_val(&self) -> i32 {
+        return 7;
+    }
+}
+
+// 毯覆：泛型具名目标 Vec<T>（更 specific）。
+impl<T> Tr for Vec<T> {
+    fn make(x: i32) -> i32 {
+        return x + 100;
+    }
+    fn get_val(&self) -> i32 {
+        return 8;
+    }
+}
+
+struct S;
+
+// 具体 impl：make 显式覆盖（优先于毯覆）。
+impl Tr for S {
+    fn make(x: i32) -> i32 {
+        return x + 5;
+    }
+    fn get_val(&self) -> i32 {
+        return 9;
+    }
+}
+
+struct W;
+
+// 具体 impl：不覆盖关联函数（从毯覆继承）。
+impl Tr for W {
+    fn get_val(&self) -> i32 {
+        return 3;
+    }
+}
+
+fn main() -> i32 {
+    // S 显式写了 make（具体优先）：1 + 5 = 6。
+    let a = S::make(1);
+    if a != 6 {
+        return 1;
+    }
+    // W 没写 make：从毯覆（for T）继承：1 + 1 = 2。
+    let b = W::make(1);
+    if b != 2 {
+        return 2;
+    }
+    // Vec<i32> 匹配更 specific 的 for Vec<T>：1 + 100 = 101。
+    let c = Vec::<i32>::make(1);
+    if c != 101 {
+        return 3;
+    }
+    // 方法（点调用）与关联函数（路径调用）在同一毯覆 impl 里分派。
+    let s = S {};
+    if s.get_val() != 9 {
+        return 4;
+    }
+    let w = W {};
+    if w.get_val() != 3 {
+        return 5;
+    }
+    let v: Vec<i32> = Vec::new();
+    if v.get_val() != 8 {
+        return 6;
+    }
+    return 0;
+}

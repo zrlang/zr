@@ -6188,6 +6188,76 @@ impl TypeChecker {
         best.map(|(_, m)| m)
     }
 
+    /// 毯覆 impl 的**关联函数**（无 `self`）查找：`S::make` 路径调用。
+    ///
+    /// `lookup_blanket_method` 服务点调用（`s.method()`）；关联函数走路径
+    /// 调用（`S::make(..)`），`resolve_path` 按 `S__make` 查不到（毯覆的
+    /// `make` 被 mangle 成 `T__make`），`S::make` 静默当类型路径解析成
+    /// `S` 的类型 DefId、调用整体丢失（`-c` 目标文件无 `make` 符号）。
+    ///
+    /// 这里扫描泛型 impl 的关联函数（`impl_generics` 非空、方法**无**
+    /// receiver），`ast_blanket_matches` 判断目标是否匹配 `type_name` 的
+    /// 类型（`impl<T> Tr for T` 匹配任何、`impl<T> Tr for Vec<T>` 只匹配
+    /// `Vec<..>`）。返回的方法 DefId 交给 `check_blanket_assoc_fn_call`
+    /// 按类型名单态化。
+    fn lookup_blanket_assoc_fn(&self, type_name: &str, fn_name: &str) -> Option<hir::DefId> {
+        let suffix = format!("__{fn_name}");
+        // 类型名的 AST 形状（`S` / `Foo`）与泛型 impl 目标比较。
+        let concrete_ast = AstType::Named {
+            path: vec![type_name.to_string()],
+            generics: vec![],
+        };
+        let mut best: Option<(usize, hir::DefId)> = None;
+        for (mangled, target) in &self.impl_targets {
+            if !mangled.ends_with(&suffix) {
+                continue;
+            }
+            let Some(generics) = self.impl_generics.get(mangled) else {
+                continue;
+            };
+            if generics.is_empty() {
+                continue;
+            }
+            let names: Vec<String> = generics
+                .iter()
+                .filter_map(|g| match g {
+                    ast::GenericParam::Type(n, _) => Some(n.clone()),
+                    ast::GenericParam::Const(n, _) => Some(n.clone()),
+                    _ => None,
+                })
+                .collect();
+            if !ast_blanket_matches(target, &concrete_ast, &names) {
+                continue;
+            }
+            let Some(method) = self.symbols.get(mangled).copied() else {
+                continue;
+            };
+            if !self.functions.contains_key(&method) {
+                continue;
+            }
+            // 只匹配**关联函数**（无 receiver）：`s.make()` 点调用不该被
+            // 路径调用命中，反之亦然。
+            let is_method = self
+                .generic_asts
+                .get(&method)
+                .map(|a| a.receiver.is_some())
+                .or_else(|| {
+                    self.ast_fns
+                        .get(&self.def_names[&method])
+                        .map(|a| a.receiver.is_some())
+                })
+                .unwrap_or(false);
+            if is_method {
+                continue;
+            }
+            let spec = ast_target_specificity(target, &names);
+            if best.as_ref().map(|(s, _)| spec > *s).unwrap_or(true) {
+                best = Some((spec, method));
+            }
+        }
+        best.map(|(_, m)| m)
+    }
+
     /// AST 泛型 impl 目标是否匹配具体类型（只读结构匹配）。
     ///
     /// 与 `match_generic_ast` 同构但不需要 `&mut self`：`lookup_blanket_method`
@@ -6767,6 +6837,91 @@ impl TypeChecker {
             span,
         })
     }
+
+    /// 毯覆 impl 的**关联函数**调用：`S::make(..)` 路径调用。
+    ///
+    /// `check_generic_method_call` 按 receiver 绑 impl 泛型参数；关联函数
+    /// 无 receiver，按**类型名**（`S`）绑——`impl<T> Tr for T` 的 `make`
+    /// 用 `S` 实例化。`try_instantiate_call` 不适合：它从**实参**推泛型
+    /// 参数（`41` 会把 `T` 绑成 `i32`，而 `T` 应绑 `S`）。
+    fn check_blanket_assoc_fn_call(
+        &mut self,
+        base: hir::DefId,
+        type_name: &str,
+        args: &[ast::Argument],
+        span: ast::Span,
+    ) -> Result<HirExpr> {
+        let ast_fn = self
+            .generic_asts
+            .get(&base)
+            .cloned()
+            .ok_or_else(|| CompileError::internal("blanket assoc fn missing AST"))?;
+        let names = self.generic_names.get(&base).cloned().unwrap_or_default();
+        // 类型名转 HIR Ty（单名类型 `S` → `Ty::Named(S_def, [])`）。
+        let type_id = self.resolve_type_path(&[type_name.to_string()])?;
+        let type_ty = Ty::Named(type_id, vec![]);
+        let mut subst: HashMap<String, Ty> = HashMap::new();
+        if let Some(target) = self.impl_targets.get(&ast_fn.name).cloned() {
+            self.match_generic_ast(&target, &type_ty, &names, &mut subst, span)?;
+        }
+        // 检查实参（关联函数无 `self`，不 push receiver）。
+        let mut hir_args = Vec::with_capacity(args.len());
+        for (i, arg) in args.iter().enumerate() {
+            let e = match arg {
+                ast::Argument::Pos(e) | ast::Argument::Named(_, e) => e,
+            };
+            let aty = self.infer.fresh_infer(span);
+            let h = self.check_expr(e, &aty)?;
+            self.check_partial_move(&h, e.span())?;
+            if let Some(p) = ast_fn.params.get(i) {
+                self.match_generic_ast(&p.ty, &h.ty, &names, &mut subst, span)?;
+            }
+            hir_args.push(h);
+        }
+        let mut ordered = Vec::with_capacity(names.len());
+        for n in &names {
+            match subst.get(n) {
+                Some(t) => ordered.push(self.infer.resolve(t)),
+                None => {
+                    return Err(CompileError::type_error(format!(
+                        "cannot infer type parameter `{n}` for `{}`",
+                        ast_fn.name
+                    ))
+                    .with_span(span))
+                }
+            }
+        }
+        self.check_impl_where_bounds(base, &subst, span)?;
+        let id = self.instantiate_generic(base, &ast_fn, &names, &ordered, span)?;
+        let sig = self.functions.get(&id).cloned();
+        let ret = sig
+            .as_ref()
+            .map(|f| f.return_type.clone())
+            .unwrap_or(Ty::Unit);
+        let mut final_args = Vec::with_capacity(hir_args.len());
+        for (i, arg) in args.iter().enumerate() {
+            let e = match arg {
+                ast::Argument::Pos(e) | ast::Argument::Named(_, e) => e,
+            };
+            let pty = match sig.as_ref().and_then(|s| s.params.get(i)) {
+                Some(p) => p.ty.clone(),
+                None => self.infer.fresh_infer(span),
+            };
+            let h = self.check_expr(e, &pty)?;
+            let h = self.check_call_arg(h, &pty, e.span())?;
+            self.check_partial_move(&h, e.span())?;
+            final_args.push(h);
+        }
+        Ok(HirExpr {
+            kind: ExprKind::Call {
+                callee: id,
+                args: final_args,
+                result: self.alloc_local(),
+            },
+            ty: ret,
+            span,
+        })
+    }
     /// 校验 impl 块的 `where` 子句（泛型方法调用时）。
     ///
     /// `subst` 是"泛型参数名 → receiver 实际类型"的映射（`match_generic_ast`
@@ -6941,6 +7096,30 @@ impl TypeChecker {
         if let Expression::Turbofish(inner, targs, _) = callee {
             if let Some(call) = self.check_turbofish_call(inner, targs, args, span)? {
                 return Ok(call);
+            }
+        }
+        // 毯覆 impl 的**关联函数**路径调用：`S::make(..)`。
+        //
+        // `resolve_path(["S","make"])` 按 `S__make` 查不到（毯覆的 `make`
+        // 被 mangle 成 `T__make`），静默把 `S` 当类型路径解析、调用整体
+        // 丢失（`-c` 目标文件无 `make` 符号，运行读到未初始化值）。这里
+        // 在类型检查前拦截：路径首段是类型名、末段是关联函数名，查毯覆
+        // impl 的关联函数并按类型名单态化。
+        if let Expression::Path(path, _) = callee {
+            if path.len() >= 2 {
+                // 具体 impl 的 `S__make` 优先：`resolve_path` 能解析成
+                // 函数时不走毯覆（`S` 显式写了 `make`）。
+                let concrete_fn = self
+                    .resolve_path(path, span)
+                    .ok()
+                    .filter(|id| self.functions.contains_key(id));
+                if concrete_fn.is_none() {
+                    if let Some(bfn) =
+                        self.lookup_blanket_assoc_fn(&path[0], &path[path.len() - 1])
+                    {
+                        return self.check_blanket_assoc_fn_call(bfn, &path[0], args, span);
+                    }
+                }
             }
         }
 
