@@ -71,6 +71,438 @@ fn module_item_names(module: &Program) -> Vec<String> {
     out
 }
 
+//=============================================================================
+// 懒导入：引用驱动的标准库按需加载
+//
+// `use std::*` 是门面（std/std.zr），它 32 个 `use x::*` 全量 glob 会把
+// 整个标准库（含 tensor 69KB、io 94KB、tls 42KB 等重模块）加载进来——
+// 一个只用 `println` 的程序也要解析 32 个模块，编译从 0.5s 涨到 3s+。
+//
+// 懒导入在**加载 std 门面时**按主程序实际引用过滤：`use std::*` 展开出的
+// 子模块 `use x::*`，只有 `x` 的导出名与主程序引用的标识符**相交**时才
+// 真正加载。主程序引用的标识符由 `collect_referenced_names` 收集（遍历
+// 函数体、类型、模式、属性等所有可能出现名字的位置），**保守完整**：
+// 宁可多加载一个模块，不可漏掉被引用的符号。
+//
+// 只作用于 std 门面的 glob 子模块；显式 `use io::*` / `use core::*` 不受
+// 影响（用户指明要哪个模块，必须全量）。
+//=============================================================================
+
+/// 收集主程序**所有**出现的标识符（保守完整）。
+///
+/// 返回的名字集合用于懒导入：std 门面的子模块导出名与它相交才加载。
+/// 收集位置：
+/// - 函数体表达式：`Variable` / `Path` 首段 / 调用 / 字段 / 类型注解；
+/// - 类型注解：`Named` 首段 / `Qualified` 的 trait；
+/// - 类型定义 / trait / 常量 / 静态的定义名（可能被 glob 导出后引用）。
+fn collect_referenced_names(prog: &Program) -> std::collections::HashSet<String> {
+    use crate::parser::ast::*;
+    let mut out = std::collections::HashSet::new();
+
+    fn type_names(t: &Type, out: &mut std::collections::HashSet<String>) {
+        match t {
+            Type::Named { path, generics } => {
+                if let Some(first) = path.first() {
+                    out.insert(first.clone());
+                }
+                for g in generics {
+                    type_names(g, out);
+                }
+            }
+            Type::Qualified { self_ty, trait_ty, .. } => {
+                type_names(self_ty, out);
+                type_names(trait_ty, out);
+            }
+            Type::Pointer(i, _) | Type::Reference(i, _) => type_names(i, out),
+            Type::Array(i, _) | Type::Slice(i, _) | Type::Optional(i) | Type::Not(i) => {
+                type_names(i, out)
+            }
+            Type::Tuple(ts) => {
+                for t in ts {
+                    type_names(t, out);
+                }
+            }
+            Type::Function { params, ret, .. } => {
+                for p in params {
+                    type_names(p, out);
+                }
+                type_names(ret, out);
+            }
+            Type::ErrorUnion(t, e) => {
+                type_names(t, out);
+                type_names(e, out);
+            }
+            Type::ImplTrait(bs) | Type::Dyn(bs) => {
+                for b in bs {
+                    type_names(b, out);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn expr_names(e: &Expression, out: &mut std::collections::HashSet<String>) {
+        match e {
+            Expression::Variable(n, _) => {
+                out.insert(n.clone());
+            }
+            Expression::Path(path, _) => {
+                if let Some(first) = path.first() {
+                    out.insert(first.clone());
+                }
+            }
+            Expression::Binary(a, _, b, _) | Expression::Assign(a, _, b, _) => {
+                expr_names(a, out);
+                expr_names(b, out);
+            }
+            Expression::Unary(_, a, _)
+            | Expression::Question(a, _)
+            | Expression::PostfixBang(a, _)
+            | Expression::AddrOf(a, _, _)
+            | Expression::Comptime(a, _)
+            | Expression::Await(a, _)
+            | Expression::Spawn(a, _)
+            | Expression::Unsafe(a, _)
+            | Expression::Defer(a, _)
+            | Expression::Throw(a, _) => expr_names(a, out),
+            Expression::Turbofish(a, tys, _) => {
+                expr_names(a, out);
+                for t in tys {
+                    type_names(t, out);
+                }
+            }
+            Expression::Call(f, args, _) => {
+                expr_names(f, out);
+                for a in args {
+                    match a {
+                        Argument::Pos(e) | Argument::Named(_, e) => expr_names(e, out),
+                    }
+                }
+            }
+            Expression::MacroCall { name, args, .. } => {
+                out.insert(name.clone());
+                // 宏参数是记号序列：无法静态收集引用，保守不收集（宏展开
+                // 阶段会处理）。若宏引用 std 符号，靠其他位置的收集兜底。
+                let _ = args;
+            }
+            Expression::Index(a, b, _) => {
+                expr_names(a, out);
+                expr_names(b, out);
+            }
+            Expression::Field(a, _, _) => expr_names(a, out),
+            Expression::Cast(a, t, _) => {
+                expr_names(a, out);
+                type_names(t, out);
+            }
+            Expression::Block(b, _) => block_names(b, out),
+            Expression::If(c, t, el, _) => {
+                expr_names(c, out);
+                block_names(t, out);
+                if let Some(el) = el {
+                    expr_names(el, out);
+                }
+            }
+            Expression::IfLet(p, c, t, el, _) => {
+                pattern_names(p, out);
+                expr_names(c, out);
+                block_names(t, out);
+                if let Some(el) = el {
+                    expr_names(el, out);
+                }
+            }
+            Expression::Match(s, arms, _) => {
+                expr_names(s, out);
+                for arm in arms {
+                    pattern_names(&arm.pattern, out);
+                    if let Some(g) = &arm.guard {
+                        expr_names(g, out);
+                    }
+                    expr_names(&arm.body, out);
+                }
+            }
+            Expression::While(c, b, el, _) => {
+                expr_names(c, out);
+                block_names(b, out);
+                if let Some(el) = el {
+                    block_names(el, out);
+                }
+            }
+            Expression::For(p, it, b, _) => {
+                pattern_names(p, out);
+                expr_names(it, out);
+                block_names(b, out);
+            }
+            Expression::Loop(b, _) => block_names(b, out),
+            Expression::Break(_, v, _) => {
+                if let Some(v) = v {
+                    expr_names(v, out);
+                }
+            }
+            Expression::Continue(_, _) | Expression::Goto(_, _) | Expression::Labeled(..)
+            | Expression::Asm(..) | Expression::Intrinsic(..) => {}
+            Expression::Return(Some(e), _) | Expression::Yield(e, _) => expr_names(e, out),
+            Expression::Return(None, _) => {}
+            Expression::Try(e, catch_pat, catch_block, _) => {
+                expr_names(e, out);
+                if let Some(p) = catch_pat {
+                    pattern_names(p, out);
+                }
+                block_names(catch_block, out);
+            }
+            Expression::Array(items, _, _) | Expression::Tuple(items, _) => {
+                for it in items {
+                    expr_names(it, out);
+                }
+            }
+            Expression::StructInit(path, fields, base, _) => {
+                if let Some(first) = path.first() {
+                    out.insert(first.clone());
+                }
+                for (_, v) in fields {
+                    expr_names(v, out);
+                }
+                if let Some(b) = base {
+                    expr_names(b, out);
+                }
+            }
+            Expression::Lambda(params, ret, body, _) => {
+                for p in params {
+                    if let Some(t) = &p.ty {
+                        type_names(t, out);
+                    }
+                    pattern_names(&p.pattern, out);
+                }
+                if let Some(t) = ret {
+                    type_names(t, out);
+                }
+                block_names(body, out);
+            }
+            Expression::AsyncBlock(b, _) => block_names(b, out),
+            Expression::Literal(..) => {}
+        }
+    }
+
+    fn stmt_names(s: &Statement, out: &mut std::collections::HashSet<String>) {
+        match s {
+            Statement::Let(p, t, e, _) | Statement::Var(p, t, e, _) => {
+                pattern_names(p, out);
+                if let Some(t) = t {
+                    type_names(t, out);
+                }
+                if let Some(e) = e {
+                    expr_names(e, out);
+                }
+            }
+            Statement::LetElse(p, t, e, b, _) => {
+                pattern_names(p, out);
+                if let Some(t) = t {
+                    type_names(t, out);
+                }
+                expr_names(e, out);
+                block_names(b, out);
+            }
+            Statement::Const(_, t, e, _) => {
+                type_names(t, out);
+                expr_names(e, out);
+            }
+            Statement::Expr(e, _) => expr_names(e, out),
+        }
+    }
+
+    fn block_names(b: &Block, out: &mut std::collections::HashSet<String>) {
+        for s in &b.stmts {
+            stmt_names(s, out);
+        }
+        if let Some(t) = &b.tail {
+            expr_names(t, out);
+        }
+    }
+
+    fn pattern_names(p: &Pattern, out: &mut std::collections::HashSet<String>) {
+        match p {
+            Pattern::Binding(_, _, sub, _) => {
+                if let Some(sub) = sub {
+                    pattern_names(sub, out);
+                }
+            }
+            Pattern::Tuple(ps, _) => {
+                for p in ps {
+                    pattern_names(p, out);
+                }
+            }
+            Pattern::Struct { path, fields, .. } => {
+                if let Some(first) = path.first() {
+                    out.insert(first.clone());
+                }
+                for f in fields {
+                    pattern_names(&f.pattern, out);
+                }
+            }
+            Pattern::Variant { path, args, .. } => {
+                if let Some(first) = path.first() {
+                    out.insert(first.clone());
+                }
+                for a in args {
+                    pattern_names(a, out);
+                }
+            }
+            Pattern::Slice(ps, _) => {
+                for p in ps {
+                    pattern_names(p, out);
+                }
+            }
+            Pattern::Range(a, b, _, _) => {
+                expr_names(a, out);
+                expr_names(b, out);
+            }
+            Pattern::Ref(inner, _, _) => pattern_names(inner, out),
+            Pattern::Or(ps) => {
+                for p in ps {
+                    pattern_names(p, out);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    // 函数定义名、参数类型、返回类型、函数体、where 子句。
+    for f in &prog.functions {
+        out.insert(f.name.clone());
+        for p in &f.params {
+            type_names(&p.ty, &mut out);
+        }
+        type_names(&f.return_type, &mut out);
+        if let Some(b) = &f.body {
+            block_names(b, &mut out);
+        }
+        for g in &f.generics {
+            match g {
+                GenericParam::Type(n, bounds) => {
+                    out.insert(n.clone());
+                    for b in bounds {
+                        type_names(b, &mut out);
+                    }
+                }
+                GenericParam::Const(n, _) => {
+                    out.insert(n.clone());
+                }
+                _ => {}
+            }
+        }
+        for w in &f.where_clause {
+            type_names(&w.lhs, &mut out);
+            for b in &w.bounds {
+                type_names(b, &mut out);
+            }
+        }
+    }
+    // 类型定义名（可能被 glob 导出后引用）与字段类型。
+    for td in &prog.type_defs {
+        match td {
+            TypeDef::Struct(s) => {
+                out.insert(s.name.clone());
+                for f in &s.fields {
+                    type_names(&f.ty, &mut out);
+                }
+                for g in &s.generics {
+                    if let GenericParam::Type(n, _) = g {
+                        out.insert(n.clone());
+                    }
+                }
+            }
+            TypeDef::Enum(e) => {
+                out.insert(e.name.clone());
+                for v in &e.variants {
+                    match &v.payload {
+                        VariantPayload::Tuple(ts) => {
+                            for t in ts {
+                                type_names(t, &mut out);
+                            }
+                        }
+                        VariantPayload::Struct(fs) => {
+                            for f in fs {
+                                type_names(&f.ty, &mut out);
+                            }
+                        }
+                        VariantPayload::Unit => {}
+                    }
+                }
+                for g in &e.generics {
+                    if let GenericParam::Type(n, _) = g {
+                        out.insert(n.clone());
+                    }
+                }
+            }
+            TypeDef::Union(u) => {
+                out.insert(u.name.clone());
+                for f in &u.fields {
+                    type_names(&f.ty, &mut out);
+                }
+            }
+            TypeDef::Alias { name, target, .. } => {
+                out.insert(name.clone());
+                type_names(target, &mut out);
+            }
+        }
+    }
+    // trait 名、方法签名、关联类型、边界。
+    for t in &prog.traits {
+        out.insert(t.name.clone());
+        for st in &t.super_traits {
+            type_names(st, &mut out);
+        }
+        for m in &t.methods {
+            for p in &m.params {
+                type_names(&p.ty, &mut out);
+            }
+            type_names(&m.return_type, &mut out);
+            if let Some(b) = &m.body {
+                block_names(b, &mut out);
+            }
+        }
+        for at in &t.assoc_types {
+            if let Some(ty) = &at.ty {
+                type_names(ty, &mut out);
+            }
+        }
+    }
+    // const / static 的类型与值。
+    for c in &prog.consts {
+        type_names(&c.ty, &mut out);
+        expr_names(&c.value, &mut out);
+    }
+    for s in &prog.statics {
+        type_names(&s.ty, &mut out);
+        expr_names(&s.init, &mut out);
+    }
+    // impl 目标、trait、方法体、关联类型。
+    for i in &prog.impls {
+        type_names(&i.target, &mut out);
+        if let Some(t) = &i.trait_type {
+            type_names(t, &mut out);
+        }
+        for m in &i.methods {
+            for p in &m.params {
+                type_names(&p.ty, &mut out);
+            }
+            type_names(&m.return_type, &mut out);
+            if let Some(b) = &m.body {
+                block_names(b, &mut out);
+            }
+        }
+        for at in &i.assoc_types {
+            if let Some(ty) = &at.ty {
+                type_names(ty, &mut out);
+            }
+        }
+    }
+    // 宏名。
+    for m in &prog.macros {
+        out.insert(m.name.clone());
+    }
+    out
+}
+
 /// 标准库根目录（`<crate>/std`）。
 pub fn std_root() -> PathBuf {
     let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
@@ -177,8 +609,11 @@ pub fn load_with_root(prog: &mut Program, base_dir: &Path, root_file: Option<&Pa
         glob_deps: std::collections::HashMap::new(),
         report: &mut out.report,
         module_exports: &mut out.module_exports,
+        // 懒导入：主程序引用的标识符。在吸收内联模块**之前**收集
+        // （此时 prog 已解析完，函数体 AST 完整）。
+        referenced_names: collect_referenced_names(prog),
+        filtered: std::collections::HashSet::new(),
     };
-
     // 1) 先展开内联模块（它们已经在内存里了）
     let inline = std::mem::take(&mut prog.modules);
     for decl in inline {
@@ -282,6 +717,11 @@ struct Loader<'a> {
     report: &'a mut LoadReport,
     /// 模块名 → 导出的条目名（`use foo::*` 用）。
     module_exports: &'a mut std::collections::HashMap<String, Vec<String>>,
+    /// 主程序引用的标识符（懒导入过滤用）。空 = 不启用懒导入（主程序
+    /// 无函数体或未被引用收集——保持全量加载，保守）。
+    referenced_names: std::collections::HashSet<String>,
+    /// 懒导入过滤跳过的模块名（符号未加载）。真实依赖到达时覆盖加载。
+    filtered: std::collections::HashSet<String>,
 }
 
 /// `mod` 嵌套深度上限。超过就当作循环引用报错——递归 `mod` 会无限展开。
@@ -299,6 +739,38 @@ impl Loader<'_> {
             roots.into_iter().map(|n| (n, None)).collect();
         while let Some((name, origin)) = queue.pop() {
             let maybe_path = stdlib_module_path(&std_root(), &name);
+            // （无诊断）
+            // 懒导入：`std` 门面（std/std.zr）的 glob 子模块按主程序引用
+            // 过滤——`use std::*` 全量加载 41 个模块，含 tensor / io / tls
+            // 等重模块；一个只用 `println` 的程序也要解析全部。这里只对
+            // **std 门面的直接子模块**（origin == Some("std")）过滤：用户
+            // 显式 `use io::*` 走 origin == None（不过滤，必须全量）；模块
+            // 内部依赖（io 需要 string）也全量（被加载模块的依赖链完整）。
+            // `referenced_names` 为空（未收集到）时保守全量加载。
+            //
+            // 过滤跳过的模块**仍填 `module_exports`**（std.zr 的 `use cmp::*`
+            // 被 absorb 并进主程序，typeck 会对它做 glob——没有导出名表会报
+            // `cannot glob-import`），并进 `modules`（`use cmp::*` 的
+            // `Name("cmp")` 分支靠 `known_modules` 早退）。只是不加载模块体、
+            // 不 absorb——符号缺失时 typeck 报 `cannot find value`，正确。
+            if origin.as_deref() == Some("std") {
+                if let Some(exports) = self.std_glob_exports(&name) {
+                    if exports
+                        .iter()
+                        .any(|e| self.referenced_names.contains(e))
+                    {
+                        // 被引用：走正常加载。
+                    } else {
+                        // 未引用：跳过加载，但记录导出名、模块名与"曾被
+                        // 过滤"标记。真实依赖（已加载模块的内部 use）到达
+                        // 时会覆盖加载。
+                        self.modules.insert(name.clone());
+                        self.module_exports.insert(name.clone(), exports);
+                        self.filtered.insert(name.clone());
+                        continue;
+                    }
+                }
+            }
 
             // 分层约束：core 只能依赖 core；alloc 只能依赖 core/alloc；
             // std 可以依赖任意层。先于"已加载则跳过"检查，避免依赖方向
@@ -316,7 +788,7 @@ impl Loader<'_> {
                 }
             }
 
-            if self.modules.contains(&name) {
+            if self.modules.contains(&name) && !self.filtered.contains(&name) {
                 continue;
             }
             let path = maybe_path.ok_or_else(|| {
@@ -329,6 +801,7 @@ impl Loader<'_> {
 
             let (module, path) = self.parse_file(&path)?;
             self.modules.insert(name.clone());
+            self.filtered.remove(&name);
             self.layers.insert(name.clone(), layer);
 
             // 记录本模块导出的条目名，供 `use core::*` 导入。
@@ -340,8 +813,12 @@ impl Loader<'_> {
                 self.glob_deps.insert(name.clone(), globs);
             }
 
+            // （std 依赖由 collect_use_roots 收集）
             for dep in collect_use_roots(&module.imports) {
-                if !self.modules.contains(&dep) {
+                // 过滤标记（std 门面懒导入跳过的模块）需要真实依赖覆盖加载：
+                // string 的 `use char::is_ascii_whitespace` 若 char 已被过滤，
+                // 这里必须重新入队，让 char 真正加载（符号进 symbols）。
+                if !self.modules.contains(&dep) || self.filtered.contains(&dep) {
                     queue.push((dep, Some(name.clone())));
                 }
             }
@@ -349,6 +826,18 @@ impl Loader<'_> {
             self.absorb(prog, module, &dir, depth, &name);
         }
         Ok(())
+    }
+
+    /// std 门面的子模块 `name` 的导出名（懒导入过滤用）。
+    ///
+    /// 读 `name` 模块文件、解析、取顶层条目名。`None` = 读/解析失败
+    /// （交给后续正常报错，不过滤）。**不**进 `seen` / `modules`——过滤
+    /// 跳过后模块仍可被其他路径正常加载。
+    fn std_glob_exports(&self, name: &str) -> Option<Vec<String>> {
+        let path = stdlib_module_path(&std_root(), name)?;
+        let src = std::fs::read_to_string(&path).ok()?;
+        let module = parse_program(&src, &path.display().to_string()).ok()?;
+        Some(module_item_names(&module))
     }
 
     /// 加载 `mod name;`。

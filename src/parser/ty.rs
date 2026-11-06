@@ -72,6 +72,22 @@ impl Parser {
                     }
                 }
             } else if self.match_kind(&TokenKind::ColonColon) {
+                // 路径段：`Vec<i32>::Item` 的 `::Item`（关联类型投影 / 嵌套
+                // 类型名）。前缀解析器只吃掉基础名的路径（`Foo::Bar` 在
+                // `parse_type_prefix` 里拼完），`Vec<i32>` 这类**带泛型实参**
+                // 的基础名返回后，后面的 `::Item` 落到这里——`::` 被吞掉、
+                // `Item` 留在流里，下游报 `expected Semicolon, found
+                // Ident("Item")`。所以 `::` 后是标识符时把它拼进 Named 路径。
+                //
+                // `::<`（turbofish，`Foo::<i32>`）不是路径段：`::` 后是
+                // `<`/`Shl`，保持原行为（吞掉 `::`，泛型由后续分支处理）。
+                if let TokenKind::Ident(_) = self.peek().kind {
+                    if let Type::Named { path, .. } = &mut ty {
+                        let seg = self.consume_ident("expected path segment")?;
+                        path.push(seg);
+                        continue;
+                    }
+                }
                 // 泛型参数：`Foo::<i32, u64>` —— zr 采用 Rust 的 turbofish 语法
                 // 此处简化：把 `T` 作为路径的一部分处理
                 let _ = ty;
@@ -302,17 +318,43 @@ impl Parser {
             TokenKind::Ident(_) => {
                 let first = self.consume_ident("expected type name")?;
                 let mut path = vec![first];
-                while self.match_kind(&TokenKind::ColonColon) {
-                    path.push(self.consume_ident("expected path segment")?);
+                let mut generics: Vec<Type> = Vec::new();
+                loop {
+                    if self.match_kind(&TokenKind::ColonColon) {
+                        // `::<i32>`（turbofish）：泛型实参挂基类型。
+                        // `Vec::<i32>::Item` 里 `::<i32>` 属 `Vec`，`::Item`
+                        // 是路径段。`::` 后是 `<` 才算 turbofish；是标识符
+                        // 则是路径段（`Foo::Bar`）。
+                        if self.check(&TokenKind::Shl) || self.check(&TokenKind::Lt) {
+                            // `<i32>`：`split_angle` 拆 `<<`（嵌套泛型）为两个
+                            // `<`，`match_kind(Lt)` 消费 `<` 后交给
+                            // `parse_generic_args`（它假定 `<` 已被消费）。
+                            self.split_angle();
+                            if self.match_kind(&TokenKind::Lt) {
+                                generics = self.parse_generic_args()?;
+                            }
+                            continue;
+                        }
+                        // 路径段：`Foo::Bar` / `Vec<i32>::Item` 的 `::Item`。
+                        if let TokenKind::Ident(_) = self.peek().kind {
+                            let seg = self.consume_ident("expected path segment")?;
+                            path.push(seg);
+                            continue;
+                        }
+                        break;
+                    }
+                    // 无 `::`：泛型实参 `<i32>`（非 turbofish）挂在路径末尾。
+                    // `<<`（嵌套限定路径）由 split_angle 拆成两个 `<`，
+                    // `match_kind(Lt)` 消费后交给 parse_generic_args。
+                    if self.check(&TokenKind::Shl) || self.check(&TokenKind::Lt) {
+                        self.split_angle();
+                        if self.match_kind(&TokenKind::Lt) {
+                            generics = self.parse_generic_args()?;
+                        }
+                        continue;
+                    }
+                    break;
                 }
-                if self.check(&TokenKind::Shl) {
-                    self.split_angle();
-                }
-                let generics = if self.match_kind(&TokenKind::Lt) {
-                    self.parse_generic_args()?
-                } else {
-                    vec![]
-                };
                 Ok(Type::Named { path, generics })
             }
             _ => Err(crate::error::CompileError::type_error(format!(
@@ -363,7 +405,6 @@ impl Parser {
         // `>>` / `<<` 拆分：这里正要解析第一个实参，而它可能以 `<` 开头
         // （`Vec<<T as Tr>::Item>`）；反过来收尾处可能撞上 `>>`
         // （`Vec<Vec<i32>>`）。
-        self.split_angle();
         if !self.check(&TokenKind::Gt) {
             self.parse_one_generic_arg(&mut args)?;
             while self.match_kind(&TokenKind::Comma) {

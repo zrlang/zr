@@ -1,0 +1,114 @@
+//=============================================================================
+// tests/cases/176_assoc_path_item.zr - 带泛型实参的路径后接关联类型
+//
+// 早先 `Vec<i32>::Item` 在类型位置解析不了：`parse_type_bp` 的 `ColonColon`
+// 后缀分支把 `::` 吞掉、`Item` 留在 token 流里，报 `expected Semicolon,
+// found Ident("Item")`。`Vec::<i32>::Item`（turbofish）更早：`parse_type_prefix`
+// 的 `Ident` 分支遇 `::<` 报 `expected path segment, found Lt`。
+//
+// 现在：
+// - 解析器 `Ident` 分支重构为"段 + turbofish"循环：`Vec<i32>::Item` 拼成
+//   `Named{path:["Vec","Item"], generics:[i32]}`，`Vec::<i32>::Item` 同理；
+// - `parse_type_bp` 的 `ColonColon` 后缀分支把 `::Ident` 拼进 Named 路径
+//   （`parse_type_prefix` 只吃基础名的路径，带泛型实参的基础名返回后，
+//   `::Item` 落到后缀分支）；
+// - typeck `ast_to_hir_type` 的投影分支放开 `generics.is_empty()` 限制：
+//   基类型用 `Named(Vec_def, [i32])` 而非 `Named(Vec_def, [])`，
+//   `resolve_assoc_type` 才能把 `impl<T> Tr for Vec<T>` 的 `T` 绑成 `i32`；
+// - `resolve_assoc_type` 路径 2（泛型 impl）遍历全部候选、选**最 specific**
+//   （`impl<T> Tr for T` 与 `impl<T> Tr for Vec<T>` 都匹配 `Vec<u8>` 时取
+//   `for Vec<T>`，与 `lookup_blanket_assoc_fn` 一致）。
+//
+// 覆盖：
+// - 非 turbofish 类型位置 `Vec<i32>::Item`（泛型具名目标）
+// - turbofish 类型位置 `Vec::<i32>::Item`
+// - 具体类型 `S::Item`（具体 impl，具体覆盖优先）
+// - 具体类型 `W::Item`（具体 impl 不覆盖，从毯覆继承）
+// - 纯泛型参数目标 `T::Item`（`impl<T> Tr for T`）
+// - 嵌套泛型 `Vec<Vec<i32>>::Item`（`impl<T> Tr for Vec<Vec<T>>`）
+// - 多候选选最 specific（`Vec<u8>::Item` 得 `for Vec<T>` 的 `u8`，非 `i32`）
+// - 泛型函数体内投影
+//=============================================================================
+use std::*;
+
+trait Tr {
+    type Item;
+}
+
+// 毯覆：纯泛型参数目标。
+impl<T> Tr for T {
+    type Item = i32;
+}
+
+// 毯覆：泛型具名目标 Vec<T>（更 specific）。
+impl<T> Tr for Vec<T> {
+    type Item = u8;
+}
+
+// 毯覆：嵌套泛型目标 Vec<Vec<T>>。
+impl<T> Tr for Vec<Vec<T>> {
+    type Item = u16;
+}
+
+struct S;
+
+// 具体 impl：Item 显式覆盖（优先于毯覆）。
+impl Tr for S {
+    type Item = i64;
+}
+
+struct W;
+
+// 具体 impl：不覆盖关联类型（从毯覆继承）。
+impl Tr for W {}
+
+// 泛型函数体内投影：`Vec<i32>::Item` 在函数体里也要能解析。
+fn use_item(v: Vec<i32>) -> u8 {
+    let x: Vec<i32>::Item = 7;
+    return x;
+}
+
+fn main() -> i32 {
+    // 非 turbofish：`Vec<i32>::Item` 得 `for Vec<T>` 的 `u8`。
+    let x: Vec<i32>::Item = 5;
+    if x as i32 != 5 {
+        return 1;
+    }
+
+    // turbofish：`Vec::<i32>::Item` 同上。
+    let y: Vec::<i32>::Item = 6;
+    if y as i32 != 6 {
+        return 2;
+    }
+    // 具体类型 + 具体 impl（具体覆盖优先）：i64。
+    let s: S::Item = 3;
+    if s as i32 != 3 {
+        return 3;
+    }
+    // 具体类型 + 毯覆（for T）：i32。
+    let w: W::Item = 4;
+    if w as i32 != 4 {
+        return 4;
+    }
+    // 纯泛型参数目标：`impl<T> Tr for T` 的 `Item = i32`（`W` 从毯覆继承）。
+    let t: W::Item = 5;
+    if t as i32 != 5 {
+        return 4;
+    }
+    // 多候选选最 specific：`Vec<u8>` 匹配 `for Vec<T>`（u8）而非 `for T`（i32）。
+    let z: Vec<u8>::Item = 9;
+    if z as i32 != 9 {
+        return 5;
+    }
+    // 嵌套泛型：`Vec<Vec<i32>>::Item` 得 `for Vec<Vec<T>>` 的 `u16`。
+    let n: Vec<Vec<i32>>::Item = 10;
+    if n as i32 != 10 {
+        return 6;
+    }
+    // 泛型函数体内投影。
+    let v: Vec<i32> = Vec::new();
+    if use_item(v) != 7 {
+        return 7;
+    }
+    return 0;
+}

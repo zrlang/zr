@@ -577,8 +577,20 @@ README 里"指针与 unsafe"一节目前是**愿景**：
   （`lookup_blanket_method` 匹配有 receiver、`lookup_blanket_assoc_fn`
   排除 receiver；点调用关联函数 `s.make()` 仍报 `no field`）。
   回归 `tests/cases/175_blanket_assoc_fn.zr`。
-  **仍不支持**：`Vec<i32>::Item`（带泛型实参的路径后接关联类型）的表达式
-  位置解析——需用限定路径 `<Vec<i32> as Tr>::Item`。
+  **带泛型实参的路径后接关联类型已实现**（2026-11-06，
+  `176_assoc_path_item.zr`）：`Vec<i32>::Item` / `Vec::<i32>::Item`
+  （turbofish）在类型位置早先解析不了（`parse_type_bp` 的 `ColonColon`
+  后缀分支吞 `::`、`Item` 留流里报 `expected Semicolon`；turbofish
+  前缀分支遇 `::<` 报 `expected path segment`）。现在解析器 `Ident`
+  分支重构为"段 + turbofish"循环、`parse_type_bp` 后缀分支把 `::Ident`
+  拼进 Named 路径；typeck 投影分支放开 `generics.is_empty()` 限制
+  （基类型用 `Named(Vec_def,[i32])` 才能把 `impl<T> Tr for Vec<T>` 的
+  `T` 绑成 `i32`）；`resolve_assoc_type` 路径 2 遍历全部候选选**最
+  specific**（`impl<T> Tr for T` 与 `for Vec<T>` 都匹配 `Vec<u8>` 时取
+  后者，与 `lookup_blanket_assoc_fn` 一致）。覆盖具体类型（具体 impl
+  覆盖优先、毯覆继承）、纯泛型参数目标、嵌套泛型、泛型函数体内投影。
+  **仍不支持**：`i32::Item`（基元类型基，`i32` 是 `Type::I` 非 `Named`，
+  需用限定路径 `<i32 as Tr>::Item`）的表达式位置解析。
 - **借用检查**：🟡 最小切片已实现——同位置借用重叠（`&mut`+`&mut` / `&`+`&mut`）
   报 `cannot borrow ... while already borrowed`；**写被借用位置**（`x = 5` 而
   `&x`/`&mut x` 存活）报 `cannot assign to ... while it is borrowed`；**读被借用

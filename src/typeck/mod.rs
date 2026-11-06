@@ -9275,6 +9275,12 @@ impl TypeChecker {
         // 目标 AST，匹配成功就把关联类型 AST 在替换后的作用域里降低。
         // 同样按 trait_id 过滤：限定路径 `<A as Tr>::Item` 只认实现 `Tr`
         // 的 impl，`F::Output`（trait_id=None）不设限。
+        //
+        // 多个泛型 impl 同时匹配时（`impl<T> Tr for T` 与
+        // `impl<T> Tr for Vec<T>` 都匹配 `Vec<u8>`），取**最 specific**——
+        // `Vec<u8>::Item` 应得 `for Vec<T>` 的 `u8`，而不是先收集的
+        // `for T` 的 `i32`。与 `lookup_blanket_assoc_fn` 的候选选择一致。
+        let mut best: Option<(usize, Ty)> = None;
         for entry in self.generic_impl_assocs.clone() {
             if let Some(tid) = trait_id {
                 if entry.trait_id != Some(tid) {
@@ -9299,9 +9305,16 @@ impl TypeChecker {
             );
             let result = self.ast_to_hir_type(assoc_ast).ok();
             self.type_params = saved;
-            if result.is_some() {
-                return result;
+            let Some(result) = result else {
+                continue;
+            };
+            let spec = ast_target_specificity(&entry.target_ast, &entry.generic_names);
+            if best.as_ref().map(|(s, _)| spec > *s).unwrap_or(true) {
+                best = Some((spec, result));
             }
+        }
+        if let Some((_, ty)) = best {
+            return Some(ty);
         }
         None
     }
@@ -11760,20 +11773,31 @@ fn subst_const_expr(e: &HirExpr, consts: &HashMap<String, i128>) -> HirExpr {
                         return Ok(ty);
                     }
                 }
-                // 关联类型投影：`Self::Output` / `F::Output` / `IntFut::Output`。
+                // 关联类型投影：`Self::Output` / `F::Output` / `IntFut::Output`
+                // / `Vec<i32>::Item`。
                 //
                 // `path[0]` 可以是：
                 // - 类型参数（`Self`、泛型函数的 `F`）——`lookup_type_param` 命中；
-                // - 具体命名类型（`IntFut`）——`resolve_type_path` 拿到 DefId。
+                // - 具体命名类型（`IntFut` / `Vec`）——`resolve_type_path` 拿到 DefId。
                 //
                 // 泛型函数声明期 `F` 还是推断变量，投影不出具体类型——返回一个
                 // 新的推断变量占位，等实例化时（`build_instance_signature`，
                 // `F` 已被替换成具体类型）重新降低签名时再投影。
-                if path.len() == 2 && generics.is_empty() {
+                //
+                // `generics` 不再要求为空：`Vec<i32>::Item` 的泛型实参挂在
+                // 基类型上（`path: ["Vec","Item"], generics: [i32]`），基类型
+                // 是 `Vec<i32>` 而不是 `Vec`——`resolve_assoc_type` 按带实参的
+                // 基类型匹配 `impl<T> Tr for Vec<T>` 才能把 `T` 绑成 `i32`。
+                if path.len() == 2 {
                     let base_ty = if let Some(ty) = self.lookup_type_param(&path[0]) {
                         Some(ty)
                     } else if let Ok(id) = self.resolve_type_path(&[path[0].clone()]) {
-                        Some(Ty::Named(id, Vec::new()))
+                        // 基类型的泛型实参：`Vec<i32>` 的 `[i32]`。
+                        let base_args: Vec<Ty> = generics
+                            .iter()
+                            .map(|g| self.ast_to_hir_type_arg(g))
+                            .collect::<Result<_>>()?;
+                        Some(Ty::Named(id, base_args))
                     } else {
                         None
                     };
