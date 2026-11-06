@@ -1,0 +1,28 @@
+//=============================================================================
+// tests/negative/52_blanket_bound.zr - 毯覆 impl 的边界校验
+//
+// `impl<T: Marker2> GoTrait for T` 的毯覆方法，receiver 不实现 `Marker2`
+// 时单态化必须报错（与泛型函数边界同一路径）。
+//=============================================================================
+trait Marker2 {
+    fn cl(&self) -> i32;
+}
+
+trait GoTrait {
+    fn go(&self) -> i32;
+}
+
+struct NoClone;
+
+impl<T: Marker2> GoTrait for T {
+    fn go(&self) -> i32 {
+        return self.cl();
+    }
+}
+
+fn main() -> i32 {
+    let n = NoClone {};
+    let _ = n.go();
+    return 0;
+}
+// expect: does not implement trait `Marker2`

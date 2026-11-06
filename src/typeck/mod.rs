@@ -5971,21 +5971,45 @@ impl TypeChecker {
                     }
                     if let Ty::Named(_, args) = ty {
                         if let Some(inner) = args.first() {
-                            return self.lookup_method(inner, name);
+                            if let Some(m) = self.lookup_method(inner, name) {
+                                return Some(m);
+                            }
                         }
                     }
-                    return None;
+                    return self.lookup_blanket_method(ty, name);
                 }
-                self.lookup_named_method(&self.def_names.get(id)?.clone(), name)
+                if let Some(m) =
+                    self.lookup_named_method(&self.def_names.get(id)?.clone(), name)
+                {
+                    return Some(m);
+                }
+                self.lookup_blanket_method(ty, name)
             }
-            Ty::Int(w) => self.lookup_named_method(&format!("i{w}"), name),
-            Ty::Uint(w) => self.lookup_named_method(&format!("u{w}"), name),
-            Ty::Float(w) => self.lookup_named_method(&format!("f{w}"), name),
-            Ty::Bool => self.lookup_named_method("bool", name),
-            Ty::Char => self.lookup_named_method("char", name),
-            Ty::Str => self.lookup_named_method("str", name),
+            Ty::Int(w) => self
+                .lookup_named_method(&format!("i{w}"), name)
+                .or_else(|| self.lookup_blanket_method(ty, name)),
+            Ty::Uint(w) => self
+                .lookup_named_method(&format!("u{w}"), name)
+                .or_else(|| self.lookup_blanket_method(ty, name)),
+            Ty::Float(w) => self
+                .lookup_named_method(&format!("f{w}"), name)
+                .or_else(|| self.lookup_blanket_method(ty, name)),
+            Ty::Bool => self
+                .lookup_named_method("bool", name)
+                .or_else(|| self.lookup_blanket_method(ty, name)),
+            Ty::Char => self
+                .lookup_named_method("char", name)
+                .or_else(|| self.lookup_blanket_method(ty, name)),
+            Ty::Str => self
+                .lookup_named_method("str", name)
+                .or_else(|| self.lookup_blanket_method(ty, name)),
             Ty::Reference(inner, _) | Ty::Pointer(inner, _) => {
-                self.lookup_method(inner, name)
+                // `&T` / `*T` 的方法先按内层 `T` 查（Rust 自动解引用），
+                // 再查 `&T` 本身的毯覆（`impl<T> Tr for &T`）。
+                if let Some(m) = self.lookup_method(inner, name) {
+                    return Some(m);
+                }
+                self.lookup_blanket_method(ty, name)
             }
             Ty::Opaque(id) => {
                 if let Some(hidden) = self.opaque_hidden.get(id) {
@@ -6001,8 +6025,19 @@ impl TypeChecker {
                         return Some(method);
                     }
                 }
-                None
+                self.lookup_blanket_method(ty, name)
             }
+            // 元组 / 切片 / 数组 / 可选 / 错误联合 / `()` / `!` 也能有
+            // 毯覆方法（`impl<T> Tr for T` 匹配任何类型），不能直接落到
+            // `_ => None`。
+            Ty::Tuple(_)
+            | Ty::Slice(_, _)
+            | Ty::Array(_, _)
+            | Ty::Optional(_)
+            | Ty::ErrorUnion(_, _)
+            | Ty::Unit
+            | Ty::Never
+            | Ty::Dyn(_) => self.lookup_blanket_method(ty, name),
             _ => None,
         }
     }
@@ -6034,6 +6069,155 @@ impl TypeChecker {
             return None;
         }
         Some(method)
+    }
+
+    /// 泛型 impl（`impl<T> Tr for T`）的毯覆方法查找。
+    ///
+    /// `lookup_method` 按具名类型名（`S__method`）查不到时回退到这里：扫描
+    /// 所有**泛型** impl 的方法（`impl_generics` 非空），找目标类型能匹配
+    /// receiver 的那个（`impl<T> Tr for T` 匹配任何类型、`impl<T> Tr for
+    /// Vec<T>` 只匹配 `Vec<..>`）。匹配到的方法 DefId 交给
+    /// `check_generic_method_call` 按 receiver 具体类型单态化。
+    ///
+    /// 早先这个方法查找缺失：`impl<T> Greet for T` 的方法被 mangle 成
+    /// `T__greet`，`lookup_method` 按 `S__greet` 查不到，`s.greet()` 报
+    /// `no field greet on type S`（`future/specialization.md` 的两级继承
+    /// 也因此无法推进——毯覆 impl 的方法解析是它的前提）。
+    fn lookup_blanket_method(&self, ty: &Ty, name: &str) -> Option<hir::DefId> {
+        let suffix = format!("__{name}");
+        // 收集所有匹配候选：`(specificity, method)`。多个毯覆 impl 同时
+        // 匹配（`impl<T> Tr for T` 与 `impl<T> Tr for Vec<T>` 都匹配
+        // `Vec<i32>`）时选**最 specific**（`impl<T> Tr for Vec<T>`），与
+        // `check_overlap` 的特化选择一致——早先遍历 `impl_targets`
+        // （HashMap，无序）直接返回首个匹配，`Vec<i32>` 可能落到 `for T`
+        // 的通用方法（`overlap2.zr` 实测依赖插入顺序）。
+        let mut best: Option<(usize, hir::DefId)> = None;
+        for (mangled, target) in &self.impl_targets {
+            if !mangled.ends_with(&suffix) {
+                continue;
+            }
+            let Some(generics) = self.impl_generics.get(mangled) else {
+                continue;
+            };
+            if generics.is_empty() {
+                continue;
+            }
+            let names: Vec<String> = generics
+                .iter()
+                .filter_map(|g| match g {
+                    ast::GenericParam::Type(n, _) => Some(n.clone()),
+                    ast::GenericParam::Const(n, _) => Some(n.clone()),
+                    _ => None,
+                })
+                .collect();
+            if !self.ast_target_matches(target, ty, &names) {
+                continue;
+            }
+            let Some(method) = self.symbols.get(mangled).copied() else {
+                continue;
+            };
+            if !self.functions.contains_key(&method) {
+                continue;
+            }
+            // 只匹配**有 receiver** 的方法（关联函数走路径调用，不该被
+            // 点调用命中——与 `lookup_named_method` 同一约定）。
+            let is_method = self
+                .generic_asts
+                .get(&method)
+                .map(|a| a.receiver.is_some())
+                .or_else(|| {
+                    self.ast_fns
+                        .get(&self.def_names[&method])
+                        .map(|a| a.receiver.is_some())
+                })
+                .unwrap_or(false);
+            if !is_method {
+                continue;
+            }
+            let spec = ast_target_specificity(target, &names);
+            if best.as_ref().map(|(s, _)| spec > *s).unwrap_or(true) {
+                best = Some((spec, method));
+            }
+        }
+        best.map(|(_, m)| m)
+    }
+
+    /// AST 泛型 impl 目标是否匹配具体类型（只读结构匹配）。
+    ///
+    /// 与 `match_generic_ast` 同构但不需要 `&mut self`：`lookup_blanket_method`
+    /// 在 `&self` 上下文里扫描，这里只判断"形状匹配"，不绑定推断变量。
+    /// `names` 是 impl 的泛型参数名列表（`T` / `N` …），占位参数匹配任何
+    /// 子类型。
+    fn ast_target_matches(&self, pat: &AstType, actual: &Ty, names: &[String]) -> bool {
+        let actual = self.resolve_ty(actual);
+        match pat {
+            // 纯泛型参数占位：`impl<T> Tr for T` 的目标 `T` 匹配任何类型。
+            AstType::Named { path, generics }
+                if path.len() == 1 && generics.is_empty() && names.iter().any(|n| n == &path[0]) =>
+            {
+                true
+            }
+            // 具名类型：`impl<T> Tr for Vec<T>` 的目标 `Vec<T>`。
+            AstType::Named { path, generics } => {
+                let Some(type_name) = path.last() else {
+                    return false;
+                };
+                match &actual {
+                    Ty::Named(id, args) => {
+                        self.def_names.get(id).map(|n| n == type_name).unwrap_or(false)
+                            && generics.len() == args.len()
+                            && generics
+                                .iter()
+                                .zip(args)
+                                .all(|(g, a)| self.ast_target_matches(g, a, names))
+                    }
+                    _ => false,
+                }
+            }
+            AstType::I(w) => matches!(actual, Ty::Int(x) if x as usize == *w),
+            AstType::U(w) => matches!(actual, Ty::Uint(x) if x as usize == *w),
+            AstType::F(w) => matches!(actual, Ty::Float(x) if x as usize == *w),
+            AstType::Bool => matches!(actual, Ty::Bool),
+            AstType::Char => matches!(actual, Ty::Char),
+            AstType::Str => matches!(actual, Ty::Str),
+            AstType::Pointer(inner, _) => match &actual {
+                Ty::Pointer(a, _) | Ty::Reference(a, _) => {
+                    self.ast_target_matches(inner, a, names)
+                }
+                _ => false,
+            },
+            AstType::Reference(inner, _) => match &actual {
+                Ty::Reference(a, _) | Ty::Pointer(a, _) => {
+                    self.ast_target_matches(inner, a, names)
+                }
+                _ => false,
+            },
+            AstType::Array(inner, _) => match &actual {
+                Ty::Array(a, _) => self.ast_target_matches(inner, a, names),
+                _ => false,
+            },
+            AstType::Slice(inner, _) => match &actual {
+                Ty::Slice(a, _) | Ty::Array(a, _) => self.ast_target_matches(inner, a, names),
+                _ => false,
+            },
+            AstType::Tuple(ps) => match &actual {
+                Ty::Tuple(as_) => {
+                    ps.len() == as_.len()
+                        && ps.iter().zip(as_).all(|(p, a)| self.ast_target_matches(p, a, names))
+                }
+                _ => false,
+            },
+            AstType::Optional(inner) => match &actual {
+                Ty::Optional(a) => self.ast_target_matches(inner, a, names),
+                // `T?` 语法糖是 `Option<T>`：具名类型也匹配内层（`T` 是
+                // `Option` 的唯一实参）。
+                Ty::Named(_, args) if args.len() == 1 => {
+                    self.ast_target_matches(inner, &args[0], names)
+                }
+                _ => false,
+            },
+            _ => false,
+        }
     }
 
     /// 识别 `size_of` / `align_of` 的**编译期定义**形状。
@@ -13059,6 +13243,36 @@ fn check_orphan_rule(
 
 /// 重叠检查：两个 impl 不能应用到同一个具体类型。
 /// 对于 marker trait，允许重叠（多个 impl 可以共存）。
+/// AST 泛型 impl 目标的"具体化程度"。纯泛型参数（`T`）= 0，具名类型按
+/// 嵌套泛型深度递增（`Vec<T>` = 1，`Vec<Vec<T>>` = 2）。
+///
+/// `lookup_blanket_method` 收集多个匹配候选（`impl<T> Tr for T` 与
+/// `impl<T> Tr for Vec<T>` 都匹配 `Vec<i32>`）时用它选最 specific，与
+/// `check_overlap` 的特化选择一致。`is_more_specific` 只区分"具体 vs
+/// 泛型参数"（`Ty::Infer`），无法区分 `Vec<T>` 与 `Vec<Vec<T>>` 的嵌套
+/// 深度，这里按结构递归。
+fn ast_target_specificity(pat: &AstType, names: &[String]) -> usize {
+    match pat {
+        AstType::Named { path, generics }
+            if path.len() == 1 && generics.is_empty() && names.iter().any(|n| n == &path[0]) =>
+        {
+            0
+        }
+        AstType::Named { generics, .. } => {
+            1 + generics
+                .iter()
+                .map(|g| ast_target_specificity(g, names))
+                .sum::<usize>()
+        }
+        AstType::Pointer(inner, _)
+        | AstType::Reference(inner, _)
+        | AstType::Array(inner, _)
+        | AstType::Slice(inner, _)
+        | AstType::Optional(inner) => ast_target_specificity(inner, names),
+        AstType::Tuple(ps) => ps.iter().map(|p| ast_target_specificity(p, names)).sum(),
+        _ => 0,
+    }
+}
 fn check_overlap(
     new_impl: &hir::HirImpl,
     existing_impls: &[hir::HirImpl],

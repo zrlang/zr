@@ -1,0 +1,117 @@
+//=============================================================================
+// tests/cases/172_blanket_impl.zr - 毯覆 impl（泛型 impl）的方法查找
+//
+// 早先 `impl<T> Tr for T` 的方法被 mangle 成 `T__method`，`lookup_method`
+// 按 receiver 类型名（`S__method`）查不到，`s.method()` 一律报
+// `no field method on type S`——毯覆 impl 的方法解析完全缺失
+// （`future/specialization.md` 的两级默认体继承因此无法推进）。
+//
+// 现在 `lookup_method` 查不到具名方法时回退到 `lookup_blanket_method`：
+// 扫描所有泛型 impl 的方法（`impl_generics` 非空），用
+// `ast_target_matches` 做只读结构匹配——`impl<T> Tr for T` 匹配任何类型、
+// `impl<T> Tr for Vec<T>` 只匹配 `Vec<..>`、`impl<T: Clone2> Tr for T`
+// 的边界在单态化时校验。匹配到的方法 DefId 交给
+// `check_generic_method_call` 按 receiver 具体类型单态化（方法体里
+// `self.other()` 走同一条毯覆查找）。
+//
+// 覆盖：
+// - `impl<T> Tr for T`（纯泛型参数目标）匹配具体类型
+// - `impl<T> Tr for Vec<T>`（泛型具名目标）只匹配 `Vec<..>`
+// - 毯覆方法体里调 impl 泛型参数的方法（`self.cl()`，`T: Clone2`）
+// - 带边界的毯覆 impl：receiver 不满足边界时单态化报错
+//   （负向 `tests/negative/52_blanket_bound.zr`）
+// - 具体 impl 优先于毯覆 impl（特化：更 specific 的 impl 优先）
+// - 固有方法与毯覆方法的优先级（固有先查）
+// - 基元类型的毯覆（`i32` 也走 `impl<T> Tr for T`）
+//=============================================================================
+use std::*;
+
+trait Marker2 {
+    fn cl(&self) -> i32;
+}
+
+trait Tr {
+    fn val(&self) -> i32;
+}
+
+struct S;
+struct W;
+struct HasClone;
+
+impl Marker2 for HasClone {
+    fn cl(&self) -> i32 {
+        return 3;
+    }
+}
+
+// 毯覆 impl：所有类型（`i32` 也命中）。
+impl<T> Tr for T {
+    fn val(&self) -> i32 {
+        return 1;
+    }
+}
+
+// 具体 impl：`S` 覆盖毯覆（更 specific）。
+impl Tr for S {
+    fn val(&self) -> i32 {
+        return 2;
+    }
+}
+
+// 另一个毯覆候选：`Vec<..>` 比 `for T` 更 specific。`Vec<i32>` 的 `val()`
+// 应走这里（`for T` 的通用方法不覆盖），`i32` 仍走 `for T`。
+impl<T> Tr for Vec<T> {
+    fn val(&self) -> i32 {
+        return 4;
+    }
+}
+
+// 泛型具名目标：只匹配 `Vec<..>`。
+trait SumTrait {
+    fn sum_len(&self) -> i32;
+}
+
+impl<T> SumTrait for Vec<T> {
+    fn sum_len(&self) -> i32 {
+        return self.len();
+    }
+}
+
+// 带边界的毯覆 impl：方法体调用 `T` 的方法。
+trait GoTrait {
+    fn go(&self) -> i32;
+}
+
+impl<T: Marker2> GoTrait for T {
+    fn go(&self) -> i32 {
+        return self.cl();
+    }
+}
+
+fn main() -> i32 {
+    let s = S {};
+    let w = W {};
+    if s.val() != 2 {
+        return 1; // 具体 impl 优先
+    }
+    if w.val() != 1 {
+        return 2; // 毯覆兜底
+    }
+    let x: i32 = 5;
+    if x.val() != 1 {
+        return 3; // 基元也走毯覆
+    }
+    let v: Vec<i32> = Vec::new();
+    if v.sum_len() != 0 {
+        return 4; // Vec<T> 目标匹配
+    }
+    let h = HasClone {};
+    if h.go() != 3 {
+        return 5; // 带边界毯覆的方法体调用 T 的方法
+    }
+    let v2: Vec<i32> = Vec::new();
+    if v2.val() != 4 {
+        return 6; // 更 specific 的毯覆候选（`Vec<T>`）优先于 `for T`
+    }
+    return 0;
+}

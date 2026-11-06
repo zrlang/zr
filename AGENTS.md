@@ -542,10 +542,17 @@ README 里"指针与 unsafe"一节目前是**愿景**：
   `tests/negative/37_trait_missing_method.zr`）。
   回归 `tests/cases/124_trait_default_methods.zr`（常量默认体、默认体读字段 /
   调另一个默认体、impl 覆盖、trait 与 impl 两侧的 `default fn`、`&self`
-  接收者核验）。**仍不支持**：泛型 impl（`impl<T> Tr for T`）的毯覆方法解析
-  （方法名落在类型参数 `T__m` 上，receiver 的具体类型名查不到），以及
-  Rust 特化里"更具体的 impl 只覆盖一部分默认方法、其余从毯覆 impl 继承"的
-  两级默认体继承——那需要毯覆 impl 的方法查找本身先做出来。
+  接收者核验）。**毯覆 impl 的方法解析已实现**（2026-11-06）：`lookup_method`
+  查不到具名方法（`S__m`）时回退 `lookup_blanket_method`——扫描
+  `impl_targets` 里 `impl_generics` 非空的方法，`ast_target_matches` 做
+  只读结构匹配（`impl<T> Tr for T` 匹配任何类型、`impl<T> Tr for Vec<T>`
+  只匹配 `Vec<..>`），匹配到的方法 DefId 交给 `check_generic_method_call`
+  单态化。毯覆方法体里调 `T` 的方法（`self.cl()`，`T: Clone2`）、带边界
+  毯覆（receiver 不满足边界时单态化报错，负向 `52`）、具体 impl 优先于
+  毯覆（特化）、基元走毯覆都可用；回归 `tests/cases/172_blanket_impl.zr`。
+  **仍不支持**：Rust 特化里"更具体的 impl 只覆盖一部分默认方法、其余从
+  毯覆 impl 继承"的两级默认体继承——那需要默认方法合成与毯覆方法查找的
+  组合（当前具体 impl 未覆盖的默认方法仍不会从毯覆继承）。
 - **借用检查**：🟡 最小切片已实现——同位置借用重叠（`&mut`+`&mut` / `&`+`&mut`）
   报 `cannot borrow ... while already borrowed`；**写被借用位置**（`x = 5` 而
   `&x`/`&mut x` 存活）报 `cannot assign to ... while it is borrowed`；**读被借用
