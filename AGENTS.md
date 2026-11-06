@@ -550,9 +550,17 @@ README 里"指针与 unsafe"一节目前是**愿景**：
   单态化。毯覆方法体里调 `T` 的方法（`self.cl()`，`T: Clone2`）、带边界
   毯覆（receiver 不满足边界时单态化报错，负向 `52`）、具体 impl 优先于
   毯覆（特化）、基元走毯覆都可用；回归 `tests/cases/172_blanket_impl.zr`。
-  **仍不支持**：Rust 特化里"更具体的 impl 只覆盖一部分默认方法、其余从
-  毯覆 impl 继承"的两级默认体继承——那需要默认方法合成与毯覆方法查找的
-  组合（当前具体 impl 未覆盖的默认方法仍不会从毯覆继承）。
+  **两级默认体继承已实现**（2026-11-06）：具体 impl（`ib.generics.is_empty()`）
+  未覆盖的默认方法，若存在毯覆 impl（泛型 impl 实现了同一 trait 且覆盖了
+  该方法），不合成 trait 默认体——`lookup_blanket_method` 找到毯覆方法并按
+  具体类型单态化（`S.default_a()` 得毯覆值而非 trait 默认值，实测 14 vs 1）；
+  毯覆方法体里调 `self` 其它方法（`self.required_b()`）单态化后正确解析；
+  毯覆覆盖无默认体的必需方法时也不算缺失（`impl Tr for W {}` + 毯覆
+  `required_b` 合法，缺了才报 `not all trait items implemented`）。
+  回归 `tests/cases/173_two_level_default.zr`；负向
+  `tests/negative/53_blanket_required_missing.zr`。**仍不支持**：trait 关联
+  类型的毯覆提供（`impl<T> Tr for T { type Item = ... }` 的关联类型继承）——
+  关联类型仍需具体 impl 显式写。
 - **借用检查**：🟡 最小切片已实现——同位置借用重叠（`&mut`+`&mut` / `&`+`&mut`）
   报 `cannot borrow ... while already borrowed`；**写被借用位置**（`x = 5` 而
   `&x`/`&mut x` 存活）报 `cannot assign to ... while it is borrowed`；**读被借用

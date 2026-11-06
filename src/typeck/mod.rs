@@ -740,7 +740,38 @@ impl TypeChecker {
             if ib.generics.is_empty() {
                 if let Some(tname) = ib.trait_type.as_ref().and_then(ast_type_name) {
                     if let Some(td) = prog.traits.iter().find(|t| t.name == tname) {
-                        for tm in &td.methods {
+                        // 是否存在**毯覆 impl**（泛型 impl 实现了同一 trait
+                        // 且覆盖了方法 `method_name`）。两级默认体继承与
+                        // "缺必需方法"检查都复用这个判断：具体 impl 未覆盖
+                        // 某方法时，若毯覆 impl 覆盖了它，方法从毯覆继承。
+                        let blanket_covers = |method_name: &str| {
+                            prog.impls.iter().any(|bi| {
+                                if bi.generics.is_empty()
+                                    || bi.trait_type
+                                        .as_ref()
+                                        .and_then(ast_type_name)
+                                        .as_deref()
+                                        != Some(tname.as_str())
+                                    || !bi.methods.iter().any(|m| m.name == method_name)
+                                {
+                                    return false;
+                                }
+                                // 泛型 impl 的目标必须**匹配当前具体类型**
+                                // （`WithContext<E>` 覆盖 `cause` 但只适用于
+                                // `WithContext<..>`，`SimpleError` 不匹配）。
+                                let bi_names: Vec<String> = bi
+                                    .generics
+                                    .iter()
+                                    .filter_map(|g| match g {
+                                        ast::GenericParam::Type(n, _) => Some(n.clone()),
+                                        ast::GenericParam::Const(n, _) => Some(n.clone()),
+                                        _ => None,
+                                    })
+                                    .collect();
+                                ast_blanket_matches(&bi.target, &ib.target, &bi_names)
+                            })
+                        };
+                         for tm in &td.methods {
                             if !self.cfg_enabled(&tm.attrs) {
                                 continue;
                             }
@@ -752,7 +783,12 @@ impl TypeChecker {
                                 //
                                 // 注意只看**本 impl 写出来的**方法名：默认体
                                 // 合成在下面，不算"用户提供了实现"。
-                                if !ib.methods.iter().any(|m| m.name == tm.name) {
+                                // 毯覆 impl 覆盖了该必需方法时，方法从毯覆
+                                // 继承，不算缺失（`impl Tr for W {}` + 毯覆
+                                // `required_b` 合法）。
+                                if !ib.methods.iter().any(|m| m.name == tm.name)
+                                    && !blanket_covers(&tm.name)
+                                {
                                     return Err(CompileError::type_error(format!(
                                         "not all trait items implemented, missing: `{}`",
                                         tm.name
@@ -762,6 +798,16 @@ impl TypeChecker {
                                 continue;
                             }
                             if ib.methods.iter().any(|m| m.name == tm.name) {
+                                continue;
+                            }
+                            // 两级默认体继承：具体 impl 未覆盖该默认方法时，
+                            // 若存在**毯覆 impl**（泛型 impl 实现了同一 trait
+                            // 且覆盖了该方法），不合成 trait 默认体——让
+                            // `lookup_blanket_method` 找到毯覆方法并按具体类型
+                            // 单态化（Rust 特化：更具体的 impl 只覆盖部分默认
+                            // 方法，其余从毯覆 impl 继承）。若没有毯覆覆盖，
+                            // 照旧合成 trait 默认体。
+                            if blanket_covers(&tm.name) {
                                 continue;
                             }
                             let mut m = tm.clone();
@@ -13271,6 +13317,82 @@ fn ast_target_specificity(pat: &AstType, names: &[String]) -> usize {
         | AstType::Optional(inner) => ast_target_specificity(inner, names),
         AstType::Tuple(ps) => ps.iter().map(|p| ast_target_specificity(p, names)).sum(),
         _ => 0,
+    }
+}
+/// 具体类型 AST 是否匹配泛型 impl 目标 AST（两级默认体继承用）。
+///
+/// `blanket_covers` 需要判断"某个泛型 impl 的目标是否适用于当前具体
+/// impl 的类型"（如 `WithContext<E>` 覆盖 `cause`，但 `SimpleError` 不匹配
+/// `WithContext<..>`——`ast_target_matches` 要 HIR `Ty`，这里在
+/// `check_program` 早期还没有类型表，直接做 AST 形状比较）。
+///
+/// `impl_target` 是泛型 impl 的目标（可含泛型参数占位），`concrete` 是
+/// 具体 impl 的目标（如 `SimpleError` / `Foo<i32>`）。`names` 是泛型 impl
+/// 的参数名列表，占位参数匹配任何形状。
+fn ast_blanket_matches(impl_target: &AstType, concrete: &AstType, names: &[String]) -> bool {
+    match impl_target {
+        // 纯泛型参数占位：`impl<T> Tr for T` 的目标 `T` 匹配任何类型。
+        AstType::Named { path, generics }
+            if path.len() == 1
+                && generics.is_empty()
+                && names.iter().any(|n| n == &path[0]) =>
+        {
+            true
+        }
+        AstType::Named { path, generics } => {
+            let Some(impl_name) = path.last() else {
+                return false;
+            };
+            match concrete {
+                AstType::Named { path: cpath, generics: cgens } => {
+                    cpath.last().map(|n| n == impl_name).unwrap_or(false)
+                        && generics.len() == cgens.len()
+                        && generics
+                            .iter()
+                            .zip(cgens)
+                            .all(|(g, c)| ast_blanket_matches(g, c, names))
+                }
+                _ => false,
+            }
+        }
+        AstType::Pointer(inner, _) | AstType::Reference(inner, _) => match concrete {
+            AstType::Pointer(c, _) | AstType::Reference(c, _) => {
+                ast_blanket_matches(inner, c, names)
+            }
+            _ => false,
+        },
+        AstType::Array(inner, _) => match concrete {
+            AstType::Array(c, _) => ast_blanket_matches(inner, c, names),
+            _ => false,
+        },
+        AstType::Slice(inner, _) => match concrete {
+            AstType::Slice(c, _) | AstType::Array(c, _) => {
+                ast_blanket_matches(inner, c, names)
+            }
+            _ => false,
+        },
+        AstType::Tuple(ps) => match concrete {
+            AstType::Tuple(cs) => {
+                ps.len() == cs.len()
+                    && ps.iter()
+                        .zip(cs)
+                        .all(|(p, c)| ast_blanket_matches(p, c, names))
+            }
+            _ => false,
+        },
+        AstType::Optional(inner) => match concrete {
+            AstType::Optional(c) => ast_blanket_matches(inner, c, names),
+            // `T?` 语法糖是 `Option<T>`。
+            AstType::Named { path, generics }
+                if path.len() == 1 && generics.len() == 1 =>
+            {
+                ast_blanket_matches(inner, &generics[0], names)
+            }
+            _ => false,
+        },
+        // 基元形状（`impl Tr for i32` 类，非泛型，`blanket_covers` 只关心
+        // 泛型 impl，不会到这里）。
+        _ => false,
     }
 }
 fn check_overlap(

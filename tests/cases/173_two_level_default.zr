@@ -1,0 +1,87 @@
+//=============================================================================
+// tests/cases/173_two_level_default.zr - 两级默认体继承（Rust 特化）
+//
+// Rust 特化里"更具体的 impl 只覆盖一部分默认方法、其余从毯覆 impl 继承"。
+// 早先具体 impl 未覆盖的默认方法一律合成 **trait 默认体**（`lookup_method`
+// 先命中 `S__default_a`），毯覆 impl 覆盖的版本被遮蔽——`s.default_a()` 得
+// trait 默认值而非毯覆值（实测 `S` 期望 10 得 1）。
+//
+// 现在具体 impl（`ib.generics.is_empty()`）未覆盖某默认方法时，若存在
+// **毯覆 impl**（泛型 impl 实现了同一 trait 且覆盖了该方法），不合成 trait
+// 默认体——`lookup_blanket_method` 找到毯覆方法并按具体类型单态化。
+//
+// 覆盖：
+// - 具体 impl 只覆盖部分方法（`required_b`），其余（`default_a`）从毯覆继承
+// - 毯覆方法体里调 `self` 的其它方法（`self.required_b()`，具体 impl 提供）
+// - 多个毯覆候选：`impl<T> Tr for T` 与 `impl<T> Tr for Vec<T>` 都覆盖
+//   `default_a` 时，receiver 按**最 specific** 继承（`Vec<i32>` 走 `Vec<T>`、
+//   `S` 走 `for T`）
+// - 无毯覆覆盖时 trait 默认体照旧合成（负向无此场景，`124` 钉住）
+//=============================================================================
+use std::*;
+
+trait Tr {
+    fn default_a(&self) -> i32 {
+        return 1;
+    }
+    fn required_b(&self) -> i32;
+}
+
+struct S;
+struct W;
+
+// 毯覆 impl：default_a 的方法体调 `self.required_b()`（继承到具体类型后
+// 走 `S` 的 `required_b`）。
+impl<T> Tr for T {
+    fn default_a(&self) -> i32 {
+        return self.required_b() + 10;
+    }
+    fn required_b(&self) -> i32 {
+        return 2;
+    }
+}
+
+// 更 specific 毯覆候选：Vec<T>。`Vec<i32>` 的 default_a 应继承这里（20）。
+impl<T> Tr for Vec<T> {
+    fn default_a(&self) -> i32 {
+        return 20;
+    }
+    fn required_b(&self) -> i32 {
+        return 3;
+    }
+}
+
+// 具体 impl：只覆盖 required_b，default_a 从毯覆继承（`T` 的版本）。
+impl Tr for S {
+    fn required_b(&self) -> i32 {
+        return 4;
+    }
+}
+
+// 具体 impl：什么都不覆盖（default_a 与 required_b 都从毯覆继承）。
+impl Tr for W {}
+
+fn main() -> i32 {
+    let s = S {};
+    // default_a = S.required_b() + 10 = 4 + 10 = 14
+    if s.default_a() != 14 {
+        return 1;
+    }
+    if s.required_b() != 4 {
+        return 2;
+    }
+    let w = W {};
+    // W 的 required_b 从毯覆继承（2），default_a = 2 + 10 = 12
+    if w.default_a() != 12 {
+        return 3;
+    }
+    if w.required_b() != 2 {
+        return 4;
+    }
+    // Vec<i32> 走更 specific 毯覆（20）。
+    let v: Vec<i32> = Vec::new();
+    if v.default_a() != 20 {
+        return 5;
+    }
+    return 0;
+}

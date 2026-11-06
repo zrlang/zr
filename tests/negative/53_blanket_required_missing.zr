@@ -1,0 +1,31 @@
+//=============================================================================
+// tests/negative/53_blanket_required_missing.zr - 毯覆不覆盖必需方法时报缺失
+//
+// 毯覆 impl 只覆盖 `default_a`（有默认体），没覆盖无默认体的 `required_b`。
+// 具体 impl 也不写 `required_b` 时，必须在 impl 块上报
+// `not all trait items implemented, missing: required_b`——毯覆覆盖才算
+// 实现，没覆盖不算（与 Rust 一致）。
+//=============================================================================
+trait Tr {
+    fn default_a(&self) -> i32 {
+        return 1;
+    }
+    fn required_b(&self) -> i32;
+}
+
+// 毯覆 impl：只覆盖 default_a，不覆盖 required_b。
+impl<T> Tr for T {
+    fn default_a(&self) -> i32 {
+        return 10;
+    }
+}
+
+struct S;
+
+// 具体 impl：required_b 既没写、毯覆也没覆盖 → 报错。
+impl Tr for S {}
+
+fn main() -> i32 {
+    return 0;
+}
+// expect: not all trait items implemented, missing: `required_b`
